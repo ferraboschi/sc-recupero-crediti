@@ -15,7 +15,7 @@ NC='\033[0m' # No Color
 PROJECT_NAME="SC Recupero Crediti"
 PROJECT_DIR="/opt/sc-recupero-crediti"
 GITHUB_REPO="https://github.com/ferraboschi/sc-recupero-crediti.git"
-DOMAIN="recupero.sakecompany.com"
+DOMAIN="api-recupero.sakecompany.com"
 BACKUP_DIR="/opt/backups/sc-recupero"
 NGINX_LOG_DIR="/var/log/nginx/sc-recupero"
 

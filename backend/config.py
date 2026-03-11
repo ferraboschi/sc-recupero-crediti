@@ -40,6 +40,9 @@ class Config:
     SCHEDULER_HOUR = int(os.getenv("SCHEDULER_HOUR", "8"))
     SCHEDULER_MINUTE = int(os.getenv("SCHEDULER_MINUTE", "30"))
 
+    # CORS - frontend origin (GitHub Pages)
+    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "https://recupero.sakecompany.com,http://localhost:5173").split(",")
+
     # Business rules
     FUZZY_MATCH_THRESHOLD = 85  # Minimum score for fuzzy matching
     BUSINESS_HOURS_START = 9
