@@ -68,8 +68,48 @@ export default function Dashboard() {
 
   if (error) {
     return (
-      <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-red-800">
-        {error}
+      <div className="space-y-6">
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-6">
+          <div className="flex items-start gap-4">
+            <svg className="w-6 h-6 text-amber-600 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+            </svg>
+            <div>
+              <h3 className="font-semibold text-amber-800 text-lg mb-2">Backend non raggiungibile</h3>
+              <p className="text-amber-700 mb-3">
+                Il server API non è ancora configurato. Il frontend è attivo su GitHub Pages, ma il backend deve essere deployato separatamente su un VPS.
+              </p>
+              <div className="bg-amber-100 rounded-md p-4 text-sm text-amber-800">
+                <p className="font-medium mb-2">Per completare il setup:</p>
+                <ol className="list-decimal list-inside space-y-1">
+                  <li>Deploy del backend su un VPS con Docker</li>
+                  <li>Configurare il file .env con le API key</li>
+                  <li>Impostare VITE_API_BASE_URL e ri-deployare il frontend</li>
+                </ol>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Preview delle funzionalità */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+          <div className="bg-white rounded-lg p-6 border border-slate-200">
+            <p className="text-sm text-slate-500 mb-1">Totale Crediti</p>
+            <p className="text-2xl font-bold text-slate-300">--</p>
+          </div>
+          <div className="bg-white rounded-lg p-6 border border-slate-200">
+            <p className="text-sm text-slate-500 mb-1">Posizioni Aperte</p>
+            <p className="text-2xl font-bold text-slate-300">--</p>
+          </div>
+          <div className="bg-white rounded-lg p-6 border border-slate-200">
+            <p className="text-sm text-slate-500 mb-1">Messaggi in Coda</p>
+            <p className="text-2xl font-bold text-slate-300">--</p>
+          </div>
+          <div className="bg-white rounded-lg p-6 border border-slate-200">
+            <p className="text-sm text-slate-500 mb-1">Clienti Attivi</p>
+            <p className="text-2xl font-bold text-slate-300">--</p>
+          </div>
+        </div>
       </div>
     )
   }

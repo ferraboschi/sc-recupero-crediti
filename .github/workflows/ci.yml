@@ -35,10 +35,10 @@ jobs:
         run: flake8 backend/ --ignore=E501,W503,W504,F401 --max-line-length=120
 
       # Frontend Build
-      - name: Set up Node.js 20
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Deploy to Production
     needs: ci
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.DEPLOY_ENABLED == 'true'
 
     steps:
       - name: Checkout code

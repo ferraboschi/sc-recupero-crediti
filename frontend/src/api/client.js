@@ -1,7 +1,8 @@
 import axios from 'axios'
+import config from '../config'
 
 const client = axios.create({
-  baseURL: '/api',
+  baseURL: config.API_BASE_URL ? `${config.API_BASE_URL}/api` : '/api',
   timeout: 30000,
 })
 
