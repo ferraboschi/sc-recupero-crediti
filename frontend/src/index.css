@@ -1,0 +1,93 @@
+@import "tailwindcss/base";
+@import "tailwindcss/components";
+@import "tailwindcss/utilities";
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #f8fafc;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Status badge colors */
+.badge-open {
+  @apply bg-blue-100 text-blue-800;
+}
+
+.badge-contacted {
+  @apply bg-amber-100 text-amber-800;
+}
+
+.badge-promised {
+  @apply bg-purple-100 text-purple-800;
+}
+
+.badge-paid {
+  @apply bg-green-100 text-green-800;
+}
+
+.badge-disputed {
+  @apply bg-red-100 text-red-800;
+}
+
+.badge-escalated {
+  @apply bg-orange-100 text-orange-800;
+}
+
+.badge-draft {
+  @apply bg-gray-100 text-gray-800;
+}
+
+.badge-approved {
+  @apply bg-blue-100 text-blue-800;
+}
+
+.badge-sent {
+  @apply bg-green-100 text-green-800;
+}
+
+/* Utility animations */
+.animate-spin-slow {
+  animation: spin 2s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
