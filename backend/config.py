@@ -14,12 +14,14 @@ class Config:
 
     # Fattura24 (legacy)
     FATTURA24_API_KEY = os.getenv("FATTURA24_API_KEY", "")
-    FATTURA24_API_URL = "https://www.fattura24.com/api/v0.3"
+    FATTURA24_API_URL = os.getenv("FATTURA24_API_URL", "https://www.app.fattura24.com/api/v0.3")
 
     # FatturaPro (current)
     FATTURAPRO_API_URL = os.getenv("FATTURAPRO_API_URL", "https://cloud.fatturapro.click")
     FATTURAPRO_API_KEY = os.getenv("FATTURAPRO_API_KEY", "")
     FATTURAPRO_DOMAIN = os.getenv("FATTURAPRO_DOMAIN", "sakecompany.com")
+    FATTURAPRO_USERNAME = os.getenv("FATTURAPRO_USERNAME", "")
+    FATTURAPRO_PASSWORD = os.getenv("FATTURAPRO_PASSWORD", "")
 
     # Shopify
     SHOPIFY_STORE_URL = os.getenv("SHOPIFY_STORE_URL", "")

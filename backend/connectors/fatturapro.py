@@ -75,24 +75,85 @@ class FatturaProConnector:
             True if authentication successful, False otherwise
         """
         if self._authenticated:
-            return True
+            # Verify session is still valid
+            if self._check_session_valid():
+                return True
+            self._authenticated = False
 
         logger.info("Attempting FatturaPro authentication...")
 
-        # Try /ws/ endpoint first
+        # Check if we already have a valid session (e.g., from cookies)
+        if self._check_session_valid():
+            self._authenticated = True
+            logger.info("Existing session is valid")
+            return True
+
+        # Try form login with username/password
+        if self._try_form_login():
+            self._authenticated = True
+            logger.info("Successfully authenticated via form login")
+            return True
+
+        # Try /ws/ endpoint as fallback
         if self._try_ws_auth():
             self._authenticated = True
             logger.info("Successfully authenticated via /ws/ endpoint")
             return True
 
-        # Fall back to web form authentication
-        if self._try_web_auth():
-            self._authenticated = True
-            logger.info("Successfully authenticated via web form")
-            return True
-
         logger.error("Failed to authenticate with FatturaPro")
         return False
+
+    def _try_form_login(self) -> bool:
+        """Try authentication via web login form with username/password.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        username = config.FATTURAPRO_USERNAME
+        password = config.FATTURAPRO_PASSWORD
+
+        if not username or not password:
+            logger.warning("FATTURAPRO_USERNAME or FATTURAPRO_PASSWORD not configured")
+            return False
+
+        try:
+            logger.debug(f"Attempting form login with user {username}...")
+
+            # Submit login form
+            response = self.client.post(
+                f"{self.base_url}/signin.php",
+                data={
+                    "username": username,
+                    "password": password,
+                    "remember": "on",
+                },
+                timeout=self.timeout,
+            )
+
+            # After successful login, check if we can access a protected page
+            # Use follow_redirects=False to check where it redirects
+            check = self.client.get(
+                f"{self.base_url}/documenti.php",
+                timeout=self.timeout,
+            )
+
+            # If we're still on signin.php, login failed
+            final_url = str(check.url)
+            if "signin.php" in final_url:
+                logger.warning("Form login failed: redirected back to signin")
+                return False
+
+            # Check if the page contains actual content (not login form)
+            if "documenti" in check.text.lower() or "xcrud" in check.text.lower():
+                logger.info("Form login successful")
+                return True
+
+            logger.warning(f"Form login uncertain: final URL={final_url}")
+            return False
+
+        except Exception as e:
+            logger.error(f"Form login error: {e}")
+            return False
 
     def _try_ws_auth(self) -> bool:
         """Try authentication via /ws/ endpoint with API key.
@@ -109,45 +170,42 @@ class FatturaProConnector:
             )
 
             if response.status_code == 200:
-                # Check if response indicates success (varies by endpoint)
-                if "error" not in response.text.lower():
+                # Check for valid response - returnCode 0 means success
+                if "<returnCode>0</returnCode>" in response.text:
                     logger.debug(f"WS auth response: {response.text[:100]}")
                     return True
+                else:
+                    logger.debug(f"WS auth rejected: {response.text[:200]}")
 
             return False
         except Exception as e:
             logger.debug(f"WS authentication failed: {e}")
             return False
 
-    def _try_web_auth(self) -> bool:
-        """Try authentication via web login form.
-
-        This is a fallback if /ws/ endpoint doesn't work.
-        Requires credentials or session token setup.
+    def _check_session_valid(self) -> bool:
+        """Check if current session can access protected pages.
 
         Returns:
             True if session is valid, False otherwise
         """
         try:
-            # Try accessing the main page to see if we have valid cookies
             response = self.client.get(
                 f"{self.base_url}/documenti.php",
                 timeout=self.timeout
             )
 
-            # If we get a redirect to login or 403, authentication failed
-            if response.status_code in [401, 403]:
-                logger.debug("Web authentication: Access denied")
+            final_url = str(response.url)
+            # If redirected to signin, session is invalid
+            if "signin.php" in final_url:
                 return False
 
-            if response.status_code == 200:
-                # Successfully accessed the page
-                logger.debug("Web form access successful")
+            # If we got 200 and page has actual content
+            if response.status_code == 200 and "xcrud" in response.text.lower():
                 return True
 
             return False
         except Exception as e:
-            logger.debug(f"Web authentication attempt failed: {e}")
+            logger.debug(f"Session check failed: {e}")
             return False
 
     def _get_xcrud_key(self) -> Optional[str]:
@@ -213,8 +271,8 @@ class FatturaProConnector:
     def fetch_overdue_invoices(self) -> List[Dict[str, Any]]:
         """Fetch all overdue invoices from FatturaPro.
 
-        Scrapes the documenti.php?s=1 page ("Da incassare" / invoices to collect)
-        and paginates through all results using AJAX requests.
+        Scrapes the documenti.php?s=1 page ("Da incassare" / invoices to collect).
+        First parses the initial page HTML, then paginates via xcrud AJAX if needed.
 
         Returns:
             List of invoice dictionaries with keys:
@@ -235,50 +293,69 @@ class FatturaProConnector:
         all_invoices = []
 
         try:
+            # First, load the initial page which already contains data
+            response = self.client.get(
+                f"{self.base_url}/documenti.php?s=1",
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+
+            # Parse the initial page
+            initial_invoices = self._parse_invoice_table(response.text)
+            all_invoices.extend(initial_invoices)
+            logger.info(f"Initial page: found {len(initial_invoices)} invoices")
+
+            # Get xcrud key for pagination
             xcrud_key = self._get_xcrud_key()
             if not xcrud_key:
-                logger.error("Cannot proceed without xcrud key")
-                return []
+                logger.warning("No xcrud key found, returning initial page results only")
+                return all_invoices
 
-            # Paginate through all results
-            offset = 0
-            limit = 10
+            # Check if there are more pages by looking for pagination info
+            soup = BeautifulSoup(response.text, "html.parser")
+            # Look for pagination indicators (e.g., "showing 1-10 of 500")
+            pager = soup.find(class_=re.compile(r"xcrud-nav|xcrud-pagination|pager"))
+            has_more = pager is not None and len(initial_invoices) >= 10
 
-            while True:
-                logger.debug(f"Fetching invoices at offset {offset}...")
+            # Paginate through remaining results via AJAX
+            if has_more:
+                offset = len(initial_invoices)
+                limit = 20
 
-                response = self.client.post(
-                    f"{self.base_url}/xcrud/xcrud_ajax.php",
-                    data={
-                        "key": xcrud_key,
-                        "instance": "documenti",
-                        "task": "list",
-                        "start": offset,
-                        "limit": limit,
-                        "orderby": "documenti.Data",
-                        "order": "desc"
-                    },
-                    timeout=self.timeout
-                )
-                response.raise_for_status()
+                while True:
+                    logger.debug(f"Fetching invoices at offset {offset}...")
 
-                # Parse the HTML response
-                invoices_batch = self._parse_invoice_table(response.text)
+                    ajax_resp = self.client.post(
+                        f"{self.base_url}/xcrud/xcrud_ajax.php",
+                        data={
+                            "key": xcrud_key,
+                            "task": "ajax",
+                            "action": "list",
+                            "start": offset,
+                            "limit": limit,
+                        },
+                        headers={
+                            "X-Requested-With": "XMLHttpRequest",
+                        },
+                        timeout=self.timeout,
+                    )
+                    ajax_resp.raise_for_status()
 
-                if not invoices_batch:
-                    logger.debug("No more invoices found, stopping pagination")
-                    break
+                    invoices_batch = self._parse_invoice_table(ajax_resp.text)
 
-                all_invoices.extend(invoices_batch)
+                    if not invoices_batch:
+                        logger.debug("No more invoices found, stopping pagination")
+                        break
 
-                # If we got fewer results than the limit, we've reached the end
-                if len(invoices_batch) < limit:
-                    logger.debug(f"Received {len(invoices_batch)} results (< {limit}), reached end")
-                    break
+                    all_invoices.extend(invoices_batch)
+                    logger.debug(f"Fetched {len(invoices_batch)} invoices at offset {offset}")
 
-                offset += limit
+                    if len(invoices_batch) < limit:
+                        break
 
-            logger.info(f"Successfully fetched {len(all_invoices)} overdue invoices")
+                    offset += limit
+
+            logger.info(f"Successfully fetched {len(all_invoices)} overdue invoices (total)")
             return all_invoices
 
         except Exception as e:
@@ -327,6 +404,11 @@ class FatturaProConnector:
                     customer_name = cells[2].get_text(strip=True)
                     total_str = cells[3].get_text(strip=True)
                     balance_str = cells[4].get_text(strip=True)
+
+                    # Skip summary/total rows (no invoice number or no date)
+                    if not invoice_number or not date_str:
+                        logger.debug("Skipping row without invoice number or date (likely summary row)")
+                        continue
 
                     # Parse numeric values
                     total = self._parse_currency(total_str)
