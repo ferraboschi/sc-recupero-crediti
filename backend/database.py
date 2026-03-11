@@ -132,6 +132,9 @@ def get_engine():
             poolclass=NullPool,
         )
 
+    # Register SQLite pragma listener (no-op for PostgreSQL)
+    event.listen(_engine, "connect", _set_sqlite_pragma)
+
     return _engine
 
 
@@ -149,9 +152,9 @@ def get_session():
     return Session()
 
 
-# Enable WAL mode for SQLite only
-@event.listens_for(get_engine(), "connect")
-def set_sqlite_pragma(dbapi_conn, connection_record):
+# SQLite WAL mode listener — registered lazily inside get_engine()
+# to avoid creating the engine at import time.
+def _set_sqlite_pragma(dbapi_conn, connection_record):
     """Set SQLite pragmas (skipped for PostgreSQL)."""
     db_url = config.DATABASE_URL
     if not db_url.startswith("sqlite"):
