@@ -122,16 +122,14 @@ def get_engine():
     if db_url.startswith("sqlite"):
         _engine = create_engine(db_url, echo=False)
     else:
-        # PostgreSQL (Supabase) — use minimal connection pooling
-        # Supabase Session Pooler has limited max_clients
+        # PostgreSQL (Supabase) — use NullPool to avoid connection exhaustion
+        # Supabase Session Pooler has limited max_clients; NullPool creates
+        # a fresh connection for each request and closes it immediately after
+        from sqlalchemy.pool import NullPool
         _engine = create_engine(
             db_url,
             echo=False,
-            pool_size=2,
-            max_overflow=3,
-            pool_pre_ping=True,
-            pool_recycle=300,
-            pool_timeout=30,
+            poolclass=NullPool,
         )
 
     return _engine
