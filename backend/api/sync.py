@@ -77,7 +77,8 @@ def _sync_invoices_task() -> dict:
                 result["fatturapro"]["updated"] = updated
                 logger.info(f"FatturaPro sync: created={created}, updated={updated}")
             else:
-                result["fatturapro"]["error"] = "Login failed"
+                result["fatturapro"]["error"] = "Login failed — check FATTURAPRO_USERNAME/PASSWORD env vars and server logs"
+                logger.error("FatturaPro login failed — cannot sync invoices")
                 logger.warning("FatturaPro login failed")
         except Exception as e:
             result["fatturapro"]["error"] = str(e)

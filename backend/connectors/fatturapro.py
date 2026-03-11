@@ -106,6 +106,9 @@ class FatturaProConnector:
     def _try_form_login(self) -> bool:
         """Try authentication via web login form with username/password.
 
+        First fetches the login page to extract any hidden tokens (CSRF),
+        then submits the form with all required fields.
+
         Returns:
             True if successful, False otherwise
         """
@@ -117,42 +120,65 @@ class FatturaProConnector:
             return False
 
         try:
-            logger.debug(f"Attempting form login with user {username}...")
+            logger.info(f"Attempting form login with user {username}...")
+
+            # First, GET the login page to capture cookies and any hidden form fields
+            login_page = self.client.get(
+                f"{self.base_url}/signin.php",
+                timeout=self.timeout,
+            )
+            logger.info(f"Login page status: {login_page.status_code}, URL: {login_page.url}")
+
+            # Parse login form for hidden fields
+            form_data = {
+                "username": username,
+                "password": password,
+                "remember": "on",
+            }
+
+            soup = BeautifulSoup(login_page.text, "html.parser")
+            login_form = soup.find("form")
+            if login_form:
+                for hidden in login_form.find_all("input", {"type": "hidden"}):
+                    name = hidden.get("name")
+                    value = hidden.get("value", "")
+                    if name and name not in form_data:
+                        form_data[name] = value
+                        logger.info(f"Found hidden form field: {name}={value[:20]}...")
 
             # Submit login form
             response = self.client.post(
                 f"{self.base_url}/signin.php",
-                data={
-                    "username": username,
-                    "password": password,
-                    "remember": "on",
-                },
+                data=form_data,
                 timeout=self.timeout,
             )
+            logger.info(f"Login POST status: {response.status_code}, URL: {response.url}")
 
             # After successful login, check if we can access a protected page
-            # Use follow_redirects=False to check where it redirects
             check = self.client.get(
                 f"{self.base_url}/documenti.php",
                 timeout=self.timeout,
             )
+            logger.info(f"Post-login check status: {check.status_code}, URL: {check.url}")
 
             # If we're still on signin.php, login failed
             final_url = str(check.url)
             if "signin.php" in final_url:
                 logger.warning("Form login failed: redirected back to signin")
+                # Log a snippet of the page to debug
+                logger.info(f"Login page snippet: {check.text[:500]}")
                 return False
 
             # Check if the page contains actual content (not login form)
             if "documenti" in check.text.lower() or "xcrud" in check.text.lower():
-                logger.info("Form login successful")
+                logger.info("Form login successful — authenticated!")
                 return True
 
-            logger.warning(f"Form login uncertain: final URL={final_url}")
+            logger.warning(f"Form login uncertain: final URL={final_url}, content length={len(check.text)}")
             return False
 
         except Exception as e:
-            logger.error(f"Form login error: {e}")
+            logger.error(f"Form login error: {e}", exc_info=True)
             return False
 
     def _try_ws_auth(self) -> bool:
