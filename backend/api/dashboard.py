@@ -74,9 +74,17 @@ async def get_dashboard(session: Session = Depends(get_session)):
             for activity in recent_activity
         ]
 
+        # Additional stats for dashboard cards
+        total_customers = session.query(func.count(Customer.id)).scalar() or 0
+        draft_messages = session.query(func.count(Message.id)).filter(
+            Message.status == "draft"
+        ).scalar() or 0
+
         return {
             "total_crediti": float(total_crediti),
             "total_positions": total_positions,
+            "total_customers": total_customers,
+            "draft_messages": draft_messages,
             "positions_by_status": status_breakdown,
             "positions_by_escalation_level": escalation_breakdown,
             "recent_activity": activity_list,

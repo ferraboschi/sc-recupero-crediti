@@ -216,12 +216,12 @@ export default function Dashboard() {
         />
         <StatsWidget
           label="Messaggi in Coda"
-          value={data.recent_activity?.length || 0}
+          value={data.draft_messages || 0}
           color="orange"
         />
         <StatsWidget
-          label="Ultimi Aggiornamenti"
-          value={data.recent_activity?.length || 0}
+          label="Clienti Totali"
+          value={data.total_customers || 0}
           color="green"
         />
       </div>
