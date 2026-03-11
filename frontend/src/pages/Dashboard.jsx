@@ -37,7 +37,7 @@ export default function Dashboard() {
     setSyncing(true)
     setSyncMessage('')
     try {
-      await client.post('/sync/all')
+      await client.post('/sync/full')
       setSyncMessage('Sincronizzazione completata con successo')
       const now = new Date()
       setLastSync(now)
