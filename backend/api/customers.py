@@ -144,7 +144,6 @@ async def toggle_customer_exclusion(
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
 
-        old_excluded = customer.excluded
         customer.excluded = exclude
         customer.updated_at = datetime.utcnow()
         session.commit()

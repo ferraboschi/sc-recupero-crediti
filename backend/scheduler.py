@@ -182,7 +182,7 @@ def start_scheduler():
 
 def stop_scheduler():
     """Stop the background scheduler."""
-    global _scheduler, _scheduler_started
+    global _scheduler_started
 
     if not _scheduler_started or not _scheduler:
         logger.warning("Scheduler not running")

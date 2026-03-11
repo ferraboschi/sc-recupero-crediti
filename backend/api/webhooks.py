@@ -65,8 +65,6 @@ async def twilio_webhook(
         twilio_message_sid = form_data.get("MessageSid")
         from_number = form_data.get("From", "")  # Phone number format: whatsapp:+1234567890
         message_body = form_data.get("Body", "").strip()
-        timestamp = form_data.get("Timestamp", datetime.utcnow().isoformat())
-
         logger.info(f"Received Twilio message: {twilio_message_sid} from {from_number}")
 
         if not message_body:
