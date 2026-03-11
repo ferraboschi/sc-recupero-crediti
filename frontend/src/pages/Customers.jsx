@@ -52,6 +52,12 @@ export default function Customers() {
     }
   }
 
+  const isPhoneValid = (phone) => {
+    if (!phone) return false
+    const phoneRegex = /^[\d\s\-\+\(\)]+$/
+    return phone.length >= 9 && phoneRegex.test(phone)
+  }
+
   return (
     <div className="space-y-6">
       {/* Search Bar */}
@@ -105,8 +111,23 @@ export default function Customers() {
                       <td className="px-6 py-3 text-sm text-slate-600">
                         {customer.partita_iva}
                       </td>
-                      <td className="px-6 py-3 text-sm text-slate-600">
-                        {customer.phone || '-'}
+                      <td className="px-6 py-3 text-sm text-slate-600 flex items-center gap-2">
+                        {customer.phone ? (
+                          <>
+                            <span>{customer.phone}</span>
+                            {isPhoneValid(customer.phone) ? (
+                              <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-green-100 text-green-600 text-xs font-bold" title="Numero valido">
+                                ✓
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-yellow-100 text-yellow-600 text-xs font-bold" title="Formato sospetto">
+                                ⚠
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span className="text-slate-400">-</span>
+                        )}
                       </td>
                       <td className="px-6 py-3 text-sm text-slate-600">
                         {customer.email || '-'}

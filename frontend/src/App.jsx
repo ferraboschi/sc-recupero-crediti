@@ -63,14 +63,20 @@ export default function App() {
       {/* Main Content */}
       <div className="flex-1 flex flex-col">
         {/* Top Bar */}
-        <div className="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between">
-          <h1 className="text-2xl font-bold text-slate-900">
-            {navItems.find(item => item.path === location.pathname)?.label || 'Dashboard'}
-          </h1>
+        <div className="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between shadow-sm">
+          <div className="flex items-center gap-3">
+            <div className="text-3xl">💳</div>
+            <div>
+              <h1 className="text-2xl font-bold text-slate-900">SC Recupero Crediti</h1>
+              <p className="text-xs text-slate-500">
+                {navItems.find(item => item.path === location.pathname)?.label || 'Dashboard'}
+              </p>
+            </div>
+          </div>
           <div className="flex items-center gap-4">
             <SyncButton />
             <div className="flex items-center gap-2 text-sm text-slate-600">
-              <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+              <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
               Sistema Attivo
             </div>
           </div>

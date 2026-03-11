@@ -7,22 +7,51 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
+  const [syncing, setSyncing] = useState(false)
+  const [syncMessage, setSyncMessage] = useState('')
+  const [lastSync, setLastSync] = useState(null)
+
+  const fetchData = async () => {
+    try {
+      setLoading(true)
+      const response = await client.get('/dashboard')
+      setData(response.data)
+      // Load last sync time from localStorage
+      const savedLastSync = localStorage.getItem('lastSyncTime')
+      if (savedLastSync) {
+        setLastSync(new Date(savedLastSync))
+      }
+    } catch (err) {
+      setError('Errore nel caricamento dei dati del dashboard')
+      console.error(err)
+    } finally {
+      setLoading(false)
+    }
+  }
 
   useEffect(() => {
-    const fetchData = async () => {
-      try {
-        setLoading(true)
-        const response = await client.get('/dashboard')
-        setData(response.data)
-      } catch (err) {
-        setError('Errore nel caricamento dei dati del dashboard')
-        console.error(err)
-      } finally {
-        setLoading(false)
-      }
-    }
     fetchData()
   }, [])
+
+  const handleSync = async () => {
+    setSyncing(true)
+    setSyncMessage('')
+    try {
+      await client.post('/sync/all')
+      setSyncMessage('Sincronizzazione completata con successo')
+      const now = new Date()
+      setLastSync(now)
+      localStorage.setItem('lastSyncTime', now.toISOString())
+      // Refresh dashboard data
+      await fetchData()
+      setTimeout(() => setSyncMessage(''), 3000)
+    } catch (err) {
+      setSyncMessage('Errore nella sincronizzazione')
+      console.error(err)
+    } finally {
+      setSyncing(false)
+    }
+  }
 
   if (loading) {
     return (
@@ -88,6 +117,51 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-8">
+      {/* Last Sync and Sync Button */}
+      <div className="bg-white rounded-lg p-6 border border-slate-200 flex items-center justify-between">
+        <div>
+          <h3 className="font-medium text-slate-900 mb-2">Stato Sincronizzazione</h3>
+          <p className="text-sm text-slate-600">
+            {lastSync
+              ? `Ultimo aggiornamento: ${lastSync.toLocaleString('it-IT')}`
+              : 'Nessuna sincronizzazione eseguita'
+            }
+          </p>
+        </div>
+        <div className="flex items-center gap-4">
+          {syncMessage && (
+            <p className={`text-sm font-medium ${syncMessage.includes('Errore') ? 'text-red-600' : 'text-green-600'}`}>
+              {syncMessage}
+            </p>
+          )}
+          <button
+            onClick={handleSync}
+            disabled={syncing}
+            className={`px-4 py-2 rounded-lg font-medium text-sm transition-colors flex items-center gap-2 ${
+              syncing
+                ? 'bg-slate-300 text-slate-500 cursor-not-allowed'
+                : 'bg-blue-600 text-white hover:bg-blue-700'
+            }`}
+          >
+            {syncing ? (
+              <>
+                <svg className="animate-spin w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Sincronizzazione...
+              </>
+            ) : (
+              <>
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Sincronizza Ora
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+
       {/* Top Stats */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatsWidget

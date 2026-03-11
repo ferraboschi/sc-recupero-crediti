@@ -23,6 +23,8 @@ export default function Positions() {
   const [escalationFilter, setEscalationFilter] = useState('')
   const [minAmountFilter, setMinAmountFilter] = useState('')
   const [searchFilter, setSearchFilter] = useState('')
+  const [sortBy, setSortBy] = useState('') // 'amount', 'days_overdue'
+  const [sortOrder, setSortOrder] = useState('asc') // 'asc', 'desc'
 
   useEffect(() => {
     const fetchPositions = async () => {
@@ -70,12 +72,38 @@ export default function Positions() {
     return statusObj?.label || status
   }
 
+  // Calculate total amount due for filtered positions
+  const totalAmountDue = positions.reduce((sum, pos) => sum + (pos.amount_due || 0), 0)
+
+  const handleSort = (field) => {
+    if (sortBy === field) {
+      setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortBy(field)
+      setSortOrder('asc')
+    }
+  }
+
   return (
     <div className="space-y-6">
       {/* Filters */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <h2 className="text-lg font-bold text-slate-900 mb-4">Filtri</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <h2 className="text-lg font-bold text-slate-900 mb-4">Filtri e Ricerca</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-2">Ricerca Cliente/Fattura</label>
+            <input
+              type="text"
+              value={searchFilter}
+              onChange={(e) => {
+                setSearchFilter(e.target.value)
+                setSkip(0)
+              }}
+              placeholder="Nome cliente, P.IVA, Fattura..."
+              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-2">Stato</label>
             <select
@@ -128,20 +156,33 @@ export default function Positions() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Ricerca</label>
-            <input
-              type="text"
-              value={searchFilter}
-              onChange={(e) => {
-                setSearchFilter(e.target.value)
-                setSkip(0)
-              }}
-              placeholder="Cliente, Fattura..."
+            <label className="block text-sm font-medium text-slate-700 mb-2">Ordina Per</label>
+            <select
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value)}
               className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
+            >
+              <option value="">Nessuno</option>
+              <option value="amount">Importo</option>
+              <option value="days_overdue">Giorni Ritardo</option>
+            </select>
           </div>
         </div>
       </div>
+
+      {/* Summary Stats */}
+      {positions.length > 0 && (
+        <div className="bg-blue-50 rounded-lg p-4 border border-blue-200 flex items-center gap-6">
+          <div>
+            <p className="text-sm font-medium text-blue-900">Totale Importo Dovuto</p>
+            <p className="text-2xl font-bold text-blue-600">{formatCurrency(totalAmountDue)}</p>
+          </div>
+          <div>
+            <p className="text-sm font-medium text-blue-900">Posizioni Mostrate</p>
+            <p className="text-2xl font-bold text-blue-600">{positions.length} di {total}</p>
+          </div>
+        </div>
+      )}
 
       {/* Table */}
       <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
@@ -163,10 +204,14 @@ export default function Positions() {
                   <tr>
                     <th className="px-6 py-3 text-left text-sm font-semibold text-slate-900">Cliente</th>
                     <th className="px-6 py-3 text-left text-sm font-semibold text-slate-900">Fattura</th>
-                    <th className="px-6 py-3 text-right text-sm font-semibold text-slate-900">Importo</th>
+                    <th className="px-6 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('amount')}>
+                      Importo {sortBy === 'amount' && (sortOrder === 'asc' ? '↑' : '↓')}
+                    </th>
                     <th className="px-6 py-3 text-right text-sm font-semibold text-slate-900">Saldo</th>
                     <th className="px-6 py-3 text-left text-sm font-semibold text-slate-900">Scadenza</th>
-                    <th className="px-6 py-3 text-right text-sm font-semibold text-slate-900">Giorni Ritardo</th>
+                    <th className="px-6 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('days_overdue')}>
+                      Giorni Ritardo {sortBy === 'days_overdue' && (sortOrder === 'asc' ? '↑' : '↓')}
+                    </th>
                     <th className="px-6 py-3 text-center text-sm font-semibold text-slate-900">Livello</th>
                     <th className="px-6 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
                   </tr>

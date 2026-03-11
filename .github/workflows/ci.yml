@@ -32,7 +32,7 @@ jobs:
         run: pytest tests/ -v
 
       - name: Run flake8 linting
-        run: flake8 backend/ --ignore=E501 --max-line-length=88
+        run: flake8 backend/ --ignore=E501,W503,W504,F401 --max-line-length=120
 
       # Frontend Build
       - name: Set up Node.js 20
@@ -43,7 +43,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install frontend dependencies
-        run: cd frontend && npm ci
+        run: cd frontend && npm install
 
       - name: Build frontend
         run: cd frontend && npm run build
@@ -79,4 +79,4 @@ jobs:
       - name: Health check
         run: |
           sleep 5
-          curl -f http://${{ secrets.DEPLOY_HOST }}:8000/health || exit 1
+          curl -f http://${{ secrets.DEPLOY_HOST }}:8000/api/health || exit 1

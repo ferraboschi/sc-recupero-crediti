@@ -10,6 +10,7 @@ export default function Messages() {
   const [actionLoading, setActionLoading] = useState(false)
   const [skip, setSkip] = useState(0)
   const [total, setTotal] = useState(0)
+  const [statusFilter, setStatusFilter] = useState('')
   const limit = 50
 
   useEffect(() => {
@@ -19,6 +20,9 @@ export default function Messages() {
         const params = { skip, limit }
         if (activeTab !== 'all') {
           params.status = activeTab === 'sent' ? 'sent' : activeTab
+        }
+        if (statusFilter) {
+          params.status = statusFilter
         }
         const response = await client.get('/messages', { params })
         setMessages(response.data.items)
@@ -31,7 +35,7 @@ export default function Messages() {
       }
     }
     fetchMessages()
-  }, [skip, activeTab])
+  }, [skip, activeTab, statusFilter])
 
   const handleSelectAll = () => {
     if (selectedMessages.size === messages.length) {
@@ -111,28 +115,35 @@ export default function Messages() {
     { value: 'sent', label: 'Inviati' },
   ]
 
+  const statuses = [
+    { value: 'draft', label: 'Bozza', color: 'gray' },
+    { value: 'approved', label: 'Approvato', color: 'blue' },
+    { value: 'sent', label: 'Inviato', color: 'green' },
+    { value: 'delivered', label: 'Consegnato', color: 'green' },
+    { value: 'read', label: 'Letto', color: 'green' },
+    { value: 'replied', label: 'Risposto', color: 'purple' },
+    { value: 'failed', label: 'Non Riuscito', color: 'red' },
+  ]
+
   const getStatusColor = (status) => {
-    const colors = {
-      draft: 'gray',
-      approved: 'blue',
-      sent: 'green',
-      delivered: 'green',
-      read: 'green',
-      replied: 'purple',
-    }
-    return colors[status] || 'gray'
+    const statusObj = statuses.find(s => s.value === status)
+    return statusObj?.color || 'gray'
   }
 
   const getStatusLabel = (status) => {
-    const labels = {
-      draft: 'Bozza',
-      approved: 'Approvato',
-      sent: 'Inviato',
-      delivered: 'Consegnato',
-      read: 'Letto',
-      replied: 'Risposto',
+    const statusObj = statuses.find(s => s.value === status)
+    return statusObj?.label || status
+  }
+
+  const getStatusBgClass = (status) => {
+    const colorMap = {
+      gray: 'bg-gray-100 text-gray-800',
+      blue: 'bg-blue-100 text-blue-800',
+      green: 'bg-green-100 text-green-800',
+      purple: 'bg-purple-100 text-purple-800',
+      red: 'bg-red-100 text-red-800',
     }
-    return labels[status] || status
+    return colorMap[getStatusColor(status)] || 'bg-gray-100 text-gray-800'
   }
 
   return (
@@ -158,6 +169,26 @@ export default function Messages() {
             </button>
           ))}
         </div>
+      </div>
+
+      {/* Status Filter */}
+      <div className="bg-white rounded-lg p-4 border border-slate-200">
+        <label className="block text-sm font-medium text-slate-700 mb-2">Filtra per Stato</label>
+        <select
+          value={statusFilter}
+          onChange={(e) => {
+            setStatusFilter(e.target.value)
+            setSkip(0)
+          }}
+          className="w-full md:w-64 px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+        >
+          <option value="">Tutti gli stati</option>
+          {statuses.map(status => (
+            <option key={status.value} value={status.value}>
+              {status.label}
+            </option>
+          ))}
+        </select>
       </div>
 
       {/* Bulk Actions */}
@@ -217,59 +248,69 @@ export default function Messages() {
           </div>
         ) : (
           messages.map(message => (
-            <div key={message.id} className="bg-white rounded-lg border border-slate-200 p-6 hover:shadow-md transition-shadow">
-              <div className="flex items-start justify-between gap-4">
-                <div className="flex items-start gap-4 flex-1">
-                  <input
-                    type="checkbox"
-                    checked={selectedMessages.has(message.id)}
-                    onChange={() => handleSelectMessage(message.id)}
-                    className="w-4 h-4 text-blue-600 rounded mt-1"
-                  />
-                  <div className="flex-1">
-                    <div className="flex items-center gap-3 mb-2">
-                      <h3 className="font-semibold text-slate-900">Fattura: {message.id}</h3>
-                      <span className={`badge-${message.status} px-3 py-1 rounded-full text-xs font-medium`}>
-                        {getStatusLabel(message.status)}
-                      </span>
-                      <span className="px-3 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
-                        Livello {message.escalation_level}
-                      </span>
+            <div key={message.id} className="bg-white rounded-lg border border-slate-200 overflow-hidden hover:shadow-md transition-shadow">
+              {/* Message Header */}
+              <div className="p-6 border-b border-slate-100">
+                <div className="flex items-start justify-between gap-4 mb-3">
+                  <div className="flex items-start gap-4 flex-1">
+                    <input
+                      type="checkbox"
+                      checked={selectedMessages.has(message.id)}
+                      onChange={() => handleSelectMessage(message.id)}
+                      className="w-4 h-4 text-blue-600 rounded mt-1"
+                    />
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 flex-wrap mb-2">
+                        <h3 className="font-semibold text-slate-900">Fattura: {message.id}</h3>
+                        <span className={`px-2 py-1 rounded-full text-xs font-semibold ${getStatusBgClass(message.status)}`}>
+                          {getStatusLabel(message.status)}
+                        </span>
+                        <span className="px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+                          Livello {message.escalation_level}
+                        </span>
+                      </div>
                     </div>
-                    <p className="text-slate-600 text-sm mb-2 line-clamp-2">
-                      {message.body}
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      Creato: {new Date(message.created_at).toLocaleString('it-IT')}
-                    </p>
                   </div>
-                </div>
 
-                {/* Action Buttons */}
-                <div className="flex gap-2">
-                  {message.status === 'draft' && (
-                    <>
-                      <button
-                        onClick={() => handleApproveMessage(message.id)}
-                        className="px-3 py-1 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700"
-                      >
-                        Approva
-                      </button>
+                  {/* Action Buttons */}
+                  <div className="flex gap-2">
+                    {message.status === 'draft' && (
+                      <>
+                        <button
+                          onClick={() => handleApproveMessage(message.id)}
+                          className="px-3 py-1 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700"
+                        >
+                          Approva
+                        </button>
+                        <button
+                          onClick={() => handleSendMessage(message.id)}
+                          className="px-3 py-1 bg-green-600 text-white rounded text-sm font-medium hover:bg-green-700"
+                        >
+                          Invia
+                        </button>
+                      </>
+                    )}
+                    {message.status === 'approved' && (
                       <button
                         onClick={() => handleSendMessage(message.id)}
                         className="px-3 py-1 bg-green-600 text-white rounded text-sm font-medium hover:bg-green-700"
                       >
                         Invia
                       </button>
-                    </>
-                  )}
-                  {message.status === 'approved' && (
-                    <button
-                      onClick={() => handleSendMessage(message.id)}
-                      className="px-3 py-1 bg-green-600 text-white rounded text-sm font-medium hover:bg-green-700"
-                    >
-                      Invia
-                    </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Message Body */}
+              <div className="p-6 bg-slate-50">
+                <p className="text-slate-700 text-sm whitespace-pre-wrap mb-3">
+                  {message.body}
+                </p>
+                <div className="flex items-center justify-between text-xs text-slate-500">
+                  <span>Creato: {new Date(message.created_at).toLocaleString('it-IT')}</span>
+                  {message.sent_at && (
+                    <span>Inviato: {new Date(message.sent_at).toLocaleString('it-IT')}</span>
                   )}
                 </div>
               </div>
