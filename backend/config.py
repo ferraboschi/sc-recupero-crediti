@@ -34,8 +34,14 @@ class Config:
     TWILIO_WHATSAPP_NUMBER_RECOVERY = os.getenv("TWILIO_WHATSAPP_NUMBER_RECOVERY", "")
     TWILIO_WEBHOOK_URL = os.getenv("TWILIO_WEBHOOK_URL", "")
 
+    # Database
+    # Use DATABASE_URL for PostgreSQL (Supabase) or fall back to SQLite
+    DATABASE_URL = os.getenv(
+        "DATABASE_URL",
+        f"sqlite:///{os.getenv('DATABASE_PATH', 'data/sc_recupero.db')}"
+    )
+
     # App
-    DATABASE_PATH = os.getenv("DATABASE_PATH", "data/sc_recupero.db")
     TIMEZONE = os.getenv("TIMEZONE", "Europe/Rome")
     SCHEDULER_HOUR = int(os.getenv("SCHEDULER_HOUR", "8"))
     SCHEDULER_MINUTE = int(os.getenv("SCHEDULER_MINUTE", "30"))

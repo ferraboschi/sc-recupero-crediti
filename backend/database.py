@@ -1,4 +1,4 @@
-"""Database setup and models using SQLite with SQLAlchemy."""
+"""Database setup and models using SQLAlchemy (PostgreSQL/SQLite)."""
 
 import datetime
 from sqlalchemy import (
@@ -108,10 +108,30 @@ class ActivityLog(Base):
 
 
 # Database engine and session
+_engine = None
+
+
 def get_engine():
-    """Create SQLite engine."""
-    db_path = config.DATABASE_PATH
-    return create_engine(f"sqlite:///{db_path}", echo=False)
+    """Create database engine (PostgreSQL or SQLite based on DATABASE_URL)."""
+    global _engine
+    if _engine is not None:
+        return _engine
+
+    db_url = config.DATABASE_URL
+
+    if db_url.startswith("sqlite"):
+        _engine = create_engine(db_url, echo=False)
+    else:
+        # PostgreSQL (Supabase) — use connection pooling
+        _engine = create_engine(
+            db_url,
+            echo=False,
+            pool_size=5,
+            max_overflow=10,
+            pool_pre_ping=True,
+        )
+
+    return _engine
 
 
 def init_db():
@@ -128,9 +148,13 @@ def get_session():
     return Session()
 
 
-# Enable WAL mode for better concurrency
+# Enable WAL mode for SQLite only
 @event.listens_for(get_engine(), "connect")
 def set_sqlite_pragma(dbapi_conn, connection_record):
+    """Set SQLite pragmas (skipped for PostgreSQL)."""
+    db_url = config.DATABASE_URL
+    if not db_url.startswith("sqlite"):
+        return
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")

@@ -1,12 +1,13 @@
 # SC Recupero Crediti - Backend API
-# Docker image for FastAPI backend only (frontend is on GitHub Pages)
+# Docker image for FastAPI backend (PostgreSQL via Supabase or SQLite locale)
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (include libpq for psycopg2)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    libpq-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -22,7 +23,7 @@ COPY backend/ ./backend/
 # Copy .env.example as default (can be overridden at runtime)
 COPY .env.example .env
 
-# Create data directory for SQLite
+# Create data directory (for SQLite fallback)
 RUN mkdir -p data/logs
 
 # Expose port

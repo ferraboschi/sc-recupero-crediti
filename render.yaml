@@ -1,0 +1,51 @@
+# SC Recupero Crediti - Render Blueprint
+# Deploy: https://render.com/deploy → Connect GitHub repo
+# Il database è su Supabase (PostgreSQL), non serve un DB Render
+
+services:
+  - type: web
+    name: sc-recupero-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false  # Set manually in Render dashboard (Supabase connection string)
+      - key: FATTURAPRO_API_URL
+        sync: false
+      - key: FATTURAPRO_API_KEY
+        sync: false
+      - key: FATTURAPRO_DOMAIN
+        sync: false
+      - key: FATTURA24_API_KEY
+        sync: false
+      - key: SHOPIFY_STORE_URL
+        sync: false
+      - key: SHOPIFY_ACCESS_TOKEN
+        sync: false
+      - key: SHOPIFY_API_VERSION
+        value: "2026-01"
+      - key: SHOPIFY_PIVA_FIELD
+        value: address2
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_NUMBER_BUSINESS
+        sync: false
+      - key: TWILIO_WHATSAPP_NUMBER_RECOVERY
+        sync: false
+      - key: TWILIO_WEBHOOK_URL
+        sync: false
+      - key: TIMEZONE
+        value: Europe/Rome
+      - key: SCHEDULER_HOUR
+        value: "8"
+      - key: SCHEDULER_MINUTE
+        value: "30"
+      - key: CORS_ORIGINS
+        value: "https://recupero.sakecompany.com"
+      - key: PYTHON_VERSION
+        value: "3.12.0"

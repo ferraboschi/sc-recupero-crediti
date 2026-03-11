@@ -48,35 +48,5 @@ jobs:
       - name: Build frontend
         run: cd frontend && npm run build
 
-  deploy:
-    runs-on: ubuntu-latest
-    name: Deploy to Production
-    needs: ci
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.DEPLOY_ENABLED == 'true'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy to production server
-        env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-        run: |
-          mkdir -p ~/.ssh
-          echo "$DEPLOY_SSH_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts 2>/dev/null
-
-          ssh $DEPLOY_USER@$DEPLOY_HOST << 'EOFSH'
-          cd /opt/sc-recupero-crediti
-          git pull origin main
-          docker-compose build
-          docker-compose up -d
-          EOFSH
-
-      - name: Health check
-        run: |
-          sleep 5
-          curl -f http://${{ secrets.DEPLOY_HOST }}:8000/api/health || exit 1
+  # Deploy backend: automatico su Render (collegato al branch main via render.yaml)
+  # Per deploy manuale su VPS con Docker, usare deploy/setup.sh

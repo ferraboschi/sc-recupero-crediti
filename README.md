@@ -9,7 +9,7 @@ Sistema automatizzato di recupero crediti per Sake Company con integrazione Fatt
 Il sistema è diviso in due componenti:
 
 - **Frontend** (React + Vite + Tailwind) — hostato su GitHub Pages con deploy automatico
-- **Backend** (FastAPI + SQLite) — da deployare su VPS con Docker
+- **Backend** (FastAPI + Supabase PostgreSQL) — deployato su Render (free tier)
 
 ### Come funziona
 
@@ -21,7 +21,7 @@ Il sistema è diviso in due componenti:
 ## Quick Start — Sviluppo Locale
 
 ```bash
-# Backend
+# Backend (con SQLite locale)
 cp .env.example .env
 # Modifica .env con le credenziali
 pip install -r requirements.txt
@@ -33,41 +33,54 @@ cd frontend && npm install && npm run dev
 
 L'app sarà su http://localhost:5173 (frontend) e http://localhost:8000 (API).
 
-## Deploy Produzione con Docker
+Per sviluppo locale il sistema usa SQLite automaticamente (nessun setup database necessario).
 
-### Prerequisiti
+## Deploy Produzione — Supabase + Render
 
-- VPS con Ubuntu 22+ (minimo 1GB RAM)
-- Dominio `api-recupero.sakecompany.com` puntato all'IP del VPS
+### 1. Supabase (Database PostgreSQL)
 
-### Setup rapido
+1. Crea un progetto su [supabase.com](https://supabase.com)
+2. Vai su **Settings → Database → Connection string → URI**
+3. Copia la connection string (formato: `postgresql://postgres.[ref]:[password]@...pooler.supabase.com:6543/postgres`)
+4. Le tabelle vengono create automaticamente al primo avvio dell'app
+
+### 2. Render (Backend API)
+
+1. Vai su [render.com](https://render.com) e connetti il repo GitHub
+2. Render rileva `render.yaml` e configura il servizio automaticamente
+3. Aggiungi le variabili d'ambiente nel dashboard Render:
+   - `DATABASE_URL` → connection string Supabase
+   - `FATTURAPRO_API_KEY`, `FATTURAPRO_DOMAIN`
+   - `SHOPIFY_STORE_URL`, `SHOPIFY_ACCESS_TOKEN`
+   - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_NUMBER_*`
+   - `CORS_ORIGINS` → `https://recupero.sakecompany.com`
+4. Il deploy è automatico ad ogni push su `main`
+
+### 3. Frontend (GitHub Pages)
+
+Il frontend si deploya automaticamente su push al branch `main` via GitHub Actions.
+Imposta la variabile `VITE_API_BASE_URL` nei Settings → Variables del repo GitHub con l'URL del backend Render.
+
+### Deploy alternativo con Docker
+
+Per chi preferisce un VPS:
 
 ```bash
 # Sul VPS, come root
 git clone https://github.com/ferraboschi/sc-recupero-crediti.git /opt/sc-recupero-crediti
 cd /opt/sc-recupero-crediti
 cp .env.example .env
-nano .env  # inserisci le credenziali reali
-
-# Avvia
+nano .env  # inserisci DATABASE_URL Supabase + altre credenziali
 docker-compose up -d --build
-
-# Verifica
-curl http://localhost:8000/api/health
 ```
 
-### Setup completo con Nginx + SSL
-
-```bash
-sudo bash deploy/setup.sh
-```
-
-Lo script installa Docker, Nginx, configura SSL con Let's Encrypt e avvia il sistema.
+Per setup completo con Nginx + SSL: `sudo bash deploy/setup.sh`
 
 ## Configurazione (.env)
 
 | Variabile | Descrizione |
 |-----------|-------------|
+| `DATABASE_URL` | Connection string database (PostgreSQL Supabase o SQLite) |
 | `FATTURAPRO_API_KEY` | Chiave API FatturaPro |
 | `FATTURAPRO_DOMAIN` | Dominio FatturaPro (es. sakecompany.com) |
 | `FATTURA24_API_KEY` | Chiave API Fattura24 (legacy) |
@@ -77,7 +90,7 @@ Lo script installa Docker, Nginx, configura SSL con Let's Encrypt e avvia il sis
 | `TWILIO_AUTH_TOKEN` | Auth token Twilio |
 | `TWILIO_WHATSAPP_NUMBER_BUSINESS` | Numero WhatsApp business |
 | `TWILIO_WHATSAPP_NUMBER_RECOVERY` | Numero WhatsApp recupero crediti |
-| `CORS_ORIGINS` | Origini CORS consentite (es. https://recupero.sakecompany.com) |
+| `CORS_ORIGINS` | Origini CORS consentite |
 
 ## API Endpoints
 
@@ -86,7 +99,7 @@ Lo script installa Docker, Nginx, configura SSL con Let's Encrypt e avvia il sis
 - `GET /api/positions` — Lista posizioni debitorie
 - `GET /api/customers` — Lista clienti
 - `GET /api/messages` — Lista messaggi WhatsApp
-- `POST /api/sync/all` — Sincronizzazione completa (FatturaPro + Shopify + matching)
+- `POST /api/sync/full` — Sincronizzazione completa (FatturaPro + Shopify + matching)
 - `POST /api/webhooks/twilio` — Webhook Twilio per risposte WhatsApp
 
 ## Struttura Progetto
@@ -94,13 +107,15 @@ Lo script installa Docker, Nginx, configura SSL con Let's Encrypt e avvia il sis
 ```
 ├── backend/
 │   ├── api/            # Route FastAPI
-│   ├── models/         # Modelli SQLAlchemy
-│   ├── services/       # Logica business
+│   ├── connectors/     # Client API (FatturaPro, Fattura24, Shopify, Twilio)
+│   ├── engine/         # Logica business
 │   │   ├── normalizer.py      # Normalizzazione ragioni sociali
 │   │   ├── phone_validator.py # Validazione numeri per WhatsApp
 │   │   ├── matching.py        # Matching fatture-clienti
-│   │   └── deduplicator.py    # Deduplicazione fatture
+│   │   ├── deduplicator.py    # Deduplicazione fatture
+│   │   └── escalation.py     # Escalation a 4 livelli
 │   ├── config.py       # Configurazione da .env
+│   ├── database.py     # SQLAlchemy ORM (PostgreSQL/SQLite)
 │   ├── scheduler.py    # APScheduler (job giornaliero)
 │   └── main.py         # Entry point FastAPI
 ├── frontend/
@@ -114,11 +129,12 @@ Lo script installa Docker, Nginx, configura SSL con Let's Encrypt e avvia il sis
 ├── tests/               # 167 test (pytest)
 ├── deploy/
 │   ├── nginx.conf       # Configurazione Nginx
-│   ├── setup.sh         # Script setup server
+│   ├── setup.sh         # Script setup server (VPS alternativo)
 │   └── backup.sh        # Script backup DB
 ├── .github/workflows/
 │   ├── ci.yml           # CI: test + lint + build
 │   └── pages.yml        # Deploy frontend GitHub Pages
+├── render.yaml          # Deploy backend su Render
 ├── Dockerfile           # Backend Docker image
 ├── docker-compose.yml   # Orchestrazione Docker
 └── .env.example         # Template variabili ambiente
@@ -135,8 +151,8 @@ pytest tests/ -v
 
 ## CI/CD
 
-- **Push su main** → CI (pytest + flake8 + npm build) + deploy frontend su GitHub Pages
-- **Deploy backend** → manuale via Docker sul VPS (o automatico con secrets GitHub configurati)
+- **Push su main** → CI (pytest + flake8 + npm build) + deploy frontend su GitHub Pages + deploy backend su Render
+- **Database** → Supabase PostgreSQL (gestito esternamente, nessun deploy necessario)
 
 ## Licenza
 
