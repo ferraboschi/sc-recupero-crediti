@@ -51,13 +51,19 @@ async def health_check():
 @app.on_event("startup")
 async def startup_event():
     """Initialize database and start scheduler on app startup."""
-    try:
-        logger.info("Initializing database...")
-        init_db()
-        logger.info("Database initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
-        raise
+    for attempt in range(3):
+        try:
+            logger.info(f"Initializing database (attempt {attempt + 1})...")
+            init_db()
+            logger.info("Database initialized successfully")
+            break
+        except Exception as e:
+            logger.error(f"Failed to initialize database (attempt {attempt + 1}): {e}")
+            if attempt < 2:
+                import asyncio
+                await asyncio.sleep(2)
+            else:
+                raise
 
     try:
         logger.info("Starting scheduler...")

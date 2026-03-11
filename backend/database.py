@@ -122,13 +122,16 @@ def get_engine():
     if db_url.startswith("sqlite"):
         _engine = create_engine(db_url, echo=False)
     else:
-        # PostgreSQL (Supabase) — use connection pooling
+        # PostgreSQL (Supabase) — use minimal connection pooling
+        # Supabase Session Pooler has limited max_clients
         _engine = create_engine(
             db_url,
             echo=False,
-            pool_size=5,
-            max_overflow=10,
+            pool_size=2,
+            max_overflow=3,
             pool_pre_ping=True,
+            pool_recycle=300,
+            pool_timeout=30,
         )
 
     return _engine
