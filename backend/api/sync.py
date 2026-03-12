@@ -712,6 +712,47 @@ async def get_sync_status():
     }
 
 
+@router.post("/cleanup-stale-f24")
+async def cleanup_stale_f24():
+    """Mark all Fattura24 invoices as paid (cleanup for stale data when F24 API is unavailable).
+
+    This is a one-off maintenance endpoint. Use CSV import to re-add F24 invoices if needed.
+    """
+    session = get_session()
+    try:
+        stale = session.query(Invoice).filter(
+            Invoice.source_platform == "fatture24",
+            Invoice.status != "paid",
+        ).all()
+
+        count = 0
+        for inv in stale:
+            inv.status = "paid"
+            inv.amount_due = 0
+            inv.days_overdue = 0
+            count += 1
+
+        session.commit()
+
+        # Log activity
+        activity = ActivityLog(
+            action="cleanup_stale_f24",
+            entity_type="invoice",
+            details={"marked_paid": count}
+        )
+        session.add(activity)
+        session.commit()
+
+        logger.info(f"Cleanup: marked {count} stale Fattura24 invoices as paid")
+        return {"marked_paid": count, "message": f"Marked {count} Fattura24 invoices as paid"}
+    except Exception as e:
+        logger.error(f"Error in F24 cleanup: {e}", exc_info=True)
+        session.rollback()
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
 @router.post("/import-csv")
 async def import_csv(file: UploadFile = File(...)):
     """
