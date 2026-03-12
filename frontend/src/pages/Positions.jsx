@@ -16,6 +16,18 @@ const SOURCES = [
   { value: 'fatture24', label: 'Fattura24' },
 ]
 
+const OVERDUE_OPTIONS = [
+  { value: '', label: 'Tutti' },
+  { value: 'yes', label: 'Scaduti' },
+  { value: 'no', label: 'Non Scaduti' },
+]
+
+const CUSTOMER_OPTIONS = [
+  { value: '', label: 'Tutti' },
+  { value: 'yes', label: 'Solo Fatture (con P.IVA)' },
+  { value: 'no', label: 'Solo Vendite (senza P.IVA)' },
+]
+
 export default function Positions() {
   const [positions, setPositions] = useState([])
   const [loading, setLoading] = useState(true)
@@ -24,12 +36,14 @@ export default function Positions() {
   const [total, setTotal] = useState(0)
   const [limit] = useState(50)
 
-  // Filters
+  // Filters - default to showing only real invoices (with customer/P.IVA)
   const [statusFilter, setStatusFilter] = useState('')
   const [escalationFilter, setEscalationFilter] = useState('')
   const [minAmountFilter, setMinAmountFilter] = useState('')
   const [searchFilter, setSearchFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
+  const [overdueFilter, setOverdueFilter] = useState('')
+  const [hasCustomerFilter, setHasCustomerFilter] = useState('yes')
   const [issueDateFrom, setIssueDateFrom] = useState('')
   const [issueDateTo, setIssueDateTo] = useState('')
   const [dueDateFrom, setDueDateFrom] = useState('')
@@ -37,6 +51,10 @@ export default function Positions() {
   const [sortBy, setSortBy] = useState('')
   const [sortOrder, setSortOrder] = useState('desc')
   const [showDateFilters, setShowDateFilters] = useState(false)
+
+  // CSV Import
+  const [importing, setImporting] = useState(false)
+  const [importResult, setImportResult] = useState(null)
 
   useEffect(() => {
     const fetchPositions = async () => {
@@ -48,6 +66,8 @@ export default function Positions() {
         if (minAmountFilter) params.min_amount = parseFloat(minAmountFilter)
         if (searchFilter) params.search = searchFilter
         if (sourceFilter) params.source = sourceFilter
+        if (overdueFilter) params.overdue = overdueFilter
+        if (hasCustomerFilter) params.has_customer = hasCustomerFilter
         if (issueDateFrom) params.issue_date_from = issueDateFrom
         if (issueDateTo) params.issue_date_to = issueDateTo
         if (dueDateFrom) params.due_date_from = dueDateFrom
@@ -69,7 +89,8 @@ export default function Positions() {
     }
     fetchPositions()
   }, [skip, limit, statusFilter, escalationFilter, minAmountFilter, searchFilter,
-      sourceFilter, issueDateFrom, issueDateTo, dueDateFrom, dueDateTo, sortBy, sortOrder])
+      sourceFilter, overdueFilter, hasCustomerFilter, issueDateFrom, issueDateTo,
+      dueDateFrom, dueDateTo, sortBy, sortOrder])
 
   const formatCurrency = (value) => {
     return new Intl.NumberFormat('it-IT', {
@@ -118,12 +139,70 @@ export default function Positions() {
     return sortOrder === 'asc' ? ' ↑' : ' ↓'
   }
 
+  const handleCsvImport = async (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+
+    setImporting(true)
+    setImportResult(null)
+
+    const formData = new FormData()
+    formData.append('file', file)
+
+    try {
+      const response = await client.post('/sync/import-csv', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      })
+      setImportResult(response.data)
+      // Refresh positions after import
+      setSkip(0)
+    } catch (err) {
+      setImportResult({ errors: [err.message || 'Errore durante l\'importazione'] })
+    } finally {
+      setImporting(false)
+      // Reset file input
+      e.target.value = ''
+    }
+  }
+
   return (
     <div className="space-y-6">
       {/* Filters */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <h2 className="text-lg font-bold text-slate-900 mb-4">Filtri e Ricerca</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-bold text-slate-900">Filtri e Ricerca</h2>
+          <div className="flex items-center gap-3">
+            {/* CSV Import Button */}
+            <label className={`px-4 py-2 rounded-lg text-sm font-medium cursor-pointer
+              ${importing ? 'bg-slate-200 text-slate-400' : 'bg-teal-600 text-white hover:bg-teal-700'}`}>
+              {importing ? 'Importando...' : 'Importa CSV (Fattura24)'}
+              <input
+                type="file"
+                accept=".csv,.tsv,.txt"
+                onChange={handleCsvImport}
+                disabled={importing}
+                className="hidden"
+              />
+            </label>
+          </div>
+        </div>
+
+        {/* Import result */}
+        {importResult && (
+          <div className={`mb-4 p-3 rounded-lg text-sm ${importResult.errors?.length > 0 && !importResult.created
+            ? 'bg-red-50 text-red-700 border border-red-200'
+            : 'bg-green-50 text-green-700 border border-green-200'}`}>
+            {importResult.created !== undefined && (
+              <p>Importazione completata: {importResult.created} create, {importResult.updated} aggiornate, {importResult.skipped} saltate su {importResult.total_rows} righe.</p>
+            )}
+            {importResult.errors?.length > 0 && importResult.errors.map((err, i) => (
+              <p key={i} className="text-red-600">{err}</p>
+            ))}
+            <button onClick={() => setImportResult(null)} className="mt-1 text-xs underline">Chiudi</button>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-2">Ricerca Cliente/Fattura</label>
             <input
@@ -148,6 +227,34 @@ export default function Positions() {
             </select>
           </div>
 
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-2">Scaduto</label>
+            <select
+              value={overdueFilter}
+              onChange={(e) => { setOverdueFilter(e.target.value); setSkip(0) }}
+              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {OVERDUE_OPTIONS.map(o => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-2">Tipo</label>
+            <select
+              value={hasCustomerFilter}
+              onChange={(e) => { setHasCustomerFilter(e.target.value); setSkip(0) }}
+              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {CUSTOMER_OPTIONS.map(c => (
+                <option key={c.value} value={c.value}>{c.label}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-4">
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-2">Stato</label>
             <select
@@ -275,6 +382,7 @@ export default function Positions() {
                   <tr>
                     <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Fonte</th>
                     <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Cliente</th>
+                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">P.IVA</th>
                     <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Fattura</th>
                     <th className="px-4 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('amount_due')}>
                       Saldo{sortArrow('amount_due')}
@@ -301,6 +409,9 @@ export default function Positions() {
                       </td>
                       <td className="px-4 py-3 text-sm text-slate-900">
                         {pos.customer?.ragione_sociale || pos.customer_name_raw || 'Non assegnato'}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-slate-500 font-mono text-xs">
+                        {pos.customer?.partita_iva || '-'}
                       </td>
                       <td className="px-4 py-3 text-sm text-slate-600">
                         {pos.invoice_number}
