@@ -367,6 +367,9 @@ def _sync_customers_task() -> dict:
     except Exception as e:
         result["error"] = str(e)
         logger.error(f"Error syncing customers: {e}", exc_info=True)
+        # Still update status so we can see the error
+        _sync_status["customers"]["last_sync"] = datetime.utcnow().isoformat()
+        _sync_status["customers"]["result"] = result
     finally:
         session.close()
 
@@ -376,15 +379,13 @@ def _sync_customers_task() -> dict:
 def _auto_create_customers_from_invoices(session) -> int:
     """Auto-create Customer records from unmatched invoices.
 
-    For invoices that have customer_name_raw or customer_piva_raw but no
-    customer_id, check if a matching Customer exists. If not, create one.
-    This ensures customers that only exist in FatturaPro/Fattura24 are captured.
+    For invoices that have customer_name_raw but no customer_id and no
+    matching Customer, create a new Customer record. Uses normalized name
+    deduplication (not fuzzy matching, which is too slow for batch operations).
 
     Returns:
         Number of customers auto-created
     """
-    from backend.engine.matching import match_invoice_to_customer
-
     unmatched = session.query(Invoice).filter(
         Invoice.customer_id.is_(None),
         Invoice.status != "paid",
@@ -393,72 +394,68 @@ def _auto_create_customers_from_invoices(session) -> int:
     if not unmatched:
         return 0
 
-    all_customers = session.query(Customer).all()
     auto_created = 0
-    # Track names/PIVAs we've already created in this run to avoid duplicates
-    created_pivas = set()
-    created_names_normalized = set()
+    # Track normalized names → customer_id for dedup within this run
+    name_to_customer_id = {}
+    piva_to_customer_id = {}
+
+    # Pre-build lookup maps from existing customers
+    existing_customers = session.query(Customer).all()
+    for c in existing_customers:
+        if c.ragione_sociale_normalized:
+            name_to_customer_id[c.ragione_sociale_normalized] = c.id
+        if c.partita_iva:
+            piva_to_customer_id[c.partita_iva.strip().upper()] = c.id
 
     for inv in unmatched:
-        # Skip if no identifying info
-        if not inv.customer_name_raw and not inv.customer_piva_raw:
-            continue
-
-        # First try to match against existing customers (including any just created)
-        if all_customers:
-            match = match_invoice_to_customer(inv, all_customers, session)
-            if match:
-                inv.customer_id = match.id
+        try:
+            # Skip if no identifying info
+            if not inv.customer_name_raw and not inv.customer_piva_raw:
                 continue
 
-        # Check if we already have this customer by P.IVA
-        piva = (inv.customer_piva_raw or "").strip().upper()
-        if piva and piva in created_pivas:
-            continue
-        if piva:
-            existing_by_piva = session.query(Customer).filter(
-                Customer.partita_iva == piva
-            ).first()
-            if existing_by_piva:
-                inv.customer_id = existing_by_piva.id
+            piva = (inv.customer_piva_raw or "").strip().upper()
+            name = (inv.customer_name_raw or "").strip()
+            name_norm = normalize_ragione_sociale(name) if name else ""
+
+            # Try P.IVA match first
+            if piva and piva in piva_to_customer_id:
+                inv.customer_id = piva_to_customer_id[piva]
                 continue
 
-        # Check if we already have this customer by normalized name
-        name = inv.customer_name_raw or ""
-        name_norm = normalize_ragione_sociale(name)
-        if name_norm and name_norm in created_names_normalized:
-            continue
-        if name_norm:
-            existing_by_name = session.query(Customer).filter(
-                Customer.ragione_sociale_normalized == name_norm
-            ).first()
-            if existing_by_name:
-                inv.customer_id = existing_by_name.id
+            # Try normalized name match
+            if name_norm and name_norm in name_to_customer_id:
+                inv.customer_id = name_to_customer_id[name_norm]
                 continue
 
-        # Create new customer
-        new_customer = Customer(
-            ragione_sociale=name.strip() if name else f"Cliente P.IVA {piva}",
-            ragione_sociale_normalized=name_norm,
-            partita_iva=piva if piva else None,
-            source=inv.source_platform,  # fatturapro / fatture24
-        )
-        session.add(new_customer)
-        session.flush()  # Get the ID
+            # No match — create new customer
+            if not name and not piva:
+                continue
 
-        inv.customer_id = new_customer.id
-        all_customers.append(new_customer)  # Add to local list for future matching
-        auto_created += 1
+            new_customer = Customer(
+                ragione_sociale=name if name else f"Cliente P.IVA {piva}",
+                ragione_sociale_normalized=name_norm,
+                partita_iva=piva if piva else None,
+                source=inv.source_platform,
+            )
+            session.add(new_customer)
+            session.flush()  # Get the ID
 
-        if piva:
-            created_pivas.add(piva)
-        if name_norm:
-            created_names_normalized.add(name_norm)
+            inv.customer_id = new_customer.id
+            auto_created += 1
 
-        logger.info(
-            f"Auto-created customer '{new_customer.ragione_sociale}' "
-            f"(P.IVA: {piva or 'N/A'}) from {inv.source_platform} invoice {inv.invoice_number}"
-        )
+            # Update lookup maps
+            if piva:
+                piva_to_customer_id[piva] = new_customer.id
+            if name_norm:
+                name_to_customer_id[name_norm] = new_customer.id
+
+            logger.info(
+                f"Auto-created customer '{new_customer.ragione_sociale}' "
+                f"(P.IVA: {piva or 'N/A'}) from {inv.source_platform} invoice {inv.invoice_number}"
+            )
+        except Exception as e:
+            logger.warning(f"Error processing invoice {inv.invoice_number} for auto-create: {e}")
+            continue
 
     if auto_created > 0:
         session.commit()
