@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 
 const STATUSES = [
@@ -39,6 +40,7 @@ const PAYMENT_OPTIONS = [
 ]
 
 export default function Positions() {
+  const navigate = useNavigate()
   const [positions, setPositions] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -452,7 +454,16 @@ export default function Positions() {
                       </td>
                       <td className="px-3 py-3 text-sm text-slate-900">
                         <div className="flex flex-col">
-                          <span>{pos.customer?.ragione_sociale || pos.customer_name_raw || 'Non assegnato'}</span>
+                          {pos.customer?.id ? (
+                            <span
+                              className="text-blue-700 cursor-pointer hover:text-blue-900 hover:underline"
+                              onClick={(e) => { e.stopPropagation(); navigate(`/customers/${pos.customer.id}`) }}
+                            >
+                              {pos.customer.ragione_sociale}
+                            </span>
+                          ) : (
+                            <span>{pos.customer_name_raw || 'Non assegnato'}</span>
+                          )}
                           {!pos.customer && pos.customer_name_raw && (
                             <span className="text-xs text-amber-600">da verificare</span>
                           )}

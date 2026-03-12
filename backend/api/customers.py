@@ -2,11 +2,12 @@
 
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_
+from sqlalchemy import or_, Integer
 from sqlalchemy.orm import Session
 from datetime import datetime
 
-from backend.database import get_session, Customer, Invoice, ActivityLog
+from sqlalchemy import func
+from backend.database import get_session, Customer, Invoice, ActivityLog, RecoveryAction
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -44,6 +45,33 @@ async def list_customers(
         total = query.count()
         customers = query.order_by(Customer.ragione_sociale.asc()).offset(skip).limit(limit).all()
 
+        # Get invoice stats for each customer
+        customer_ids = [c.id for c in customers]
+        invoice_stats = {}
+        if customer_ids:
+            stats_query = (
+                session.query(
+                    Invoice.customer_id,
+                    func.count(Invoice.id).label("invoice_count"),
+                    func.sum(Invoice.amount_due).label("total_due"),
+                    func.sum(
+                        func.cast(Invoice.days_overdue > 0, Integer)
+                    ).label("overdue_count"),
+                )
+                .filter(
+                    Invoice.customer_id.in_(customer_ids),
+                    Invoice.status != "paid",
+                )
+                .group_by(Invoice.customer_id)
+                .all()
+            )
+            for row in stats_query:
+                invoice_stats[row.customer_id] = {
+                    "invoice_count": row.invoice_count,
+                    "total_due": float(row.total_due or 0),
+                    "overdue_count": row.overdue_count or 0,
+                }
+
         return {
             "total": total,
             "skip": skip,
@@ -58,6 +86,12 @@ async def list_customers(
                     "excluded": cust.excluded,
                     "source": cust.source,
                     "phone_validated": cust.phone_validated,
+                    "recovery_status": cust.recovery_status,
+                    "next_action_date": cust.next_action_date.isoformat() if cust.next_action_date else None,
+                    "next_action_type": cust.next_action_type,
+                    "invoice_count": invoice_stats.get(cust.id, {}).get("invoice_count", 0),
+                    "total_due": invoice_stats.get(cust.id, {}).get("total_due", 0),
+                    "overdue_count": invoice_stats.get(cust.id, {}).get("overdue_count", 0),
                     "created_at": cust.created_at.isoformat(),
                 }
                 for cust in customers
@@ -103,6 +137,27 @@ async def get_customer_detail(
             for inv in invoices
         ]
 
+        # Get recovery actions
+        actions = (
+            session.query(RecoveryAction)
+            .filter(RecoveryAction.customer_id == customer_id)
+            .order_by(RecoveryAction.created_at.desc())
+            .limit(20)
+            .all()
+        )
+
+        action_list = [
+            {
+                "id": a.id,
+                "action_type": a.action_type,
+                "scheduled_date": a.scheduled_date.isoformat() if a.scheduled_date else None,
+                "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+                "notes": a.notes,
+                "created_at": a.created_at.isoformat(),
+            }
+            for a in actions
+        ]
+
         return {
             "id": customer.id,
             "ragione_sociale": customer.ragione_sociale,
@@ -115,6 +170,9 @@ async def get_customer_detail(
             "phone_validated": customer.phone_validated,
             "shopify_id": customer.shopify_id,
             "tags": customer.tags,
+            "recovery_status": customer.recovery_status,
+            "next_action_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
+            "next_action_type": customer.next_action_type,
             "created_at": customer.created_at.isoformat(),
             "updated_at": customer.updated_at.isoformat(),
             "invoices": {
@@ -123,6 +181,7 @@ async def get_customer_detail(
                 "count": len(invoices),
                 "items": invoice_list,
             },
+            "recovery_actions": action_list,
         }
 
     except HTTPException:

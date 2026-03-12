@@ -1,7 +1,27 @@
 import React, { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 
+const STATUS_LABELS = {
+  idle: 'Da Gestire',
+  first_contact: 'I Contatto',
+  second_contact: 'II Contatto',
+  lawyer: 'Avvocato',
+  archived: 'Archiviato',
+  waiting: 'In Attesa',
+}
+
+const STATUS_COLORS = {
+  idle: 'bg-slate-100 text-slate-600',
+  first_contact: 'bg-blue-100 text-blue-700',
+  second_contact: 'bg-amber-100 text-amber-700',
+  lawyer: 'bg-red-100 text-red-700',
+  archived: 'bg-slate-200 text-slate-500',
+  waiting: 'bg-purple-100 text-purple-700',
+}
+
 export default function Customers() {
+  const navigate = useNavigate()
   const [customers, setCustomers] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -22,7 +42,6 @@ export default function Customers() {
         setCustomers(response.data.items)
         setTotal(response.data.total)
 
-        // Initialize excluded toggle state
         const toggleState = {}
         response.data.items.forEach(c => {
           toggleState[c.id] = c.excluded
@@ -38,7 +57,8 @@ export default function Customers() {
     fetchCustomers()
   }, [skip, limit, search])
 
-  const handleToggleExcluded = async (customerId, newValue) => {
+  const handleToggleExcluded = async (customerId, newValue, e) => {
+    e.stopPropagation()
     try {
       await client.put(`/customers/${customerId}/exclude`, null, {
         params: { exclude: newValue },
@@ -50,6 +70,14 @@ export default function Customers() {
     } catch (err) {
       console.error(err)
     }
+  }
+
+  const formatCurrency = (value) =>
+    new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(value)
+
+  const formatDate = (dateStr) => {
+    if (!dateStr) return '-'
+    return new Date(dateStr).toLocaleDateString('it-IT')
   }
 
   const isPhoneValid = (phone) => {
@@ -95,59 +123,83 @@ export default function Customers() {
               <table className="w-full">
                 <thead className="bg-slate-50 border-b border-slate-200">
                   <tr>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-slate-900">Ragione Sociale</th>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-slate-900">P.IVA</th>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-slate-900">Telefono</th>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-slate-900">Email</th>
-                    <th className="px-6 py-3 text-center text-sm font-semibold text-slate-900">Escluso</th>
+                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Ragione Sociale</th>
+                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">P.IVA</th>
+                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Telefono</th>
+                    <th className="px-4 py-3 text-right text-sm font-semibold text-slate-900">Dovuto</th>
+                    <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Scadute</th>
+                    <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Stato Recupero</th>
+                    <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Pross. Azione</th>
+                    <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Escluso</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200">
                   {customers.map(customer => (
-                    <tr key={customer.id} className="hover:bg-slate-50">
-                      <td className="px-6 py-3 text-sm font-medium text-slate-900 cursor-pointer hover:text-blue-600">
+                    <tr
+                      key={customer.id}
+                      className={`hover:bg-blue-50 cursor-pointer transition-colors ${
+                        customer.excluded || excludedToggle[customer.id] ? 'opacity-50' : ''
+                      }`}
+                      onClick={() => navigate(`/customers/${customer.id}`)}
+                    >
+                      <td className="px-4 py-3 text-sm font-medium text-blue-700 hover:text-blue-900">
                         {customer.ragione_sociale}
                       </td>
-                      <td className="px-6 py-3 text-sm text-slate-600">
-                        {customer.partita_iva}
+                      <td className="px-4 py-3 text-sm text-slate-600 font-mono text-xs">
+                        {customer.partita_iva || '-'}
                       </td>
-                      <td className="px-6 py-3 text-sm text-slate-600 flex items-center gap-2">
-                        {customer.phone ? (
-                          <>
-                            <span>{customer.phone}</span>
-                            {isPhoneValid(customer.phone) ? (
-                              <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-green-100 text-green-600 text-xs font-bold" title="Numero valido">
-                                ✓
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-yellow-100 text-yellow-600 text-xs font-bold" title="Formato sospetto">
-                                ⚠
-                              </span>
-                            )}
-                          </>
+                      <td className="px-4 py-3 text-sm text-slate-600">
+                        <div className="flex items-center gap-1">
+                          {customer.phone ? (
+                            <>
+                              <span className="text-xs">{customer.phone}</span>
+                              {isPhoneValid(customer.phone) ? (
+                                <span className="w-4 h-4 rounded-full bg-green-100 text-green-600 text-xs flex items-center justify-center">✓</span>
+                              ) : (
+                                <span className="w-4 h-4 rounded-full bg-yellow-100 text-yellow-600 text-xs flex items-center justify-center">!</span>
+                              )}
+                            </>
+                          ) : (
+                            <span className="text-slate-400 text-xs">-</span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-sm text-right font-medium">
+                        {customer.total_due > 0 ? (
+                          <span className="text-red-600">{formatCurrency(customer.total_due)}</span>
                         ) : (
                           <span className="text-slate-400">-</span>
                         )}
                       </td>
-                      <td className="px-6 py-3 text-sm text-slate-600">
-                        {customer.email || '-'}
+                      <td className="px-4 py-3 text-sm text-center">
+                        {customer.overdue_count > 0 ? (
+                          <span className="bg-red-100 text-red-700 px-2 py-0.5 rounded-full text-xs font-medium">
+                            {customer.overdue_count}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400 text-xs">0</span>
+                        )}
                       </td>
-                      <td className="px-6 py-3 text-center">
+                      <td className="px-4 py-3 text-sm text-center">
+                        <span className={`${STATUS_COLORS[customer.recovery_status] || STATUS_COLORS.idle} px-2 py-0.5 rounded-full text-xs font-medium`}>
+                          {STATUS_LABELS[customer.recovery_status] || 'Da Gestire'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-sm text-center text-slate-500">
+                        {customer.next_action_date ? (
+                          <span className="text-xs">{formatDate(customer.next_action_date)}</span>
+                        ) : '-'}
+                      </td>
+                      <td className="px-4 py-3 text-center" onClick={(e) => e.stopPropagation()}>
                         <button
-                          onClick={() => handleToggleExcluded(customer.id, !excludedToggle[customer.id])}
-                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                            excludedToggle[customer.id]
-                              ? 'bg-red-600'
-                              : 'bg-green-600'
+                          onClick={(e) => handleToggleExcluded(customer.id, !excludedToggle[customer.id], e)}
+                          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                            excludedToggle[customer.id] ? 'bg-red-500' : 'bg-green-500'
                           }`}
                         >
-                          <span
-                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                              excludedToggle[customer.id]
-                                ? 'translate-x-6'
-                                : 'translate-x-1'
-                            }`}
-                          />
+                          <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                            excludedToggle[customer.id] ? 'translate-x-4.5' : 'translate-x-0.5'
+                          }`} />
                         </button>
                       </td>
                     </tr>

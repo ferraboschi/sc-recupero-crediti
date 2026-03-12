@@ -1,22 +1,45 @@
 import React, { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { PieChart, Pie, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Cell } from 'recharts'
 import client from '../api/client'
 import StatsWidget from '../components/StatsWidget'
 
+const ACTION_LABELS = {
+  first_contact: 'I Contatto',
+  second_contact: 'II Contatto',
+  lawyer: 'Avvocato',
+  archive: 'Archivia',
+  wait: 'Attendi',
+  idle: 'Da Gestire',
+  waiting: 'In Attesa',
+}
+
+const ACTION_BADGE_COLORS = {
+  first_contact: 'bg-blue-100 text-blue-700 border-blue-200',
+  second_contact: 'bg-amber-100 text-amber-700 border-amber-200',
+  lawyer: 'bg-red-100 text-red-700 border-red-200',
+  archive: 'bg-slate-100 text-slate-600 border-slate-200',
+  wait: 'bg-purple-100 text-purple-700 border-purple-200',
+  idle: 'bg-slate-100 text-slate-600 border-slate-200',
+  waiting: 'bg-purple-100 text-purple-700 border-purple-200',
+}
+
 export default function Dashboard() {
+  const navigate = useNavigate()
   const [loading, setLoading] = useState(true)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [syncing, setSyncing] = useState(false)
   const [syncMessage, setSyncMessage] = useState('')
   const [lastSync, setLastSync] = useState(null)
+  const [calendarItems, setCalendarItems] = useState([])
+  const [calendarLoading, setCalendarLoading] = useState(true)
 
   const fetchData = async () => {
     try {
       setLoading(true)
       const response = await client.get('/dashboard')
       setData(response.data)
-      // Load last sync time from localStorage
       const savedLastSync = localStorage.getItem('lastSyncTime')
       if (savedLastSync) {
         setLastSync(new Date(savedLastSync))
@@ -29,8 +52,21 @@ export default function Dashboard() {
     }
   }
 
+  const fetchCalendar = async () => {
+    try {
+      setCalendarLoading(true)
+      const response = await client.get('/recovery/calendar')
+      setCalendarItems(response.data.items || [])
+    } catch (err) {
+      console.error('Error fetching calendar:', err)
+    } finally {
+      setCalendarLoading(false)
+    }
+  }
+
   useEffect(() => {
     fetchData()
+    fetchCalendar()
   }, [])
 
   const handleSync = async () => {
@@ -42,7 +78,6 @@ export default function Dashboard() {
       const now = new Date()
       setLastSync(now)
       localStorage.setItem('lastSyncTime', now.toISOString())
-      // Refresh dashboard data
       await fetchData()
       setTimeout(() => setSyncMessage(''), 3000)
     } catch (err) {
@@ -52,6 +87,35 @@ export default function Dashboard() {
       setSyncing(false)
     }
   }
+
+  const formatCurrency = (value) =>
+    new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR', minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(value)
+
+  const formatDate = (dateStr) => {
+    if (!dateStr) return '-'
+    return new Date(dateStr).toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric', month: 'short' })
+  }
+
+  function getStatusLabel(status) {
+    const labels = {
+      open: 'Aperto', contacted: 'Contattato', promised: 'Promesso',
+      paid: 'Pagato', disputed: 'Contestato', escalated: 'Escalato',
+    }
+    return labels[status] || status
+  }
+
+  // Group calendar items by date
+  const calendarByDate = calendarItems.reduce((acc, item) => {
+    const d = item.scheduled_date
+    if (!acc[d]) acc[d] = []
+    acc[d].push(item)
+    return acc
+  }, {})
+
+  const today = new Date().toISOString().slice(0, 10)
+  const overdueItems = calendarItems.filter(i => i.scheduled_date < today)
+  const todayItems = calendarItems.filter(i => i.scheduled_date === today)
+  const futureItems = calendarItems.filter(i => i.scheduled_date > today)
 
   if (loading) {
     return (
@@ -70,45 +134,8 @@ export default function Dashboard() {
     return (
       <div className="space-y-6">
         <div className="bg-amber-50 border border-amber-200 rounded-lg p-6">
-          <div className="flex items-start gap-4">
-            <svg className="w-6 h-6 text-amber-600 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
-            </svg>
-            <div>
-              <h3 className="font-semibold text-amber-800 text-lg mb-2">Backend non raggiungibile</h3>
-              <p className="text-amber-700 mb-3">
-                Il server API non è ancora configurato. Il frontend è attivo su GitHub Pages, ma il backend deve essere deployato separatamente su un VPS.
-              </p>
-              <div className="bg-amber-100 rounded-md p-4 text-sm text-amber-800">
-                <p className="font-medium mb-2">Per completare il setup:</p>
-                <ol className="list-decimal list-inside space-y-1">
-                  <li>Deploy del backend su un VPS con Docker</li>
-                  <li>Configurare il file .env con le API key</li>
-                  <li>Impostare VITE_API_BASE_URL e ri-deployare il frontend</li>
-                </ol>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Preview delle funzionalità */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-          <div className="bg-white rounded-lg p-6 border border-slate-200">
-            <p className="text-sm text-slate-500 mb-1">Totale Crediti</p>
-            <p className="text-2xl font-bold text-slate-300">--</p>
-          </div>
-          <div className="bg-white rounded-lg p-6 border border-slate-200">
-            <p className="text-sm text-slate-500 mb-1">Posizioni Aperte</p>
-            <p className="text-2xl font-bold text-slate-300">--</p>
-          </div>
-          <div className="bg-white rounded-lg p-6 border border-slate-200">
-            <p className="text-sm text-slate-500 mb-1">Messaggi in Coda</p>
-            <p className="text-2xl font-bold text-slate-300">--</p>
-          </div>
-          <div className="bg-white rounded-lg p-6 border border-slate-200">
-            <p className="text-sm text-slate-500 mb-1">Clienti Attivi</p>
-            <p className="text-2xl font-bold text-slate-300">--</p>
-          </div>
+          <h3 className="font-semibold text-amber-800 text-lg mb-2">Backend non raggiungibile</h3>
+          <p className="text-amber-700">Il server API non risponde. Verifica che il backend sia in esecuzione.</p>
         </div>
       </div>
     )
@@ -116,56 +143,61 @@ export default function Dashboard() {
 
   if (!data) return null
 
-  // Prepare status breakdown data for pie chart
   const statusData = Object.entries(data.positions_by_status || {}).map(([status, info]) => ({
-    name: getStatusLabel(status),
-    value: info.count,
-    amount: info.amount,
+    name: getStatusLabel(status), value: info.count, amount: info.amount,
   }))
-
-  // Prepare escalation data for bar chart
   const escalationData = Object.entries(data.positions_by_escalation_level || {}).map(([level, info]) => ({
-    name: `Livello ${level}`,
-    count: info.count,
-    amount: info.amount,
+    name: `Livello ${level}`, count: info.count, amount: info.amount,
   }))
-
-  // Format currency
-  const formatCurrency = (value) => {
-    return new Intl.NumberFormat('it-IT', {
-      style: 'currency',
-      currency: 'EUR',
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(value)
-  }
-
-  // Get status label
-  function getStatusLabel(status) {
-    const labels = {
-      open: 'Aperto',
-      contacted: 'Contattato',
-      promised: 'Promesso',
-      paid: 'Pagato',
-      disputed: 'Contestato',
-      escalated: 'Escalato',
-    }
-    return labels[status] || status
-  }
 
   const COLORS = ['#3b82f6', '#f59e0b', '#a855f7', '#10b981', '#ef4444', '#f97316']
 
+  const renderCalendarSection = (title, items, bgColor, borderColor) => {
+    if (items.length === 0) return null
+    return (
+      <div className={`${bgColor} rounded-lg p-4 border ${borderColor}`}>
+        <h3 className="font-semibold text-sm mb-3">{title} ({items.length})</h3>
+        <div className="space-y-2">
+          {items.map((item, idx) => (
+            <div
+              key={`${item.customer_id}-${idx}`}
+              onClick={() => navigate(`/customers/${item.customer_id}`)}
+              className="flex items-center justify-between bg-white rounded-lg px-3 py-2 cursor-pointer hover:shadow-sm transition-shadow border border-slate-100"
+            >
+              <div className="flex items-center gap-3">
+                <span className={`${ACTION_BADGE_COLORS[item.action_type] || ACTION_BADGE_COLORS.idle} px-2 py-0.5 rounded text-xs font-medium border`}>
+                  {ACTION_LABELS[item.action_type] || item.action_type}
+                </span>
+                <span className="text-sm font-medium text-slate-900 truncate max-w-[200px]">
+                  {item.customer_name}
+                </span>
+              </div>
+              <div className="flex items-center gap-3 text-xs text-slate-500">
+                {item.overdue_invoices > 0 && (
+                  <span className="bg-red-50 text-red-600 px-1.5 py-0.5 rounded">
+                    {item.overdue_invoices} scad.
+                  </span>
+                )}
+                {item.total_due > 0 && (
+                  <span className="font-medium text-slate-700">{formatCurrency(item.total_due)}</span>
+                )}
+                <span>{formatDate(item.scheduled_date)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="space-y-8">
-      {/* Last Sync and Sync Button */}
+      {/* Sync Bar */}
       <div className="bg-white rounded-lg p-6 border border-slate-200 flex items-center justify-between">
         <div>
           <h3 className="font-medium text-slate-900 mb-2">Stato Sincronizzazione</h3>
           <p className="text-sm text-slate-600">
-            {lastSync
-              ? `Ultimo aggiornamento: ${lastSync.toLocaleString('it-IT')}`
-              : 'Nessuna sincronizzazione eseguita'
-            }
+            {lastSync ? `Ultimo aggiornamento: ${lastSync.toLocaleString('it-IT')}` : 'Nessuna sincronizzazione eseguita'}
           </p>
         </div>
         <div className="flex items-center gap-4">
@@ -174,76 +206,49 @@ export default function Dashboard() {
               {syncMessage}
             </p>
           )}
-          <button
-            onClick={handleSync}
-            disabled={syncing}
+          <button onClick={handleSync} disabled={syncing}
             className={`px-4 py-2 rounded-lg font-medium text-sm transition-colors flex items-center gap-2 ${
-              syncing
-                ? 'bg-slate-300 text-slate-500 cursor-not-allowed'
-                : 'bg-blue-600 text-white hover:bg-blue-700'
-            }`}
-          >
-            {syncing ? (
-              <>
-                <svg className="animate-spin w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-                Sincronizzazione...
-              </>
-            ) : (
-              <>
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-                Sincronizza Ora
-              </>
-            )}
+              syncing ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700'
+            }`}>
+            {syncing ? 'Sincronizzazione...' : 'Sincronizza Ora'}
           </button>
         </div>
       </div>
 
       {/* Top Stats */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        <StatsWidget
-          label="Totale Crediti"
-          value={formatCurrency(data.total_crediti)}
-          color="blue"
-        />
-        <StatsWidget
-          label="Posizioni Aperte"
-          value={data.total_positions}
-          color="purple"
-        />
-        <StatsWidget
-          label="Messaggi in Coda"
-          value={data.draft_messages || 0}
-          color="orange"
-        />
-        <StatsWidget
-          label="Clienti Totali"
-          value={data.total_customers || 0}
-          color="green"
-        />
+        <StatsWidget label="Totale Crediti" value={formatCurrency(data.total_crediti)} color="blue" />
+        <StatsWidget label="Posizioni Aperte" value={data.total_positions} color="purple" />
+        <StatsWidget label="Messaggi in Coda" value={data.draft_messages || 0} color="orange" />
+        <StatsWidget label="Clienti Totali" value={data.total_customers || 0} color="green" />
+      </div>
+
+      {/* Calendar Section */}
+      <div className="bg-white rounded-lg p-6 border border-slate-200">
+        <h2 className="text-lg font-bold text-slate-900 mb-4">Calendario Attività</h2>
+        {calendarLoading ? (
+          <p className="text-slate-500 text-center py-4">Caricamento calendario...</p>
+        ) : calendarItems.length === 0 ? (
+          <p className="text-slate-500 text-center py-4">Nessuna attività pianificata. Vai nella scheda Clienti per iniziare il flusso di recupero.</p>
+        ) : (
+          <div className="space-y-4">
+            {renderCalendarSection('In Ritardo', overdueItems, 'bg-red-50', 'border-red-200')}
+            {renderCalendarSection('Oggi', todayItems, 'bg-blue-50', 'border-blue-200')}
+            {renderCalendarSection('Prossime', futureItems, 'bg-slate-50', 'border-slate-200')}
+          </div>
+        )}
       </div>
 
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Status Breakdown */}
         <div className="bg-white rounded-lg p-6 border border-slate-200">
           <h2 className="text-lg font-bold text-slate-900 mb-4">Distribuzione per Stato</h2>
           {statusData.length > 0 ? (
             <ResponsiveContainer width="100%" height={300}>
               <PieChart>
-                <Pie
-                  data={statusData}
-                  cx="50%"
-                  cy="50%"
-                  labelLine={false}
+                <Pie data={statusData} cx="50%" cy="50%" labelLine={false}
                   label={({ name, value }) => `${name}: ${value}`}
-                  outerRadius={80}
-                  fill="#8884d8"
-                  dataKey="value"
-                >
+                  outerRadius={80} fill="#8884d8" dataKey="value">
                   {statusData.map((entry, index) => (
                     <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                   ))}
@@ -256,7 +261,6 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* Escalation Levels */}
         <div className="bg-white rounded-lg p-6 border border-slate-200">
           <h2 className="text-lg font-bold text-slate-900 mb-4">Distribuzione per Livello di Escalation</h2>
           {escalationData.length > 0 ? (
@@ -289,13 +293,9 @@ export default function Dashboard() {
                 <div className="flex-1">
                   <div className="flex items-center gap-2">
                     <p className="font-medium text-slate-900">{activity.action}</p>
-                    <span className="text-xs bg-slate-100 text-slate-600 px-2 py-1 rounded">
-                      {activity.entity_type}
-                    </span>
+                    <span className="text-xs bg-slate-100 text-slate-600 px-2 py-1 rounded">{activity.entity_type}</span>
                   </div>
-                  <p className="text-sm text-slate-600 mt-1">
-                    {new Date(activity.timestamp).toLocaleString('it-IT')}
-                  </p>
+                  <p className="text-sm text-slate-600 mt-1">{new Date(activity.timestamp).toLocaleString('it-IT')}</p>
                 </div>
               </div>
             ))}

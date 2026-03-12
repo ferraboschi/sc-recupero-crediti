@@ -4,6 +4,7 @@ import Dashboard from './pages/Dashboard'
 import Positions from './pages/Positions'
 import Messages from './pages/Messages'
 import Customers from './pages/Customers'
+import ClientDetail from './pages/ClientDetail'
 import Activity from './pages/Activity'
 import SyncButton from './components/SyncButton'
 
@@ -14,10 +15,17 @@ export default function App() {
   const navItems = [
     { path: '/', label: 'Dashboard', icon: '📊' },
     { path: '/positions', label: 'Posizioni', icon: '📋' },
-    { path: '/messages', label: 'Messaggi', icon: '💬' },
     { path: '/customers', label: 'Clienti', icon: '👥' },
+    { path: '/messages', label: 'Messaggi', icon: '💬' },
     { path: '/activity', label: 'Attività', icon: '📜' },
   ]
+
+  const isActive = (path) => {
+    if (path === '/customers') {
+      return location.pathname === '/customers' || location.pathname.startsWith('/customers/')
+    }
+    return location.pathname === path
+  }
 
   return (
     <div className="flex h-screen bg-slate-50">
@@ -38,7 +46,7 @@ export default function App() {
               key={item.path}
               to={item.path}
               className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
-                location.pathname === item.path
+                isActive(item.path)
                   ? 'bg-blue-600 text-white'
                   : 'text-slate-300 hover:bg-slate-700'
               }`}
@@ -69,7 +77,7 @@ export default function App() {
             <div>
               <h1 className="text-2xl font-bold text-slate-900">SC Recupero Crediti</h1>
               <p className="text-xs text-slate-500">
-                {navItems.find(item => item.path === location.pathname)?.label || 'Dashboard'}
+                {navItems.find(item => isActive(item.path))?.label || 'Dashboard'}
               </p>
             </div>
           </div>
@@ -89,6 +97,7 @@ export default function App() {
             <Route path="/positions" element={<Positions />} />
             <Route path="/messages" element={<Messages />} />
             <Route path="/customers" element={<Customers />} />
+            <Route path="/customers/:customerId" element={<ClientDetail />} />
             <Route path="/activity" element={<Activity />} />
           </Routes>
         </div>

@@ -1,0 +1,437 @@
+"""Recovery workflow API endpoints."""
+
+import logging
+from datetime import datetime, date, timedelta
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from sqlalchemy import and_, or_
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from io import BytesIO
+
+from backend.database import get_session, Customer, Invoice, RecoveryAction, ActivityLog
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+# --- Pydantic models ---
+
+class ActionCreate(BaseModel):
+    action_type: str  # first_contact / second_contact / lawyer / archive / wait / note
+    scheduled_date: Optional[str] = None  # YYYY-MM-DD
+    notes: Optional[str] = None
+
+
+class ActionUpdate(BaseModel):
+    notes: Optional[str] = None
+    scheduled_date: Optional[str] = None
+
+
+# --- Calendar endpoint ---
+
+@router.get("/calendar")
+async def get_calendar(
+    session: Session = Depends(get_session),
+    date_from: str = Query(None, description="Start date (YYYY-MM-DD), defaults to today"),
+    date_to: str = Query(None, description="End date (YYYY-MM-DD), defaults to +30 days"),
+):
+    """
+    Get all scheduled recovery actions for the calendar view.
+    Returns actions grouped by date.
+    """
+    try:
+        today = date.today()
+        start = date.fromisoformat(date_from) if date_from else today - timedelta(days=7)
+        end = date.fromisoformat(date_to) if date_to else today + timedelta(days=60)
+
+        actions = (
+            session.query(RecoveryAction)
+            .join(Customer)
+            .filter(
+                RecoveryAction.scheduled_date.isnot(None),
+                RecoveryAction.scheduled_date >= start,
+                RecoveryAction.scheduled_date <= end,
+                RecoveryAction.completed_at.is_(None),
+            )
+            .order_by(RecoveryAction.scheduled_date.asc())
+            .all()
+        )
+
+        # Also get customers with next_action_date that don't have a pending action
+        customers_with_actions = (
+            session.query(Customer)
+            .filter(
+                Customer.next_action_date.isnot(None),
+                Customer.next_action_date >= start,
+                Customer.next_action_date <= end,
+                Customer.recovery_status != "archived",
+            )
+            .all()
+        )
+
+        items = []
+        seen_customer_ids = set()
+
+        for action in actions:
+            seen_customer_ids.add(action.customer_id)
+            # Count overdue invoices for this customer
+            overdue_count = session.query(Invoice).filter(
+                Invoice.customer_id == action.customer_id,
+                Invoice.status != "paid",
+                Invoice.days_overdue > 0,
+            ).count()
+            total_due = session.query(Invoice).filter(
+                Invoice.customer_id == action.customer_id,
+                Invoice.status != "paid",
+            ).with_entities(Invoice.amount_due).all()
+            total_amount = sum(r[0] for r in total_due) if total_due else 0
+
+            items.append({
+                "id": action.id,
+                "customer_id": action.customer_id,
+                "customer_name": action.customer.ragione_sociale,
+                "action_type": action.action_type,
+                "scheduled_date": action.scheduled_date.isoformat(),
+                "notes": action.notes,
+                "overdue_invoices": overdue_count,
+                "total_due": float(total_amount),
+                "source": "action",
+            })
+
+        # Add customers that have next_action_date but no pending action record
+        for cust in customers_with_actions:
+            if cust.id not in seen_customer_ids:
+                overdue_count = session.query(Invoice).filter(
+                    Invoice.customer_id == cust.id,
+                    Invoice.status != "paid",
+                    Invoice.days_overdue > 0,
+                ).count()
+                total_due = session.query(Invoice).filter(
+                    Invoice.customer_id == cust.id,
+                    Invoice.status != "paid",
+                ).with_entities(Invoice.amount_due).all()
+                total_amount = sum(r[0] for r in total_due) if total_due else 0
+
+                items.append({
+                    "id": None,
+                    "customer_id": cust.id,
+                    "customer_name": cust.ragione_sociale,
+                    "action_type": cust.next_action_type or cust.recovery_status,
+                    "scheduled_date": cust.next_action_date.isoformat(),
+                    "notes": None,
+                    "overdue_invoices": overdue_count,
+                    "total_due": float(total_amount),
+                    "source": "customer",
+                })
+
+        # Sort all items by date
+        items.sort(key=lambda x: x["scheduled_date"])
+
+        return {"items": items, "total": len(items)}
+
+    except Exception as e:
+        logger.error(f"Error fetching calendar: {e}", exc_info=True)
+        raise
+
+
+# --- Customer recovery actions ---
+
+@router.get("/customers/{customer_id}/actions")
+async def get_customer_actions(
+    customer_id: int,
+    session: Session = Depends(get_session),
+):
+    """Get recovery action history for a customer."""
+    try:
+        customer = session.query(Customer).filter(Customer.id == customer_id).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        actions = (
+            session.query(RecoveryAction)
+            .filter(RecoveryAction.customer_id == customer_id)
+            .order_by(RecoveryAction.created_at.desc())
+            .all()
+        )
+
+        return {
+            "customer_id": customer_id,
+            "recovery_status": customer.recovery_status,
+            "next_action_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
+            "next_action_type": customer.next_action_type,
+            "actions": [
+                {
+                    "id": a.id,
+                    "action_type": a.action_type,
+                    "scheduled_date": a.scheduled_date.isoformat() if a.scheduled_date else None,
+                    "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+                    "notes": a.notes,
+                    "created_at": a.created_at.isoformat(),
+                }
+                for a in actions
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching customer actions: {e}", exc_info=True)
+        raise
+
+
+@router.post("/customers/{customer_id}/actions")
+async def create_action(
+    customer_id: int,
+    action: ActionCreate,
+    session: Session = Depends(get_session),
+):
+    """
+    Create a new recovery action for a customer.
+
+    Action types and their behavior:
+    - first_contact: Schedule first contact, sets next_action +7 days
+    - second_contact: Schedule second contact, sets next_action +14 days
+    - lawyer: Pass to lawyer, auto-schedules follow-up in 30 days
+    - archive: Mark as unrecoverable, no next action
+    - wait: Postpone next action by 30 days
+    - note: Just add a note, no status change
+    """
+    valid_types = ["first_contact", "second_contact", "lawyer", "archive", "wait", "note"]
+    if action.action_type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid action type. Must be one of: {', '.join(valid_types)}"
+        )
+
+    try:
+        customer = session.query(Customer).filter(Customer.id == customer_id).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        today = date.today()
+        scheduled = date.fromisoformat(action.scheduled_date) if action.scheduled_date else None
+
+        # Create the action record
+        new_action = RecoveryAction(
+            customer_id=customer_id,
+            action_type=action.action_type,
+            scheduled_date=scheduled or today,
+            notes=action.notes,
+        )
+        session.add(new_action)
+
+        # Update customer recovery status and next action
+        if action.action_type == "first_contact":
+            customer.recovery_status = "first_contact"
+            customer.next_action_date = today + timedelta(days=7)
+            customer.next_action_type = "second_contact"
+        elif action.action_type == "second_contact":
+            customer.recovery_status = "second_contact"
+            customer.next_action_date = today + timedelta(days=14)
+            customer.next_action_type = "lawyer"
+        elif action.action_type == "lawyer":
+            customer.recovery_status = "lawyer"
+            customer.next_action_date = today + timedelta(days=30)
+            customer.next_action_type = "lawyer"  # Follow-up with lawyer
+        elif action.action_type == "archive":
+            customer.recovery_status = "archived"
+            customer.next_action_date = None
+            customer.next_action_type = None
+        elif action.action_type == "wait":
+            customer.recovery_status = "waiting"
+            customer.next_action_date = today + timedelta(days=30)
+            # Keep same next_action_type
+        # "note" doesn't change status
+
+        customer.updated_at = datetime.utcnow()
+        session.commit()
+
+        # Log activity
+        activity = ActivityLog(
+            action=f"recovery_{action.action_type}",
+            entity_type="customer",
+            entity_id=customer_id,
+            details={
+                "ragione_sociale": customer.ragione_sociale,
+                "action_type": action.action_type,
+                "notes": action.notes,
+                "next_action_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
+            }
+        )
+        session.add(activity)
+        session.commit()
+
+        return {
+            "id": new_action.id,
+            "action_type": new_action.action_type,
+            "scheduled_date": new_action.scheduled_date.isoformat() if new_action.scheduled_date else None,
+            "recovery_status": customer.recovery_status,
+            "next_action_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
+            "next_action_type": customer.next_action_type,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating action: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.put("/customers/{customer_id}/actions/{action_id}/complete")
+async def complete_action(
+    customer_id: int,
+    action_id: int,
+    session: Session = Depends(get_session),
+):
+    """Mark a recovery action as completed."""
+    try:
+        action = session.query(RecoveryAction).filter(
+            RecoveryAction.id == action_id,
+            RecoveryAction.customer_id == customer_id,
+        ).first()
+        if not action:
+            raise HTTPException(status_code=404, detail="Action not found")
+
+        action.completed_at = datetime.utcnow()
+        session.commit()
+
+        return {
+            "id": action.id,
+            "completed_at": action.completed_at.isoformat(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error completing action: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+# --- PDF Riepilogativo ---
+
+@router.get("/customers/{customer_id}/pdf-riepilogativo")
+async def generate_pdf_riepilogativo(
+    customer_id: int,
+    session: Session = Depends(get_session),
+    overdue_only: bool = Query(True, description="Include only overdue invoices"),
+):
+    """
+    Generate a PDF summary of overdue invoices for a customer.
+    Includes: invoice number, amount, due date, total, IBAN.
+    """
+    try:
+        customer = session.query(Customer).filter(Customer.id == customer_id).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        # Get invoices
+        query = session.query(Invoice).filter(
+            Invoice.customer_id == customer_id,
+            Invoice.status != "paid",
+        )
+        if overdue_only:
+            query = query.filter(Invoice.days_overdue > 0)
+
+        invoices = query.order_by(Invoice.due_date.asc()).all()
+
+        if not invoices:
+            raise HTTPException(status_code=404, detail="No invoices found for this customer")
+
+        # Generate PDF
+        pdf_bytes = _build_riepilogativo_pdf(customer, invoices)
+
+        filename = f"riepilogativo_{customer.ragione_sociale.replace(' ', '_')}.pdf"
+
+        return StreamingResponse(
+            BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating PDF: {e}", exc_info=True)
+        raise
+
+
+def _build_riepilogativo_pdf(customer, invoices):
+    """Build the PDF riepilogativo using fpdf2."""
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # Header
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 12, "Sake Company", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, "Wagyu Company S.R.L.", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(8)
+
+    # Title
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "Riepilogo Fatture Scadute", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(6)
+
+    # Customer info
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, f"Cliente: {customer.ragione_sociale}", new_x="LMARGIN", new_y="NEXT")
+    if customer.partita_iva:
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 6, f"P.IVA: {customer.partita_iva}", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, f"Data: {date.today().strftime('%d/%m/%Y')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(8)
+
+    # Table header
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(240, 240, 240)
+    col_widths = [50, 45, 40, 55]  # Fattura, Importo, Scadenza, GG Ritardo
+    headers = ["N. Fattura", "Importo", "Scadenza", "GG Ritardo"]
+    for i, h in enumerate(headers):
+        pdf.cell(col_widths[i], 8, h, border=1, fill=True, align="C")
+    pdf.ln()
+
+    # Table rows
+    pdf.set_font("Helvetica", "", 10)
+    total_due = 0.0
+    for inv in invoices:
+        total_due += float(inv.amount_due)
+        pdf.cell(col_widths[0], 7, str(inv.invoice_number)[:25], border=1, align="L")
+        pdf.cell(col_widths[1], 7, f"{float(inv.amount_due):,.2f} EUR".replace(",", "."), border=1, align="R")
+        pdf.cell(col_widths[2], 7, inv.due_date.strftime("%d/%m/%Y") if inv.due_date else "-", border=1, align="C")
+        pdf.cell(col_widths[3], 7, str(inv.days_overdue or 0), border=1, align="C")
+        pdf.ln()
+
+    # Total row
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(col_widths[0], 9, "TOTALE", border=1, fill=True, align="R")
+    pdf.cell(col_widths[1], 9, f"{total_due:,.2f} EUR".replace(",", "."), border=1, fill=True, align="R")
+    pdf.cell(col_widths[2] + col_widths[3], 9, "", border=1, fill=True)
+    pdf.ln(14)
+
+    # Payment info
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, "Coordinate per il pagamento:", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7, "Intestatario: Wagyu Company S.R.L.", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, "IBAN: IT60F0306909606100000194066", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, "Banca: Intesa Sanpaolo", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"Causale: Saldo fatture {customer.ragione_sociale}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(8)
+
+    # Footer note
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.multi_cell(0, 5,
+        "Vi preghiamo di provvedere al pagamento entro 7 giorni dalla ricezione "
+        "di questo riepilogo. Per qualsiasi chiarimento, non esitate a contattarci."
+    )
+
+    return pdf.output()

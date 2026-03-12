@@ -27,12 +27,17 @@ class Customer(Base):
     excluded = Column(Boolean, default=False)
     source = Column(String, default="shopify")  # shopify / fatturapro / fatture24
     tags = Column(String, nullable=True)
+    # Recovery workflow
+    recovery_status = Column(String, default="idle")  # idle / first_contact / second_contact / lawyer / archived / waiting
+    next_action_date = Column(Date, nullable=True)
+    next_action_type = Column(String, nullable=True)  # first_contact / second_contact / lawyer / archive / wait
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
     # Relationships
     invoices = relationship("Invoice", back_populates="customer")
     messages = relationship("Message", back_populates="customer")
+    recovery_actions = relationship("RecoveryAction", back_populates="customer", order_by="RecoveryAction.created_at.desc()")
 
 
 class Invoice(Base):
@@ -94,6 +99,22 @@ class Conversation(Base):
 
     # Relationships
     message = relationship("Message", back_populates="conversations")
+
+
+class RecoveryAction(Base):
+    """Tracks recovery workflow actions per customer."""
+    __tablename__ = "recovery_actions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    action_type = Column(String, nullable=False)  # first_contact / second_contact / lawyer / archive / wait / note
+    scheduled_date = Column(Date, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    # Relationships
+    customer = relationship("Customer", back_populates="recovery_actions")
 
 
 class ActivityLog(Base):

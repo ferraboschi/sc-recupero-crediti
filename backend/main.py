@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from backend.database import init_db
 from backend.config import config
 from backend.scheduler import start_scheduler, stop_scheduler
-from backend.api import dashboard, positions, messages, customers, sync, webhooks
+from backend.api import dashboard, positions, messages, customers, sync, webhooks, recovery
 
 # Configure logging
 logging.basicConfig(
@@ -93,6 +93,7 @@ app.include_router(messages.router, prefix="/api/messages", tags=["messages"])
 app.include_router(customers.router, prefix="/api/customers", tags=["customers"])
 app.include_router(sync.router, prefix="/api/sync", tags=["sync"])
 app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])
+app.include_router(recovery.router, prefix="/api/recovery", tags=["recovery"])
 
 
 # Mount static files for frontend (if they exist)
