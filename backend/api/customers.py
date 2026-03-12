@@ -35,6 +35,7 @@ async def list_customers(
                 Invoice.customer_id,
                 Invoice.amount_due,
                 Invoice.days_overdue,
+                Invoice.due_date,
             )
             .filter(Invoice.status != "paid", Invoice.customer_id.isnot(None))
             .all()
@@ -44,13 +45,17 @@ async def list_customers(
         for row in raw_stats:
             cid = row[0]
             if cid not in invoice_stats:
-                invoice_stats[cid] = {"invoice_count": 0, "total_due": 0.0, "overdue_count": 0, "total_overdue": 0.0}
+                invoice_stats[cid] = {"invoice_count": 0, "total_due": 0.0, "overdue_count": 0, "total_overdue": 0.0, "earliest_due_date": None}
             stats = invoice_stats[cid]
             stats["invoice_count"] += 1
             stats["total_due"] += float(row[1] or 0)
+            # Track earliest due date for overdue invoices
+            due_dt = row[3]
             if (row[2] or 0) > 0:
                 stats["overdue_count"] += 1
                 stats["total_overdue"] += float(row[1] or 0)
+                if due_dt and (stats["earliest_due_date"] is None or due_dt < stats["earliest_due_date"]):
+                    stats["earliest_due_date"] = due_dt
 
         # Step 2: Query customers with basic filters
         query = session.query(Customer)
@@ -73,7 +78,7 @@ async def list_customers(
         # Step 3: Build enriched list
         enriched = []
         for cust in all_customers:
-            stats = invoice_stats.get(cust.id, {"invoice_count": 0, "total_due": 0.0, "overdue_count": 0, "total_overdue": 0.0})
+            stats = invoice_stats.get(cust.id, {"invoice_count": 0, "total_due": 0.0, "overdue_count": 0, "total_overdue": 0.0, "earliest_due_date": None})
             enriched.append({"customer": cust, **stats})
 
         # Step 4: Filter only_overdue
@@ -87,6 +92,13 @@ async def list_customers(
             enriched.sort(key=lambda e: e["total_overdue"], reverse=(sort_order == "desc"))
         elif sort_by == "overdue_count":
             enriched.sort(key=lambda e: e["overdue_count"], reverse=(sort_order == "desc"))
+        elif sort_by == "earliest_due_date":
+            from datetime import date as date_type
+            far_future = date_type(9999, 12, 31)
+            enriched.sort(
+                key=lambda e: e.get("earliest_due_date") or far_future,
+                reverse=(sort_order == "desc"),
+            )
         else:
             enriched.sort(key=lambda e: (e["customer"].ragione_sociale or "").lower())
 
@@ -112,6 +124,7 @@ async def list_customers(
                 "total_due": entry["total_due"],
                 "overdue_count": entry["overdue_count"],
                 "total_overdue": entry["total_overdue"],
+                "earliest_due_date": entry["earliest_due_date"].isoformat() if entry.get("earliest_due_date") else None,
                 "created_at": cust.created_at.isoformat(),
             })
 

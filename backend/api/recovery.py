@@ -359,6 +359,83 @@ async def generate_pdf_riepilogativo(
         raise
 
 
+@router.get("/invoices/{invoice_id}/pdf")
+async def generate_single_invoice_pdf(
+    invoice_id: int,
+    session: Session = Depends(get_session),
+):
+    """
+    Generate a PDF for a single invoice with payment details.
+    """
+    try:
+        invoice = session.query(Invoice).filter(Invoice.id == invoice_id).first()
+        if not invoice:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+
+        customer = session.query(Customer).filter(Customer.id == invoice.customer_id).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        pdf_bytes = _build_riepilogativo_pdf(customer, [invoice])
+        filename = f"fattura_{invoice.invoice_number.replace('/', '_')}_{customer.ragione_sociale.replace(' ', '_')}.pdf"
+
+        return StreamingResponse(
+            BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating single invoice PDF: {e}", exc_info=True)
+        raise
+
+
+@router.get("/customers/{customer_id}/pdf-selected")
+async def generate_selected_invoices_pdf(
+    customer_id: int,
+    invoice_ids: str = Query(..., description="Comma-separated invoice IDs"),
+    session: Session = Depends(get_session),
+):
+    """
+    Generate a PDF riepilogativo for selected invoices only.
+    """
+    try:
+        customer = session.query(Customer).filter(Customer.id == customer_id).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        ids = [int(x.strip()) for x in invoice_ids.split(",") if x.strip()]
+        if not ids:
+            raise HTTPException(status_code=400, detail="No invoice IDs provided")
+
+        invoices = (
+            session.query(Invoice)
+            .filter(Invoice.id.in_(ids), Invoice.customer_id == customer_id)
+            .order_by(Invoice.due_date.asc())
+            .all()
+        )
+
+        if not invoices:
+            raise HTTPException(status_code=404, detail="No invoices found")
+
+        pdf_bytes = _build_riepilogativo_pdf(customer, invoices)
+        filename = f"riepilogativo_{customer.ragione_sociale.replace(' ', '_')}.pdf"
+
+        return StreamingResponse(
+            BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating selected invoices PDF: {e}", exc_info=True)
+        raise
+
+
 def _build_riepilogativo_pdf(customer, invoices):
     """Build the PDF riepilogativo using fpdf2."""
     from fpdf import FPDF
