@@ -70,6 +70,7 @@ export default function Positions() {
 
   // Status update feedback
   const [updatingId, setUpdatingId] = useState(null)
+  const [summaryTotalAmountDue, setSummaryTotalAmountDue] = useState(0)
 
   useEffect(() => {
     const fetchPositions = async () => {
@@ -100,6 +101,7 @@ export default function Positions() {
         const response = await client.get('/positions', { params })
         setPositions(response.data.items)
         setTotal(response.data.total)
+        setSummaryTotalAmountDue(response.data.summary_total_amount_due || 0)
       } catch (err) {
         setError('Errore nel caricamento delle posizioni')
         console.error(err)
@@ -396,11 +398,15 @@ export default function Positions() {
       {positions.length > 0 && (
         <div className="bg-blue-50 rounded-lg p-4 border border-blue-200 flex items-center gap-6">
           <div>
-            <p className="text-sm font-medium text-blue-900">Totale Importo Dovuto</p>
-            <p className="text-2xl font-bold text-blue-600">{formatCurrency(totalAmountDue)}</p>
+            <p className="text-sm font-medium text-blue-900">Totale Scaduto (filtro attivo)</p>
+            <p className="text-2xl font-bold text-blue-600">{formatCurrency(summaryTotalAmountDue)}</p>
           </div>
           <div>
-            <p className="text-sm font-medium text-blue-900">Posizioni Mostrate</p>
+            <p className="text-sm font-medium text-blue-900">Posizioni Totali (filtro attivo)</p>
+            <p className="text-2xl font-bold text-blue-600">{total}</p>
+          </div>
+          <div>
+            <p className="text-sm font-medium text-blue-900">Mostrate in Pagina</p>
             <p className="text-2xl font-bold text-blue-600">{positions.length} di {total}</p>
           </div>
         </div>
