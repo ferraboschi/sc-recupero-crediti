@@ -28,40 +28,32 @@ async def list_customers(
     List customers with optional search and filter by excluded status.
     Supports filtering to only_overdue customers and sorting by overdue amounts.
     """
-    from sqlalchemy import case as sa_case
-
     try:
-        # Build stats subquery
-        stats_sub = (
+        # Step 1: Get all invoice stats keyed by customer_id
+        raw_stats = (
             session.query(
-                Invoice.customer_id.label("cid"),
-                func.count(Invoice.id).label("inv_count"),
-                func.coalesce(func.sum(Invoice.amount_due), 0).label("t_due"),
-                func.coalesce(func.sum(
-                    func.cast(Invoice.days_overdue > 0, Integer)
-                ), 0).label("o_count"),
-                func.coalesce(func.sum(
-                    sa_case(
-                        (Invoice.days_overdue > 0, Invoice.amount_due),
-                        else_=0,
-                    )
-                ), 0).label("t_overdue"),
+                Invoice.customer_id,
+                Invoice.amount_due,
+                Invoice.days_overdue,
             )
-            .filter(Invoice.status != "paid")
-            .group_by(Invoice.customer_id)
-            .subquery("inv_stats")
+            .filter(Invoice.status != "paid", Invoice.customer_id.isnot(None))
+            .all()
         )
 
-        query = (
-            session.query(
-                Customer,
-                func.coalesce(stats_sub.c.inv_count, 0).label("invoice_count"),
-                func.coalesce(stats_sub.c.t_due, 0).label("total_due"),
-                func.coalesce(stats_sub.c.o_count, 0).label("overdue_count"),
-                func.coalesce(stats_sub.c.t_overdue, 0).label("total_overdue"),
-            )
-            .outerjoin(stats_sub, Customer.id == stats_sub.c.cid)
-        )
+        invoice_stats = {}
+        for row in raw_stats:
+            cid = row[0]
+            if cid not in invoice_stats:
+                invoice_stats[cid] = {"invoice_count": 0, "total_due": 0.0, "overdue_count": 0, "total_overdue": 0.0}
+            stats = invoice_stats[cid]
+            stats["invoice_count"] += 1
+            stats["total_due"] += float(row[1] or 0)
+            if (row[2] or 0) > 0:
+                stats["overdue_count"] += 1
+                stats["total_overdue"] += float(row[1] or 0)
+
+        # Step 2: Query customers with basic filters
+        query = session.query(Customer)
 
         if search:
             search_pattern = f"%{search}%"
@@ -76,26 +68,34 @@ async def list_customers(
         if excluded is not None:
             query = query.filter(Customer.excluded == excluded)
 
+        all_customers = query.all()
+
+        # Step 3: Build enriched list
+        enriched = []
+        for cust in all_customers:
+            stats = invoice_stats.get(cust.id, {"invoice_count": 0, "total_due": 0.0, "overdue_count": 0, "total_overdue": 0.0})
+            enriched.append({"customer": cust, **stats})
+
+        # Step 4: Filter only_overdue
         if only_overdue:
-            query = query.filter(stats_sub.c.o_count > 0)
+            enriched = [e for e in enriched if e["overdue_count"] > 0]
 
-        total = query.count()
+        total = len(enriched)
 
-        # Sorting
+        # Step 5: Sort
         if sort_by == "total_overdue":
-            col = stats_sub.c.t_overdue
-            query = query.order_by(col.desc() if sort_order == "desc" else col.asc())
+            enriched.sort(key=lambda e: e["total_overdue"], reverse=(sort_order == "desc"))
         elif sort_by == "overdue_count":
-            col = stats_sub.c.o_count
-            query = query.order_by(col.desc() if sort_order == "desc" else col.asc())
+            enriched.sort(key=lambda e: e["overdue_count"], reverse=(sort_order == "desc"))
         else:
-            query = query.order_by(Customer.ragione_sociale.asc())
+            enriched.sort(key=lambda e: (e["customer"].ragione_sociale or "").lower())
 
-        results = query.offset(skip).limit(limit).all()
+        # Step 6: Paginate
+        page = enriched[skip:skip + limit]
 
         items = []
-        for row in results:
-            cust = row[0]
+        for entry in page:
+            cust = entry["customer"]
             items.append({
                 "id": cust.id,
                 "ragione_sociale": cust.ragione_sociale,
@@ -108,10 +108,10 @@ async def list_customers(
                 "recovery_status": cust.recovery_status,
                 "next_action_date": cust.next_action_date.isoformat() if cust.next_action_date else None,
                 "next_action_type": cust.next_action_type,
-                "invoice_count": row[1] or 0,
-                "total_due": float(row[2] or 0),
-                "overdue_count": row[3] or 0,
-                "total_overdue": float(row[4] or 0),
+                "invoice_count": entry["invoice_count"],
+                "total_due": entry["total_due"],
+                "overdue_count": entry["overdue_count"],
+                "total_overdue": entry["total_overdue"],
                 "created_at": cust.created_at.isoformat(),
             })
 
