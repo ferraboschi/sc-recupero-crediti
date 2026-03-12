@@ -429,7 +429,8 @@ def _build_riepilogativo_pdf(customer, invoices):
 
     # Footer note
     pdf.set_font("Helvetica", "I", 9)
-    pdf.multi_cell(0, 5,
+    pdf.multi_cell(
+        0, 5,
         "Vi preghiamo di provvedere al pagamento entro 7 giorni dalla ricezione "
         "di questo riepilogo. Per qualsiasi chiarimento, non esitate a contattarci."
     )
@@ -463,19 +464,19 @@ async def get_recovery_report(
         # Active recovery customers
         active_customers = session.query(Customer).filter(
             Customer.recovery_status.in_(["first_contact", "second_contact"]),
-            Customer.excluded == False,
+            Customer.excluded.is_(False),
         ).all()
 
         # Waiting customers
         waiting_customers = session.query(Customer).filter(
             Customer.recovery_status == "waiting",
-            Customer.excluded == False,
+            Customer.excluded.is_(False),
         ).all()
 
         # Lawyer customers
         lawyer_customers = session.query(Customer).filter(
             Customer.recovery_status == "lawyer",
-            Customer.excluded == False,
+            Customer.excluded.is_(False),
         ).all()
 
         # Paid invoices
@@ -503,7 +504,7 @@ async def get_recovery_report(
             Customer.next_action_date >= today,
             Customer.next_action_date <= today + timedelta(days=30),
             Customer.recovery_status != "archived",
-            Customer.excluded == False,
+            Customer.excluded.is_(False),
         ).all()
 
         # Helper to get customer invoice stats

@@ -854,5 +854,3 @@ async def import_csv(file: UploadFile = File(...)):
         return result
     finally:
         session.close()
-
-
