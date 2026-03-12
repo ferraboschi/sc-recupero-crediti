@@ -16,15 +16,42 @@ client.interceptors.request.use(
   }
 )
 
-// Response interceptor
+// Retry logic for cold starts (503) and network errors
+const MAX_RETRIES = 3
+const RETRY_DELAY = 5000 // 5 seconds between retries
+
+function shouldRetry(error) {
+  // Retry on 503 (Render cold start)
+  if (error.response && error.response.status === 503) return true
+  // Retry on network errors (server not yet responding)
+  if (!error.response && error.request) return true
+  return false
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+// Response interceptor with auto-retry
 client.interceptors.response.use(
   response => response,
-  error => {
+  async error => {
+    const cfg = error.config
+    if (!cfg) return Promise.reject(error)
+
+    cfg.__retryCount = cfg.__retryCount || 0
+
+    if (shouldRetry(error) && cfg.__retryCount < MAX_RETRIES) {
+      cfg.__retryCount += 1
+      console.log(`[Retry ${cfg.__retryCount}/${MAX_RETRIES}] ${cfg.method?.toUpperCase()} ${cfg.url} — waiting ${RETRY_DELAY / 1000}s...`)
+      await delay(RETRY_DELAY)
+      return client(cfg)
+    }
+
+    // Final failure — log and reject
     if (error.response) {
-      // Server responded with error status
       console.error('API Error:', error.response.status, error.response.data)
     } else if (error.request) {
-      // Request was made but no response received
       console.error('Network Error:', error.request)
     } else {
       console.error('Error:', error.message)
