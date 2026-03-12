@@ -1,7 +1,9 @@
 """Sync API endpoints for manual trigger of data synchronization."""
 
 import logging
-from fastapi import APIRouter, BackgroundTasks
+import csv
+from io import StringIO
+from fastapi import APIRouter, BackgroundTasks, UploadFile, File, Form
 from datetime import datetime, date
 
 from backend.database import get_session, ActivityLog, Invoice, Customer
@@ -368,5 +370,216 @@ async def get_sync_status():
         "last_sync": _sync_status,
         "scheduler": get_scheduler_status(),
     }
+
+
+@router.post("/import-csv")
+async def import_csv(file: UploadFile = File(...)):
+    """
+    Import invoices from a CSV file (e.g. exported from Fattura24).
+
+    Expected CSV columns (flexible matching, case-insensitive):
+    - Invoice Number: numero, invoice_number, numero_fattura, n_documento
+    - Customer Name: cliente, customer, ragione_sociale, destinatario
+    - P.IVA: partita_iva, piva, p_iva, vat
+    - Amount: importo, amount, totale, total
+    - Amount Due: saldo, amount_due, da_incassare, balance
+    - Issue Date: data, issue_date, data_emissione, data_documento
+    - Due Date: scadenza, due_date, data_scadenza
+
+    Returns import statistics.
+    """
+    session = get_session()
+    result = {"created": 0, "updated": 0, "skipped": 0, "errors": [], "total_rows": 0}
+
+    try:
+        content = await file.read()
+        text = content.decode("utf-8-sig")  # Handle BOM
+
+        reader = csv.DictReader(StringIO(text), delimiter=None)
+
+        # Auto-detect delimiter
+        first_line = text.split("\n")[0]
+        if ";" in first_line and "," not in first_line:
+            reader = csv.DictReader(StringIO(text), delimiter=";")
+        elif "\t" in first_line:
+            reader = csv.DictReader(StringIO(text), delimiter="\t")
+        else:
+            reader = csv.DictReader(StringIO(text), delimiter=",")
+
+        # Column mapping - map common Italian/English column names to our fields
+        COLUMN_MAP = {
+            # invoice_number
+            "numero": "invoice_number",
+            "invoice_number": "invoice_number",
+            "numero_fattura": "invoice_number",
+            "n_documento": "invoice_number",
+            "numero documento": "invoice_number",
+            "n. documento": "invoice_number",
+            "documento": "invoice_number",
+            # customer_name
+            "cliente": "customer_name",
+            "customer": "customer_name",
+            "ragione_sociale": "customer_name",
+            "ragione sociale": "customer_name",
+            "destinatario": "customer_name",
+            "nome": "customer_name",
+            # piva
+            "partita_iva": "piva",
+            "partita iva": "piva",
+            "piva": "piva",
+            "p_iva": "piva",
+            "p.iva": "piva",
+            "p. iva": "piva",
+            "vat": "piva",
+            "codice fiscale": "piva",
+            # amount
+            "importo": "amount",
+            "amount": "amount",
+            "totale": "amount",
+            "total": "amount",
+            # amount_due
+            "saldo": "amount_due",
+            "amount_due": "amount_due",
+            "da_incassare": "amount_due",
+            "da incassare": "amount_due",
+            "balance": "amount_due",
+            "residuo": "amount_due",
+            # issue_date
+            "data": "issue_date",
+            "issue_date": "issue_date",
+            "data_emissione": "issue_date",
+            "data emissione": "issue_date",
+            "data_documento": "issue_date",
+            "data documento": "issue_date",
+            # due_date
+            "scadenza": "due_date",
+            "due_date": "due_date",
+            "data_scadenza": "due_date",
+            "data scadenza": "due_date",
+        }
+
+        def map_row(row):
+            """Map CSV columns to our field names."""
+            mapped = {}
+            for csv_col, value in row.items():
+                if csv_col is None:
+                    continue
+                key = COLUMN_MAP.get(csv_col.strip().lower())
+                if key and value and value.strip():
+                    mapped[key] = value.strip()
+            return mapped
+
+        def parse_amount(s):
+            """Parse Italian or English formatted currency amount."""
+            if not s:
+                return 0.0
+            # Remove currency symbols and spaces
+            s = s.replace("€", "").replace("$", "").strip()
+            # Handle Italian format: 1.234,56
+            if "," in s and "." in s:
+                if s.index(",") > s.index("."):
+                    # Italian: 1.234,56
+                    s = s.replace(".", "").replace(",", ".")
+                # else English: 1,234.56
+                else:
+                    s = s.replace(",", "")
+            elif "," in s:
+                # Could be Italian decimal: 123,45
+                s = s.replace(",", ".")
+            try:
+                return float(s)
+            except (ValueError, TypeError):
+                return 0.0
+
+        def parse_date(s):
+            """Parse date in various formats."""
+            if not s:
+                return None
+            # Try common formats
+            for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y/%m/%d"]:
+                try:
+                    return datetime.strptime(s, fmt).date()
+                except ValueError:
+                    continue
+            return None
+
+        for row_num, row in enumerate(reader, start=1):
+            result["total_rows"] += 1
+            mapped = map_row(row)
+
+            if not mapped.get("invoice_number"):
+                result["skipped"] += 1
+                result["errors"].append(f"Row {row_num}: missing invoice number")
+                continue
+
+            inv_num = mapped["invoice_number"]
+
+            # Check if already exists
+            existing = session.query(Invoice).filter_by(
+                invoice_number=inv_num,
+                source_platform="fatture24"
+            ).first()
+
+            amount = parse_amount(mapped.get("amount", "0"))
+            amount_due = parse_amount(mapped.get("amount_due", "0"))
+            if amount_due == 0 and amount > 0:
+                amount_due = amount  # If no separate balance, assume full amount due
+
+            issue_date = parse_date(mapped.get("issue_date"))
+            due_date = parse_date(mapped.get("due_date"))
+
+            days_overdue = 0
+            if due_date:
+                days_overdue = max(0, (date.today() - due_date).days)
+
+            if existing:
+                existing.amount = amount
+                existing.amount_due = amount_due
+                existing.issue_date = issue_date or existing.issue_date
+                existing.due_date = due_date or existing.due_date
+                existing.customer_name_raw = mapped.get("customer_name") or existing.customer_name_raw
+                existing.customer_piva_raw = mapped.get("piva") or existing.customer_piva_raw
+                existing.days_overdue = days_overdue
+                result["updated"] += 1
+            else:
+                new_invoice = Invoice(
+                    invoice_number=inv_num,
+                    amount=amount,
+                    amount_due=amount_due,
+                    issue_date=issue_date,
+                    due_date=due_date,
+                    customer_name_raw=mapped.get("customer_name"),
+                    customer_piva_raw=mapped.get("piva"),
+                    source_platform="fatture24",
+                    days_overdue=days_overdue,
+                )
+                session.add(new_invoice)
+                result["created"] += 1
+
+        session.commit()
+
+        # Log activity
+        activity = ActivityLog(
+            action="csv_import",
+            entity_type="invoice",
+            details={
+                "filename": file.filename,
+                "source": "fatture24",
+                **result
+            }
+        )
+        session.add(activity)
+        session.commit()
+
+        logger.info(f"CSV import complete: {result}")
+        return result
+
+    except Exception as e:
+        logger.error(f"Error importing CSV: {e}", exc_info=True)
+        session.rollback()
+        result["errors"].append(str(e))
+        return result
+    finally:
+        session.close()
 
 

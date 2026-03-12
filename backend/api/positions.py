@@ -26,6 +26,8 @@ async def list_positions(
     issue_date_to: str = Query(None, description="Issue date to (YYYY-MM-DD)"),
     due_date_from: str = Query(None, description="Due date from (YYYY-MM-DD)"),
     due_date_to: str = Query(None, description="Due date to (YYYY-MM-DD)"),
+    overdue: str = Query(None, description="Filter by overdue status: 'yes' for overdue, 'no' for not overdue"),
+    has_customer: str = Query(None, description="Filter by customer assignment: 'yes' for matched invoices only"),
     sort_by: str = Query(None, description="Sort field: amount_due, issue_date, due_date, days_overdue"),
     sort_order: str = Query("desc", description="Sort order: asc or desc"),
     skip: int = Query(0, ge=0),
@@ -35,7 +37,8 @@ async def list_positions(
     List all positions (invoices joined with customers).
 
     Supports filtering by status, escalation level, minimum amount, search,
-    source platform, issue date range, and due date range.
+    source platform, overdue status, customer assignment, issue date range,
+    and due date range.
     """
     from datetime import date as date_type
 
@@ -56,6 +59,16 @@ async def list_positions(
 
         if source:
             query = query.filter(Invoice.source_platform == source)
+
+        if overdue == "yes":
+            query = query.filter(Invoice.days_overdue > 0)
+        elif overdue == "no":
+            query = query.filter(Invoice.days_overdue <= 0)
+
+        if has_customer == "yes":
+            query = query.filter(Invoice.customer_id.isnot(None))
+        elif has_customer == "no":
+            query = query.filter(Invoice.customer_id.is_(None))
 
         if issue_date_from:
             try:
@@ -92,6 +105,7 @@ async def list_positions(
                     Customer.ragione_sociale.ilike(search_pattern),
                     Customer.partita_iva.ilike(search_pattern),
                     Invoice.invoice_number.ilike(search_pattern),
+                    Invoice.customer_name_raw.ilike(search_pattern),
                 )
             )
 
@@ -127,6 +141,7 @@ async def list_positions(
                     "days_overdue": pos.days_overdue,
                     "status": pos.status,
                     "source_platform": pos.source_platform,
+                    "customer_name_raw": pos.customer_name_raw,
                     "customer": {
                         "id": pos.customer.id if pos.customer else None,
                         "ragione_sociale": pos.customer.ragione_sociale if pos.customer else pos.customer_name_raw,
@@ -140,6 +155,60 @@ async def list_positions(
 
     except Exception as e:
         logger.error(f"Error listing positions: {e}", exc_info=True)
+        raise
+
+
+@router.get("/export")
+async def export_positions(session: Session = Depends(get_session)):
+    """Export all positions as CSV."""
+    try:
+        positions = session.query(Invoice).outerjoin(Customer).all()
+
+        # Create CSV in memory
+        output = StringIO()
+        writer = csv.writer(output)
+
+        # Write header
+        writer.writerow([
+            "Invoice Number",
+            "Customer",
+            "P.IVA",
+            "Amount",
+            "Amount Due",
+            "Issue Date",
+            "Due Date",
+            "Days Overdue",
+            "Status",
+            "Phone",
+            "Email",
+        ])
+
+        # Write data rows
+        for pos in positions:
+            writer.writerow([
+                pos.invoice_number,
+                pos.customer.ragione_sociale if pos.customer else pos.customer_name_raw,
+                pos.customer.partita_iva if pos.customer else pos.customer_piva_raw,
+                float(pos.amount),
+                float(pos.amount_due),
+                pos.issue_date.isoformat() if pos.issue_date else "",
+                pos.due_date.isoformat() if pos.due_date else "",
+                pos.days_overdue,
+                pos.status,
+                pos.customer.phone if pos.customer else "",
+                pos.customer.email if pos.customer else "",
+            ])
+
+        # Return as streaming response
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=positions_export.csv"}
+        )
+
+    except Exception as e:
+        logger.error(f"Error exporting positions: {e}", exc_info=True)
         raise
 
 
@@ -252,58 +321,4 @@ async def update_position_status(
     except Exception as e:
         logger.error(f"Error updating position status: {e}", exc_info=True)
         session.rollback()
-        raise
-
-
-@router.get("/export")
-async def export_positions(session: Session = Depends(get_session)):
-    """Export all positions as CSV."""
-    try:
-        positions = session.query(Invoice).outerjoin(Customer).all()
-
-        # Create CSV in memory
-        output = StringIO()
-        writer = csv.writer(output)
-
-        # Write header
-        writer.writerow([
-            "Invoice Number",
-            "Customer",
-            "P.IVA",
-            "Amount",
-            "Amount Due",
-            "Issue Date",
-            "Due Date",
-            "Days Overdue",
-            "Status",
-            "Phone",
-            "Email",
-        ])
-
-        # Write data rows
-        for pos in positions:
-            writer.writerow([
-                pos.invoice_number,
-                pos.customer.ragione_sociale if pos.customer else pos.customer_name_raw,
-                pos.customer.partita_iva if pos.customer else pos.customer_piva_raw,
-                float(pos.amount),
-                float(pos.amount_due),
-                pos.issue_date.isoformat() if pos.issue_date else "",
-                pos.due_date.isoformat() if pos.due_date else "",
-                pos.days_overdue,
-                pos.status,
-                pos.customer.phone if pos.customer else "",
-                pos.customer.email if pos.customer else "",
-            ])
-
-        # Return as streaming response
-        output.seek(0)
-        return StreamingResponse(
-            iter([output.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=positions_export.csv"}
-        )
-
-    except Exception as e:
-        logger.error(f"Error exporting positions: {e}", exc_info=True)
         raise

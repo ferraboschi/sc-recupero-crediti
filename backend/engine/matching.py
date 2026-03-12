@@ -1,4 +1,4 @@
-"""Matching module - matches invoices to Shopify customers."""
+"""Matching module - matches invoices to customers."""
 
 import logging
 from typing import Optional, Dict, Any
@@ -32,11 +32,6 @@ def match_invoice_to_customer(
 
     Returns:
         Matched Customer object, or None if no match found
-
-    Examples:
-        >>> customer = match_invoice_to_customer(invoice, customers, session)
-        >>> if customer:
-        ...     print(f"Matched to {customer.ragione_sociale}")
     """
     if not invoice.customer_piva_raw and not invoice.customer_name_raw:
         logger.warning(f"Invoice {invoice.invoice_number} has no customer data")
@@ -104,18 +99,14 @@ def run_matching(session: Session) -> Dict[str, Any]:
     Processes all invoices with customer_id = NULL and attempts to match them
     to customers using match_invoice_to_customer.
 
+    Unmatched invoices without a customer with P.IVA are likely Shopify sales
+    (not real invoices) and are left unmatched intentionally.
+
     Args:
         session: Database session
 
     Returns:
-        Dictionary with match statistics:
-        {
-            'matched_piva': int,           # Matched by P.IVA
-            'matched_exact': int,          # Matched by exact normalized name
-            'matched_fuzzy': int,          # Matched by fuzzy match
-            'unmatched': int,              # Could not be matched
-            'total': int                   # Total invoices processed
-        }
+        Dictionary with match statistics
     """
     stats = {
         'matched_piva': 0,
