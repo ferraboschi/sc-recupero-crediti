@@ -175,9 +175,10 @@ def _sync_invoices_task() -> dict:
                 fattura24 = Fattura24Connector()
 
                 # Fetch ALL invoices (not just overdue) to detect payments
+                # Use wide date range (4 years) to catch old invoices that may have been paid
                 from datetime import timedelta
                 date_to = datetime.now().strftime("%Y-%m-%d")
-                date_from = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+                date_from = (datetime.now() - timedelta(days=1460)).strftime("%Y-%m-%d")
                 raw_invoices = fattura24.fetch_invoices(date_from, date_to)
 
                 created, updated, paid_detected = 0, 0, 0
@@ -251,12 +252,32 @@ def _sync_invoices_task() -> dict:
                         session.add(new_invoice)
                         created += 1
 
+                # Mark as paid any F24 invoices in our DB that are NOT in the API response
+                # If Fatture24 doesn't return them anymore, they've been paid/settled
+                stale_paid = 0
+                stale_invoices = (
+                    session.query(Invoice)
+                    .filter(
+                        Invoice.source_platform == "fatture24",
+                        Invoice.status != "paid",
+                        Invoice.invoice_number.notin_(fetched_invoice_numbers) if fetched_invoice_numbers else True,
+                    )
+                    .all()
+                )
+                for inv in stale_invoices:
+                    if inv.invoice_number not in fetched_invoice_numbers:
+                        inv.status = "paid"
+                        inv.amount_due = 0
+                        stale_paid += 1
+                        logger.info(f"Stale F24 invoice marked paid: {inv.invoice_number} (not in API response)")
+
                 session.commit()
                 result["fattura24"]["success"] = True
                 result["fattura24"]["created"] = created
                 result["fattura24"]["updated"] = updated
                 result["fattura24"]["paid_detected"] = paid_detected
-                logger.info(f"Fattura24 sync: created={created}, updated={updated}, paid_detected={paid_detected}")
+                result["fattura24"]["stale_paid"] = stale_paid
+                logger.info(f"Fattura24 sync: created={created}, updated={updated}, paid_detected={paid_detected}, stale_paid={stale_paid}")
             else:
                 logger.debug("Fattura24 not configured")
         except Exception as e:
