@@ -1,0 +1,12 @@
+Spett.le {ragione_sociale},
+
+Con la presente ti comunichiamo che la fattura n. {invoice_number} emessa da {company_name} per un importo di €{amount_due}, scaduta in data {due_date}, risulta non pagata da {days_overdue} giorni.
+
+Nonostante i ripetuti solleciti, non abbiamo ricevuto alcun riscontro da parte vostra.
+
+Pertanto, qualora il saldo non venisse regolarizzato entro i prossimi 5 giorni, procederemo all'avvio di azioni legali per il recupero coattivo del credito, con i relativi costi aggiuntivi che ricadranno a vostro carico.
+
+Questa è la comunicazione finale prima di procedere alle azioni legali.
+
+Cordiali saluti,
+{company_name}

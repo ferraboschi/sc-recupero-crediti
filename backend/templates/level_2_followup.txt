@@ -1,0 +1,12 @@
+Buongiorno {ragione_sociale},
+
+Con riferimento alla nostra precedente comunicazione, ti informiamo che la fattura n. {invoice_number} emessa da {company_name}, per un importo di €{amount_due}, rimane ancora in sospeso.
+
+Ti chiediamo cortesemente di regolarizzare il pagamento entro i prossimi giorni.
+
+Qualora il saldo sia già stato effettuato, ti ringraziamo anticipatamente e considera questa comunicazione come non pervenuta.
+
+Per qualsiasi dubbio o necessità di chiarimenti, non esitare a contattarci.
+
+Cordiali saluti,
+{company_name}
