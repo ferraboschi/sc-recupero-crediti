@@ -28,31 +28,39 @@ async def list_customers(
     List customers with optional search and filter by excluded status.
     Supports filtering to only_overdue customers and sorting by overdue amounts.
     """
+    from sqlalchemy import case as sa_case
+
     try:
-        # First get invoice stats for ALL matching customers (needed for filtering/sorting)
-        # Base stats subquery
-        stats_subquery = (
+        # Build stats subquery
+        stats_sub = (
             session.query(
-                Invoice.customer_id,
-                func.count(Invoice.id).label("invoice_count"),
-                func.sum(Invoice.amount_due).label("total_due"),
-                func.sum(
+                Invoice.customer_id.label("cid"),
+                func.count(Invoice.id).label("inv_count"),
+                func.coalesce(func.sum(Invoice.amount_due), 0).label("t_due"),
+                func.coalesce(func.sum(
                     func.cast(Invoice.days_overdue > 0, Integer)
-                ).label("overdue_count"),
-                func.sum(
-                    func.case(
+                ), 0).label("o_count"),
+                func.coalesce(func.sum(
+                    sa_case(
                         (Invoice.days_overdue > 0, Invoice.amount_due),
                         else_=0,
                     )
-                ).label("total_overdue"),
+                ), 0).label("t_overdue"),
             )
             .filter(Invoice.status != "paid")
             .group_by(Invoice.customer_id)
-            .subquery()
+            .subquery("inv_stats")
         )
 
-        query = session.query(Customer, stats_subquery).outerjoin(
-            stats_subquery, Customer.id == stats_subquery.c.customer_id
+        query = (
+            session.query(
+                Customer,
+                func.coalesce(stats_sub.c.inv_count, 0).label("invoice_count"),
+                func.coalesce(stats_sub.c.t_due, 0).label("total_due"),
+                func.coalesce(stats_sub.c.o_count, 0).label("overdue_count"),
+                func.coalesce(stats_sub.c.t_overdue, 0).label("total_overdue"),
+            )
+            .outerjoin(stats_sub, Customer.id == stats_sub.c.cid)
         )
 
         if search:
@@ -69,16 +77,16 @@ async def list_customers(
             query = query.filter(Customer.excluded == excluded)
 
         if only_overdue:
-            query = query.filter(stats_subquery.c.overdue_count > 0)
+            query = query.filter(stats_sub.c.o_count > 0)
 
         total = query.count()
 
         # Sorting
         if sort_by == "total_overdue":
-            col = stats_subquery.c.total_overdue
+            col = stats_sub.c.t_overdue
             query = query.order_by(col.desc() if sort_order == "desc" else col.asc())
         elif sort_by == "overdue_count":
-            col = stats_subquery.c.overdue_count
+            col = stats_sub.c.o_count
             query = query.order_by(col.desc() if sort_order == "desc" else col.asc())
         else:
             query = query.order_by(Customer.ragione_sociale.asc())
@@ -88,11 +96,6 @@ async def list_customers(
         items = []
         for row in results:
             cust = row[0]
-            invoice_count = row[1] or 0
-            total_due = float(row[2] or 0)
-            overdue_count = row[3] or 0
-            total_overdue = float(row[4] or 0)
-
             items.append({
                 "id": cust.id,
                 "ragione_sociale": cust.ragione_sociale,
@@ -105,10 +108,10 @@ async def list_customers(
                 "recovery_status": cust.recovery_status,
                 "next_action_date": cust.next_action_date.isoformat() if cust.next_action_date else None,
                 "next_action_type": cust.next_action_type,
-                "invoice_count": invoice_count,
-                "total_due": total_due,
-                "overdue_count": overdue_count,
-                "total_overdue": total_overdue,
+                "invoice_count": row[1] or 0,
+                "total_due": float(row[2] or 0),
+                "overdue_count": row[3] or 0,
+                "total_overdue": float(row[4] or 0),
                 "created_at": cust.created_at.isoformat(),
             })
 
