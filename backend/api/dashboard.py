@@ -19,11 +19,15 @@ async def get_dashboard(session: Session = Depends(get_session)):
     Returns statistics about crediti, positions, and escalations.
     """
     try:
-        # Total amount of credit
-        total_crediti = session.query(func.sum(Invoice.amount_due)).scalar() or 0.0
+        # Total amount of credit (excluding paid invoices)
+        total_crediti = session.query(func.sum(Invoice.amount_due)).filter(
+            Invoice.status != "paid"
+        ).scalar() or 0.0
 
-        # Total number of positions (invoices)
-        total_positions = session.query(func.count(Invoice.id)).scalar() or 0
+        # Total number of positions (excluding paid)
+        total_positions = session.query(func.count(Invoice.id)).filter(
+            Invoice.status != "paid"
+        ).scalar() or 0
 
         # Positions by status
         positions_by_status = session.query(

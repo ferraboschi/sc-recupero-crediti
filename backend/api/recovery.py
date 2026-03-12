@@ -435,3 +435,142 @@ def _build_riepilogativo_pdf(customer, invoices):
     )
 
     return pdf.output()
+
+
+# --- Recovery Report / Attività ---
+
+@router.get("/report")
+async def get_recovery_report(
+    session: Session = Depends(get_session),
+):
+    """
+    Get recovery report with stats by status, upcoming deadlines, and paid summary.
+
+    Returns data for the Attività report page:
+    - recuperi_attivi: customers in active recovery (first_contact, second_contact)
+    - saldato: customers/invoices that have been paid
+    - in_attesa: customers in waiting status
+    - avvocato: customers passed to lawyer
+    - prossime_scadenze: upcoming scheduled actions (next 30 days)
+    - summary stats
+    """
+    from sqlalchemy import func
+
+    try:
+        today = date.today()
+
+        # --- Summary stats ---
+        # Active recovery customers
+        active_customers = session.query(Customer).filter(
+            Customer.recovery_status.in_(["first_contact", "second_contact"]),
+            Customer.excluded == False,
+        ).all()
+
+        # Waiting customers
+        waiting_customers = session.query(Customer).filter(
+            Customer.recovery_status == "waiting",
+            Customer.excluded == False,
+        ).all()
+
+        # Lawyer customers
+        lawyer_customers = session.query(Customer).filter(
+            Customer.recovery_status == "lawyer",
+            Customer.excluded == False,
+        ).all()
+
+        # Paid invoices
+        paid_invoices = session.query(Invoice).filter(
+            Invoice.status == "paid",
+        ).all()
+
+        # Upcoming actions (next 30 days)
+        upcoming_actions = (
+            session.query(RecoveryAction)
+            .join(Customer)
+            .filter(
+                RecoveryAction.scheduled_date.isnot(None),
+                RecoveryAction.scheduled_date >= today,
+                RecoveryAction.scheduled_date <= today + timedelta(days=30),
+                RecoveryAction.completed_at.is_(None),
+            )
+            .order_by(RecoveryAction.scheduled_date.asc())
+            .all()
+        )
+
+        # Also include customers with next_action_date
+        customers_upcoming = session.query(Customer).filter(
+            Customer.next_action_date.isnot(None),
+            Customer.next_action_date >= today,
+            Customer.next_action_date <= today + timedelta(days=30),
+            Customer.recovery_status != "archived",
+            Customer.excluded == False,
+        ).all()
+
+        # Helper to get customer invoice stats
+        def get_customer_stats(cust):
+            inv_query = session.query(Invoice).filter(
+                Invoice.customer_id == cust.id,
+                Invoice.status != "paid",
+            )
+            total_due = sum(i.amount_due for i in inv_query.all())
+            count = inv_query.count()
+            return {
+                "id": cust.id,
+                "ragione_sociale": cust.ragione_sociale,
+                "partita_iva": cust.partita_iva,
+                "recovery_status": cust.recovery_status,
+                "next_action_date": cust.next_action_date.isoformat() if cust.next_action_date else None,
+                "next_action_type": cust.next_action_type,
+                "total_due": float(total_due),
+                "invoice_count": count,
+            }
+
+        # Build response
+        return {
+            "summary": {
+                "active_count": len(active_customers),
+                "active_total_due": float(sum(
+                    sum(i.amount_due for i in session.query(Invoice).filter(
+                        Invoice.customer_id == c.id, Invoice.status != "paid"
+                    ).all())
+                    for c in active_customers
+                )),
+                "waiting_count": len(waiting_customers),
+                "lawyer_count": len(lawyer_customers),
+                "paid_count": len(paid_invoices),
+                "paid_total": float(sum(i.amount for i in paid_invoices)),
+                "upcoming_actions_count": len(upcoming_actions) + len([
+                    c for c in customers_upcoming
+                    if c.id not in {a.customer_id for a in upcoming_actions}
+                ]),
+            },
+            "recuperi_attivi": [get_customer_stats(c) for c in active_customers],
+            "in_attesa": [get_customer_stats(c) for c in waiting_customers],
+            "avvocato": [get_customer_stats(c) for c in lawyer_customers],
+            "saldato": [
+                {
+                    "id": inv.id,
+                    "invoice_number": inv.invoice_number,
+                    "amount": float(inv.amount),
+                    "customer_name": inv.customer.ragione_sociale if inv.customer else inv.customer_name_raw,
+                    "customer_id": inv.customer_id,
+                    "source_platform": inv.source_platform,
+                }
+                for inv in paid_invoices[:50]  # Limit to recent 50
+            ],
+            "prossime_scadenze": [
+                {
+                    "id": a.id,
+                    "customer_id": a.customer_id,
+                    "customer_name": a.customer.ragione_sociale,
+                    "action_type": a.action_type,
+                    "scheduled_date": a.scheduled_date.isoformat(),
+                    "notes": a.notes,
+                }
+                for a in upcoming_actions
+            ],
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching recovery report: {e}", exc_info=True)
+        raise

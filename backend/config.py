@@ -52,7 +52,7 @@ class Config:
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "https://recupero.sakecompany.com,http://localhost:5173").split(",")
 
     # Business rules
-    FUZZY_MATCH_THRESHOLD = 85  # Minimum score for fuzzy matching
+    FUZZY_MATCH_THRESHOLD = 75  # Minimum score for fuzzy matching (lowered from 85 for short names like F-T SRL)
     BUSINESS_HOURS_START = 9
     BUSINESS_HOURS_END = 18
     ESCALATION_DAYS = [7, 14, 21, 30]  # Days between escalation levels

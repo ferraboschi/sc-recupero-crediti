@@ -2,6 +2,7 @@
 
 import logging
 import csv
+import threading
 from io import StringIO
 from fastapi import APIRouter, BackgroundTasks, UploadFile, File, Form
 from datetime import datetime, date
@@ -19,6 +20,9 @@ from backend.engine.normalizer import normalize_ragione_sociale
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# Sync mutex to prevent concurrent syncs
+_sync_lock = threading.Lock()
+
 # Track last sync results
 _sync_status = {
     "invoices": {"last_sync": None, "result": None},
@@ -29,11 +33,20 @@ _sync_status = {
 
 
 def _sync_invoices_task() -> dict:
-    """Background task to sync invoices from FatturaPro and Fattura24."""
+    """Background task to sync invoices from FatturaPro and Fattura24.
+
+    Key behaviors:
+    - Fetches currently-overdue invoices from both platforms
+    - Updates existing invoices with fresh amount_due values
+    - Creates new invoices for newly-found overdue items
+    - Detects payments: invoices previously known but no longer in the overdue
+      list are marked as 'paid' (amount_due becomes 0)
+    - Recalculates days_overdue dynamically for ALL unpaid invoices
+    """
     session = get_session()
     result = {
-        "fatturapro": {"success": False, "created": 0, "updated": 0, "error": None},
-        "fattura24": {"success": False, "created": 0, "updated": 0, "error": None},
+        "fatturapro": {"success": False, "created": 0, "updated": 0, "paid_detected": 0, "error": None},
+        "fattura24": {"success": False, "created": 0, "updated": 0, "paid_detected": 0, "error": None},
     }
 
     try:
@@ -44,10 +57,16 @@ def _sync_invoices_task() -> dict:
             if fatturapro.login():
                 raw_invoices = fatturapro.fetch_overdue_invoices()
                 created, updated = 0, 0
+
+                # Build set of invoice numbers currently overdue in FatturaPro
+                fetched_invoice_numbers = set()
+
                 for inv in raw_invoices:
-                    # Check if invoice already exists
+                    inv_num = inv["invoice_number"]
+                    fetched_invoice_numbers.add(inv_num)
+
                     existing = session.query(Invoice).filter_by(
-                        invoice_number=inv["invoice_number"],
+                        invoice_number=inv_num,
                         source_platform="fatturapro"
                     ).first()
 
@@ -57,31 +76,52 @@ def _sync_invoices_task() -> dict:
                         existing.customer_name_raw = inv.get("customer_name")
                         if inv.get("date"):
                             existing.issue_date = inv["date"]
-                        existing.days_overdue = (date.today() - inv["date"]).days if inv.get("date") else 0
+                        # Keep status as open if it was paid before but reappeared
+                        if existing.status == "paid" and inv.get("balance", 0) > 0:
+                            existing.status = "open"
+                        existing.updated_at = datetime.utcnow()
                         updated += 1
                     else:
                         new_invoice = Invoice(
-                            invoice_number=inv["invoice_number"],
+                            invoice_number=inv_num,
                             amount=inv.get("total", 0),
                             amount_due=inv.get("balance", 0),
                             issue_date=inv.get("date"),
                             customer_name_raw=inv.get("customer_name"),
                             source_platform="fatturapro",
                             source_id=inv.get("doc_id"),
-                            days_overdue=(date.today() - inv["date"]).days if inv.get("date") else 0,
                         )
                         session.add(new_invoice)
                         created += 1
+
+                # PAYMENT DETECTION: find FatturaPro invoices in our DB that are
+                # no longer in the overdue list → they have been paid
+                paid_detected = 0
+                known_fp_invoices = session.query(Invoice).filter(
+                    Invoice.source_platform == "fatturapro",
+                    Invoice.status != "paid",
+                ).all()
+
+                for known_inv in known_fp_invoices:
+                    if known_inv.invoice_number not in fetched_invoice_numbers:
+                        known_inv.status = "paid"
+                        known_inv.amount_due = 0
+                        known_inv.updated_at = datetime.utcnow()
+                        paid_detected += 1
+                        logger.info(
+                            f"Payment detected: FatturaPro invoice {known_inv.invoice_number} "
+                            f"no longer overdue — marked as paid"
+                        )
 
                 session.commit()
                 result["fatturapro"]["success"] = True
                 result["fatturapro"]["created"] = created
                 result["fatturapro"]["updated"] = updated
-                logger.info(f"FatturaPro sync: created={created}, updated={updated}")
+                result["fatturapro"]["paid_detected"] = paid_detected
+                logger.info(f"FatturaPro sync: created={created}, updated={updated}, paid_detected={paid_detected}")
             else:
                 result["fatturapro"]["error"] = "Login failed — check FATTURAPRO_USERNAME/PASSWORD env vars and server logs"
                 logger.error("FatturaPro login failed — cannot sync invoices")
-                logger.warning("FatturaPro login failed")
         except Exception as e:
             result["fatturapro"]["error"] = str(e)
             logger.error(f"Error syncing FatturaPro: {e}", exc_info=True)
@@ -91,22 +131,60 @@ def _sync_invoices_task() -> dict:
             if config.FATTURA24_API_KEY:
                 logger.info("Syncing invoices from Fattura24...")
                 fattura24 = Fattura24Connector()
-                raw_invoices = fattura24.fetch_overdue_invoices()
-                created, updated = 0, 0
+
+                # Fetch ALL invoices (not just overdue) to detect payments
+                from datetime import timedelta
+                date_to = datetime.now().strftime("%Y-%m-%d")
+                date_from = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+                raw_invoices = fattura24.fetch_invoices(date_from, date_to)
+
+                created, updated, paid_detected = 0, 0, 0
+                fetched_invoice_numbers = set()
+
                 for inv in raw_invoices:
+                    inv_num = inv["invoice_number"]
+                    fetched_invoice_numbers.add(inv_num)
+
                     existing = session.query(Invoice).filter_by(
-                        invoice_number=inv["invoice_number"],
+                        invoice_number=inv_num,
                         source_platform="fatture24"
                     ).first()
 
+                    amount_due = inv.get("amount_due", 0)
+
                     if existing:
                         existing.amount = inv.get("amount", 0)
-                        existing.amount_due = inv.get("amount_due", 0)
+                        existing.amount_due = amount_due
                         existing.customer_name_raw = inv.get("customer_name")
                         existing.customer_piva_raw = inv.get("customer_piva")
+                        existing.updated_at = datetime.utcnow()
+
+                        # Detect payment: amount_due dropped to 0
+                        if amount_due <= 0 and existing.status != "paid":
+                            existing.status = "paid"
+                            paid_detected += 1
+                            logger.info(f"Payment detected: Fattura24 invoice {inv_num} amount_due=0 → paid")
+                        elif amount_due > 0 and existing.status == "paid":
+                            existing.status = "open"  # Re-opened
+
+                        # Parse dates for existing if missing
+                        if not existing.issue_date and inv.get("issue_date"):
+                            try:
+                                existing.issue_date = datetime.strptime(inv["issue_date"], "%Y-%m-%d").date()
+                            except (ValueError, TypeError):
+                                pass
+                        if not existing.due_date and inv.get("due_date"):
+                            try:
+                                existing.due_date = datetime.strptime(inv["due_date"], "%Y-%m-%d").date()
+                            except (ValueError, TypeError):
+                                pass
+
                         updated += 1
                     else:
-                        # Parse dates
+                        # Only create if there's something due
+                        if amount_due <= 0:
+                            continue
+
                         issue_date = None
                         due_date = None
                         try:
@@ -117,21 +195,16 @@ def _sync_invoices_task() -> dict:
                         except (ValueError, TypeError):
                             pass
 
-                        days_overdue = 0
-                        if due_date:
-                            days_overdue = max(0, (date.today() - due_date).days)
-
                         new_invoice = Invoice(
-                            invoice_number=inv["invoice_number"],
+                            invoice_number=inv_num,
                             amount=inv.get("amount", 0),
-                            amount_due=inv.get("amount_due", 0),
+                            amount_due=amount_due,
                             issue_date=issue_date,
                             due_date=due_date,
                             customer_name_raw=inv.get("customer_name"),
                             customer_piva_raw=inv.get("customer_piva"),
                             source_platform="fatture24",
                             source_id=inv.get("source_id"),
-                            days_overdue=days_overdue,
                         )
                         session.add(new_invoice)
                         created += 1
@@ -140,12 +213,16 @@ def _sync_invoices_task() -> dict:
                 result["fattura24"]["success"] = True
                 result["fattura24"]["created"] = created
                 result["fattura24"]["updated"] = updated
-                logger.info(f"Fattura24 sync: created={created}, updated={updated}")
+                result["fattura24"]["paid_detected"] = paid_detected
+                logger.info(f"Fattura24 sync: created={created}, updated={updated}, paid_detected={paid_detected}")
             else:
                 logger.debug("Fattura24 not configured")
         except Exception as e:
             result["fattura24"]["error"] = str(e)
             logger.error(f"Error syncing Fattura24: {e}", exc_info=True)
+
+        # RECALCULATE days_overdue for ALL unpaid invoices (dynamic, not stale)
+        _recalculate_days_overdue(session)
 
         _sync_status["invoices"]["last_sync"] = datetime.utcnow().isoformat()
         _sync_status["invoices"]["result"] = result
@@ -168,12 +245,59 @@ def _sync_invoices_task() -> dict:
     return result
 
 
+def _recalculate_days_overdue(session):
+    """Recalculate days_overdue for all unpaid invoices based on current date."""
+    today = date.today()
+    unpaid_invoices = session.query(Invoice).filter(
+        Invoice.status != "paid"
+    ).all()
+
+    updated = 0
+    for inv in unpaid_invoices:
+        if inv.due_date:
+            new_days = max(0, (today - inv.due_date).days)
+        elif inv.issue_date:
+            # Assume 30-day payment terms if no due_date
+            from datetime import timedelta
+            assumed_due = inv.issue_date + timedelta(days=30)
+            new_days = max(0, (today - assumed_due).days)
+        else:
+            new_days = 0
+
+        if inv.days_overdue != new_days:
+            inv.days_overdue = new_days
+            updated += 1
+
+    # Also zero-out days_overdue for paid invoices
+    paid_invoices = session.query(Invoice).filter(
+        Invoice.status == "paid",
+        Invoice.days_overdue > 0,
+    ).all()
+    for inv in paid_invoices:
+        inv.days_overdue = 0
+
+    if updated > 0:
+        session.commit()
+        logger.info(f"Recalculated days_overdue for {updated} invoices")
+
+
 def _sync_customers_task() -> dict:
-    """Background task to sync customers from Shopify."""
+    """Background task to sync customers from Shopify AND auto-create from invoices.
+
+    Two-phase approach:
+    1. Sync from Shopify (primary customer source)
+    2. Auto-create customers from unmatched invoices that have P.IVA or name
+       but no corresponding Customer record. This ensures customers like
+       "F-T SRL" that only exist in FatturaPro/Fattura24 get created.
+    """
     session = get_session()
-    result = {"success": False, "created": 0, "updated": 0, "error": None}
+    result = {
+        "success": False, "created": 0, "updated": 0,
+        "auto_created_from_invoices": 0, "error": None,
+    }
 
     try:
+        # Phase 1: Shopify sync
         if config.SHOPIFY_ACCESS_TOKEN:
             logger.info("Syncing customers from Shopify...")
             shopify = ShopifyConnector()
@@ -181,7 +305,6 @@ def _sync_customers_task() -> dict:
             created, updated = 0, 0
 
             for cust in raw_customers:
-                # Check if customer already exists by shopify_id
                 existing = session.query(Customer).filter_by(
                     shopify_id=cust["shopify_id"]
                 ).first()
@@ -222,8 +345,12 @@ def _sync_customers_task() -> dict:
             result["updated"] = updated
             logger.info(f"Shopify sync: created={created}, updated={updated}")
         else:
-            result["error"] = "Shopify not configured"
+            result["success"] = True  # Not an error, just unconfigured
             logger.debug("Shopify not configured")
+
+        # Phase 2: Auto-create customers from unmatched invoices
+        auto_created = _auto_create_customers_from_invoices(session)
+        result["auto_created_from_invoices"] = auto_created
 
         _sync_status["customers"]["last_sync"] = datetime.utcnow().isoformat()
         _sync_status["customers"]["result"] = result
@@ -239,11 +366,105 @@ def _sync_customers_task() -> dict:
 
     except Exception as e:
         result["error"] = str(e)
-        logger.error(f"Error syncing Shopify: {e}", exc_info=True)
+        logger.error(f"Error syncing customers: {e}", exc_info=True)
     finally:
         session.close()
 
     return result
+
+
+def _auto_create_customers_from_invoices(session) -> int:
+    """Auto-create Customer records from unmatched invoices.
+
+    For invoices that have customer_name_raw or customer_piva_raw but no
+    customer_id, check if a matching Customer exists. If not, create one.
+    This ensures customers that only exist in FatturaPro/Fattura24 are captured.
+
+    Returns:
+        Number of customers auto-created
+    """
+    from backend.engine.matching import match_invoice_to_customer
+
+    unmatched = session.query(Invoice).filter(
+        Invoice.customer_id.is_(None),
+        Invoice.status != "paid",
+    ).all()
+
+    if not unmatched:
+        return 0
+
+    all_customers = session.query(Customer).all()
+    auto_created = 0
+    # Track names/PIVAs we've already created in this run to avoid duplicates
+    created_pivas = set()
+    created_names_normalized = set()
+
+    for inv in unmatched:
+        # Skip if no identifying info
+        if not inv.customer_name_raw and not inv.customer_piva_raw:
+            continue
+
+        # First try to match against existing customers (including any just created)
+        if all_customers:
+            match = match_invoice_to_customer(inv, all_customers, session)
+            if match:
+                inv.customer_id = match.id
+                continue
+
+        # Check if we already have this customer by P.IVA
+        piva = (inv.customer_piva_raw or "").strip().upper()
+        if piva and piva in created_pivas:
+            continue
+        if piva:
+            existing_by_piva = session.query(Customer).filter(
+                Customer.partita_iva == piva
+            ).first()
+            if existing_by_piva:
+                inv.customer_id = existing_by_piva.id
+                continue
+
+        # Check if we already have this customer by normalized name
+        name = inv.customer_name_raw or ""
+        name_norm = normalize_ragione_sociale(name)
+        if name_norm and name_norm in created_names_normalized:
+            continue
+        if name_norm:
+            existing_by_name = session.query(Customer).filter(
+                Customer.ragione_sociale_normalized == name_norm
+            ).first()
+            if existing_by_name:
+                inv.customer_id = existing_by_name.id
+                continue
+
+        # Create new customer
+        new_customer = Customer(
+            ragione_sociale=name.strip() if name else f"Cliente P.IVA {piva}",
+            ragione_sociale_normalized=name_norm,
+            partita_iva=piva if piva else None,
+            source=inv.source_platform,  # fatturapro / fatture24
+        )
+        session.add(new_customer)
+        session.flush()  # Get the ID
+
+        inv.customer_id = new_customer.id
+        all_customers.append(new_customer)  # Add to local list for future matching
+        auto_created += 1
+
+        if piva:
+            created_pivas.add(piva)
+        if name_norm:
+            created_names_normalized.add(name_norm)
+
+        logger.info(
+            f"Auto-created customer '{new_customer.ragione_sociale}' "
+            f"(P.IVA: {piva or 'N/A'}) from {inv.source_platform} invoice {inv.invoice_number}"
+        )
+
+    if auto_created > 0:
+        session.commit()
+        logger.info(f"Auto-created {auto_created} customers from unmatched invoices")
+
+    return auto_created
 
 
 def _run_matching_task() -> dict:
@@ -349,17 +570,61 @@ async def sync_escalations(background_tasks: BackgroundTasks):
     }
 
 
+def _full_sync_task() -> dict:
+    """Run full sync sequentially: invoices → customers → matching → escalations.
+
+    Uses a mutex to prevent concurrent full syncs from corrupting data.
+    """
+    if not _sync_lock.acquire(blocking=False):
+        logger.warning("Full sync already in progress, skipping")
+        return {"error": "Sync already in progress"}
+
+    try:
+        logger.info("Starting full sync (sequential)...")
+        results = {}
+
+        # Step 1: Sync invoices first (gets latest data from platforms)
+        try:
+            results["invoices"] = _sync_invoices_task()
+        except Exception as e:
+            logger.error(f"Invoice sync failed: {e}", exc_info=True)
+            results["invoices"] = {"error": str(e)}
+
+        # Step 2: Sync customers (including auto-create from invoices)
+        try:
+            results["customers"] = _sync_customers_task()
+        except Exception as e:
+            logger.error(f"Customer sync failed: {e}", exc_info=True)
+            results["customers"] = {"error": str(e)}
+
+        # Step 3: Run matching (now that we have fresh invoices + customers)
+        try:
+            results["matching"] = _run_matching_task()
+        except Exception as e:
+            logger.error(f"Matching failed: {e}", exc_info=True)
+            results["matching"] = {"error": str(e)}
+
+        # Step 4: Process escalations (depends on matched invoices)
+        try:
+            results["escalations"] = _process_escalations_task()
+        except Exception as e:
+            logger.error(f"Escalations failed: {e}", exc_info=True)
+            results["escalations"] = {"error": str(e)}
+
+        logger.info(f"Full sync completed: {results}")
+        return results
+    finally:
+        _sync_lock.release()
+
+
 @router.post("/full")
 async def sync_full(background_tasks: BackgroundTasks):
-    """Trigger full sync: invoices + customers + matching + escalations."""
-    background_tasks.add_task(_sync_invoices_task)
-    background_tasks.add_task(_sync_customers_task)
-    background_tasks.add_task(_run_matching_task)
-    background_tasks.add_task(_process_escalations_task)
+    """Trigger full sync: invoices → customers → matching → escalations (sequential)."""
+    background_tasks.add_task(_full_sync_task)
 
     return {
         "status": "sync_started",
-        "message": "Full sync started in background"
+        "message": "Full sync started in background (sequential: invoices → customers → matching → escalations)"
     }
 
 

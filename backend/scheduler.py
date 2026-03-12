@@ -26,9 +26,10 @@ _last_sync = {
 
 def run_daily_job(manual: bool = False):
     """
-    Daily job that syncs invoices, runs matching, and processes escalations.
+    Daily job that runs the full sequential sync.
 
-    Reuses the sync task functions from backend.api.sync to avoid duplication.
+    Uses the _full_sync_task which runs steps sequentially with mutex protection:
+    invoices → customers (+ auto-create) → matching → escalations
 
     Args:
         manual: Whether this is a manual trigger (vs scheduled)
@@ -36,52 +37,23 @@ def run_daily_job(manual: bool = False):
     Returns:
         Dictionary with job results
     """
-    from backend.api.sync import (
-        _sync_invoices_task,
-        _sync_customers_task,
-        _run_matching_task,
-        _process_escalations_task,
-    )
+    from backend.api.sync import _full_sync_task
 
     logger.info(f"Starting daily job (manual={manual})")
-    results = {
-        "invoices": None,
-        "customers": None,
-        "matching": None,
-        "escalations": None,
-        "errors": [],
-        "timestamp": datetime.utcnow().isoformat(),
-    }
 
     try:
-        results["invoices"] = _sync_invoices_task()
+        results = _full_sync_task()
+        results["timestamp"] = datetime.utcnow().isoformat()
     except Exception as e:
-        logger.error(f"Error in invoice sync: {e}", exc_info=True)
-        results["errors"].append(f"Invoice sync: {str(e)}")
-
-    try:
-        results["customers"] = _sync_customers_task()
-    except Exception as e:
-        logger.error(f"Error in customer sync: {e}", exc_info=True)
-        results["errors"].append(f"Customer sync: {str(e)}")
-
-    try:
-        results["matching"] = _run_matching_task()
-    except Exception as e:
-        logger.error(f"Error in matching: {e}", exc_info=True)
-        results["errors"].append(f"Matching: {str(e)}")
-
-    try:
-        results["escalations"] = _process_escalations_task()
-    except Exception as e:
-        logger.error(f"Error in escalations: {e}", exc_info=True)
-        results["errors"].append(f"Escalations: {str(e)}")
+        logger.error(f"Error in daily job: {e}", exc_info=True)
+        results = {"error": str(e), "timestamp": datetime.utcnow().isoformat()}
 
     # Update last sync times
-    _last_sync["invoices"] = datetime.utcnow().isoformat()
-    _last_sync["customers"] = datetime.utcnow().isoformat()
-    _last_sync["matching"] = datetime.utcnow().isoformat()
-    _last_sync["escalations"] = datetime.utcnow().isoformat()
+    now = datetime.utcnow().isoformat()
+    _last_sync["invoices"] = now
+    _last_sync["customers"] = now
+    _last_sync["matching"] = now
+    _last_sync["escalations"] = now
 
     logger.info(f"Daily job completed: {results}")
     return results

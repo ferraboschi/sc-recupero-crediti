@@ -119,8 +119,9 @@ async def get_customer_detail(
             Invoice.customer_id == customer_id
         ).order_by(Invoice.due_date.desc()).all()
 
-        total_amount = sum(inv.amount for inv in invoices)
-        total_due = sum(inv.amount_due for inv in invoices)
+        # Calculate totals excluding paid invoices
+        total_amount = sum(inv.amount for inv in invoices if inv.status != "paid")
+        total_due = sum(inv.amount_due for inv in invoices if inv.status != "paid")
 
         invoice_list = [
             {
