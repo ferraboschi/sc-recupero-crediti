@@ -485,7 +485,13 @@ export default function Positions() {
                         {formatDate(pos.due_date)}
                       </td>
                       <td className="px-3 py-3 text-sm text-right">
-                        <span className={pos.days_overdue > 30 ? 'text-red-600 font-medium' : 'text-slate-600'}>
+                        <span className={`font-medium ${
+                          pos.days_overdue > 180 ? 'text-red-700 bg-red-50 px-1.5 py-0.5 rounded' :
+                          pos.days_overdue > 90 ? 'text-red-600' :
+                          pos.days_overdue > 30 ? 'text-amber-600' :
+                          pos.days_overdue > 0 ? 'text-yellow-600' :
+                          'text-slate-400'
+                        }`}>
                           {pos.days_overdue || 0}
                         </span>
                       </td>

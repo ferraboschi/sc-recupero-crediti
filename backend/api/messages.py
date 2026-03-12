@@ -6,7 +6,7 @@ from sqlalchemy import and_
 from sqlalchemy.orm import Session
 from datetime import datetime
 
-from backend.database import get_session, Message, Invoice, ActivityLog
+from backend.database import get_session, Message, Invoice, Customer, ActivityLog
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -40,6 +40,20 @@ async def list_messages(
         total = query.count()
         messages = query.order_by(Message.created_at.desc()).offset(skip).limit(limit).all()
 
+        # Pre-fetch related customer and invoice data
+        msg_invoice_ids = [msg.invoice_id for msg in messages if msg.invoice_id]
+        msg_customer_ids = [msg.customer_id for msg in messages if msg.customer_id]
+
+        invoices_map = {}
+        if msg_invoice_ids:
+            invoices = session.query(Invoice).filter(Invoice.id.in_(msg_invoice_ids)).all()
+            invoices_map = {inv.id: inv for inv in invoices}
+
+        customers_map = {}
+        if msg_customer_ids:
+            customers = session.query(Customer).filter(Customer.id.in_(msg_customer_ids)).all()
+            customers_map = {c.id: c for c in customers}
+
         return {
             "total": total,
             "skip": skip,
@@ -57,6 +71,26 @@ async def list_messages(
                     "approved_at": msg.approved_at.isoformat() if msg.approved_at else None,
                     "sent_at": msg.sent_at.isoformat() if msg.sent_at else None,
                     "approved_by": msg.approved_by,
+                    "customer_name": (
+                        customers_map.get(msg.customer_id).ragione_sociale
+                        if msg.customer_id and customers_map.get(msg.customer_id)
+                        else None
+                    ),
+                    "invoice_number": (
+                        invoices_map.get(msg.invoice_id).invoice_number
+                        if msg.invoice_id and invoices_map.get(msg.invoice_id)
+                        else None
+                    ),
+                    "invoice_amount": (
+                        float(invoices_map.get(msg.invoice_id).amount_due)
+                        if msg.invoice_id and invoices_map.get(msg.invoice_id)
+                        else None
+                    ),
+                    "invoice_due_date": (
+                        invoices_map.get(msg.invoice_id).due_date.isoformat()
+                        if msg.invoice_id and invoices_map.get(msg.invoice_id) and invoices_map.get(msg.invoice_id).due_date
+                        else None
+                    ),
                 }
                 for msg in messages
             ],

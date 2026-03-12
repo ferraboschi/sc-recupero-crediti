@@ -3,7 +3,7 @@ import config from '../config'
 
 const client = axios.create({
   baseURL: config.API_BASE_URL ? `${config.API_BASE_URL}/api` : '/api',
-  timeout: 30000,
+  timeout: 90000,
 })
 
 // Request interceptor

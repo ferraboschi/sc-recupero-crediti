@@ -164,7 +164,17 @@ export default function Activity() {
             <div>
               <h3 className="text-lg font-semibold text-slate-800 mb-4">Recuperi Attivi ({report?.recuperi_attivi?.length || 0})</h3>
               {report?.recuperi_attivi?.length === 0 ? (
-                <p className="text-slate-500">Nessun recupero attivo</p>
+                <div className="bg-blue-50 border border-blue-200 rounded-lg p-6 text-center">
+                  <div className="text-3xl mb-3">🚀</div>
+                  <h4 className="font-semibold text-blue-800 mb-2">Nessun recupero attivo</h4>
+                  <p className="text-blue-700 text-sm mb-3">Per avviare il flusso di recupero, vai nella pagina <strong>Clienti</strong> e seleziona un cliente con fatture scadute.</p>
+                  <button
+                    onClick={() => navigate('/customers')}
+                    className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700"
+                  >
+                    Vai ai Clienti
+                  </button>
+                </div>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">

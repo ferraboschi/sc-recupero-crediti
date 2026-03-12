@@ -8,7 +8,7 @@ from sqlalchemy import func, text
 from backend.database import get_session, get_engine, Customer, Invoice, Message, ActivityLog
 from backend.config import config
 from backend.scheduler import get_scheduler_status
-from backend.api.sync import _sync_status
+from backend.api.sync import _sync_status, _load_sync_state
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -27,6 +27,9 @@ async def get_system_status():
         - scheduler: cron status
         - alerts: list of issues requiring attention
     """
+    # Load persisted sync state from DB (once)
+    _load_sync_state()
+
     session = get_session()
     alerts = []
 

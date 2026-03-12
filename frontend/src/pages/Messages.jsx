@@ -260,14 +260,27 @@ export default function Messages() {
                       className="w-4 h-4 text-blue-600 rounded mt-1"
                     />
                     <div className="flex-1">
-                      <div className="flex items-center gap-2 flex-wrap mb-2">
-                        <h3 className="font-semibold text-slate-900">Fattura: {message.id}</h3>
+                      <div className="flex items-center gap-2 flex-wrap mb-1">
+                        <h3 className="font-semibold text-slate-900">
+                          {message.customer_name || `Cliente #${message.customer_id}`}
+                        </h3>
                         <span className={`px-2 py-1 rounded-full text-xs font-semibold ${getStatusBgClass(message.status)}`}>
                           {getStatusLabel(message.status)}
                         </span>
                         <span className="px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
                           Livello {message.escalation_level}
                         </span>
+                      </div>
+                      <div className="flex items-center gap-3 text-xs text-slate-500">
+                        <span>Fatt. {message.invoice_number || message.invoice_id}</span>
+                        {message.invoice_amount != null && (
+                          <span className="font-medium text-red-600">
+                            {new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(message.invoice_amount)}
+                          </span>
+                        )}
+                        {message.invoice_due_date && (
+                          <span>Scad. {new Date(message.invoice_due_date).toLocaleDateString('it-IT')}</span>
+                        )}
                       </div>
                     </div>
                   </div>

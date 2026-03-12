@@ -143,7 +143,10 @@ export default function Customers() {
                       onClick={() => navigate(`/customers/${customer.id}`)}
                     >
                       <td className="px-4 py-3 text-sm font-medium text-blue-700 hover:text-blue-900">
-                        {customer.ragione_sociale}
+                        {customer.ragione_sociale || customer.email || `Cliente #${customer.id}`}
+                        {!customer.ragione_sociale && (
+                          <span className="ml-1 text-xs text-slate-400">(nome mancante)</span>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-sm text-slate-600 font-mono text-xs">
                         {customer.partita_iva || '-'}

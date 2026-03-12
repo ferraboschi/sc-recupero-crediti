@@ -128,6 +128,16 @@ class ActivityLog(Base):
     entity_id = Column(Integer, nullable=True)
 
 
+class SyncState(Base):
+    """Persists sync status across server restarts."""
+    __tablename__ = "sync_state"
+
+    key = Column(String, primary_key=True)  # invoices / customers / matching / escalations
+    last_sync = Column(DateTime, nullable=True)
+    result = Column(JSON, nullable=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
 # Database engine and session
 _engine = None
 

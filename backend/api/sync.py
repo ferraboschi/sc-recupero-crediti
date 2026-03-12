@@ -7,7 +7,7 @@ from io import StringIO
 from fastapi import APIRouter, BackgroundTasks, UploadFile, File, Form
 from datetime import datetime, date
 
-from backend.database import get_session, ActivityLog, Invoice, Customer
+from backend.database import get_session, ActivityLog, Invoice, Customer, SyncState
 from backend.connectors.fatturapro import FatturaProConnector
 from backend.connectors.fatture24 import Fattura24Connector
 from backend.connectors.shopify import ShopifyConnector
@@ -30,6 +30,48 @@ _sync_status = {
     "matching": {"last_sync": None, "result": None},
     "escalations": {"last_sync": None, "result": None},
 }
+
+_sync_loaded = False
+
+
+def _load_sync_state():
+    """Load persisted sync state from DB on first access."""
+    global _sync_loaded
+    if _sync_loaded:
+        return
+    try:
+        session = get_session()
+        rows = session.query(SyncState).all()
+        for row in rows:
+            if row.key in _sync_status:
+                _sync_status[row.key]["last_sync"] = row.last_sync.isoformat() if row.last_sync else None
+                _sync_status[row.key]["result"] = row.result
+        session.close()
+        _sync_loaded = True
+        logger.info("Loaded persisted sync state from DB")
+    except Exception as e:
+        logger.warning(f"Could not load sync state from DB: {e}")
+        _sync_loaded = True  # Don't retry on every call
+
+
+def _persist_sync_status(key: str, result: dict):
+    """Update in-memory sync status AND persist to DB."""
+    now = datetime.utcnow()
+    _sync_status[key]["last_sync"] = now.isoformat()
+    _sync_status[key]["result"] = result
+    try:
+        session = get_session()
+        existing = session.query(SyncState).filter_by(key=key).first()
+        if existing:
+            existing.last_sync = now
+            existing.result = result
+            existing.updated_at = now
+        else:
+            session.add(SyncState(key=key, last_sync=now, result=result, updated_at=now))
+        session.commit()
+        session.close()
+    except Exception as e:
+        logger.warning(f"Could not persist sync state for {key}: {e}")
 
 
 def _sync_invoices_task() -> dict:
@@ -224,8 +266,7 @@ def _sync_invoices_task() -> dict:
         # RECALCULATE days_overdue for ALL unpaid invoices (dynamic, not stale)
         _recalculate_days_overdue(session)
 
-        _sync_status["invoices"]["last_sync"] = datetime.utcnow().isoformat()
-        _sync_status["invoices"]["result"] = result
+        _persist_sync_status("invoices", result)
 
         # Log activity
         activity = ActivityLog(
@@ -367,8 +408,7 @@ def _sync_customers_task() -> dict:
         if auto_created > 0 or result.get("success"):
             result["success"] = True
 
-        _sync_status["customers"]["last_sync"] = datetime.utcnow().isoformat()
-        _sync_status["customers"]["result"] = result
+        _persist_sync_status("customers", result)
 
         # Log activity
         activity = ActivityLog(
@@ -382,9 +422,7 @@ def _sync_customers_task() -> dict:
     except Exception as e:
         result["error"] = str(e)
         logger.error(f"Error syncing customers: {e}", exc_info=True)
-        # Still update status so we can see the error
-        _sync_status["customers"]["last_sync"] = datetime.utcnow().isoformat()
-        _sync_status["customers"]["result"] = result
+        _persist_sync_status("customers", result)
     finally:
         session.close()
 
@@ -487,8 +525,7 @@ def _run_matching_task() -> dict:
         result = run_matching(session)
         logger.info(f"Matching result: {result}")
 
-        _sync_status["matching"]["last_sync"] = datetime.utcnow().isoformat()
-        _sync_status["matching"]["result"] = result
+        _persist_sync_status("matching", result)
 
         # Log activity
         activity = ActivityLog(
@@ -503,7 +540,7 @@ def _run_matching_task() -> dict:
     except Exception as e:
         logger.error(f"Error running matching: {e}", exc_info=True)
         error_result = {"error": str(e)}
-        _sync_status["matching"]["result"] = error_result
+        _persist_sync_status("matching", error_result)
         return error_result
     finally:
         session.close()
@@ -521,8 +558,7 @@ def _process_escalations_task() -> dict:
         }
         logger.info(f"Escalations processed: {result}")
 
-        _sync_status["escalations"]["last_sync"] = datetime.utcnow().isoformat()
-        _sync_status["escalations"]["result"] = result
+        _persist_sync_status("escalations", result)
 
         # Log activity
         activity = ActivityLog(
@@ -536,7 +572,7 @@ def _process_escalations_task() -> dict:
     except Exception as e:
         logger.error(f"Error processing escalations: {e}", exc_info=True)
         error_result = {"error": str(e)}
-        _sync_status["escalations"]["result"] = error_result
+        _persist_sync_status("escalations", error_result)
         return error_result
     finally:
         session.close()
