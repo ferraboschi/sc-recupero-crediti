@@ -493,9 +493,17 @@ export default function ClientDetail() {
                   <td className="px-3 py-3 text-sm text-right font-medium">{formatCurrency(inv.amount_due)}</td>
                   <td className="px-3 py-3 text-sm text-slate-600">{formatDate(inv.due_date)}</td>
                   <td className="px-3 py-3 text-sm text-right">
-                    <span className={inv.days_overdue > 30 ? 'text-red-600 font-medium' : 'text-slate-600'}>
-                      {inv.days_overdue || 0}
-                    </span>
+                    {(inv.days_overdue || 0) > 0 ? (
+                      <span className={inv.days_overdue > 30 ? 'text-red-600 font-medium' : 'text-amber-600'}>
+                        {inv.days_overdue}
+                      </span>
+                    ) : (inv.days_overdue || 0) < 0 ? (
+                      <span className="text-green-600 font-medium">
+                        {inv.days_overdue}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400">0</span>
+                    )}
                   </td>
                   <td className="px-3 py-3 text-sm text-center">
                     <span className={`${INVOICE_STATUS_COLORS[inv.status] || 'bg-slate-100 text-slate-600'} px-2 py-1 rounded-full text-xs font-medium`}>
