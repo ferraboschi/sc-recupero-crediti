@@ -36,15 +36,12 @@ app.add_middleware(
 )
 
 
-# Health check endpoint
+# Ultra-lightweight health check for Render (must respond < 1s)
+@app.get("/health")
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "service": "SC Recupero Crediti API",
-        "credentials": config.validate()
-    }
+    """Health check endpoint — kept minimal to avoid Render timeout."""
+    return {"status": "ok"}
 
 
 # Startup event
