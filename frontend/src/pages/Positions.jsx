@@ -10,6 +10,12 @@ const STATUSES = [
   { value: 'escalated', label: 'Escalato', color: 'orange' },
 ]
 
+const SOURCES = [
+  { value: '', label: 'Tutte' },
+  { value: 'fatturapro', label: 'FatturaPro' },
+  { value: 'fatture24', label: 'Fattura24' },
+]
+
 export default function Positions() {
   const [positions, setPositions] = useState([])
   const [loading, setLoading] = useState(true)
@@ -23,21 +29,33 @@ export default function Positions() {
   const [escalationFilter, setEscalationFilter] = useState('')
   const [minAmountFilter, setMinAmountFilter] = useState('')
   const [searchFilter, setSearchFilter] = useState('')
-  const [sortBy, setSortBy] = useState('') // 'amount', 'days_overdue'
-  const [sortOrder, setSortOrder] = useState('asc') // 'asc', 'desc'
+  const [sourceFilter, setSourceFilter] = useState('')
+  const [issueDateFrom, setIssueDateFrom] = useState('')
+  const [issueDateTo, setIssueDateTo] = useState('')
+  const [dueDateFrom, setDueDateFrom] = useState('')
+  const [dueDateTo, setDueDateTo] = useState('')
+  const [sortBy, setSortBy] = useState('')
+  const [sortOrder, setSortOrder] = useState('desc')
+  const [showDateFilters, setShowDateFilters] = useState(false)
 
   useEffect(() => {
     const fetchPositions = async () => {
       try {
         setLoading(true)
-        const params = {
-          skip,
-          limit,
-        }
+        const params = { skip, limit }
         if (statusFilter) params.status = statusFilter
         if (escalationFilter) params.escalation_level = parseInt(escalationFilter)
         if (minAmountFilter) params.min_amount = parseFloat(minAmountFilter)
         if (searchFilter) params.search = searchFilter
+        if (sourceFilter) params.source = sourceFilter
+        if (issueDateFrom) params.issue_date_from = issueDateFrom
+        if (issueDateTo) params.issue_date_to = issueDateTo
+        if (dueDateFrom) params.due_date_from = dueDateFrom
+        if (dueDateTo) params.due_date_to = dueDateTo
+        if (sortBy) {
+          params.sort_by = sortBy
+          params.sort_order = sortOrder
+        }
 
         const response = await client.get('/positions', { params })
         setPositions(response.data.items)
@@ -50,7 +68,8 @@ export default function Positions() {
       }
     }
     fetchPositions()
-  }, [skip, limit, statusFilter, escalationFilter, minAmountFilter, searchFilter])
+  }, [skip, limit, statusFilter, escalationFilter, minAmountFilter, searchFilter,
+      sourceFilter, issueDateFrom, issueDateTo, dueDateFrom, dueDateTo, sortBy, sortOrder])
 
   const formatCurrency = (value) => {
     return new Intl.NumberFormat('it-IT', {
@@ -61,10 +80,9 @@ export default function Positions() {
     }).format(value)
   }
 
-  const getStatusColor = (status) => {
-    const statusObj = STATUSES.find(s => s.value === status)
-    if (!statusObj) return 'gray'
-    return statusObj.color
+  const formatDate = (dateStr) => {
+    if (!dateStr) return '-'
+    return new Date(dateStr).toLocaleDateString('it-IT')
   }
 
   const getStatusLabel = (status) => {
@@ -72,7 +90,18 @@ export default function Positions() {
     return statusObj?.label || status
   }
 
-  // Calculate total amount due for filtered positions
+  const getSourceLabel = (source) => {
+    if (source === 'fatturapro') return 'FatturaPro'
+    if (source === 'fatture24') return 'Fattura24'
+    return source || '-'
+  }
+
+  const getSourceColor = (source) => {
+    if (source === 'fatturapro') return 'bg-indigo-100 text-indigo-700'
+    if (source === 'fatture24') return 'bg-teal-100 text-teal-700'
+    return 'bg-slate-100 text-slate-600'
+  }
+
   const totalAmountDue = positions.reduce((sum, pos) => sum + (pos.amount_due || 0), 0)
 
   const handleSort = (field) => {
@@ -80,8 +109,13 @@ export default function Positions() {
       setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')
     } else {
       setSortBy(field)
-      setSortOrder('asc')
+      setSortOrder('desc')
     }
+  }
+
+  const sortArrow = (field) => {
+    if (sortBy !== field) return ''
+    return sortOrder === 'asc' ? ' ↑' : ' ↓'
   }
 
   return (
@@ -95,49 +129,36 @@ export default function Positions() {
             <input
               type="text"
               value={searchFilter}
-              onChange={(e) => {
-                setSearchFilter(e.target.value)
-                setSkip(0)
-              }}
+              onChange={(e) => { setSearchFilter(e.target.value); setSkip(0) }}
               placeholder="Nome cliente, P.IVA, Fattura..."
               className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Stato</label>
+            <label className="block text-sm font-medium text-slate-700 mb-2">Fonte</label>
             <select
-              value={statusFilter}
-              onChange={(e) => {
-                setStatusFilter(e.target.value)
-                setSkip(0)
-              }}
+              value={sourceFilter}
+              onChange={(e) => { setSourceFilter(e.target.value); setSkip(0) }}
               className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
-              <option value="">Tutti</option>
-              {STATUSES.map(status => (
-                <option key={status.value} value={status.value}>
-                  {status.label}
-                </option>
+              {SOURCES.map(s => (
+                <option key={s.value} value={s.value}>{s.label}</option>
               ))}
             </select>
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Livello Escalation</label>
+            <label className="block text-sm font-medium text-slate-700 mb-2">Stato</label>
             <select
-              value={escalationFilter}
-              onChange={(e) => {
-                setEscalationFilter(e.target.value)
-                setSkip(0)
-              }}
+              value={statusFilter}
+              onChange={(e) => { setStatusFilter(e.target.value); setSkip(0) }}
               className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
               <option value="">Tutti</option>
-              <option value="0">Livello 0</option>
-              <option value="1">Livello 1</option>
-              <option value="2">Livello 2</option>
-              <option value="3">Livello 3</option>
+              {STATUSES.map(status => (
+                <option key={status.value} value={status.value}>{status.label}</option>
+              ))}
             </select>
           </div>
 
@@ -146,10 +167,7 @@ export default function Positions() {
             <input
               type="number"
               value={minAmountFilter}
-              onChange={(e) => {
-                setMinAmountFilter(e.target.value)
-                setSkip(0)
-              }}
+              onChange={(e) => { setMinAmountFilter(e.target.value); setSkip(0) }}
               placeholder="0"
               className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
@@ -163,10 +181,63 @@ export default function Positions() {
               className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
               <option value="">Nessuno</option>
-              <option value="amount">Importo</option>
+              <option value="amount_due">Importo Dovuto</option>
               <option value="days_overdue">Giorni Ritardo</option>
+              <option value="issue_date">Data Emissione</option>
+              <option value="due_date">Data Scadenza</option>
             </select>
           </div>
+        </div>
+
+        {/* Date filters toggle */}
+        <div className="mt-4">
+          <button
+            onClick={() => setShowDateFilters(!showDateFilters)}
+            className="text-sm font-medium text-blue-600 hover:text-blue-800 flex items-center gap-1"
+          >
+            {showDateFilters ? '▼' : '▶'} Filtri per Data
+          </button>
+
+          {showDateFilters && (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-3">
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-2">Emissione Dal</label>
+                <input
+                  type="date"
+                  value={issueDateFrom}
+                  onChange={(e) => { setIssueDateFrom(e.target.value); setSkip(0) }}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-2">Emissione Al</label>
+                <input
+                  type="date"
+                  value={issueDateTo}
+                  onChange={(e) => { setIssueDateTo(e.target.value); setSkip(0) }}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-2">Scadenza Dal</label>
+                <input
+                  type="date"
+                  value={dueDateFrom}
+                  onChange={(e) => { setDueDateFrom(e.target.value); setSkip(0) }}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-2">Scadenza Al</label>
+                <input
+                  type="date"
+                  value={dueDateTo}
+                  onChange={(e) => { setDueDateTo(e.target.value); setSkip(0) }}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -202,45 +273,53 @@ export default function Positions() {
               <table className="w-full">
                 <thead className="bg-slate-50 border-b border-slate-200">
                   <tr>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-slate-900">Cliente</th>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-slate-900">Fattura</th>
-                    <th className="px-6 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('amount')}>
-                      Importo {sortBy === 'amount' && (sortOrder === 'asc' ? '↑' : '↓')}
+                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Fonte</th>
+                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Cliente</th>
+                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Fattura</th>
+                    <th className="px-4 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('amount_due')}>
+                      Saldo{sortArrow('amount_due')}
                     </th>
-                    <th className="px-6 py-3 text-right text-sm font-semibold text-slate-900">Saldo</th>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-slate-900">Scadenza</th>
-                    <th className="px-6 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('days_overdue')}>
-                      Giorni Ritardo {sortBy === 'days_overdue' && (sortOrder === 'asc' ? '↑' : '↓')}
+                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('issue_date')}>
+                      Emissione{sortArrow('issue_date')}
                     </th>
-                    <th className="px-6 py-3 text-center text-sm font-semibold text-slate-900">Livello</th>
-                    <th className="px-6 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
+                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('due_date')}>
+                      Scadenza{sortArrow('due_date')}
+                    </th>
+                    <th className="px-4 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('days_overdue')}>
+                      GG Ritardo{sortArrow('days_overdue')}
+                    </th>
+                    <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200">
                   {positions.map(pos => (
                     <tr key={pos.id} className="hover:bg-slate-50 cursor-pointer">
-                      <td className="px-6 py-3 text-sm text-slate-900">
-                        {pos.customer?.ragione_sociale || 'Non assegnato'}
+                      <td className="px-4 py-3 text-sm">
+                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${getSourceColor(pos.source_platform)}`}>
+                          {getSourceLabel(pos.source_platform)}
+                        </span>
                       </td>
-                      <td className="px-6 py-3 text-sm text-slate-600">
+                      <td className="px-4 py-3 text-sm text-slate-900">
+                        {pos.customer?.ragione_sociale || pos.customer_name_raw || 'Non assegnato'}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-slate-600">
                         {pos.invoice_number}
                       </td>
-                      <td className="px-6 py-3 text-sm text-right font-medium text-slate-900">
-                        {formatCurrency(pos.amount)}
-                      </td>
-                      <td className="px-6 py-3 text-sm text-right font-medium text-slate-900">
+                      <td className="px-4 py-3 text-sm text-right font-medium text-slate-900">
                         {formatCurrency(pos.amount_due)}
                       </td>
-                      <td className="px-6 py-3 text-sm text-slate-600">
-                        {pos.due_date ? new Date(pos.due_date).toLocaleDateString('it-IT') : '-'}
+                      <td className="px-4 py-3 text-sm text-slate-600">
+                        {formatDate(pos.issue_date)}
                       </td>
-                      <td className="px-6 py-3 text-sm text-right">
+                      <td className="px-4 py-3 text-sm text-slate-600">
+                        {formatDate(pos.due_date)}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-right">
                         <span className={pos.days_overdue > 30 ? 'text-red-600 font-medium' : 'text-slate-600'}>
                           {pos.days_overdue || 0}
                         </span>
                       </td>
-                      <td className="px-6 py-3 text-sm text-center text-slate-600">-</td>
-                      <td className="px-6 py-3 text-sm text-center">
+                      <td className="px-4 py-3 text-sm text-center">
                         <span className={`badge-${pos.status} px-3 py-1 rounded-full text-xs font-medium`}>
                           {getStatusLabel(pos.status)}
                         </span>

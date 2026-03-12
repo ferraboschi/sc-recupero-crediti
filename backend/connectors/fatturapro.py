@@ -298,7 +298,10 @@ class FatturaProConnector:
         """Fetch all overdue invoices from FatturaPro.
 
         Scrapes the documenti.php?s=1 page ("Da incassare" / invoices to collect).
-        First parses the initial page HTML, then paginates via xcrud AJAX if needed.
+        First parses the initial page HTML, then paginates via xcrud AJAX.
+
+        xcrud pagination uses jQuery-style nested POST params:
+            xcrud[key]=..., xcrud[start]=10, xcrud[task]=list, etc.
 
         Returns:
             List of invoice dictionaries with keys:
@@ -317,9 +320,10 @@ class FatturaProConnector:
 
         logger.info("Fetching overdue invoices from FatturaPro...")
         all_invoices = []
+        PAGE_SIZE = 10  # xcrud default
 
         try:
-            # First, load the initial page which already contains data
+            # Load the initial page which already contains data
             response = self.client.get(
                 f"{self.base_url}/documenti.php?s=1",
                 timeout=self.timeout,
@@ -329,64 +333,81 @@ class FatturaProConnector:
             # Parse the initial page
             initial_invoices = self._parse_invoice_table(response.text)
             all_invoices.extend(initial_invoices)
-            logger.info(f"Initial page: found {len(initial_invoices)} invoices")
+            logger.info(f"Page 1: {len(initial_invoices)} invoices")
 
-            # Get xcrud key for pagination
-            xcrud_key = self._get_xcrud_key()
-            if not xcrud_key:
-                logger.warning("No xcrud key found, returning initial page results only")
+            # Get xcrud key for pagination (from hidden input)
+            soup = BeautifulSoup(response.text, "html.parser")
+            key_input = soup.find("input", {"name": "key", "type": "hidden"})
+            if not key_input:
+                logger.warning("No xcrud key found, returning page 1 only")
                 return all_invoices
 
-            # Check if there are more pages by looking for pagination info
-            soup = BeautifulSoup(response.text, "html.parser")
-            # Look for pagination indicators (e.g., "showing 1-10 of 500")
-            pager = soup.find(class_=re.compile(r"xcrud-nav|xcrud-pagination|pager"))
-            has_more = pager is not None and len(initial_invoices) >= 10
+            xcrud_key = key_input.get("value")
 
-            # Paginate through remaining results via AJAX
-            if has_more:
-                offset = len(initial_invoices)
-                limit = 20
+            # Check if there are more pages
+            if len(initial_invoices) < PAGE_SIZE:
+                logger.info(f"All invoices fit on one page ({len(initial_invoices)})")
+                return all_invoices
 
-                while True:
-                    logger.debug(f"Fetching invoices at offset {offset}...")
+            # Paginate via xcrud AJAX with jQuery-style nested params
+            start = PAGE_SIZE
+            page = 2
+            max_pages = 100  # Safety limit
 
-                    ajax_resp = self.client.post(
-                        f"{self.base_url}/xcrud/xcrud_ajax.php",
-                        data={
-                            "key": xcrud_key,
-                            "task": "ajax",
-                            "action": "list",
-                            "start": offset,
-                            "limit": limit,
-                        },
-                        headers={
-                            "X-Requested-With": "XMLHttpRequest",
-                        },
-                        timeout=self.timeout,
-                    )
-                    ajax_resp.raise_for_status()
+            while page <= max_pages:
+                ajax_resp = self.client.post(
+                    f"{self.base_url}/xcrud/xcrud_ajax.php",
+                    data={
+                        "xcrud[key]": xcrud_key,
+                        "xcrud[orderby]": "documenti.Data",
+                        "xcrud[order]": "desc",
+                        "xcrud[start]": str(start),
+                        "xcrud[limit]": str(PAGE_SIZE),
+                        "xcrud[instance]": "documenti",
+                        "xcrud[task]": "list",
+                    },
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": f"{self.base_url}/documenti.php?s=1",
+                    },
+                    timeout=self.timeout,
+                )
+                ajax_resp.raise_for_status()
 
-                    invoices_batch = self._parse_invoice_table(ajax_resp.text)
+                # Check for xcrud error
+                if "xcrud-error" in ajax_resp.text:
+                    logger.warning(f"xcrud error at page {page}, stopping pagination")
+                    break
 
-                    if not invoices_batch:
-                        logger.debug("No more invoices found, stopping pagination")
-                        break
+                batch = self._parse_invoice_table(ajax_resp.text)
+                if not batch:
+                    logger.debug(f"Page {page}: empty — pagination complete")
+                    break
 
-                    all_invoices.extend(invoices_batch)
-                    logger.debug(f"Fetched {len(invoices_batch)} invoices at offset {offset}")
+                all_invoices.extend(batch)
 
-                    if len(invoices_batch) < limit:
-                        break
+                if page % 10 == 0:
+                    logger.info(f"Page {page}: {len(batch)} invoices (running total: {len(all_invoices)})")
 
-                    offset += limit
+                if len(batch) < PAGE_SIZE:
+                    logger.debug(f"Page {page}: {len(batch)} invoices (last page)")
+                    break
 
-            logger.info(f"Successfully fetched {len(all_invoices)} overdue invoices (total)")
+                # Update xcrud key if the response issues a new one
+                batch_soup = BeautifulSoup(ajax_resp.text, "html.parser")
+                new_key = batch_soup.find("input", {"name": "key", "type": "hidden"})
+                if new_key:
+                    xcrud_key = new_key.get("value")
+
+                start += PAGE_SIZE
+                page += 1
+
+            logger.info(f"Successfully fetched {len(all_invoices)} overdue invoices total")
             return all_invoices
 
         except Exception as e:
             logger.error(f"Error fetching overdue invoices: {e}", exc_info=True)
-            return []
+            return all_invoices  # Return what we have so far
 
     def _parse_invoice_table(self, html: str) -> List[Dict[str, Any]]:
         """Parse invoice data from xcrud HTML table response.

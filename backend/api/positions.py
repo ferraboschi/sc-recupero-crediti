@@ -21,14 +21,24 @@ async def list_positions(
     escalation_level: int = Query(None),
     min_amount: float = Query(None),
     search: str = Query(None),
+    source: str = Query(None, description="Filter by source: fatturapro or fatture24"),
+    issue_date_from: str = Query(None, description="Issue date from (YYYY-MM-DD)"),
+    issue_date_to: str = Query(None, description="Issue date to (YYYY-MM-DD)"),
+    due_date_from: str = Query(None, description="Due date from (YYYY-MM-DD)"),
+    due_date_to: str = Query(None, description="Due date to (YYYY-MM-DD)"),
+    sort_by: str = Query(None, description="Sort field: amount_due, issue_date, due_date, days_overdue"),
+    sort_order: str = Query("desc", description="Sort order: asc or desc"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
 ):
     """
     List all positions (invoices joined with customers).
 
-    Supports filtering by status, escalation level, minimum amount, and search.
+    Supports filtering by status, escalation level, minimum amount, search,
+    source platform, issue date range, and due date range.
     """
+    from datetime import date as date_type
+
     try:
         query = session.query(Invoice).outerjoin(Customer)
 
@@ -44,6 +54,37 @@ async def list_positions(
         if min_amount is not None:
             query = query.filter(Invoice.amount_due >= min_amount)
 
+        if source:
+            query = query.filter(Invoice.source_platform == source)
+
+        if issue_date_from:
+            try:
+                d = date_type.fromisoformat(issue_date_from)
+                query = query.filter(Invoice.issue_date >= d)
+            except ValueError:
+                pass
+
+        if issue_date_to:
+            try:
+                d = date_type.fromisoformat(issue_date_to)
+                query = query.filter(Invoice.issue_date <= d)
+            except ValueError:
+                pass
+
+        if due_date_from:
+            try:
+                d = date_type.fromisoformat(due_date_from)
+                query = query.filter(Invoice.due_date >= d)
+            except ValueError:
+                pass
+
+        if due_date_to:
+            try:
+                d = date_type.fromisoformat(due_date_to)
+                query = query.filter(Invoice.due_date <= d)
+            except ValueError:
+                pass
+
         if search:
             search_pattern = f"%{search}%"
             query = query.filter(
@@ -53,6 +94,17 @@ async def list_positions(
                     Invoice.invoice_number.ilike(search_pattern),
                 )
             )
+
+        # Sorting
+        sort_map = {
+            "amount_due": Invoice.amount_due,
+            "issue_date": Invoice.issue_date,
+            "due_date": Invoice.due_date,
+            "days_overdue": Invoice.days_overdue,
+        }
+        if sort_by and sort_by in sort_map:
+            col = sort_map[sort_by]
+            query = query.order_by(col.desc() if sort_order == "desc" else col.asc())
 
         # Total count before pagination
         total = query.count()
@@ -74,6 +126,7 @@ async def list_positions(
                     "due_date": pos.due_date.isoformat() if pos.due_date else None,
                     "days_overdue": pos.days_overdue,
                     "status": pos.status,
+                    "source_platform": pos.source_platform,
                     "customer": {
                         "id": pos.customer.id if pos.customer else None,
                         "ragione_sociale": pos.customer.ragione_sociale if pos.customer else pos.customer_name_raw,
