@@ -368,3 +368,54 @@ async def get_sync_status():
         "last_sync": _sync_status,
         "scheduler": get_scheduler_status(),
     }
+
+
+@router.get("/test-fatturapro")
+async def test_fatturapro_login():
+    """Debug endpoint to test FatturaPro login (synchronous, returns details)."""
+    import traceback
+    result = {
+        "username_configured": bool(config.FATTURAPRO_USERNAME),
+        "password_configured": bool(config.FATTURAPRO_PASSWORD),
+        "api_key_configured": bool(config.FATTURAPRO_API_KEY),
+        "base_url": config.FATTURAPRO_API_URL,
+    }
+
+    try:
+        connector = FatturaProConnector()
+
+        # Test 1: Can we reach the login page?
+        import httpx
+        try:
+            resp = connector.client.get(
+                f"{config.FATTURAPRO_API_URL}/signin.php",
+                timeout=15,
+            )
+            result["login_page_status"] = resp.status_code
+            result["login_page_url"] = str(resp.url)
+            result["login_page_length"] = len(resp.text)
+        except Exception as e:
+            result["login_page_error"] = str(e)
+
+        # Test 2: Try full login
+        login_ok = connector.login()
+        result["login_success"] = login_ok
+
+        if login_ok:
+            # Test 3: Try fetching invoices
+            invoices = connector.fetch_overdue_invoices()
+            result["invoices_count"] = len(invoices)
+            if invoices:
+                result["sample_invoice"] = {
+                    "number": invoices[0].get("invoice_number"),
+                    "customer": invoices[0].get("customer_name"),
+                    "balance": invoices[0].get("balance"),
+                }
+
+        connector.close()
+
+    except Exception as e:
+        result["error"] = str(e)
+        result["traceback"] = traceback.format_exc()
+
+    return result
