@@ -395,8 +395,6 @@ async def import_csv(file: UploadFile = File(...)):
         content = await file.read()
         text = content.decode("utf-8-sig")  # Handle BOM
 
-        reader = csv.DictReader(StringIO(text), delimiter=None)
-
         # Auto-detect delimiter
         first_line = text.split("\n")[0]
         if ";" in first_line and "," not in first_line:
