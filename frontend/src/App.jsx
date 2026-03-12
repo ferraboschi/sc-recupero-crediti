@@ -6,6 +6,7 @@ import Messages from './pages/Messages'
 import Customers from './pages/Customers'
 import ClientDetail from './pages/ClientDetail'
 import Activity from './pages/Activity'
+import System from './pages/System'
 import SyncButton from './components/SyncButton'
 
 export default function App() {
@@ -18,6 +19,7 @@ export default function App() {
     { path: '/customers', label: 'Clienti', icon: '👥' },
     { path: '/messages', label: 'Messaggi', icon: '💬' },
     { path: '/activity', label: 'Attività', icon: '📜' },
+    { path: '/system', label: 'Sistema', icon: '⚙️' },
   ]
 
   const isActive = (path) => {
@@ -99,6 +101,7 @@ export default function App() {
             <Route path="/customers" element={<Customers />} />
             <Route path="/customers/:customerId" element={<ClientDetail />} />
             <Route path="/activity" element={<Activity />} />
+            <Route path="/system" element={<System />} />
           </Routes>
         </div>
       </div>

@@ -94,6 +94,19 @@ def start_scheduler():
         logger.error(f"Failed to schedule daily job: {e}", exc_info=True)
         raise
 
+    # Schedule a startup sync 60 seconds after boot (Render cold start recovery)
+    from datetime import timedelta
+    _scheduler.add_job(
+        run_daily_job,
+        trigger="date",
+        run_date=datetime.now(pytz.timezone(config.TIMEZONE)) + timedelta(seconds=60),
+        id="startup_sync",
+        name="Startup sync after cold start",
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("Scheduled startup sync in 60 seconds")
+
     _scheduler.start()
     _scheduler_started = True
     logger.info("Scheduler started")
