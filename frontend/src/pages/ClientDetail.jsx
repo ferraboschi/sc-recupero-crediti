@@ -59,12 +59,18 @@ export default function ClientDetail() {
   const [selectedInvoices, setSelectedInvoices] = useState(new Set())
   const [phoneEdit, setPhoneEdit] = useState(null)
   const [updatingInvoice, setUpdatingInvoice] = useState(null)
+  const [showAllInvoices, setShowAllInvoices] = useState(false)
 
   const fetchData = useCallback(async () => {
     try {
       setLoading(true)
       const response = await client.get(`/customers/${customerId}`)
       setData(response.data)
+      // Auto-select all overdue invoices
+      const overdueIds = (response.data.invoices?.items || [])
+        .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid')
+        .map(inv => inv.id)
+      setSelectedInvoices(new Set(overdueIds))
     } catch (err) {
       setError('Errore nel caricamento del cliente')
       console.error(err)
@@ -180,6 +186,35 @@ export default function ClientDetail() {
     setSelectedInvoices(new Set(overdueIds))
   }
 
+  // Build WhatsApp message with selected invoices
+  const buildWhatsAppMessage = () => {
+    if (!data || selectedInvoices.size === 0) return ''
+    const selected = (data.invoices?.items || []).filter(inv => selectedInvoices.has(inv.id))
+    const totalSelected = selected.reduce((sum, inv) => sum + inv.amount_due, 0)
+
+    let msg = `Gentile ${data.ragione_sociale},\n\n`
+    msg += `le scriviamo per ricordarle che risultano in sospeso le seguenti fatture:\n\n`
+
+    selected.forEach(inv => {
+      const dueDate = inv.due_date ? new Date(inv.due_date).toLocaleDateString('it-IT') : 'N/D'
+      msg += `- Fatt. ${inv.invoice_number}: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(inv.amount_due)} (scad. ${dueDate})\n`
+    })
+
+    msg += `\nTotale: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(totalSelected)}\n\n`
+    msg += `Coordinate bancarie:\nIBAN: IT60F0306909606100000194066\nIntestatario: Wagyu Company S.R.L.\nCausale: Saldo fatture ${data.ragione_sociale}\n\n`
+    msg += `La preghiamo di provvedere al saldo o contattarci per chiarimenti.\n\nGrazie,\nSake Company`
+
+    return msg
+  }
+
+  const handleWhatsAppSend = () => {
+    if (!data?.phone) return
+    const number = data.phone.replace(/[^+\d]/g, '')
+    const message = buildWhatsAppMessage()
+    const url = `https://wa.me/${number}?text=${encodeURIComponent(message)}`
+    window.open(url, '_blank')
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-96">
@@ -197,6 +232,15 @@ export default function ClientDetail() {
   const totalOverdue = overdueInvoices.reduce((sum, inv) => sum + inv.amount_due, 0)
   const allUnpaid = data.invoices?.items?.filter(inv => inv.status !== 'paid') || []
   const whatsappNumber = data.phone ? data.phone.replace(/[^+\d]/g, '') : null
+
+  // By default show only overdue, unless user toggles
+  const visibleInvoices = showAllInvoices
+    ? (data.invoices?.items || [])
+    : overdueInvoices
+
+  const selectedTotal = (data.invoices?.items || [])
+    .filter(inv => selectedInvoices.has(inv.id))
+    .reduce((sum, inv) => sum + inv.amount_due, 0)
 
   return (
     <div className="space-y-6">
@@ -256,40 +300,80 @@ export default function ClientDetail() {
                 Prossima azione: <span className="font-medium">{formatDate(data.next_action_date)}</span>
               </p>
             )}
-            {/* WhatsApp button */}
-            {whatsappNumber && (
-              <a
-                href={`https://wa.me/${whatsappNumber}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700"
-              >
-                <span>WhatsApp</span>
-              </a>
-            )}
           </div>
         </div>
 
         {/* Summary stats */}
         <div className="mt-6 grid grid-cols-2 md:grid-cols-4 gap-4">
-          <div className="bg-slate-50 rounded-lg p-3 text-center">
-            <p className="text-xs text-slate-500">Fatture Totali</p>
-            <p className="text-xl font-bold text-slate-900">{data.invoices?.count || 0}</p>
-          </div>
           <div className="bg-red-50 rounded-lg p-3 text-center">
-            <p className="text-xs text-red-600">Scadute</p>
+            <p className="text-xs text-red-600">Fatture Scadute</p>
             <p className="text-xl font-bold text-red-700">{overdueInvoices.length}</p>
+          </div>
+          <div className="bg-amber-50 rounded-lg p-3 text-center">
+            <p className="text-xs text-amber-600">Totale Scaduto</p>
+            <p className="text-xl font-bold text-amber-700">{formatCurrency(totalOverdue)}</p>
           </div>
           <div className="bg-blue-50 rounded-lg p-3 text-center">
             <p className="text-xs text-blue-600">Totale Dovuto</p>
             <p className="text-xl font-bold text-blue-700">{formatCurrency(data.invoices?.total_due || 0)}</p>
           </div>
-          <div className="bg-amber-50 rounded-lg p-3 text-center">
-            <p className="text-xs text-amber-600">Scaduto</p>
-            <p className="text-xl font-bold text-amber-700">{formatCurrency(totalOverdue)}</p>
+          <div className="bg-slate-50 rounded-lg p-3 text-center">
+            <p className="text-xs text-slate-500">Fatture Totali</p>
+            <p className="text-xl font-bold text-slate-900">{data.invoices?.count || 0}</p>
           </div>
         </div>
       </div>
+
+      {/* WhatsApp Send Section — prominent when invoices are selected */}
+      {whatsappNumber && selectedInvoices.size > 0 && (
+        <div className="bg-green-50 rounded-lg p-4 border border-green-200">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-green-900">
+                {selectedInvoices.size} fattur{selectedInvoices.size === 1 ? 'a' : 'e'} selezionat{selectedInvoices.size === 1 ? 'a' : 'e'} — {formatCurrency(selectedTotal)}
+              </p>
+              <p className="text-xs text-green-700 mt-1">
+                Invia un messaggio WhatsApp con il riepilogo delle fatture selezionate
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleDownloadPdf}
+                disabled={pdfLoading}
+                className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700 disabled:opacity-50"
+              >
+                {pdfLoading ? '...' : 'PDF'}
+              </button>
+              <button
+                onClick={handleWhatsAppSend}
+                className="px-6 py-2 bg-green-600 text-white rounded-lg text-sm font-bold hover:bg-green-700 flex items-center gap-2"
+              >
+                <span>Invia WhatsApp</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* No phone warning */}
+      {!whatsappNumber && overdueInvoices.length > 0 && (
+        <div className="bg-yellow-50 rounded-lg p-4 border border-yellow-200 flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium text-yellow-900">
+              Telefono mancante — impossibile inviare WhatsApp
+            </p>
+            <p className="text-xs text-yellow-700 mt-1">
+              Aggiungi il numero di telefono per poter inviare il riepilogo fatture
+            </p>
+          </div>
+          <button
+            onClick={() => setPhoneEdit(data.phone || '')}
+            className="px-4 py-2 bg-yellow-600 text-white rounded-lg text-sm font-medium hover:bg-yellow-700"
+          >
+            Aggiungi Telefono
+          </button>
+        </div>
+      )}
 
       {/* Recovery Actions */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
@@ -362,31 +446,20 @@ export default function ClientDetail() {
         )}
       </div>
 
-      {/* PDF Generation */}
-      {overdueInvoices.length > 0 && (
-        <div className="bg-amber-50 rounded-lg p-4 border border-amber-200 flex items-center justify-between">
-          <div>
-            <p className="text-sm font-medium text-amber-900">
-              {overdueInvoices.length} fattur{overdueInvoices.length === 1 ? 'a' : 'e'} scadut{overdueInvoices.length === 1 ? 'a' : 'e'} per {formatCurrency(totalOverdue)}
-            </p>
-            <p className="text-xs text-amber-700 mt-1">
-              Genera un PDF riepilogativo con IBAN per facilitare il pagamento
-            </p>
-          </div>
-          <button
-            onClick={handleDownloadPdf}
-            disabled={pdfLoading}
-            className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700 disabled:opacity-50"
-          >
-            {pdfLoading ? 'Generazione...' : 'Scarica PDF Riepilogativo'}
-          </button>
-        </div>
-      )}
-
       {/* Invoices Table */}
       <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
         <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-          <h2 className="text-lg font-bold text-slate-900">Fatture ({data.invoices?.count || 0})</h2>
+          <div className="flex items-center gap-4">
+            <h2 className="text-lg font-bold text-slate-900">
+              {showAllInvoices ? `Tutte le Fatture (${data.invoices?.count || 0})` : `Fatture Scadute (${overdueInvoices.length})`}
+            </h2>
+            <button
+              onClick={() => setShowAllInvoices(!showAllInvoices)}
+              className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+            >
+              {showAllInvoices ? 'Solo Scadute' : 'Mostra Tutte'}
+            </button>
+          </div>
           <button
             onClick={selectAllOverdue}
             className="text-sm text-blue-600 hover:text-blue-800 font-medium"
@@ -415,9 +488,7 @@ export default function ClientDetail() {
                 </th>
                 <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fattura</th>
                 <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fonte</th>
-                <th className="px-3 py-3 text-right text-sm font-semibold text-slate-900">Importo</th>
                 <th className="px-3 py-3 text-right text-sm font-semibold text-slate-900">Dovuto</th>
-                <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Emissione</th>
                 <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Scadenza</th>
                 <th className="px-3 py-3 text-right text-sm font-semibold text-slate-900">GG</th>
                 <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
@@ -425,7 +496,7 @@ export default function ClientDetail() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200">
-              {data.invoices?.items?.map(inv => (
+              {visibleInvoices.map(inv => (
                 <tr
                   key={inv.id}
                   className={`
@@ -452,9 +523,7 @@ export default function ClientDetail() {
                       {inv.source_platform === 'fatturapro' ? 'FPro' : 'F24'}
                     </span>
                   </td>
-                  <td className="px-3 py-3 text-sm text-right">{formatCurrency(inv.amount)}</td>
                   <td className="px-3 py-3 text-sm text-right font-medium">{formatCurrency(inv.amount_due)}</td>
-                  <td className="px-3 py-3 text-sm text-slate-600">{formatDate(inv.issue_date)}</td>
                   <td className="px-3 py-3 text-sm text-slate-600">{formatDate(inv.due_date)}</td>
                   <td className="px-3 py-3 text-sm text-right">
                     <span className={inv.days_overdue > 30 ? 'text-red-600 font-medium' : 'text-slate-600'}>

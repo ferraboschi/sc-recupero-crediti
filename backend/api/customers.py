@@ -18,16 +18,42 @@ async def list_customers(
     session: Session = Depends(get_session),
     search: str = Query(None),
     excluded: bool = Query(None),
+    only_overdue: bool = Query(False, description="Show only customers with overdue invoices"),
+    sort_by: str = Query(None, description="Sort field: total_overdue, overdue_count, ragione_sociale"),
+    sort_order: str = Query("desc", description="Sort order: asc or desc"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
 ):
     """
     List customers with optional search and filter by excluded status.
-
-    Search can match against ragione_sociale, partita_iva, or email.
+    Supports filtering to only_overdue customers and sorting by overdue amounts.
     """
     try:
-        query = session.query(Customer)
+        # First get invoice stats for ALL matching customers (needed for filtering/sorting)
+        # Base stats subquery
+        stats_subquery = (
+            session.query(
+                Invoice.customer_id,
+                func.count(Invoice.id).label("invoice_count"),
+                func.sum(Invoice.amount_due).label("total_due"),
+                func.sum(
+                    func.cast(Invoice.days_overdue > 0, Integer)
+                ).label("overdue_count"),
+                func.sum(
+                    func.case(
+                        (Invoice.days_overdue > 0, Invoice.amount_due),
+                        else_=0,
+                    )
+                ).label("total_overdue"),
+            )
+            .filter(Invoice.status != "paid")
+            .group_by(Invoice.customer_id)
+            .subquery()
+        )
+
+        query = session.query(Customer, stats_subquery).outerjoin(
+            stats_subquery, Customer.id == stats_subquery.c.customer_id
+        )
 
         if search:
             search_pattern = f"%{search}%"
@@ -42,60 +68,55 @@ async def list_customers(
         if excluded is not None:
             query = query.filter(Customer.excluded == excluded)
 
-        total = query.count()
-        customers = query.order_by(Customer.ragione_sociale.asc()).offset(skip).limit(limit).all()
+        if only_overdue:
+            query = query.filter(stats_subquery.c.overdue_count > 0)
 
-        # Get invoice stats for each customer
-        customer_ids = [c.id for c in customers]
-        invoice_stats = {}
-        if customer_ids:
-            stats_query = (
-                session.query(
-                    Invoice.customer_id,
-                    func.count(Invoice.id).label("invoice_count"),
-                    func.sum(Invoice.amount_due).label("total_due"),
-                    func.sum(
-                        func.cast(Invoice.days_overdue > 0, Integer)
-                    ).label("overdue_count"),
-                )
-                .filter(
-                    Invoice.customer_id.in_(customer_ids),
-                    Invoice.status != "paid",
-                )
-                .group_by(Invoice.customer_id)
-                .all()
-            )
-            for row in stats_query:
-                invoice_stats[row.customer_id] = {
-                    "invoice_count": row.invoice_count,
-                    "total_due": float(row.total_due or 0),
-                    "overdue_count": row.overdue_count or 0,
-                }
+        total = query.count()
+
+        # Sorting
+        if sort_by == "total_overdue":
+            col = stats_subquery.c.total_overdue
+            query = query.order_by(col.desc() if sort_order == "desc" else col.asc())
+        elif sort_by == "overdue_count":
+            col = stats_subquery.c.overdue_count
+            query = query.order_by(col.desc() if sort_order == "desc" else col.asc())
+        else:
+            query = query.order_by(Customer.ragione_sociale.asc())
+
+        results = query.offset(skip).limit(limit).all()
+
+        items = []
+        for row in results:
+            cust = row[0]
+            invoice_count = row[1] or 0
+            total_due = float(row[2] or 0)
+            overdue_count = row[3] or 0
+            total_overdue = float(row[4] or 0)
+
+            items.append({
+                "id": cust.id,
+                "ragione_sociale": cust.ragione_sociale,
+                "partita_iva": cust.partita_iva,
+                "phone": cust.phone,
+                "email": cust.email,
+                "excluded": cust.excluded,
+                "source": cust.source,
+                "phone_validated": cust.phone_validated,
+                "recovery_status": cust.recovery_status,
+                "next_action_date": cust.next_action_date.isoformat() if cust.next_action_date else None,
+                "next_action_type": cust.next_action_type,
+                "invoice_count": invoice_count,
+                "total_due": total_due,
+                "overdue_count": overdue_count,
+                "total_overdue": total_overdue,
+                "created_at": cust.created_at.isoformat(),
+            })
 
         return {
             "total": total,
             "skip": skip,
             "limit": limit,
-            "items": [
-                {
-                    "id": cust.id,
-                    "ragione_sociale": cust.ragione_sociale,
-                    "partita_iva": cust.partita_iva,
-                    "phone": cust.phone,
-                    "email": cust.email,
-                    "excluded": cust.excluded,
-                    "source": cust.source,
-                    "phone_validated": cust.phone_validated,
-                    "recovery_status": cust.recovery_status,
-                    "next_action_date": cust.next_action_date.isoformat() if cust.next_action_date else None,
-                    "next_action_type": cust.next_action_type,
-                    "invoice_count": invoice_stats.get(cust.id, {}).get("invoice_count", 0),
-                    "total_due": invoice_stats.get(cust.id, {}).get("total_due", 0),
-                    "overdue_count": invoice_stats.get(cust.id, {}).get("overdue_count", 0),
-                    "created_at": cust.created_at.isoformat(),
-                }
-                for cust in customers
-            ],
+            "items": items,
         }
 
     except Exception as e:

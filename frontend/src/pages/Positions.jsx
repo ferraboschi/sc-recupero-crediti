@@ -48,13 +48,13 @@ export default function Positions() {
   const [total, setTotal] = useState(0)
   const [limit] = useState(50)
 
-  // Filters - show all invoices, exclude paid by default
+  // Filters - show only overdue invoices by default
   const [statusFilter, setStatusFilter] = useState('exclude_paid')
   const [escalationFilter, setEscalationFilter] = useState('')
   const [minAmountFilter, setMinAmountFilter] = useState('')
   const [searchFilter, setSearchFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
-  const [overdueFilter, setOverdueFilter] = useState('')
+  const [overdueFilter, setOverdueFilter] = useState('yes')
   const [hasCustomerFilter, setHasCustomerFilter] = useState('')
   const [issueDateFrom, setIssueDateFrom] = useState('')
   const [issueDateTo, setIssueDateTo] = useState('')

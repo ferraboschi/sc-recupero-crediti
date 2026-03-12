@@ -12,6 +12,7 @@ const ACTION_LABELS = {
   wait: 'Attendi',
   idle: 'Da Gestire',
   waiting: 'In Attesa',
+  note: 'Nota',
 }
 
 const ACTION_BADGE_COLORS = {
@@ -24,6 +25,13 @@ const ACTION_BADGE_COLORS = {
   waiting: 'bg-purple-100 text-purple-700 border-purple-200',
 }
 
+const PRIORITY_CONFIG = {
+  overdue: { label: 'In Ritardo', bg: 'bg-red-50', border: 'border-red-200', badge: 'bg-red-600 text-white' },
+  today: { label: 'Oggi', bg: 'bg-blue-50', border: 'border-blue-200', badge: 'bg-blue-600 text-white' },
+  new: { label: 'Da Contattare', bg: 'bg-amber-50', border: 'border-amber-200', badge: 'bg-amber-600 text-white' },
+  upcoming: { label: 'Prossimamente', bg: 'bg-slate-50', border: 'border-slate-200', badge: 'bg-slate-500 text-white' },
+}
+
 export default function Dashboard() {
   const navigate = useNavigate()
   const [loading, setLoading] = useState(true)
@@ -32,8 +40,9 @@ export default function Dashboard() {
   const [syncing, setSyncing] = useState(false)
   const [syncMessage, setSyncMessage] = useState('')
   const [lastSync, setLastSync] = useState(null)
-  const [calendarItems, setCalendarItems] = useState([])
-  const [calendarLoading, setCalendarLoading] = useState(true)
+  const [todos, setTodos] = useState([])
+  const [todoCounts, setTodoCounts] = useState({})
+  const [todoLoading, setTodoLoading] = useState(true)
   const [retryCount, setRetryCount] = useState(0)
 
   const fetchData = async (retry = 0) => {
@@ -49,7 +58,6 @@ export default function Dashboard() {
     } catch (err) {
       console.error(err)
       if (retry < 2) {
-        // Auto-retry after 10s for cold start
         setRetryCount(retry + 1)
         setTimeout(() => fetchData(retry + 1), 10000)
       } else {
@@ -60,21 +68,22 @@ export default function Dashboard() {
     }
   }
 
-  const fetchCalendar = async () => {
+  const fetchTodos = async () => {
     try {
-      setCalendarLoading(true)
-      const response = await client.get('/recovery/calendar')
-      setCalendarItems(response.data.items || [])
+      setTodoLoading(true)
+      const response = await client.get('/dashboard/todos')
+      setTodos(response.data.todos || [])
+      setTodoCounts(response.data.counts || {})
     } catch (err) {
-      console.error('Error fetching calendar:', err)
+      console.error('Error fetching todos:', err)
     } finally {
-      setCalendarLoading(false)
+      setTodoLoading(false)
     }
   }
 
   useEffect(() => {
     fetchData()
-    fetchCalendar()
+    fetchTodos()
   }, [])
 
   const handleSync = async () => {
@@ -87,6 +96,7 @@ export default function Dashboard() {
       setLastSync(now)
       localStorage.setItem('lastSyncTime', now.toISOString())
       await fetchData()
+      await fetchTodos()
       setTimeout(() => setSyncMessage(''), 3000)
     } catch (err) {
       setSyncMessage('Errore nella sincronizzazione')
@@ -111,19 +121,6 @@ export default function Dashboard() {
     }
     return labels[status] || status
   }
-
-  // Group calendar items by date
-  const calendarByDate = calendarItems.reduce((acc, item) => {
-    const d = item.scheduled_date
-    if (!acc[d]) acc[d] = []
-    acc[d].push(item)
-    return acc
-  }, {})
-
-  const today = new Date().toISOString().slice(0, 10)
-  const overdueItems = calendarItems.filter(i => i.scheduled_date < today)
-  const todayItems = calendarItems.filter(i => i.scheduled_date === today)
-  const futureItems = calendarItems.filter(i => i.scheduled_date > today)
 
   if (loading) {
     return (
@@ -151,7 +148,7 @@ export default function Dashboard() {
           </div>
           <p className="text-amber-700 mb-3">Il server si sta risvegliando (può richiedere fino a 60 secondi). Ricaricamento automatico in corso.</p>
           <button
-            onClick={() => { setError(null); fetchData(); fetchCalendar(); }}
+            onClick={() => { setError(null); fetchData(); fetchTodos(); }}
             className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700"
           >
             Riprova Ora
@@ -172,36 +169,67 @@ export default function Dashboard() {
 
   const COLORS = ['#3b82f6', '#f59e0b', '#a855f7', '#10b981', '#ef4444', '#f97316']
 
-  const renderCalendarSection = (title, items, bgColor, borderColor) => {
-    if (items.length === 0) return null
+  // Group todos by priority
+  const todosByPriority = {}
+  todos.forEach(todo => {
+    if (!todosByPriority[todo.priority]) todosByPriority[todo.priority] = []
+    todosByPriority[todo.priority].push(todo)
+  })
+
+  const renderTodoSection = (priority) => {
+    const items = todosByPriority[priority]
+    if (!items || items.length === 0) return null
+    const config = PRIORITY_CONFIG[priority]
     return (
-      <div className={`${bgColor} rounded-lg p-4 border ${borderColor}`}>
-        <h3 className="font-semibold text-sm mb-3">{title} ({items.length})</h3>
+      <div key={priority} className={`${config.bg} rounded-lg p-4 border ${config.border}`}>
+        <div className="flex items-center gap-2 mb-3">
+          <span className={`${config.badge} px-2 py-0.5 rounded text-xs font-bold`}>
+            {config.label}
+          </span>
+          <span className="text-sm text-slate-500">({items.length})</span>
+        </div>
         <div className="space-y-2">
-          {items.map((item, idx) => (
+          {items.map((todo) => (
             <div
-              key={`${item.customer_id}-${idx}`}
-              onClick={() => navigate(`/customers/${item.customer_id}`)}
+              key={todo.id}
+              onClick={() => navigate(`/customers/${todo.customer_id}`)}
               className="flex items-center justify-between bg-white rounded-lg px-3 py-2 cursor-pointer hover:shadow-sm transition-shadow border border-slate-100"
             >
-              <div className="flex items-center gap-3">
-                <span className={`${ACTION_BADGE_COLORS[item.action_type] || ACTION_BADGE_COLORS.idle} px-2 py-0.5 rounded text-xs font-medium border`}>
-                  {ACTION_LABELS[item.action_type] || item.action_type}
+              <div className="flex items-center gap-3 min-w-0">
+                <span className={`${ACTION_BADGE_COLORS[todo.action_type] || ACTION_BADGE_COLORS.idle} px-2 py-0.5 rounded text-xs font-medium border shrink-0`}>
+                  {ACTION_LABELS[todo.action_type] || todo.action_type}
                 </span>
-                <span className="text-sm font-medium text-slate-900 truncate max-w-[200px]">
-                  {item.customer_name}
-                </span>
+                <div className="min-w-0">
+                  <span className="text-sm font-medium text-slate-900 truncate block max-w-[200px]">
+                    {todo.customer_name}
+                  </span>
+                  {todo.partita_iva && (
+                    <span className="text-xs text-slate-400 font-mono">{todo.partita_iva}</span>
+                  )}
+                </div>
               </div>
-              <div className="flex items-center gap-3 text-xs text-slate-500">
-                {item.overdue_invoices > 0 && (
+              <div className="flex items-center gap-3 text-xs text-slate-500 shrink-0">
+                {todo.overdue_count > 0 && (
                   <span className="bg-red-50 text-red-600 px-1.5 py-0.5 rounded">
-                    {item.overdue_invoices} scad.
+                    {todo.overdue_count} scad.
                   </span>
                 )}
-                {item.total_due > 0 && (
-                  <span className="font-medium text-slate-700">{formatCurrency(item.total_due)}</span>
+                {todo.total_overdue > 0 && (
+                  <span className="font-medium text-red-700">{formatCurrency(todo.total_overdue)}</span>
                 )}
-                <span>{formatDate(item.scheduled_date)}</span>
+                {todo.phone && (
+                  <a
+                    href={`https://wa.me/${todo.phone.replace(/[^+\d]/g, '')}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    className="w-5 h-5 bg-green-500 text-white rounded-full text-xs flex items-center justify-center hover:bg-green-600"
+                    title="WhatsApp"
+                  >
+                    W
+                  </a>
+                )}
+                <span>{formatDate(todo.scheduled_date)}</span>
               </div>
             </div>
           ))}
@@ -209,6 +237,8 @@ export default function Dashboard() {
       </div>
     )
   }
+
+  const totalTodoOverdue = todos.reduce((sum, t) => sum + (t.total_overdue || 0), 0)
 
   return (
     <div className="space-y-8">
@@ -239,22 +269,39 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatsWidget label="Totale Crediti" value={formatCurrency(data.total_crediti)} color="blue" />
         <StatsWidget label="Posizioni Aperte" value={data.total_positions} color="purple" />
-        <StatsWidget label="Messaggi in Coda" value={data.draft_messages || 0} color="orange" />
+        <StatsWidget label="Da Gestire" value={todos.length || 0} color="orange" />
         <StatsWidget label="Clienti Totali" value={data.total_customers || 0} color="green" />
       </div>
 
-      {/* Calendar Section */}
+      {/* TODO Section — primary focus */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <h2 className="text-lg font-bold text-slate-900 mb-4">Calendario Attività</h2>
-        {calendarLoading ? (
-          <p className="text-slate-500 text-center py-4">Caricamento calendario...</p>
-        ) : calendarItems.length === 0 ? (
-          <p className="text-slate-500 text-center py-4">Nessuna attività pianificata. Vai nella scheda Clienti per iniziare il flusso di recupero.</p>
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <h2 className="text-lg font-bold text-slate-900">Da Fare</h2>
+            {todos.length > 0 && (
+              <span className="bg-red-100 text-red-700 px-2.5 py-0.5 rounded-full text-sm font-bold">
+                {todos.length}
+              </span>
+            )}
+          </div>
+          {totalTodoOverdue > 0 && (
+            <div className="text-right">
+              <p className="text-sm text-slate-500">Totale scaduto in gestione</p>
+              <p className="text-lg font-bold text-red-600">{formatCurrency(totalTodoOverdue)}</p>
+            </div>
+          )}
+        </div>
+
+        {todoLoading ? (
+          <p className="text-slate-500 text-center py-4">Caricamento...</p>
+        ) : todos.length === 0 ? (
+          <div className="text-center py-8">
+            <p className="text-slate-500 mb-2">Nessuna azione da fare</p>
+            <p className="text-sm text-slate-400">Sincronizza le fatture e vai nella scheda Clienti per iniziare il flusso di recupero.</p>
+          </div>
         ) : (
           <div className="space-y-4">
-            {renderCalendarSection('In Ritardo', overdueItems, 'bg-red-50', 'border-red-200')}
-            {renderCalendarSection('Oggi', todayItems, 'bg-blue-50', 'border-blue-200')}
-            {renderCalendarSection('Prossime', futureItems, 'bg-slate-50', 'border-slate-200')}
+            {['overdue', 'today', 'new', 'upcoming'].map(p => renderTodoSection(p))}
           </div>
         )}
       </div>

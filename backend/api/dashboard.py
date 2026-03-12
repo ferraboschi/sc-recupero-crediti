@@ -1,11 +1,12 @@
 """Dashboard API endpoints."""
 
 import logging
+from datetime import date, timedelta
 from fastapi import APIRouter, Depends
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from backend.database import get_session, Invoice, Customer, Message, ActivityLog
+from backend.database import get_session, Invoice, Customer, Message, ActivityLog, RecoveryAction
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -96,6 +97,129 @@ async def get_dashboard(session: Session = Depends(get_session)):
 
     except Exception as e:
         logger.error(f"Error fetching dashboard data: {e}", exc_info=True)
+        raise
+
+
+@router.get("/todos")
+async def get_todos(session: Session = Depends(get_session)):
+    """
+    Get todo list for the dashboard — pending recovery actions and customers needing attention.
+    Groups: overdue (past due), today, upcoming (next 14 days), and idle customers with overdue invoices.
+    """
+    try:
+        today = date.today()
+
+        # 1. Pending recovery actions (not completed, scheduled)
+        pending_actions = (
+            session.query(RecoveryAction)
+            .join(Customer)
+            .filter(
+                RecoveryAction.completed_at.is_(None),
+                RecoveryAction.scheduled_date.isnot(None),
+                Customer.excluded.is_(False),
+            )
+            .order_by(RecoveryAction.scheduled_date.asc())
+            .all()
+        )
+
+        # 2. Idle customers with overdue invoices (need first contact)
+        from sqlalchemy import Integer as SqlInteger
+        idle_customers_with_overdue = (
+            session.query(
+                Customer,
+                func.count(Invoice.id).label("overdue_count"),
+                func.sum(Invoice.amount_due).label("total_overdue"),
+            )
+            .join(Invoice, Invoice.customer_id == Customer.id)
+            .filter(
+                Customer.recovery_status == "idle",
+                Customer.excluded.is_(False),
+                Invoice.status != "paid",
+                Invoice.days_overdue > 0,
+            )
+            .group_by(Customer.id)
+            .having(func.count(Invoice.id) > 0)
+            .all()
+        )
+
+        todos = []
+        seen_customer_ids = set()
+
+        # Build action-based todos
+        for action in pending_actions:
+            cid = action.customer_id
+            seen_customer_ids.add(cid)
+            # Get overdue stats
+            overdue_invoices = session.query(Invoice).filter(
+                Invoice.customer_id == cid,
+                Invoice.status != "paid",
+                Invoice.days_overdue > 0,
+            ).all()
+            total_overdue = sum(i.amount_due for i in overdue_invoices)
+
+            sched = action.scheduled_date
+            if sched < today:
+                priority = "overdue"
+            elif sched == today:
+                priority = "today"
+            elif sched <= today + timedelta(days=14):
+                priority = "upcoming"
+            else:
+                continue  # Skip far-future
+
+            todos.append({
+                "id": f"action_{action.id}",
+                "type": "action",
+                "priority": priority,
+                "customer_id": cid,
+                "customer_name": action.customer.ragione_sociale,
+                "partita_iva": action.customer.partita_iva,
+                "phone": action.customer.phone,
+                "action_type": action.action_type,
+                "scheduled_date": sched.isoformat(),
+                "notes": action.notes,
+                "overdue_count": len(overdue_invoices),
+                "total_overdue": float(total_overdue),
+                "recovery_status": action.customer.recovery_status,
+            })
+
+        # Build idle-customer todos (need first contact)
+        for cust, overdue_count, total_overdue in idle_customers_with_overdue:
+            if cust.id in seen_customer_ids:
+                continue
+            todos.append({
+                "id": f"idle_{cust.id}",
+                "type": "new_contact",
+                "priority": "new",
+                "customer_id": cust.id,
+                "customer_name": cust.ragione_sociale,
+                "partita_iva": cust.partita_iva,
+                "phone": cust.phone,
+                "action_type": "first_contact",
+                "scheduled_date": today.isoformat(),
+                "notes": None,
+                "overdue_count": overdue_count,
+                "total_overdue": float(total_overdue or 0),
+                "recovery_status": "idle",
+            })
+
+        # Sort: overdue first, then today, then new, then upcoming
+        priority_order = {"overdue": 0, "today": 1, "new": 2, "upcoming": 3}
+        todos.sort(key=lambda t: (priority_order.get(t["priority"], 9), t.get("scheduled_date", "")))
+
+        return {
+            "todos": todos,
+            "total": len(todos),
+            "counts": {
+                "overdue": sum(1 for t in todos if t["priority"] == "overdue"),
+                "today": sum(1 for t in todos if t["priority"] == "today"),
+                "new": sum(1 for t in todos if t["priority"] == "new"),
+                "upcoming": sum(1 for t in todos if t["priority"] == "upcoming"),
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching todos: {e}", exc_info=True)
         raise
 
 

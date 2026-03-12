@@ -29,13 +29,16 @@ export default function Customers() {
   const [total, setTotal] = useState(0)
   const [limit] = useState(50)
   const [search, setSearch] = useState('')
+  const [onlyOverdue, setOnlyOverdue] = useState(true)
+  const [sortBy, setSortBy] = useState('total_overdue')
+  const [sortOrder, setSortOrder] = useState('desc')
   const [excludedToggle, setExcludedToggle] = useState({})
 
   useEffect(() => {
     const fetchCustomers = async () => {
       try {
         setLoading(true)
-        const params = { skip, limit }
+        const params = { skip, limit, only_overdue: onlyOverdue, sort_by: sortBy, sort_order: sortOrder }
         if (search) params.search = search
 
         const response = await client.get('/customers', { params })
@@ -55,7 +58,7 @@ export default function Customers() {
       }
     }
     fetchCustomers()
-  }, [skip, limit, search])
+  }, [skip, limit, search, onlyOverdue, sortBy, sortOrder])
 
   const handleToggleExcluded = async (customerId, newValue, e) => {
     e.stopPropagation()
@@ -80,30 +83,68 @@ export default function Customers() {
     return new Date(dateStr).toLocaleDateString('it-IT')
   }
 
-  const isPhoneValid = (phone) => {
-    if (!phone) return false
-    const phoneRegex = /^[\d\s\-\+\(\)]+$/
-    return phone.length >= 9 && phoneRegex.test(phone)
+  const handleSort = (field) => {
+    if (sortBy === field) {
+      setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortBy(field)
+      setSortOrder('desc')
+    }
+    setSkip(0)
+  }
+
+  const sortArrow = (field) => {
+    if (sortBy !== field) return ''
+    return sortOrder === 'asc' ? ' ↑' : ' ↓'
   }
 
   return (
     <div className="space-y-6">
-      {/* Search Bar */}
+      {/* Filters */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <div>
-          <label className="block text-sm font-medium text-slate-700 mb-2">Ricerca Clienti</label>
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => {
-              setSearch(e.target.value)
-              setSkip(0)
-            }}
-            placeholder="Ragione Sociale, P.IVA, Email..."
-            className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
+        <div className="flex flex-col md:flex-row gap-4 items-start md:items-end">
+          <div className="flex-1">
+            <label className="block text-sm font-medium text-slate-700 mb-2">Ricerca Azienda</label>
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => {
+                setSearch(e.target.value)
+                setSkip(0)
+              }}
+              placeholder="Ragione Sociale, P.IVA, Email..."
+              className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div className="flex items-center gap-4">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={onlyOverdue}
+                onChange={(e) => { setOnlyOverdue(e.target.checked); setSkip(0) }}
+                className="rounded border-slate-300 text-red-600 focus:ring-red-500"
+              />
+              <span className="text-sm font-medium text-slate-700">Solo con scadute</span>
+            </label>
+          </div>
         </div>
       </div>
+
+      {/* Summary */}
+      {customers.length > 0 && (
+        <div className="bg-red-50 rounded-lg p-4 border border-red-200 flex items-center gap-6">
+          <div>
+            <p className="text-sm font-medium text-red-900">Aziende con Fatture Scadute</p>
+            <p className="text-2xl font-bold text-red-600">{total}</p>
+          </div>
+          <div>
+            <p className="text-sm font-medium text-red-900">Totale Scaduto</p>
+            <p className="text-2xl font-bold text-red-600">
+              {formatCurrency(customers.reduce((sum, c) => sum + (c.total_overdue || 0), 0))}
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Table */}
       <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
@@ -116,20 +157,32 @@ export default function Customers() {
         ) : error ? (
           <div className="p-6 text-red-600">{error}</div>
         ) : customers.length === 0 ? (
-          <div className="p-6 text-center text-slate-500">Nessun cliente trovato</div>
+          <div className="p-6 text-center text-slate-500">
+            {onlyOverdue ? 'Nessuna azienda con fatture scadute' : 'Nessun cliente trovato'}
+          </div>
         ) : (
           <>
             <div className="overflow-x-auto">
               <table className="w-full">
                 <thead className="bg-slate-50 border-b border-slate-200">
                   <tr>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Ragione Sociale</th>
+                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Azienda</th>
                     <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">P.IVA</th>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Telefono</th>
-                    <th className="px-4 py-3 text-right text-sm font-semibold text-slate-900">Dovuto</th>
-                    <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Scadute</th>
-                    <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Stato Recupero</th>
+                    <th
+                      className="px-4 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
+                      onClick={() => handleSort('total_overdue')}
+                    >
+                      Scaduto{sortArrow('total_overdue')}
+                    </th>
+                    <th
+                      className="px-4 py-3 text-center text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
+                      onClick={() => handleSort('overdue_count')}
+                    >
+                      Fatt. Scadute{sortArrow('overdue_count')}
+                    </th>
+                    <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
                     <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Pross. Azione</th>
+                    <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Telefono</th>
                     <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Escluso</th>
                   </tr>
                 </thead>
@@ -142,34 +195,20 @@ export default function Customers() {
                       }`}
                       onClick={() => navigate(`/customers/${customer.id}`)}
                     >
-                      <td className="px-4 py-3 text-sm font-medium text-blue-700 hover:text-blue-900">
-                        {customer.ragione_sociale || customer.email || `Cliente #${customer.id}`}
+                      <td className="px-4 py-3">
+                        <div className="text-sm font-medium text-blue-700 hover:text-blue-900">
+                          {customer.ragione_sociale || customer.email || `Cliente #${customer.id}`}
+                        </div>
                         {!customer.ragione_sociale && (
-                          <span className="ml-1 text-xs text-slate-400">(nome mancante)</span>
+                          <span className="text-xs text-slate-400">(nome mancante)</span>
                         )}
                       </td>
                       <td className="px-4 py-3 text-sm text-slate-600 font-mono text-xs">
                         {customer.partita_iva || '-'}
                       </td>
-                      <td className="px-4 py-3 text-sm text-slate-600">
-                        <div className="flex items-center gap-1">
-                          {customer.phone ? (
-                            <>
-                              <span className="text-xs">{customer.phone}</span>
-                              {isPhoneValid(customer.phone) ? (
-                                <span className="w-4 h-4 rounded-full bg-green-100 text-green-600 text-xs flex items-center justify-center">✓</span>
-                              ) : (
-                                <span className="w-4 h-4 rounded-full bg-yellow-100 text-yellow-600 text-xs flex items-center justify-center">!</span>
-                              )}
-                            </>
-                          ) : (
-                            <span className="text-slate-400 text-xs">-</span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-sm text-right font-medium">
-                        {customer.total_due > 0 ? (
-                          <span className="text-red-600">{formatCurrency(customer.total_due)}</span>
+                      <td className="px-4 py-3 text-sm text-right font-bold">
+                        {(customer.total_overdue || 0) > 0 ? (
+                          <span className="text-red-600">{formatCurrency(customer.total_overdue)}</span>
                         ) : (
                           <span className="text-slate-400">-</span>
                         )}
@@ -193,6 +232,27 @@ export default function Customers() {
                           <span className="text-xs">{formatDate(customer.next_action_date)}</span>
                         ) : '-'}
                       </td>
+                      <td className="px-4 py-3 text-sm text-center">
+                        {customer.phone ? (
+                          <div className="flex items-center justify-center gap-1">
+                            <span className="text-xs text-slate-600">{customer.phone}</span>
+                            {customer.phone && (
+                              <a
+                                href={`https://wa.me/${customer.phone.replace(/[^+\d]/g, '')}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="w-5 h-5 bg-green-500 text-white rounded-full text-xs flex items-center justify-center hover:bg-green-600"
+                                title="WhatsApp"
+                              >
+                                W
+                              </a>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-slate-400 text-xs">-</span>
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-center" onClick={(e) => e.stopPropagation()}>
                         <button
                           onClick={(e) => handleToggleExcluded(customer.id, !excludedToggle[customer.id], e)}
@@ -214,7 +274,7 @@ export default function Customers() {
             {/* Pagination */}
             <div className="px-6 py-4 border-t border-slate-200 flex items-center justify-between">
               <p className="text-sm text-slate-600">
-                Mostrando {skip + 1} a {Math.min(skip + limit, total)} di {total} clienti
+                Mostrando {skip + 1} a {Math.min(skip + limit, total)} di {total} aziende
               </p>
               <div className="flex gap-2">
                 <button
