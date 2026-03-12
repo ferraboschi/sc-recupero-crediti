@@ -297,60 +297,73 @@ def _sync_customers_task() -> dict:
     }
 
     try:
-        # Phase 1: Shopify sync
-        if config.SHOPIFY_ACCESS_TOKEN:
-            logger.info("Syncing customers from Shopify...")
-            shopify = ShopifyConnector()
-            raw_customers = shopify.fetch_b2b_customers()
-            created, updated = 0, 0
+        # Phase 1: Shopify sync (isolated — failure here must NOT block Phase 2)
+        try:
+            if config.SHOPIFY_ACCESS_TOKEN:
+                logger.info("Syncing customers from Shopify...")
+                shopify = ShopifyConnector()
+                raw_customers = shopify.fetch_b2b_customers()
+                created, updated = 0, 0
 
-            for cust in raw_customers:
-                existing = session.query(Customer).filter_by(
-                    shopify_id=cust["shopify_id"]
-                ).first()
+                for cust in raw_customers:
+                    existing = session.query(Customer).filter_by(
+                        shopify_id=cust["shopify_id"]
+                    ).first()
 
-                if existing:
-                    existing.ragione_sociale = cust.get("ragione_sociale", existing.ragione_sociale)
-                    existing.ragione_sociale_normalized = normalize_ragione_sociale(
-                        cust.get("ragione_sociale", "")
-                    )
-                    existing.partita_iva = cust.get("partita_iva") or existing.partita_iva
-                    existing.codice_fiscale = cust.get("codice_fiscale") or existing.codice_fiscale
-                    existing.codice_sdi = cust.get("codice_sdi") or existing.codice_sdi
-                    existing.phone = cust.get("phone") or existing.phone
-                    existing.email = cust.get("email") or existing.email
-                    existing.tags = cust.get("tags") or existing.tags
-                    updated += 1
-                else:
-                    new_customer = Customer(
-                        shopify_id=cust["shopify_id"],
-                        ragione_sociale=cust.get("ragione_sociale", ""),
-                        ragione_sociale_normalized=normalize_ragione_sociale(
+                    if existing:
+                        existing.ragione_sociale = cust.get("ragione_sociale", existing.ragione_sociale)
+                        existing.ragione_sociale_normalized = normalize_ragione_sociale(
                             cust.get("ragione_sociale", "")
-                        ),
-                        partita_iva=cust.get("partita_iva"),
-                        codice_fiscale=cust.get("codice_fiscale"),
-                        codice_sdi=cust.get("codice_sdi"),
-                        phone=cust.get("phone"),
-                        email=cust.get("email"),
-                        tags=cust.get("tags"),
-                        source="shopify",
-                    )
-                    session.add(new_customer)
-                    created += 1
+                        )
+                        existing.partita_iva = cust.get("partita_iva") or existing.partita_iva
+                        existing.codice_fiscale = cust.get("codice_fiscale") or existing.codice_fiscale
+                        existing.codice_sdi = cust.get("codice_sdi") or existing.codice_sdi
+                        existing.phone = cust.get("phone") or existing.phone
+                        existing.email = cust.get("email") or existing.email
+                        existing.tags = cust.get("tags") or existing.tags
+                        updated += 1
+                    else:
+                        new_customer = Customer(
+                            shopify_id=cust["shopify_id"],
+                            ragione_sociale=cust.get("ragione_sociale", ""),
+                            ragione_sociale_normalized=normalize_ragione_sociale(
+                                cust.get("ragione_sociale", "")
+                            ),
+                            partita_iva=cust.get("partita_iva"),
+                            codice_fiscale=cust.get("codice_fiscale"),
+                            codice_sdi=cust.get("codice_sdi"),
+                            phone=cust.get("phone"),
+                            email=cust.get("email"),
+                            tags=cust.get("tags"),
+                            source="shopify",
+                        )
+                        session.add(new_customer)
+                        created += 1
 
-            session.commit()
-            result["success"] = True
-            result["created"] = created
-            result["updated"] = updated
-            logger.info(f"Shopify sync: created={created}, updated={updated}")
-        else:
-            result["success"] = True  # Not an error, just unconfigured
-            logger.debug("Shopify not configured")
+                session.commit()
+                result["success"] = True
+                result["created"] = created
+                result["updated"] = updated
+                logger.info(f"Shopify sync: created={created}, updated={updated}")
+            else:
+                result["success"] = True  # Not an error, just unconfigured
+                logger.debug("Shopify not configured")
+        except Exception as e:
+            logger.error(f"Shopify sync failed (non-blocking): {e}", exc_info=True)
+            result["shopify_error"] = str(e)
+            # Rollback any partial Shopify changes to keep session clean
+            try:
+                session.rollback()
+            except Exception:
+                pass
+            # Continue to Phase 2 — auto-create must still run
 
         # Phase 2: Auto-create customers from unmatched invoices
         auto_created = _auto_create_customers_from_invoices(session)
         result["auto_created_from_invoices"] = auto_created
+        # Mark success if auto-create ran even if Shopify failed
+        if auto_created > 0 or result.get("success"):
+            result["success"] = True
 
         _sync_status["customers"]["last_sync"] = datetime.utcnow().isoformat()
         _sync_status["customers"]["result"] = result

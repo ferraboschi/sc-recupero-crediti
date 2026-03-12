@@ -26,7 +26,7 @@ class Config:
     # Shopify
     SHOPIFY_STORE_URL = os.getenv("SHOPIFY_STORE_URL", "")
     SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN", "")
-    SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-01")
+    SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10")
     SHOPIFY_PIVA_FIELD = os.getenv("SHOPIFY_PIVA_FIELD", "address2")
 
     # Twilio / WhatsApp
