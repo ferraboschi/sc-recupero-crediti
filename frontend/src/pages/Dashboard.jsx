@@ -267,10 +267,10 @@ export default function Dashboard() {
 
       {/* Top Stats */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        <StatsWidget label="Totale Crediti" value={formatCurrency(data.total_crediti)} color="blue" />
-        <StatsWidget label="Posizioni Aperte" value={data.total_positions} color="purple" />
-        <StatsWidget label="Da Gestire" value={todos.length || 0} color="orange" />
-        <StatsWidget label="Clienti Totali" value={data.total_customers || 0} color="green" />
+        <StatsWidget label="Totale Scaduto" value={formatCurrency(data.total_scaduto || 0)} color="red" />
+        <StatsWidget label="Fatture Scadute" value={data.total_fatture_scadute || 0} color="orange" />
+        <StatsWidget label="Clienti con Scaduto" value={data.total_clienti_scaduti || 0} color="purple" />
+        <StatsWidget label="Da Gestire" value={todos.length || 0} color="blue" />
       </div>
 
       {/* TODO Section — primary focus */}

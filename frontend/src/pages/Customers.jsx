@@ -33,6 +33,8 @@ export default function Customers() {
   const [sortBy, setSortBy] = useState('total_overdue')
   const [sortOrder, setSortOrder] = useState('desc')
   const [excludedToggle, setExcludedToggle] = useState({})
+  const [summaryTotalOverdue, setSummaryTotalOverdue] = useState(0)
+  const [summaryOverdueCustomers, setSummaryOverdueCustomers] = useState(0)
 
   useEffect(() => {
     const fetchCustomers = async () => {
@@ -44,6 +46,8 @@ export default function Customers() {
         const response = await client.get('/customers', { params })
         setCustomers(response.data.items)
         setTotal(response.data.total)
+        setSummaryTotalOverdue(response.data.summary_total_overdue || 0)
+        setSummaryOverdueCustomers(response.data.summary_overdue_customers || 0)
 
         const toggleState = {}
         response.data.items.forEach(c => {
@@ -135,12 +139,12 @@ export default function Customers() {
         <div className="bg-red-50 rounded-lg p-4 border border-red-200 flex items-center gap-6">
           <div>
             <p className="text-sm font-medium text-red-900">Aziende con Fatture Scadute</p>
-            <p className="text-2xl font-bold text-red-600">{total}</p>
+            <p className="text-2xl font-bold text-red-600">{summaryOverdueCustomers}</p>
           </div>
           <div>
             <p className="text-sm font-medium text-red-900">Totale Scaduto</p>
             <p className="text-2xl font-bold text-red-600">
-              {formatCurrency(customers.reduce((sum, c) => sum + (c.total_overdue || 0), 0))}
+              {formatCurrency(summaryTotalOverdue)}
             </p>
           </div>
         </div>

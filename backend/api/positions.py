@@ -124,14 +124,19 @@ async def list_positions(
             col = sort_map[sort_by]
             query = query.order_by(col.desc() if sort_order == "desc" else col.asc())
 
-        # Total count before pagination
+        # Total count and sum before pagination
+        from sqlalchemy import func as sqlfunc
         total = query.count()
+        summary_total_amount_due = query.with_entities(
+            sqlfunc.sum(Invoice.amount_due)
+        ).scalar() or 0.0
 
         # Get paginated results
         positions = query.offset(skip).limit(limit).all()
 
         return {
             "total": total,
+            "summary_total_amount_due": float(summary_total_amount_due),
             "skip": skip,
             "limit": limit,
             "items": [

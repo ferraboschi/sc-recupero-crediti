@@ -87,6 +87,10 @@ async def list_customers(
 
         total = len(enriched)
 
+        # Compute summary totals BEFORE pagination (across ALL matching records)
+        summary_total_overdue = sum(e["total_overdue"] for e in enriched)
+        summary_overdue_customers = sum(1 for e in enriched if e["overdue_count"] > 0)
+
         # Step 5: Sort
         if sort_by == "total_overdue":
             enriched.sort(key=lambda e: e["total_overdue"], reverse=(sort_order == "desc"))
@@ -132,6 +136,8 @@ async def list_customers(
             "total": total,
             "skip": skip,
             "limit": limit,
+            "summary_total_overdue": summary_total_overdue,
+            "summary_overdue_customers": summary_overdue_customers,
             "items": items,
         }
 

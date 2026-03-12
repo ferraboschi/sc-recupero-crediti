@@ -25,6 +25,23 @@ async def get_dashboard(session: Session = Depends(get_session)):
             Invoice.status != "paid"
         ).scalar() or 0.0
 
+        # Total OVERDUE amount (only invoices past due date)
+        total_scaduto = session.query(func.sum(Invoice.amount_due)).filter(
+            Invoice.status != "paid",
+            Invoice.days_overdue > 0,
+        ).scalar() or 0.0
+
+        total_fatture_scadute = session.query(func.count(Invoice.id)).filter(
+            Invoice.status != "paid",
+            Invoice.days_overdue > 0,
+        ).scalar() or 0
+
+        total_clienti_scaduti = session.query(func.count(func.distinct(Invoice.customer_id))).filter(
+            Invoice.status != "paid",
+            Invoice.days_overdue > 0,
+            Invoice.customer_id.isnot(None),
+        ).scalar() or 0
+
         # Total number of positions (excluding paid)
         total_positions = session.query(func.count(Invoice.id)).filter(
             Invoice.status != "paid"
@@ -87,6 +104,9 @@ async def get_dashboard(session: Session = Depends(get_session)):
 
         return {
             "total_crediti": float(total_crediti),
+            "total_scaduto": float(total_scaduto),
+            "total_fatture_scadute": total_fatture_scadute,
+            "total_clienti_scaduti": total_clienti_scaduti,
             "total_positions": total_positions,
             "total_customers": total_customers,
             "draft_messages": draft_messages,
