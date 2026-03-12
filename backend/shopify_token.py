@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Optional
 
-import requests
+import httpx
 
 from backend.config import config
 
@@ -61,7 +61,7 @@ def _refresh_token() -> str:
     token_url = f"{store_url}/admin/oauth/access_token"
 
     try:
-        resp = requests.post(
+        resp = httpx.post(
             token_url,
             json={
                 "client_id": config.SHOPIFY_CLIENT_ID,
