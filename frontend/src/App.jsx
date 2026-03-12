@@ -2,10 +2,8 @@ import React, { useState } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import Positions from './pages/Positions'
-import Messages from './pages/Messages'
 import Customers from './pages/Customers'
 import ClientDetail from './pages/ClientDetail'
-import Activity from './pages/Activity'
 import System from './pages/System'
 import SyncButton from './components/SyncButton'
 
@@ -15,10 +13,8 @@ export default function App() {
 
   const navItems = [
     { path: '/', label: 'Dashboard', icon: '📊' },
-    { path: '/positions', label: 'Posizioni', icon: '📋' },
     { path: '/customers', label: 'Clienti', icon: '👥' },
-    { path: '/messages', label: 'Messaggi', icon: '💬' },
-    { path: '/activity', label: 'Attività', icon: '📜' },
+    { path: '/positions', label: 'Fatture', icon: '📋' },
     { path: '/system', label: 'Sistema', icon: '⚙️' },
   ]
 
@@ -96,11 +92,9 @@ export default function App() {
         <div className="flex-1 overflow-auto p-8">
           <Routes>
             <Route path="/" element={<Dashboard />} />
-            <Route path="/positions" element={<Positions />} />
-            <Route path="/messages" element={<Messages />} />
             <Route path="/customers" element={<Customers />} />
             <Route path="/customers/:customerId" element={<ClientDetail />} />
-            <Route path="/activity" element={<Activity />} />
+            <Route path="/positions" element={<Positions />} />
             <Route path="/system" element={<System />} />
           </Routes>
         </div>
