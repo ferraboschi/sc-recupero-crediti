@@ -180,6 +180,12 @@ export default function Customers() {
                     >
                       Fatt. Scadute{sortArrow('overdue_count')}
                     </th>
+                    <th
+                      className="px-4 py-3 text-center text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
+                      onClick={() => handleSort('earliest_due_date')}
+                    >
+                      Scadenza{sortArrow('earliest_due_date')}
+                    </th>
                     <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
                     <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Pross. Azione</th>
                     <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Telefono</th>
@@ -221,6 +227,11 @@ export default function Customers() {
                         ) : (
                           <span className="text-slate-400 text-xs">0</span>
                         )}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-center text-slate-600">
+                        {customer.earliest_due_date ? (
+                          <span className="text-xs">{formatDate(customer.earliest_due_date)}</span>
+                        ) : '-'}
                       </td>
                       <td className="px-4 py-3 text-sm text-center">
                         <span className={`${STATUS_COLORS[customer.recovery_status] || STATUS_COLORS.idle} px-2 py-0.5 rounded-full text-xs font-medium`}>

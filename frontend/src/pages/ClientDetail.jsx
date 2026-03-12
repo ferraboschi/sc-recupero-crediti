@@ -56,10 +56,13 @@ export default function ClientDetail() {
   const [actionNotes, setActionNotes] = useState('')
   const [showNoteInput, setShowNoteInput] = useState(false)
   const [pdfLoading, setPdfLoading] = useState(false)
+  const [singlePdfLoading, setSinglePdfLoading] = useState(null)
   const [selectedInvoices, setSelectedInvoices] = useState(new Set())
   const [phoneEdit, setPhoneEdit] = useState(null)
   const [updatingInvoice, setUpdatingInvoice] = useState(null)
   const [showAllInvoices, setShowAllInvoices] = useState(false)
+  const [invoiceSortBy, setInvoiceSortBy] = useState('due_date')
+  const [invoiceSortOrder, setInvoiceSortOrder] = useState('asc')
 
   const fetchData = useCallback(async () => {
     try {
@@ -109,12 +112,15 @@ export default function ClientDetail() {
     }
   }
 
-  const handleDownloadPdf = async () => {
+  // Download PDF riepilogativo for SELECTED invoices
+  const handleDownloadPdfSelected = async () => {
+    if (selectedInvoices.size === 0) return
     setPdfLoading(true)
     try {
-      const response = await client.get(`/recovery/customers/${customerId}/pdf-riepilogativo`, {
+      const ids = Array.from(selectedInvoices).join(',')
+      const response = await client.get(`/recovery/customers/${customerId}/pdf-selected`, {
         responseType: 'blob',
-        params: { overdue_only: true },
+        params: { invoice_ids: ids },
       })
       const url = window.URL.createObjectURL(new Blob([response.data]))
       const link = document.createElement('a')
@@ -129,6 +135,29 @@ export default function ClientDetail() {
       alert('Errore nella generazione del PDF')
     } finally {
       setPdfLoading(false)
+    }
+  }
+
+  // Download single invoice PDF
+  const handleDownloadSinglePdf = async (invoiceId, invoiceNumber) => {
+    setSinglePdfLoading(invoiceId)
+    try {
+      const response = await client.get(`/recovery/invoices/${invoiceId}/pdf`, {
+        responseType: 'blob',
+      })
+      const url = window.URL.createObjectURL(new Blob([response.data]))
+      const link = document.createElement('a')
+      link.href = url
+      link.setAttribute('download', `fattura_${invoiceNumber?.replace(/\//g, '_')}.pdf`)
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      window.URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error('Error downloading single PDF:', err)
+      alert('Errore nella generazione del PDF')
+    } finally {
+      setSinglePdfLoading(null)
     }
   }
 
@@ -215,6 +244,21 @@ export default function ClientDetail() {
     window.open(url, '_blank')
   }
 
+  // Invoice sorting
+  const handleInvoiceSort = (field) => {
+    if (invoiceSortBy === field) {
+      setInvoiceSortOrder(invoiceSortOrder === 'asc' ? 'desc' : 'asc')
+    } else {
+      setInvoiceSortBy(field)
+      setInvoiceSortOrder(field === 'due_date' ? 'asc' : 'desc')
+    }
+  }
+
+  const invoiceSortArrow = (field) => {
+    if (invoiceSortBy !== field) return ''
+    return invoiceSortOrder === 'asc' ? ' ↑' : ' ↓'
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-96">
@@ -234,9 +278,30 @@ export default function ClientDetail() {
   const whatsappNumber = data.phone ? data.phone.replace(/[^+\d]/g, '') : null
 
   // By default show only overdue, unless user toggles
-  const visibleInvoices = showAllInvoices
+  let visibleInvoices = showAllInvoices
     ? (data.invoices?.items || [])
     : overdueInvoices
+
+  // Sort visible invoices
+  visibleInvoices = [...visibleInvoices].sort((a, b) => {
+    let valA, valB
+    if (invoiceSortBy === 'due_date') {
+      valA = a.due_date || '9999-12-31'
+      valB = b.due_date || '9999-12-31'
+    } else if (invoiceSortBy === 'amount_due') {
+      valA = a.amount_due
+      valB = b.amount_due
+    } else if (invoiceSortBy === 'days_overdue') {
+      valA = a.days_overdue || 0
+      valB = b.days_overdue || 0
+    } else {
+      valA = a.invoice_number
+      valB = b.invoice_number
+    }
+    if (valA < valB) return invoiceSortOrder === 'asc' ? -1 : 1
+    if (valA > valB) return invoiceSortOrder === 'asc' ? 1 : -1
+    return 0
+  })
 
   const selectedTotal = (data.invoices?.items || [])
     .filter(inv => selectedInvoices.has(inv.id))
@@ -324,58 +389,196 @@ export default function ClientDetail() {
         </div>
       </div>
 
-      {/* WhatsApp Send Section — prominent when invoices are selected */}
-      {whatsappNumber && selectedInvoices.size > 0 && (
-        <div className="bg-green-50 rounded-lg p-4 border border-green-200">
+      {/* ═══════════════════════════════════════════════════════ */}
+      {/* SEZIONE 1: FATTURE — select invoices, per-row PDF, riepilogativo */}
+      {/* ═══════════════════════════════════════════════════════ */}
+      <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-200">
           <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium text-green-900">
-                {selectedInvoices.size} fattur{selectedInvoices.size === 1 ? 'a' : 'e'} selezionat{selectedInvoices.size === 1 ? 'a' : 'e'} — {formatCurrency(selectedTotal)}
-              </p>
-              <p className="text-xs text-green-700 mt-1">
-                Invia un messaggio WhatsApp con il riepilogo delle fatture selezionate
-              </p>
-            </div>
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-4">
+              <h2 className="text-lg font-bold text-slate-900">
+                {showAllInvoices ? `Tutte le Fatture (${data.invoices?.count || 0})` : `Fatture Scadute (${overdueInvoices.length})`}
+              </h2>
               <button
-                onClick={handleDownloadPdf}
-                disabled={pdfLoading}
-                className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700 disabled:opacity-50"
+                onClick={() => setShowAllInvoices(!showAllInvoices)}
+                className="text-sm text-blue-600 hover:text-blue-800 font-medium"
               >
-                {pdfLoading ? '...' : 'PDF'}
-              </button>
-              <button
-                onClick={handleWhatsAppSend}
-                className="px-6 py-2 bg-green-600 text-white rounded-lg text-sm font-bold hover:bg-green-700 flex items-center gap-2"
-              >
-                <span>Invia WhatsApp</span>
+                {showAllInvoices ? 'Solo Scadute' : 'Mostra Tutte'}
               </button>
             </div>
+            <button
+              onClick={selectAllOverdue}
+              className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+            >
+              Seleziona Scadute
+            </button>
           </div>
         </div>
-      )}
 
-      {/* No phone warning */}
-      {!whatsappNumber && overdueInvoices.length > 0 && (
-        <div className="bg-yellow-50 rounded-lg p-4 border border-yellow-200 flex items-center justify-between">
-          <div>
-            <p className="text-sm font-medium text-yellow-900">
-              Telefono mancante — impossibile inviare WhatsApp
-            </p>
-            <p className="text-xs text-yellow-700 mt-1">
-              Aggiungi il numero di telefono per poter inviare il riepilogo fatture
-            </p>
-          </div>
-          <button
-            onClick={() => setPhoneEdit(data.phone || '')}
-            className="px-4 py-2 bg-yellow-600 text-white rounded-lg text-sm font-medium hover:bg-yellow-700"
-          >
-            Aggiungi Telefono
-          </button>
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead className="bg-slate-50 border-b border-slate-200">
+              <tr>
+                <th className="px-3 py-3 text-center text-sm font-semibold text-slate-600 w-10">
+                  <input
+                    type="checkbox"
+                    checked={selectedInvoices.size === allUnpaid.length && allUnpaid.length > 0}
+                    onChange={() => {
+                      if (selectedInvoices.size === allUnpaid.length) {
+                        setSelectedInvoices(new Set())
+                      } else {
+                        setSelectedInvoices(new Set(allUnpaid.map(i => i.id)))
+                      }
+                    }}
+                    className="rounded"
+                  />
+                </th>
+                <th
+                  className="px-3 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
+                  onClick={() => handleInvoiceSort('invoice_number')}
+                >
+                  Fattura{invoiceSortArrow('invoice_number')}
+                </th>
+                <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fonte</th>
+                <th
+                  className="px-3 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
+                  onClick={() => handleInvoiceSort('amount_due')}
+                >
+                  Dovuto{invoiceSortArrow('amount_due')}
+                </th>
+                <th
+                  className="px-3 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
+                  onClick={() => handleInvoiceSort('due_date')}
+                >
+                  Scadenza{invoiceSortArrow('due_date')}
+                </th>
+                <th
+                  className="px-3 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
+                  onClick={() => handleInvoiceSort('days_overdue')}
+                >
+                  GG{invoiceSortArrow('days_overdue')}
+                </th>
+                <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
+                <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Azioni</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-200">
+              {visibleInvoices.map(inv => (
+                <tr
+                  key={inv.id}
+                  className={`
+                    ${inv.status === 'paid' ? 'bg-green-50 opacity-60' : ''}
+                    ${inv.days_overdue > 0 && inv.status !== 'paid' ? 'bg-red-50' : ''}
+                    ${selectedInvoices.has(inv.id) ? 'ring-2 ring-inset ring-blue-300' : ''}
+                    hover:bg-slate-50
+                  `}
+                >
+                  <td className="px-3 py-3 text-center">
+                    <input
+                      type="checkbox"
+                      checked={selectedInvoices.has(inv.id)}
+                      onChange={() => toggleInvoiceSelection(inv.id)}
+                      className="rounded"
+                      disabled={inv.status === 'paid'}
+                    />
+                  </td>
+                  <td className="px-3 py-3 text-sm font-medium text-slate-900">{inv.invoice_number}</td>
+                  <td className="px-3 py-3 text-sm">
+                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                      inv.source_platform === 'fatturapro' ? 'bg-indigo-100 text-indigo-700' : 'bg-teal-100 text-teal-700'
+                    }`}>
+                      {inv.source_platform === 'fatturapro' ? 'FPro' : 'F24'}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 text-sm text-right font-medium">{formatCurrency(inv.amount_due)}</td>
+                  <td className="px-3 py-3 text-sm text-slate-600">{formatDate(inv.due_date)}</td>
+                  <td className="px-3 py-3 text-sm text-right">
+                    <span className={inv.days_overdue > 30 ? 'text-red-600 font-medium' : 'text-slate-600'}>
+                      {inv.days_overdue || 0}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 text-sm text-center">
+                    <span className={`${INVOICE_STATUS_COLORS[inv.status] || 'bg-slate-100 text-slate-600'} px-2 py-1 rounded-full text-xs font-medium`}>
+                      {inv.status === 'open' ? 'Aperto' : inv.status === 'paid' ? 'Pagato' : inv.status}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 text-sm text-center">
+                    <div className="flex items-center justify-center gap-1">
+                      {/* Per-row PDF download */}
+                      <button
+                        onClick={() => handleDownloadSinglePdf(inv.id, inv.invoice_number)}
+                        disabled={singlePdfLoading === inv.id}
+                        className="px-2 py-1 bg-amber-100 text-amber-700 rounded text-xs font-medium hover:bg-amber-200 disabled:opacity-50"
+                        title="Scarica PDF"
+                      >
+                        {singlePdfLoading === inv.id ? '...' : 'PDF'}
+                      </button>
+                      {inv.status !== 'paid' ? (
+                        <button
+                          onClick={() => handleMarkPaid(inv.id)}
+                          disabled={updatingInvoice === inv.id}
+                          className="px-2 py-1 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700 disabled:opacity-50"
+                        >
+                          {updatingInvoice === inv.id ? '...' : 'Pagato'}
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => handleReopenInvoice(inv.id)}
+                          disabled={updatingInvoice === inv.id}
+                          className="px-2 py-1 bg-slate-200 text-slate-600 rounded text-xs font-medium hover:bg-slate-300 disabled:opacity-50"
+                        >
+                          {updatingInvoice === inv.id ? '...' : 'Riapri'}
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
-      )}
 
-      {/* Recovery Actions */}
+        {/* Action bar for selected invoices */}
+        {selectedInvoices.size > 0 && (
+          <div className="px-6 py-4 bg-green-50 border-t border-green-200">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-green-900">
+                  {selectedInvoices.size} fattur{selectedInvoices.size === 1 ? 'a' : 'e'} selezionat{selectedInvoices.size === 1 ? 'a' : 'e'} — {formatCurrency(selectedTotal)}
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={handleDownloadPdfSelected}
+                  disabled={pdfLoading}
+                  className="px-5 py-2 bg-amber-600 text-white rounded-lg text-sm font-bold hover:bg-amber-700 disabled:opacity-50 flex items-center gap-2"
+                >
+                  {pdfLoading ? '...' : 'Genera PDF Riepilogativo'}
+                </button>
+                {whatsappNumber ? (
+                  <button
+                    onClick={handleWhatsAppSend}
+                    className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-bold hover:bg-green-700 flex items-center gap-2"
+                  >
+                    Invia WhatsApp
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => setPhoneEdit(data.phone || '')}
+                    className="px-5 py-2 bg-yellow-500 text-white rounded-lg text-sm font-bold hover:bg-yellow-600"
+                  >
+                    Aggiungi Tel per WhatsApp
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ═══════════════════════════════════════════════════════ */}
+      {/* SEZIONE 2: AZIONI DI RECUPERO */}
+      {/* ═══════════════════════════════════════════════════════ */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
         <h2 className="text-lg font-bold text-slate-900 mb-4">Azioni di Recupero</h2>
 
@@ -446,118 +649,97 @@ export default function ClientDetail() {
         )}
       </div>
 
-      {/* Invoices Table */}
-      <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
-        <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <h2 className="text-lg font-bold text-slate-900">
-              {showAllInvoices ? `Tutte le Fatture (${data.invoices?.count || 0})` : `Fatture Scadute (${overdueInvoices.length})`}
-            </h2>
-            <button
-              onClick={() => setShowAllInvoices(!showAllInvoices)}
-              className="text-sm text-blue-600 hover:text-blue-800 font-medium"
-            >
-              {showAllInvoices ? 'Solo Scadute' : 'Mostra Tutte'}
-            </button>
+      {/* ═══════════════════════════════════════════════════════ */}
+      {/* SEZIONE 3: RIEPILOGO — summary status after actions */}
+      {/* ═══════════════════════════════════════════════════════ */}
+      <div className="bg-white rounded-lg p-6 border border-slate-200">
+        <h2 className="text-lg font-bold text-slate-900 mb-4">Riepilogo</h2>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {/* Status */}
+          <div className="border border-slate-200 rounded-lg p-4">
+            <p className="text-xs text-slate-500 mb-1">Stato Recupero</p>
+            <span className={`${STATUS_COLORS[data.recovery_status] || STATUS_COLORS.idle} px-3 py-1 rounded-full text-sm font-medium`}>
+              {STATUS_LABELS[data.recovery_status] || 'Da Gestire'}
+            </span>
           </div>
-          <button
-            onClick={selectAllOverdue}
-            className="text-sm text-blue-600 hover:text-blue-800 font-medium"
-          >
-            Seleziona Scadute
-          </button>
+
+          {/* Next action */}
+          <div className="border border-slate-200 rounded-lg p-4">
+            <p className="text-xs text-slate-500 mb-1">Prossima Azione</p>
+            {data.next_action_date ? (
+              <div>
+                <p className="text-sm font-medium text-slate-900">
+                  {ACTION_LABELS[data.next_action_type] || data.next_action_type || '-'}
+                </p>
+                <p className="text-xs text-blue-600">{formatDate(data.next_action_date)}</p>
+              </div>
+            ) : (
+              <p className="text-sm text-slate-400">Nessuna pianificata</p>
+            )}
+          </div>
+
+          {/* Actions taken */}
+          <div className="border border-slate-200 rounded-lg p-4">
+            <p className="text-xs text-slate-500 mb-1">Azioni Effettuate</p>
+            <p className="text-xl font-bold text-slate-900">{data.recovery_actions?.length || 0}</p>
+          </div>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead className="bg-slate-50 border-b border-slate-200">
-              <tr>
-                <th className="px-3 py-3 text-center text-sm font-semibold text-slate-600 w-10">
-                  <input
-                    type="checkbox"
-                    checked={selectedInvoices.size === allUnpaid.length && allUnpaid.length > 0}
-                    onChange={() => {
-                      if (selectedInvoices.size === allUnpaid.length) {
-                        setSelectedInvoices(new Set())
-                      } else {
-                        setSelectedInvoices(new Set(allUnpaid.map(i => i.id)))
-                      }
-                    }}
-                    className="rounded"
-                  />
-                </th>
-                <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fattura</th>
-                <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fonte</th>
-                <th className="px-3 py-3 text-right text-sm font-semibold text-slate-900">Dovuto</th>
-                <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Scadenza</th>
-                <th className="px-3 py-3 text-right text-sm font-semibold text-slate-900">GG</th>
-                <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
-                <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Azioni</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-200">
-              {visibleInvoices.map(inv => (
-                <tr
-                  key={inv.id}
-                  className={`
-                    ${inv.status === 'paid' ? 'bg-green-50 opacity-60' : ''}
-                    ${inv.days_overdue > 0 && inv.status !== 'paid' ? 'bg-red-50' : ''}
-                    ${selectedInvoices.has(inv.id) ? 'ring-2 ring-inset ring-blue-300' : ''}
-                    hover:bg-slate-50
-                  `}
+        {/* Financial summary */}
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="border border-red-200 rounded-lg p-4 bg-red-50">
+            <p className="text-xs text-red-600 mb-1">Scaduto</p>
+            <p className="text-lg font-bold text-red-700">{formatCurrency(totalOverdue)}</p>
+            <p className="text-xs text-red-500">{overdueInvoices.length} fatture</p>
+          </div>
+          <div className="border border-blue-200 rounded-lg p-4 bg-blue-50">
+            <p className="text-xs text-blue-600 mb-1">Totale Dovuto</p>
+            <p className="text-lg font-bold text-blue-700">{formatCurrency(data.invoices?.total_due || 0)}</p>
+            <p className="text-xs text-blue-500">{allUnpaid.length} fatture non pagate</p>
+          </div>
+          <div className="border border-green-200 rounded-lg p-4 bg-green-50">
+            <p className="text-xs text-green-600 mb-1">Pagato</p>
+            <p className="text-lg font-bold text-green-700">
+              {formatCurrency(
+                (data.invoices?.items || [])
+                  .filter(inv => inv.status === 'paid')
+                  .reduce((sum, inv) => sum + inv.amount_due, 0)
+              )}
+            </p>
+            <p className="text-xs text-green-500">
+              {(data.invoices?.items || []).filter(inv => inv.status === 'paid').length} fatture pagate
+            </p>
+          </div>
+        </div>
+
+        {/* Quick actions from riepilogo */}
+        <div className="mt-4 pt-4 border-t border-slate-200 flex flex-wrap gap-3">
+          {selectedInvoices.size > 0 && (
+            <>
+              <button
+                onClick={handleDownloadPdfSelected}
+                disabled={pdfLoading}
+                className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700 disabled:opacity-50"
+              >
+                {pdfLoading ? '...' : 'Genera PDF Riepilogativo'}
+              </button>
+              {whatsappNumber && (
+                <button
+                  onClick={handleWhatsAppSend}
+                  className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700"
                 >
-                  <td className="px-3 py-3 text-center">
-                    <input
-                      type="checkbox"
-                      checked={selectedInvoices.has(inv.id)}
-                      onChange={() => toggleInvoiceSelection(inv.id)}
-                      className="rounded"
-                      disabled={inv.status === 'paid'}
-                    />
-                  </td>
-                  <td className="px-3 py-3 text-sm font-medium text-slate-900">{inv.invoice_number}</td>
-                  <td className="px-3 py-3 text-sm">
-                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${
-                      inv.source_platform === 'fatturapro' ? 'bg-indigo-100 text-indigo-700' : 'bg-teal-100 text-teal-700'
-                    }`}>
-                      {inv.source_platform === 'fatturapro' ? 'FPro' : 'F24'}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 text-sm text-right font-medium">{formatCurrency(inv.amount_due)}</td>
-                  <td className="px-3 py-3 text-sm text-slate-600">{formatDate(inv.due_date)}</td>
-                  <td className="px-3 py-3 text-sm text-right">
-                    <span className={inv.days_overdue > 30 ? 'text-red-600 font-medium' : 'text-slate-600'}>
-                      {inv.days_overdue || 0}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 text-sm text-center">
-                    <span className={`${INVOICE_STATUS_COLORS[inv.status] || 'bg-slate-100 text-slate-600'} px-2 py-1 rounded-full text-xs font-medium`}>
-                      {inv.status === 'open' ? 'Aperto' : inv.status === 'paid' ? 'Pagato' : inv.status}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 text-sm text-center">
-                    {inv.status !== 'paid' ? (
-                      <button
-                        onClick={() => handleMarkPaid(inv.id)}
-                        disabled={updatingInvoice === inv.id}
-                        className="px-2 py-1 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700 disabled:opacity-50"
-                      >
-                        {updatingInvoice === inv.id ? '...' : 'Pagato'}
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => handleReopenInvoice(inv.id)}
-                        disabled={updatingInvoice === inv.id}
-                        className="px-2 py-1 bg-slate-200 text-slate-600 rounded text-xs font-medium hover:bg-slate-300 disabled:opacity-50"
-                      >
-                        {updatingInvoice === inv.id ? '...' : 'Riapri'}
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                  Invia WhatsApp
+                </button>
+              )}
+            </>
+          )}
+          <button
+            onClick={() => navigate('/customers')}
+            className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium hover:bg-slate-200"
+          >
+            Torna alla Lista
+          </button>
         </div>
       </div>
     </div>
