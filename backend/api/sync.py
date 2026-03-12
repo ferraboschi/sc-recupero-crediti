@@ -299,7 +299,9 @@ def _sync_customers_task() -> dict:
     try:
         # Phase 1: Shopify sync (isolated — failure here must NOT block Phase 2)
         try:
-            if config.SHOPIFY_ACCESS_TOKEN:
+            if config.SHOPIFY_ACCESS_TOKEN or (
+                config.SHOPIFY_CLIENT_ID and config.SHOPIFY_CLIENT_SECRET
+            ):
                 logger.info("Syncing customers from Shopify...")
                 shopify = ShopifyConnector()
                 raw_customers = shopify.fetch_b2b_customers()

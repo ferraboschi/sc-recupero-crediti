@@ -239,7 +239,7 @@ async def get_system_status():
                 alerts.append({
                     "level": "error",
                     "component": "shopify",
-                    "message": "Token Shopify scaduto/invalido — rigenerare da Shopify Admin → Apps → Manage private apps e aggiornare SHOPIFY_ACCESS_TOKEN su Render"
+                    "message": "Shopify non raggiungibile — verificare SHOPIFY_CLIENT_ID e SHOPIFY_CLIENT_SECRET su Render"
                 })
             else:
                 alerts.append({

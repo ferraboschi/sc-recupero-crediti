@@ -26,6 +26,8 @@ class Config:
     # Shopify
     SHOPIFY_STORE_URL = os.getenv("SHOPIFY_STORE_URL", "")
     SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN", "")
+    SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "")
+    SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "")
     SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10")
     SHOPIFY_PIVA_FIELD = os.getenv("SHOPIFY_PIVA_FIELD", "address2")
 
@@ -68,7 +70,10 @@ class Config:
         return {
             "fatturapro": bool(cls.FATTURAPRO_API_KEY),
             "fattura24": bool(cls.FATTURA24_API_KEY),
-            "shopify": bool(cls.SHOPIFY_ACCESS_TOKEN),
+            "shopify": bool(
+                cls.SHOPIFY_ACCESS_TOKEN
+                or (cls.SHOPIFY_CLIENT_ID and cls.SHOPIFY_CLIENT_SECRET)
+            ),
             "twilio": bool(cls.TWILIO_ACCOUNT_SID and cls.TWILIO_AUTH_TOKEN),
         }
 

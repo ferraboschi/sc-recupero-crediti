@@ -1,11 +1,10 @@
 """Shopify Admin REST API connector for B2B customer data retrieval."""
 
 import logging
-import re
 from typing import Optional, List, Dict, Any
-from urllib.parse import urlparse, parse_qs
 from backend.connectors.base import BaseConnector
 from backend.config import config
+from backend.shopify_token import get_shopify_token
 
 logger = logging.getLogger(__name__)
 
@@ -15,20 +14,27 @@ class ShopifyConnector(BaseConnector):
 
     def __init__(self):
         """Initialize Shopify connector with store URL and access token."""
-        if not config.SHOPIFY_STORE_URL or not config.SHOPIFY_ACCESS_TOKEN:
-            raise ValueError("SHOPIFY_STORE_URL and SHOPIFY_ACCESS_TOKEN must be configured")
+        has_credentials = (
+            config.SHOPIFY_CLIENT_ID and config.SHOPIFY_CLIENT_SECRET
+        )
+        if not config.SHOPIFY_STORE_URL or (
+            not config.SHOPIFY_ACCESS_TOKEN and not has_credentials
+        ):
+            raise ValueError(
+                "SHOPIFY_STORE_URL and either SHOPIFY_ACCESS_TOKEN "
+                "or SHOPIFY_CLIENT_ID+SECRET must be configured"
+            )
 
         base_url = config.shopify_api_base()
         super().__init__(base_url=base_url, timeout=30, max_retries=3)
 
-        self.access_token = config.SHOPIFY_ACCESS_TOKEN
         self.store_url = config.SHOPIFY_STORE_URL
         self.api_version = config.SHOPIFY_API_VERSION
 
     def _get_headers(self) -> Dict[str, str]:
-        """Return headers for Shopify API requests."""
+        """Return headers for Shopify API requests (token auto-refreshes)."""
         return {
-            "X-Shopify-Access-Token": self.access_token,
+            "X-Shopify-Access-Token": get_shopify_token(),
             "Content-Type": "application/json",
         }
 
