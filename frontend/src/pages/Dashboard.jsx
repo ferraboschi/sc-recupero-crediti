@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { PieChart, Pie, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Cell } from 'recharts'
 import client from '../api/client'
 import StatsWidget from '../components/StatsWidget'
 
@@ -32,6 +31,10 @@ const PRIORITY_CONFIG = {
   upcoming: { label: 'Prossimamente', bg: 'bg-slate-50', border: 'border-slate-200', badge: 'bg-slate-500 text-white' },
 }
 
+const WEEKDAYS = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom']
+const MONTH_NAMES = ['Gennaio', 'Febbraio', 'Marzo', 'Aprile', 'Maggio', 'Giugno',
+  'Luglio', 'Agosto', 'Settembre', 'Ottobre', 'Novembre', 'Dicembre']
+
 export default function Dashboard() {
   const navigate = useNavigate()
   const [loading, setLoading] = useState(true)
@@ -44,6 +47,14 @@ export default function Dashboard() {
   const [todoCounts, setTodoCounts] = useState({})
   const [todoLoading, setTodoLoading] = useState(true)
   const [retryCount, setRetryCount] = useState(0)
+
+  // Calendar state
+  const now = new Date()
+  const [calYear, setCalYear] = useState(now.getFullYear())
+  const [calMonth, setCalMonth] = useState(now.getMonth() + 1)
+  const [calData, setCalData] = useState(null)
+  const [calLoading, setCalLoading] = useState(true)
+  const [selectedDay, setSelectedDay] = useState(null)
 
   const fetchData = async (retry = 0) => {
     try {
@@ -81,10 +92,26 @@ export default function Dashboard() {
     }
   }
 
+  const fetchCalendar = async (y, m) => {
+    try {
+      setCalLoading(true)
+      const response = await client.get('/dashboard/calendar', { params: { year: y, month: m } })
+      setCalData(response.data)
+    } catch (err) {
+      console.error('Error fetching calendar:', err)
+    } finally {
+      setCalLoading(false)
+    }
+  }
+
   useEffect(() => {
     fetchData()
     fetchTodos()
   }, [])
+
+  useEffect(() => {
+    fetchCalendar(calYear, calMonth)
+  }, [calYear, calMonth])
 
   const handleSync = async () => {
     setSyncing(true)
@@ -92,11 +119,12 @@ export default function Dashboard() {
     try {
       await client.post('/sync/full')
       setSyncMessage('Sincronizzazione completata con successo')
-      const now = new Date()
-      setLastSync(now)
-      localStorage.setItem('lastSyncTime', now.toISOString())
+      const syncNow = new Date()
+      setLastSync(syncNow)
+      localStorage.setItem('lastSyncTime', syncNow.toISOString())
       await fetchData()
       await fetchTodos()
+      await fetchCalendar(calYear, calMonth)
       setTimeout(() => setSyncMessage(''), 3000)
     } catch (err) {
       setSyncMessage('Errore nella sincronizzazione')
@@ -114,12 +142,36 @@ export default function Dashboard() {
     return new Date(dateStr).toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric', month: 'short' })
   }
 
-  function getStatusLabel(status) {
-    const labels = {
-      open: 'Aperto', contacted: 'Contattato', promised: 'Promesso',
-      paid: 'Pagato', disputed: 'Contestato', escalated: 'Escalato',
+  const prevMonth = () => {
+    if (calMonth === 1) { setCalMonth(12); setCalYear(calYear - 1) }
+    else setCalMonth(calMonth - 1)
+    setSelectedDay(null)
+  }
+  const nextMonth = () => {
+    if (calMonth === 12) { setCalMonth(1); setCalYear(calYear + 1) }
+    else setCalMonth(calMonth + 1)
+    setSelectedDay(null)
+  }
+
+  // Build calendar grid
+  const buildCalendarDays = () => {
+    if (!calData) return []
+    const start = new Date(calData.start)
+    const end = new Date(calData.end)
+    const days = []
+    const d = new Date(start)
+    while (d <= end) {
+      const iso = d.toISOString().split('T')[0]
+      days.push({
+        date: iso,
+        day: d.getDate(),
+        isCurrentMonth: d.getMonth() + 1 === calMonth,
+        isToday: iso === new Date().toISOString().split('T')[0],
+        actions: calData.days[iso] || [],
+      })
+      d.setDate(d.getDate() + 1)
     }
-    return labels[status] || status
+    return days
   }
 
   if (loading) {
@@ -159,15 +211,6 @@ export default function Dashboard() {
   }
 
   if (!data) return null
-
-  const statusData = Object.entries(data.positions_by_status || {}).map(([status, info]) => ({
-    name: getStatusLabel(status), value: info.count, amount: info.amount,
-  }))
-  const escalationData = Object.entries(data.positions_by_escalation_level || {}).map(([level, info]) => ({
-    name: `Livello ${level}`, count: info.count, amount: info.amount,
-  }))
-
-  const COLORS = ['#3b82f6', '#f59e0b', '#a855f7', '#10b981', '#ef4444', '#f97316']
 
   // Group todos by priority
   const todosByPriority = {}
@@ -239,13 +282,14 @@ export default function Dashboard() {
   }
 
   const totalTodoOverdue = todos.reduce((sum, t) => sum + (t.total_overdue || 0), 0)
+  const calendarDays = buildCalendarDays()
+  const selectedDayActions = selectedDay && calData?.days?.[selectedDay] ? calData.days[selectedDay] : null
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       {/* Sync Bar */}
-      <div className="bg-white rounded-lg p-6 border border-slate-200 flex items-center justify-between">
+      <div className="bg-white rounded-lg p-4 border border-slate-200 flex items-center justify-between">
         <div>
-          <h3 className="font-medium text-slate-900 mb-2">Stato Sincronizzazione</h3>
           <p className="text-sm text-slate-600">
             {lastSync ? `Ultimo aggiornamento: ${lastSync.toLocaleString('it-IT')}` : 'Nessuna sincronizzazione eseguita'}
           </p>
@@ -266,110 +310,168 @@ export default function Dashboard() {
       </div>
 
       {/* Top Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatsWidget label="Totale Scaduto" value={formatCurrency(data.total_scaduto || 0)} color="red" />
         <StatsWidget label="Fatture Scadute" value={data.total_fatture_scadute || 0} color="orange" />
         <StatsWidget label="Clienti con Scaduto" value={data.total_clienti_scaduti || 0} color="purple" />
         <StatsWidget label="Da Gestire" value={todos.length || 0} color="blue" />
       </div>
 
-      {/* TODO Section — primary focus */}
-      <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-3">
-            <h2 className="text-lg font-bold text-slate-900">Da Fare</h2>
-            {todos.length > 0 && (
-              <span className="bg-red-100 text-red-700 px-2.5 py-0.5 rounded-full text-sm font-bold">
-                {todos.length}
-              </span>
+      {/* Main content: 2-column layout */}
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+
+        {/* LEFT: TODO Section (3 cols) */}
+        <div className="lg:col-span-3 bg-white rounded-lg p-6 border border-slate-200">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-3">
+              <h2 className="text-lg font-bold text-slate-900">Da Fare</h2>
+              {todos.length > 0 && (
+                <span className="bg-red-100 text-red-700 px-2.5 py-0.5 rounded-full text-sm font-bold">
+                  {todos.length}
+                </span>
+              )}
+            </div>
+            {totalTodoOverdue > 0 && (
+              <div className="text-right">
+                <p className="text-xs text-slate-500">Totale in gestione</p>
+                <p className="text-lg font-bold text-red-600">{formatCurrency(totalTodoOverdue)}</p>
+              </div>
             )}
           </div>
-          {totalTodoOverdue > 0 && (
-            <div className="text-right">
-              <p className="text-sm text-slate-500">Totale scaduto in gestione</p>
-              <p className="text-lg font-bold text-red-600">{formatCurrency(totalTodoOverdue)}</p>
+
+          {todoLoading ? (
+            <p className="text-slate-500 text-center py-4">Caricamento...</p>
+          ) : todos.length === 0 ? (
+            <div className="text-center py-8">
+              <p className="text-slate-500 mb-2">Nessuna azione da fare</p>
+              <p className="text-sm text-slate-400">Sincronizza le fatture e vai nella scheda Clienti per iniziare.</p>
+            </div>
+          ) : (
+            <div className="space-y-4 max-h-[600px] overflow-y-auto">
+              {['overdue', 'today', 'new', 'upcoming'].map(p => renderTodoSection(p))}
             </div>
           )}
         </div>
 
-        {todoLoading ? (
-          <p className="text-slate-500 text-center py-4">Caricamento...</p>
-        ) : todos.length === 0 ? (
-          <div className="text-center py-8">
-            <p className="text-slate-500 mb-2">Nessuna azione da fare</p>
-            <p className="text-sm text-slate-400">Sincronizza le fatture e vai nella scheda Clienti per iniziare il flusso di recupero.</p>
+        {/* RIGHT: Calendar (2 cols) */}
+        <div className="lg:col-span-2 bg-white rounded-lg p-6 border border-slate-200">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-bold text-slate-900">Calendario Azioni</h2>
+            <div className="flex items-center gap-2">
+              <button onClick={prevMonth} className="p-1.5 hover:bg-slate-100 rounded text-slate-600 text-sm font-bold">&lt;</button>
+              <span className="text-sm font-medium text-slate-700 min-w-[130px] text-center">
+                {MONTH_NAMES[calMonth - 1]} {calYear}
+              </span>
+              <button onClick={nextMonth} className="p-1.5 hover:bg-slate-100 rounded text-slate-600 text-sm font-bold">&gt;</button>
+            </div>
           </div>
-        ) : (
-          <div className="space-y-4">
-            {['overdue', 'today', 'new', 'upcoming'].map(p => renderTodoSection(p))}
-          </div>
-        )}
-      </div>
 
-      {/* Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="bg-white rounded-lg p-6 border border-slate-200">
-          <h2 className="text-lg font-bold text-slate-900 mb-4">Distribuzione per Stato</h2>
-          {statusData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={300}>
-              <PieChart>
-                <Pie data={statusData} cx="50%" cy="50%" labelLine={false}
-                  label={({ name, value }) => `${name}: ${value}`}
-                  outerRadius={80} fill="#8884d8" dataKey="value">
-                  {statusData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                  ))}
-                </Pie>
-                <Tooltip formatter={(value) => value} />
-              </PieChart>
-            </ResponsiveContainer>
+          {calLoading ? (
+            <p className="text-slate-500 text-center py-4">Caricamento...</p>
           ) : (
-            <p className="text-slate-500 text-center py-8">Nessun dato disponibile</p>
-          )}
-        </div>
+            <>
+              {/* Weekday headers */}
+              <div className="grid grid-cols-7 mb-1">
+                {WEEKDAYS.map(d => (
+                  <div key={d} className="text-center text-xs font-medium text-slate-400 py-1">{d}</div>
+                ))}
+              </div>
 
-        <div className="bg-white rounded-lg p-6 border border-slate-200">
-          <h2 className="text-lg font-bold text-slate-900 mb-4">Distribuzione per Livello di Escalation</h2>
-          {escalationData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={300}>
-              <BarChart data={escalationData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="name" />
-                <YAxis />
-                <Tooltip />
-                <Legend />
-                <Bar dataKey="count" fill="#3b82f6" name="Conteggio" />
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <p className="text-slate-500 text-center py-8">Nessun dato disponibile</p>
-          )}
-        </div>
-      </div>
+              {/* Calendar grid */}
+              <div className="grid grid-cols-7 gap-0.5">
+                {calendarDays.map((day) => {
+                  const hasActions = day.actions.length > 0
+                  const isSelected = selectedDay === day.date
+                  const isPast = day.date < new Date().toISOString().split('T')[0]
+                  return (
+                    <button
+                      key={day.date}
+                      onClick={() => hasActions ? setSelectedDay(isSelected ? null : day.date) : null}
+                      className={`relative p-1.5 text-center text-sm rounded transition-colors min-h-[40px]
+                        ${!day.isCurrentMonth ? 'text-slate-300' : 'text-slate-700'}
+                        ${day.isToday ? 'ring-2 ring-blue-400 font-bold' : ''}
+                        ${isSelected ? 'bg-blue-100 ring-2 ring-blue-500' : ''}
+                        ${hasActions && !isSelected ? (isPast ? 'bg-red-50 hover:bg-red-100' : 'bg-blue-50 hover:bg-blue-100') : ''}
+                        ${hasActions ? 'cursor-pointer' : 'cursor-default'}
+                      `}
+                    >
+                      {day.day}
+                      {hasActions && (
+                        <div className="flex justify-center mt-0.5 gap-0.5">
+                          {day.actions.length <= 3 ? (
+                            day.actions.map((_, i) => (
+                              <div key={i} className={`w-1.5 h-1.5 rounded-full ${isPast ? 'bg-red-400' : 'bg-blue-400'}`} />
+                            ))
+                          ) : (
+                            <span className={`text-[10px] font-bold ${isPast ? 'text-red-500' : 'text-blue-500'}`}>
+                              {day.actions.length}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </button>
+                  )
+                })}
+              </div>
 
-      {/* Recent Activity */}
-      <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <h2 className="text-lg font-bold text-slate-900 mb-4">Attività Recente</h2>
-        {data.recent_activity && data.recent_activity.length > 0 ? (
-          <div className="space-y-4">
-            {data.recent_activity.map((activity) => (
-              <div key={activity.id} className="flex items-start gap-4 pb-4 border-b border-slate-100 last:border-b-0">
-                <div className="mt-1">
-                  <div className="w-2 h-2 bg-blue-600 rounded-full"></div>
-                </div>
-                <div className="flex-1">
-                  <div className="flex items-center gap-2">
-                    <p className="font-medium text-slate-900">{activity.action}</p>
-                    <span className="text-xs bg-slate-100 text-slate-600 px-2 py-1 rounded">{activity.entity_type}</span>
+              {/* Selected day detail */}
+              {selectedDayActions && (
+                <div className="mt-4 border-t border-slate-200 pt-4">
+                  <p className="text-sm font-medium text-slate-700 mb-2">
+                    {new Date(selectedDay + 'T00:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' })}
+                    <span className="text-slate-400 ml-2">({selectedDayActions.length} azioni)</span>
+                  </p>
+                  <div className="space-y-2 max-h-[200px] overflow-y-auto">
+                    {selectedDayActions.map((a) => (
+                      <div
+                        key={a.id}
+                        onClick={() => navigate(`/customers/${a.customer_id}`)}
+                        className="flex items-center justify-between bg-slate-50 rounded-lg px-3 py-2 cursor-pointer hover:bg-blue-50 transition-colors border border-slate-100"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className={`${ACTION_BADGE_COLORS[a.action_type] || ACTION_BADGE_COLORS.idle} px-2 py-0.5 rounded text-xs font-medium border shrink-0`}>
+                            {ACTION_LABELS[a.action_type] || a.action_type}
+                          </span>
+                          <span className="text-sm font-medium text-slate-900 truncate">{a.customer_name}</span>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {a.total_overdue > 0 && (
+                            <span className="text-xs font-medium text-red-600">{formatCurrency(a.total_overdue)}</span>
+                          )}
+                          {a.phone && (
+                            <a
+                              href={`https://wa.me/${a.phone.replace(/[^+\d]/g, '')}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              className="w-5 h-5 bg-green-500 text-white rounded-full text-xs flex items-center justify-center hover:bg-green-600"
+                              title="WhatsApp"
+                            >
+                              W
+                            </a>
+                          )}
+                        </div>
+                      </div>
+                    ))}
                   </div>
-                  <p className="text-sm text-slate-600 mt-1">{new Date(activity.timestamp).toLocaleString('it-IT')}</p>
+                </div>
+              )}
+
+              {/* Legend */}
+              <div className="mt-3 flex items-center gap-4 text-xs text-slate-400">
+                <div className="flex items-center gap-1">
+                  <div className="w-2 h-2 rounded-full bg-red-400" /> Scadute
+                </div>
+                <div className="flex items-center gap-1">
+                  <div className="w-2 h-2 rounded-full bg-blue-400" /> Pianificate
+                </div>
+                <div className="flex items-center gap-1">
+                  <div className="w-2 h-2 ring-2 ring-blue-400 rounded-full" /> Oggi
                 </div>
               </div>
-            ))}
-          </div>
-        ) : (
-          <p className="text-slate-500 text-center py-8">Nessuna attività recente</p>
-        )}
+            </>
+          )}
+        </div>
       </div>
     </div>
   )

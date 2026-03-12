@@ -258,6 +258,112 @@ async def get_todos(session: Session = Depends(get_session)):
         raise
 
 
+@router.get("/calendar")
+async def get_calendar(
+    session: Session = Depends(get_session),
+    year: int = None,
+    month: int = None,
+):
+    """
+    Get calendar data for recovery actions.
+    Returns actions grouped by date for a given month.
+    Also returns overdue counts (past actions not completed).
+    """
+    from sqlalchemy import extract, case
+    try:
+        today = date.today()
+        if not year:
+            year = today.year
+        if not month:
+            month = today.month
+
+        # Get first and last day of month (with buffer for display)
+        first_day = date(year, month, 1)
+        if month == 12:
+            last_day = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            last_day = date(year, month + 1, 1) - timedelta(days=1)
+
+        # Extend range to show surrounding weeks
+        start = first_day - timedelta(days=first_day.weekday())  # Monday of first week
+        end = last_day + timedelta(days=(6 - last_day.weekday()))  # Sunday of last week
+
+        # Get all scheduled actions in range (not completed)
+        actions = (
+            session.query(RecoveryAction)
+            .join(Customer)
+            .filter(
+                RecoveryAction.scheduled_date >= start,
+                RecoveryAction.scheduled_date <= end,
+                RecoveryAction.completed_at.is_(None),
+                Customer.excluded.is_(False),
+            )
+            .order_by(RecoveryAction.scheduled_date.asc())
+            .all()
+        )
+
+        # Pre-load overdue stats
+        overdue_stats_raw = (
+            session.query(
+                Invoice.customer_id,
+                func.count(Invoice.id).label("cnt"),
+                func.sum(Invoice.amount_due).label("tot"),
+            )
+            .filter(
+                Invoice.status != "paid",
+                Invoice.days_overdue > 0,
+                Invoice.customer_id.isnot(None),
+            )
+            .group_by(Invoice.customer_id)
+            .all()
+        )
+        overdue_map = {r[0]: {"count": r[1], "total": float(r[2] or 0)} for r in overdue_stats_raw}
+
+        # Group by date
+        by_date = {}
+        for a in actions:
+            d = a.scheduled_date.isoformat()
+            if d not in by_date:
+                by_date[d] = []
+            stats = overdue_map.get(a.customer_id, {"count": 0, "total": 0})
+            by_date[d].append({
+                "id": a.id,
+                "customer_id": a.customer_id,
+                "customer_name": a.customer.ragione_sociale,
+                "phone": a.customer.phone,
+                "action_type": a.action_type,
+                "notes": a.notes,
+                "recovery_status": a.customer.recovery_status,
+                "overdue_count": stats["count"],
+                "total_overdue": stats["total"],
+            })
+
+        # Count overdue actions (scheduled before today, not completed)
+        overdue_count = (
+            session.query(func.count(RecoveryAction.id))
+            .join(Customer)
+            .filter(
+                RecoveryAction.scheduled_date < today,
+                RecoveryAction.completed_at.is_(None),
+                Customer.excluded.is_(False),
+            )
+            .scalar() or 0
+        )
+
+        return {
+            "year": year,
+            "month": month,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "overdue_count": overdue_count,
+            "days": by_date,
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching calendar: {e}", exc_info=True)
+        raise
+
+
 @router.get("/stats")
 async def get_stats(session: Session = Depends(get_session)):
     """
