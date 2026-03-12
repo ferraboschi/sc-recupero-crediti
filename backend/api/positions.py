@@ -127,11 +127,15 @@ async def list_positions(
         # Total count and sum before pagination
         from sqlalchemy import func as sqlfunc
         total = query.count()
-        summary_total_amount_due = query.with_entities(
-            sqlfunc.sum(Invoice.amount_due)
-        ).scalar() or 0.0
+        # Use subquery to compute sum without mutating the main query
+        ids_subquery = query.with_entities(Invoice.id).subquery()
+        summary_total_amount_due = float(
+            session.query(sqlfunc.sum(Invoice.amount_due))
+            .filter(Invoice.id.in_(session.query(ids_subquery)))
+            .scalar() or 0
+        )
 
-        # Get paginated results
+        # Get paginated results (query still intact since count() and with_entities above create copies)
         positions = query.offset(skip).limit(limit).all()
 
         return {

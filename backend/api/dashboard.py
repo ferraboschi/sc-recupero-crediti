@@ -125,17 +125,41 @@ async def get_todos(session: Session = Depends(get_session)):
     """
     Get todo list for the dashboard — pending recovery actions and customers needing attention.
     Groups: overdue (past due), today, upcoming (next 14 days), and idle customers with overdue invoices.
+
+    Optimized: pre-loads all overdue stats in a single query instead of N+1.
     """
     try:
         today = date.today()
 
-        # 1. Pending recovery actions (not completed, scheduled)
+        # Pre-load ALL overdue stats per customer in ONE query (avoids N+1)
+        overdue_stats_raw = (
+            session.query(
+                Invoice.customer_id,
+                func.count(Invoice.id).label("overdue_count"),
+                func.sum(Invoice.amount_due).label("total_overdue"),
+            )
+            .filter(
+                Invoice.status != "paid",
+                Invoice.days_overdue > 0,
+                Invoice.customer_id.isnot(None),
+            )
+            .group_by(Invoice.customer_id)
+            .all()
+        )
+        overdue_by_customer = {
+            row[0]: {"overdue_count": row[1], "total_overdue": float(row[2] or 0)}
+            for row in overdue_stats_raw
+        }
+
+        # 1. Pending recovery actions (not completed, scheduled within 14 days)
+        cutoff_date = today + timedelta(days=14)
         pending_actions = (
             session.query(RecoveryAction)
             .join(Customer)
             .filter(
                 RecoveryAction.completed_at.is_(None),
                 RecoveryAction.scheduled_date.isnot(None),
+                RecoveryAction.scheduled_date <= cutoff_date,
                 Customer.excluded.is_(False),
             )
             .order_by(RecoveryAction.scheduled_date.asc())
@@ -143,7 +167,6 @@ async def get_todos(session: Session = Depends(get_session)):
         )
 
         # 2. Idle customers with overdue invoices (need first contact)
-        from sqlalchemy import Integer as SqlInteger
         idle_customers_with_overdue = (
             session.query(
                 Customer,
@@ -165,27 +188,19 @@ async def get_todos(session: Session = Depends(get_session)):
         todos = []
         seen_customer_ids = set()
 
-        # Build action-based todos
+        # Build action-based todos (NO extra queries — use pre-loaded stats)
         for action in pending_actions:
             cid = action.customer_id
             seen_customer_ids.add(cid)
-            # Get overdue stats
-            overdue_invoices = session.query(Invoice).filter(
-                Invoice.customer_id == cid,
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
-            ).all()
-            total_overdue = sum(i.amount_due for i in overdue_invoices)
+            stats = overdue_by_customer.get(cid, {"overdue_count": 0, "total_overdue": 0})
 
             sched = action.scheduled_date
             if sched < today:
                 priority = "overdue"
             elif sched == today:
                 priority = "today"
-            elif sched <= today + timedelta(days=14):
-                priority = "upcoming"
             else:
-                continue  # Skip far-future
+                priority = "upcoming"
 
             todos.append({
                 "id": f"action_{action.id}",
@@ -198,8 +213,8 @@ async def get_todos(session: Session = Depends(get_session)):
                 "action_type": action.action_type,
                 "scheduled_date": sched.isoformat(),
                 "notes": action.notes,
-                "overdue_count": len(overdue_invoices),
-                "total_overdue": float(total_overdue),
+                "overdue_count": stats["overdue_count"],
+                "total_overdue": stats["total_overdue"],
                 "recovery_status": action.customer.recovery_status,
             })
 

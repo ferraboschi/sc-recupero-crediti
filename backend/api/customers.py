@@ -29,33 +29,31 @@ async def list_customers(
     Supports filtering to only_overdue customers and sorting by overdue amounts.
     """
     try:
-        # Step 1: Get all invoice stats keyed by customer_id
+        # Step 1: Get invoice stats using SQL aggregation (much faster than loading all rows)
+        from sqlalchemy import case
         raw_stats = (
             session.query(
                 Invoice.customer_id,
-                Invoice.amount_due,
-                Invoice.days_overdue,
-                Invoice.due_date,
+                func.count(Invoice.id).label("invoice_count"),
+                func.sum(Invoice.amount_due).label("total_due"),
+                func.sum(case((Invoice.days_overdue > 0, 1), else_=0)).label("overdue_count"),
+                func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).label("total_overdue"),
+                func.min(case((Invoice.days_overdue > 0, Invoice.due_date), else_=None)).label("earliest_due_date"),
             )
             .filter(Invoice.status != "paid", Invoice.customer_id.isnot(None))
+            .group_by(Invoice.customer_id)
             .all()
         )
 
         invoice_stats = {}
         for row in raw_stats:
-            cid = row[0]
-            if cid not in invoice_stats:
-                invoice_stats[cid] = {"invoice_count": 0, "total_due": 0.0, "overdue_count": 0, "total_overdue": 0.0, "earliest_due_date": None}
-            stats = invoice_stats[cid]
-            stats["invoice_count"] += 1
-            stats["total_due"] += float(row[1] or 0)
-            # Track earliest due date for overdue invoices
-            due_dt = row[3]
-            if (row[2] or 0) > 0:
-                stats["overdue_count"] += 1
-                stats["total_overdue"] += float(row[1] or 0)
-                if due_dt and (stats["earliest_due_date"] is None or due_dt < stats["earliest_due_date"]):
-                    stats["earliest_due_date"] = due_dt
+            invoice_stats[row[0]] = {
+                "invoice_count": row[1] or 0,
+                "total_due": float(row[2] or 0),
+                "overdue_count": row[3] or 0,
+                "total_overdue": float(row[4] or 0),
+                "earliest_due_date": row[5],
+            }
 
         # Step 2: Query customers with basic filters
         query = session.query(Customer)
