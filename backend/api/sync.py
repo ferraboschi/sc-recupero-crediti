@@ -287,7 +287,11 @@ def _sync_invoices_task() -> dict:
 
 
 def _recalculate_days_overdue(session):
-    """Recalculate days_overdue for all unpaid invoices based on current date."""
+    """Recalculate days_overdue for all unpaid invoices based on current date.
+
+    Positive values = days overdue (past due date).
+    Negative values = days remaining until due date.
+    """
     today = date.today()
     unpaid_invoices = session.query(Invoice).filter(
         Invoice.status != "paid"
@@ -296,12 +300,14 @@ def _recalculate_days_overdue(session):
     updated = 0
     for inv in unpaid_invoices:
         if inv.due_date:
-            new_days = max(0, (today - inv.due_date).days)
+            # Actual due_date exists — calculate difference (can be negative)
+            new_days = (today - inv.due_date).days
         elif inv.issue_date:
-            # Assume 30-day payment terms if no due_date
+            # No due_date: assume 30-day payment terms, and SAVE the assumed due_date
             from datetime import timedelta
             assumed_due = inv.issue_date + timedelta(days=30)
-            new_days = max(0, (today - assumed_due).days)
+            inv.due_date = assumed_due
+            new_days = (today - assumed_due).days
         else:
             new_days = 0
 
