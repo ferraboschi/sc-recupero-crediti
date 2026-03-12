@@ -249,6 +249,13 @@ def process_escalations(session: Session) -> List[Message]:
     escalation_count = 0
 
     for invoice in all_invoices:
+        # Skip invoices not yet matched to a customer
+        if not invoice.customer_id:
+            logger.debug(
+                f"Skipping invoice {invoice.invoice_number}: no customer linked"
+            )
+            continue
+
         should_escalate_invoice, next_level = should_escalate(invoice, session)
 
         if not should_escalate_invoice:
