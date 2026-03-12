@@ -28,6 +28,7 @@ async def list_positions(
     due_date_to: str = Query(None, description="Due date to (YYYY-MM-DD)"),
     overdue: str = Query(None, description="Filter by overdue status: 'yes' for overdue, 'no' for not overdue"),
     has_customer: str = Query(None, description="Filter by customer assignment: 'yes' for matched invoices only"),
+    exclude_status: str = Query(None, description="Exclude invoices with this status (e.g. 'paid')"),
     sort_by: str = Query(None, description="Sort field: amount_due, issue_date, due_date, days_overdue"),
     sort_order: str = Query("desc", description="Sort order: asc or desc"),
     skip: int = Query(0, ge=0),
@@ -48,6 +49,9 @@ async def list_positions(
         # Apply filters
         if status:
             query = query.filter(Invoice.status == status)
+
+        if exclude_status:
+            query = query.filter(Invoice.status != exclude_status)
 
         if escalation_level is not None:
             query = query.join(

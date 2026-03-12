@@ -24,8 +24,18 @@ const OVERDUE_OPTIONS = [
 
 const CUSTOMER_OPTIONS = [
   { value: '', label: 'Tutti' },
-  { value: 'yes', label: 'Solo Fatture (con P.IVA)' },
-  { value: 'no', label: 'Solo Vendite (senza P.IVA)' },
+  { value: 'yes', label: 'Solo con Cliente Associato' },
+  { value: 'no', label: 'Solo senza Cliente Associato' },
+]
+
+const PAYMENT_OPTIONS = [
+  { value: 'exclude_paid', label: 'Escludi Pagati' },
+  { value: '', label: 'Tutti gli Stati' },
+  { value: 'open', label: 'Solo Aperti' },
+  { value: 'paid', label: 'Solo Pagati' },
+  { value: 'contacted', label: 'Solo Contattati' },
+  { value: 'promised', label: 'Solo Promessi' },
+  { value: 'disputed', label: 'Solo Contestati' },
 ]
 
 export default function Positions() {
@@ -36,14 +46,14 @@ export default function Positions() {
   const [total, setTotal] = useState(0)
   const [limit] = useState(50)
 
-  // Filters - default to showing only real invoices (with customer/P.IVA)
-  const [statusFilter, setStatusFilter] = useState('')
+  // Filters - show all invoices, exclude paid by default
+  const [statusFilter, setStatusFilter] = useState('exclude_paid')
   const [escalationFilter, setEscalationFilter] = useState('')
   const [minAmountFilter, setMinAmountFilter] = useState('')
   const [searchFilter, setSearchFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
   const [overdueFilter, setOverdueFilter] = useState('')
-  const [hasCustomerFilter, setHasCustomerFilter] = useState('yes')
+  const [hasCustomerFilter, setHasCustomerFilter] = useState('')
   const [issueDateFrom, setIssueDateFrom] = useState('')
   const [issueDateTo, setIssueDateTo] = useState('')
   const [dueDateFrom, setDueDateFrom] = useState('')
@@ -56,12 +66,20 @@ export default function Positions() {
   const [importing, setImporting] = useState(false)
   const [importResult, setImportResult] = useState(null)
 
+  // Status update feedback
+  const [updatingId, setUpdatingId] = useState(null)
+
   useEffect(() => {
     const fetchPositions = async () => {
       try {
         setLoading(true)
         const params = { skip, limit }
-        if (statusFilter) params.status = statusFilter
+        // Handle special "exclude_paid" filter
+        if (statusFilter === 'exclude_paid') {
+          params.exclude_status = 'paid'
+        } else if (statusFilter) {
+          params.status = statusFilter
+        }
         if (escalationFilter) params.escalation_level = parseInt(escalationFilter)
         if (minAmountFilter) params.min_amount = parseFloat(minAmountFilter)
         if (searchFilter) params.search = searchFilter
@@ -111,6 +129,18 @@ export default function Positions() {
     return statusObj?.label || status
   }
 
+  const getStatusColor = (status) => {
+    const colors = {
+      open: 'bg-blue-100 text-blue-700',
+      contacted: 'bg-amber-100 text-amber-700',
+      promised: 'bg-purple-100 text-purple-700',
+      paid: 'bg-green-100 text-green-700',
+      disputed: 'bg-red-100 text-red-700',
+      escalated: 'bg-orange-100 text-orange-700',
+    }
+    return colors[status] || 'bg-slate-100 text-slate-600'
+  }
+
   const getSourceLabel = (source) => {
     if (source === 'fatturapro') return 'FatturaPro'
     if (source === 'fatture24') return 'Fattura24'
@@ -154,14 +184,45 @@ export default function Positions() {
         headers: { 'Content-Type': 'multipart/form-data' }
       })
       setImportResult(response.data)
-      // Refresh positions after import
       setSkip(0)
     } catch (err) {
       setImportResult({ errors: [err.message || 'Errore durante l\'importazione'] })
     } finally {
       setImporting(false)
-      // Reset file input
       e.target.value = ''
+    }
+  }
+
+  const handleMarkAsPaid = async (posId, e) => {
+    e.stopPropagation()
+    setUpdatingId(posId)
+    try {
+      await client.put(`/positions/${posId}/status`, null, { params: { new_status: 'paid' } })
+      // Update local state
+      setPositions(prev => prev.map(p =>
+        p.id === posId ? { ...p, status: 'paid' } : p
+      ))
+    } catch (err) {
+      console.error('Error marking as paid:', err)
+      alert('Errore nell\'aggiornamento dello stato')
+    } finally {
+      setUpdatingId(null)
+    }
+  }
+
+  const handleStatusChange = async (posId, newStatus, e) => {
+    e.stopPropagation()
+    setUpdatingId(posId)
+    try {
+      await client.put(`/positions/${posId}/status`, null, { params: { new_status: newStatus } })
+      setPositions(prev => prev.map(p =>
+        p.id === posId ? { ...p, status: newStatus } : p
+      ))
+    } catch (err) {
+      console.error('Error changing status:', err)
+      alert('Errore nell\'aggiornamento dello stato')
+    } finally {
+      setUpdatingId(null)
     }
   }
 
@@ -172,7 +233,6 @@ export default function Positions() {
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-bold text-slate-900">Filtri e Ricerca</h2>
           <div className="flex items-center gap-3">
-            {/* CSV Import Button */}
             <label className={`px-4 py-2 rounded-lg text-sm font-medium cursor-pointer
               ${importing ? 'bg-slate-200 text-slate-400' : 'bg-teal-600 text-white hover:bg-teal-700'}`}>
               {importing ? 'Importando...' : 'Importa CSV (Fattura24)'}
@@ -187,7 +247,6 @@ export default function Positions() {
           </div>
         </div>
 
-        {/* Import result */}
         {importResult && (
           <div className={`mb-4 p-3 rounded-lg text-sm ${importResult.errors?.length > 0 && !importResult.created
             ? 'bg-red-50 text-red-700 border border-red-200'
@@ -241,7 +300,7 @@ export default function Positions() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Tipo</label>
+            <label className="block text-sm font-medium text-slate-700 mb-2">Cliente Associato</label>
             <select
               value={hasCustomerFilter}
               onChange={(e) => { setHasCustomerFilter(e.target.value); setSkip(0) }}
@@ -256,21 +315,20 @@ export default function Positions() {
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Stato</label>
+            <label className="block text-sm font-medium text-slate-700 mb-2">Stato Pagamento</label>
             <select
               value={statusFilter}
               onChange={(e) => { setStatusFilter(e.target.value); setSkip(0) }}
               className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
-              <option value="">Tutti</option>
-              {STATUSES.map(status => (
-                <option key={status.value} value={status.value}>{status.label}</option>
+              {PAYMENT_OPTIONS.map(p => (
+                <option key={p.value} value={p.value}>{p.label}</option>
               ))}
             </select>
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Importo Minimo (€)</label>
+            <label className="block text-sm font-medium text-slate-700 mb-2">Importo Minimo</label>
             <input
               type="number"
               value={minAmountFilter}
@@ -309,39 +367,23 @@ export default function Positions() {
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-3">
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-2">Emissione Dal</label>
-                <input
-                  type="date"
-                  value={issueDateFrom}
-                  onChange={(e) => { setIssueDateFrom(e.target.value); setSkip(0) }}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+                <input type="date" value={issueDateFrom} onChange={(e) => { setIssueDateFrom(e.target.value); setSkip(0) }}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-2">Emissione Al</label>
-                <input
-                  type="date"
-                  value={issueDateTo}
-                  onChange={(e) => { setIssueDateTo(e.target.value); setSkip(0) }}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+                <input type="date" value={issueDateTo} onChange={(e) => { setIssueDateTo(e.target.value); setSkip(0) }}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-2">Scadenza Dal</label>
-                <input
-                  type="date"
-                  value={dueDateFrom}
-                  onChange={(e) => { setDueDateFrom(e.target.value); setSkip(0) }}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+                <input type="date" value={dueDateFrom} onChange={(e) => { setDueDateFrom(e.target.value); setSkip(0) }}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-2">Scadenza Al</label>
-                <input
-                  type="date"
-                  value={dueDateTo}
-                  onChange={(e) => { setDueDateTo(e.target.value); setSkip(0) }}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+                <input type="date" value={dueDateTo} onChange={(e) => { setDueDateTo(e.target.value); setSkip(0) }}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
               </div>
             </div>
           )}
@@ -380,60 +422,87 @@ export default function Positions() {
               <table className="w-full">
                 <thead className="bg-slate-50 border-b border-slate-200">
                   <tr>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Fonte</th>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Cliente</th>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">P.IVA</th>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900">Fattura</th>
-                    <th className="px-4 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('amount_due')}>
+                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fonte</th>
+                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Cliente</th>
+                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">P.IVA</th>
+                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fattura</th>
+                    <th className="px-3 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('amount_due')}>
                       Saldo{sortArrow('amount_due')}
                     </th>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('issue_date')}>
+                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('issue_date')}>
                       Emissione{sortArrow('issue_date')}
                     </th>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('due_date')}>
+                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('due_date')}>
                       Scadenza{sortArrow('due_date')}
                     </th>
-                    <th className="px-4 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('days_overdue')}>
-                      GG Ritardo{sortArrow('days_overdue')}
+                    <th className="px-3 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('days_overdue')}>
+                      GG{sortArrow('days_overdue')}
                     </th>
-                    <th className="px-4 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
+                    <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
+                    <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Azioni</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200">
                   {positions.map(pos => (
-                    <tr key={pos.id} className="hover:bg-slate-50 cursor-pointer">
-                      <td className="px-4 py-3 text-sm">
+                    <tr key={pos.id} className={`hover:bg-slate-50 ${pos.status === 'paid' ? 'bg-green-50 opacity-60' : ''}`}>
+                      <td className="px-3 py-3 text-sm">
                         <span className={`px-2 py-0.5 rounded text-xs font-medium ${getSourceColor(pos.source_platform)}`}>
                           {getSourceLabel(pos.source_platform)}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-sm text-slate-900">
-                        {pos.customer?.ragione_sociale || pos.customer_name_raw || 'Non assegnato'}
+                      <td className="px-3 py-3 text-sm text-slate-900">
+                        <div className="flex flex-col">
+                          <span>{pos.customer?.ragione_sociale || pos.customer_name_raw || 'Non assegnato'}</span>
+                          {!pos.customer && pos.customer_name_raw && (
+                            <span className="text-xs text-amber-600">da verificare</span>
+                          )}
+                        </div>
                       </td>
-                      <td className="px-4 py-3 text-sm text-slate-500 font-mono text-xs">
+                      <td className="px-3 py-3 text-sm text-slate-500 font-mono text-xs">
                         {pos.customer?.partita_iva || '-'}
                       </td>
-                      <td className="px-4 py-3 text-sm text-slate-600">
+                      <td className="px-3 py-3 text-sm text-slate-600">
                         {pos.invoice_number}
                       </td>
-                      <td className="px-4 py-3 text-sm text-right font-medium text-slate-900">
+                      <td className="px-3 py-3 text-sm text-right font-medium text-slate-900">
                         {formatCurrency(pos.amount_due)}
                       </td>
-                      <td className="px-4 py-3 text-sm text-slate-600">
+                      <td className="px-3 py-3 text-sm text-slate-600">
                         {formatDate(pos.issue_date)}
                       </td>
-                      <td className="px-4 py-3 text-sm text-slate-600">
+                      <td className="px-3 py-3 text-sm text-slate-600">
                         {formatDate(pos.due_date)}
                       </td>
-                      <td className="px-4 py-3 text-sm text-right">
+                      <td className="px-3 py-3 text-sm text-right">
                         <span className={pos.days_overdue > 30 ? 'text-red-600 font-medium' : 'text-slate-600'}>
                           {pos.days_overdue || 0}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-sm text-center">
-                        <span className={`badge-${pos.status} px-3 py-1 rounded-full text-xs font-medium`}>
+                      <td className="px-3 py-3 text-sm text-center">
+                        <span className={`${getStatusColor(pos.status)} px-2 py-1 rounded-full text-xs font-medium`}>
                           {getStatusLabel(pos.status)}
                         </span>
+                      </td>
+                      <td className="px-3 py-3 text-sm text-center">
+                        {pos.status !== 'paid' ? (
+                          <button
+                            onClick={(e) => handleMarkAsPaid(pos.id, e)}
+                            disabled={updatingId === pos.id}
+                            className="px-2 py-1 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700 disabled:opacity-50"
+                            title="Segna come pagato"
+                          >
+                            {updatingId === pos.id ? '...' : 'Pagato'}
+                          </button>
+                        ) : (
+                          <button
+                            onClick={(e) => handleStatusChange(pos.id, 'open', e)}
+                            disabled={updatingId === pos.id}
+                            className="px-2 py-1 bg-slate-200 text-slate-600 rounded text-xs font-medium hover:bg-slate-300 disabled:opacity-50"
+                            title="Riapri posizione"
+                          >
+                            {updatingId === pos.id ? '...' : 'Riapri'}
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
