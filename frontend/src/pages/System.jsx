@@ -7,6 +7,7 @@ function StatusBadge({ status }) {
     ok: 'bg-accent-green/15 text-accent-green',
     healthy: 'bg-accent-green/15 text-accent-green',
     configured: 'bg-accent-green/15 text-accent-green',
+    imported: 'bg-accent-green/15 text-accent-green',
     error: 'bg-accent-red/15 text-accent-red',
     degraded: 'bg-accent-amber/15 text-accent-amber',
     warning: 'bg-accent-amber/15 text-accent-amber',
@@ -18,6 +19,7 @@ function StatusBadge({ status }) {
     ok: 'Attivo',
     healthy: 'Operativo',
     configured: 'Configurato',
+    imported: 'Fatture Scaricate',
     error: 'Errore',
     degraded: 'Degradato',
     warning: 'Attenzione',
@@ -213,10 +215,13 @@ export default function System() {
                   {conn.api_version && (
                     <p className="text-xs text-txt-muted">API v{conn.api_version}</p>
                   )}
-                  {conn.last_result && conn.last_result.error && (
+                  {conn.status === 'imported' && conn.last_result?.imported_count && (
+                    <p className="text-xs text-accent-green mt-0.5">{conn.last_result.imported_count} fatture importate via CSV</p>
+                  )}
+                  {conn.last_result && conn.last_result.error && conn.status !== 'imported' && (
                     <p className="text-xs text-accent-red mt-0.5 max-w-md truncate">{conn.last_result.error}</p>
                   )}
-                  {conn.error && (
+                  {conn.error && conn.status !== 'imported' && (
                     <p className="text-xs text-accent-red mt-0.5 max-w-lg truncate">{conn.error}</p>
                   )}
                 </div>
