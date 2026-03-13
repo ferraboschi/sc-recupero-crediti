@@ -110,6 +110,7 @@ class RecoveryAction(Base):
     action_type = Column(String, nullable=False)  # first_contact / second_contact / lawyer / archive / wait / note
     scheduled_date = Column(Date, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    outcome = Column(String, nullable=True)  # contacted / promised / partial_payment / paid / unreachable / disputed / no_answer
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 

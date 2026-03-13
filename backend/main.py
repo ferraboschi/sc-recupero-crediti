@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 
-from backend.database import init_db
+from backend.database import init_db, get_engine
 from backend.config import config
 from backend.scheduler import start_scheduler, stop_scheduler
 from backend.api import dashboard, positions, messages, customers, sync, webhooks, recovery, system
@@ -36,6 +36,21 @@ app.add_middleware(
 )
 
 
+def _run_migrations():
+    """Run lightweight schema migrations for new columns."""
+    from sqlalchemy import text, inspect
+    engine = get_engine()
+    inspector = inspect(engine)
+    with engine.connect() as conn:
+        # Add 'outcome' column to recovery_actions if missing
+        if 'recovery_actions' in inspector.get_table_names():
+            cols = [c['name'] for c in inspector.get_columns('recovery_actions')]
+            if 'outcome' not in cols:
+                conn.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
+                conn.commit()
+                logger.info("Migration: added 'outcome' column to recovery_actions")
+
+
 # Ultra-lightweight health check for Render (must respond < 1s)
 @app.get("/health")
 @app.get("/api/health")
@@ -52,6 +67,8 @@ async def startup_event():
         try:
             logger.info(f"Initializing database (attempt {attempt + 1})...")
             init_db()
+            # Run lightweight migrations for new columns
+            _run_migrations()
             logger.info("Database initialized successfully")
             break
         except Exception as e:

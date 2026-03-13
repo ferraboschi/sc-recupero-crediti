@@ -120,6 +120,55 @@ async def get_dashboard(session: Session = Depends(get_session)):
         raise
 
 
+@router.get("/search")
+async def search_dashboard(
+    q: str,
+    session: Session = Depends(get_session),
+):
+    """Search customers by ragione sociale or partita IVA. Returns top 20 matches with overdue stats."""
+    from sqlalchemy import case, or_
+    try:
+        search_term = f"%{q.strip()}%"
+        results = (
+            session.query(
+                Customer,
+                func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).label("total_overdue"),
+                func.count(case((Invoice.days_overdue > 0, 1), else_=None)).label("overdue_count"),
+            )
+            .outerjoin(Invoice, (Invoice.customer_id == Customer.id) & (Invoice.status != "paid"))
+            .filter(
+                Customer.excluded.is_(False),
+                or_(
+                    Customer.ragione_sociale.ilike(search_term),
+                    Customer.partita_iva.ilike(search_term),
+                )
+            )
+            .group_by(Customer.id)
+            .order_by(func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).desc())
+            .limit(20)
+            .all()
+        )
+
+        return {
+            "results": [
+                {
+                    "id": c.id,
+                    "ragione_sociale": c.ragione_sociale,
+                    "partita_iva": c.partita_iva,
+                    "phone": c.phone,
+                    "recovery_status": c.recovery_status,
+                    "total_overdue": float(total_overdue or 0),
+                    "overdue_count": int(overdue_count or 0),
+                }
+                for c, total_overdue, overdue_count in results
+            ],
+            "total": len(results),
+        }
+    except Exception as e:
+        logger.error(f"Error searching dashboard: {e}", exc_info=True)
+        raise
+
+
 @router.get("/todos")
 async def get_todos(session: Session = Depends(get_session)):
     """
@@ -288,14 +337,13 @@ async def get_calendar(
         start = first_day - timedelta(days=first_day.weekday())  # Monday of first week
         end = last_day + timedelta(days=(6 - last_day.weekday()))  # Sunday of last week
 
-        # Get all scheduled actions in range (not completed)
+        # Get all scheduled actions in range (both pending and completed)
         actions = (
             session.query(RecoveryAction)
             .join(Customer)
             .filter(
                 RecoveryAction.scheduled_date >= start,
                 RecoveryAction.scheduled_date <= end,
-                RecoveryAction.completed_at.is_(None),
                 Customer.excluded.is_(False),
             )
             .order_by(RecoveryAction.scheduled_date.asc())
@@ -336,6 +384,8 @@ async def get_calendar(
                 "recovery_status": a.customer.recovery_status,
                 "overdue_count": stats["count"],
                 "total_overdue": stats["total"],
+                "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+                "outcome": getattr(a, 'outcome', None),
             })
 
         # Count overdue actions (scheduled before today, not completed)

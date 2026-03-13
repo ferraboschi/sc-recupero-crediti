@@ -46,6 +46,26 @@ const INVOICE_STATUS_COLORS = {
   escalated: 'bg-orange-100 text-orange-700',
 }
 
+const OUTCOME_LABELS = {
+  contacted: 'Contattato',
+  promised: 'Promessa Pagamento',
+  partial_payment: 'Pagamento Parziale',
+  paid: 'Pagato',
+  unreachable: 'Irraggiungibile',
+  disputed: 'Contestazione',
+  no_answer: 'Non Risponde',
+}
+
+const OUTCOME_COLORS = {
+  contacted: 'bg-blue-100 text-blue-700',
+  promised: 'bg-amber-100 text-amber-700',
+  partial_payment: 'bg-teal-100 text-teal-700',
+  paid: 'bg-green-100 text-green-700',
+  unreachable: 'bg-slate-100 text-slate-600',
+  disputed: 'bg-red-100 text-red-700',
+  no_answer: 'bg-orange-100 text-orange-700',
+}
+
 export default function ClientDetail() {
   const { customerId } = useParams()
   const navigate = useNavigate()
@@ -63,6 +83,11 @@ export default function ClientDetail() {
   const [showAllInvoices, setShowAllInvoices] = useState(false)
   const [invoiceSortBy, setInvoiceSortBy] = useState('due_date')
   const [invoiceSortOrder, setInvoiceSortOrder] = useState('asc')
+  // Navigation state
+  const [neighbors, setNeighbors] = useState({ prev_id: null, next_id: null, position: null, total: null })
+  // Action completion state
+  const [completingAction, setCompletingAction] = useState(null)
+  const [selectedOutcome, setSelectedOutcome] = useState('')
 
   const fetchData = useCallback(async () => {
     try {
@@ -82,9 +107,19 @@ export default function ClientDetail() {
     }
   }, [customerId])
 
+  const fetchNeighbors = useCallback(async () => {
+    try {
+      const response = await client.get(`/customers/${customerId}/neighbors`)
+      setNeighbors(response.data)
+    } catch (err) {
+      console.error('Error fetching neighbors:', err)
+    }
+  }, [customerId])
+
   useEffect(() => {
     fetchData()
-  }, [fetchData])
+    fetchNeighbors()
+  }, [fetchData, fetchNeighbors])
 
   const formatCurrency = (value) =>
     new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(value)
@@ -109,6 +144,20 @@ export default function ClientDetail() {
       alert('Errore nella creazione dell\'azione')
     } finally {
       setActionLoading(false)
+    }
+  }
+
+  const handleCompleteAction = async (actionId, outcome) => {
+    try {
+      await client.put(`/recovery/customers/${customerId}/actions/${actionId}/complete`, {
+        outcome: outcome || null,
+      })
+      setCompletingAction(null)
+      setSelectedOutcome('')
+      await fetchData()
+    } catch (err) {
+      console.error('Error completing action:', err)
+      alert('Errore nel completamento dell\'azione')
     }
   }
 
@@ -309,13 +358,38 @@ export default function ClientDetail() {
 
   return (
     <div className="space-y-6">
-      {/* Back button */}
-      <button
-        onClick={() => navigate('/customers')}
-        className="flex items-center gap-2 text-sm text-slate-600 hover:text-blue-600"
-      >
-        &larr; Torna ai Clienti
-      </button>
+      {/* Navigation bar */}
+      <div className="flex items-center justify-between">
+        <button
+          onClick={() => navigate('/customers')}
+          className="flex items-center gap-2 text-sm text-slate-600 hover:text-blue-600"
+        >
+          &larr; Torna ai Clienti
+        </button>
+        <div className="flex items-center gap-3">
+          {neighbors.position && (
+            <span className="text-xs text-slate-400">{neighbors.position} di {neighbors.total}</span>
+          )}
+          <button
+            onClick={() => neighbors.prev_id && navigate(`/customers/${neighbors.prev_id}`)}
+            disabled={!neighbors.prev_id}
+            className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+              neighbors.prev_id ? 'bg-slate-100 text-slate-700 hover:bg-slate-200' : 'bg-slate-50 text-slate-300 cursor-not-allowed'
+            }`}
+          >
+            &larr; Precedente
+          </button>
+          <button
+            onClick={() => neighbors.next_id && navigate(`/customers/${neighbors.next_id}`)}
+            disabled={!neighbors.next_id}
+            className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+              neighbors.next_id ? 'bg-slate-100 text-slate-700 hover:bg-slate-200' : 'bg-slate-50 text-slate-300 cursor-not-allowed'
+            }`}
+          >
+            Successivo &rarr;
+          </button>
+        </div>
+      </div>
 
       {/* Customer Header */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
@@ -635,14 +709,54 @@ export default function ClientDetail() {
           <div className="mt-4 border-l-2 border-slate-200 pl-4 space-y-3">
             {data.recovery_actions.map(action => (
               <div key={action.id} className="relative">
-                <div className="absolute -left-[21px] top-1 w-3 h-3 rounded-full bg-slate-400 border-2 border-white"></div>
-                <div className="flex items-center gap-2">
+                <div className={`absolute -left-[21px] top-1 w-3 h-3 rounded-full border-2 border-white ${
+                  action.completed_at ? 'bg-green-500' : 'bg-slate-400'
+                }`}></div>
+                <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-sm font-medium text-slate-900">
                     {ACTION_LABELS[action.action_type] || action.action_type}
                   </span>
                   <span className="text-xs text-slate-400">{formatDate(action.created_at)}</span>
-                  {action.completed_at && (
+                  {action.completed_at && action.outcome && (
+                    <span className={`text-xs px-1.5 py-0.5 rounded ${OUTCOME_COLORS[action.outcome] || 'bg-green-100 text-green-700'}`}>
+                      {OUTCOME_LABELS[action.outcome] || action.outcome}
+                    </span>
+                  )}
+                  {action.completed_at && !action.outcome && (
                     <span className="text-xs bg-green-100 text-green-600 px-1.5 py-0.5 rounded">completata</span>
+                  )}
+                  {/* Complete button for pending actions */}
+                  {!action.completed_at && (
+                    <>
+                      {completingAction === action.id ? (
+                        <div className="flex items-center gap-1 flex-wrap">
+                          {Object.entries(OUTCOME_LABELS).map(([key, label]) => (
+                            <button
+                              key={key}
+                              onClick={() => handleCompleteAction(action.id, key)}
+                              className={`text-xs px-2 py-0.5 rounded border transition-colors ${
+                                OUTCOME_COLORS[key] || 'bg-slate-100 text-slate-600'
+                              } hover:opacity-80`}
+                            >
+                              {label}
+                            </button>
+                          ))}
+                          <button
+                            onClick={() => setCompletingAction(null)}
+                            className="text-xs text-slate-400 ml-1"
+                          >
+                            Annulla
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => setCompletingAction(action.id)}
+                          className="text-xs bg-green-50 text-green-700 px-2 py-0.5 rounded border border-green-200 hover:bg-green-100"
+                        >
+                          Completa
+                        </button>
+                      )}
+                    </>
                   )}
                 </div>
                 {action.notes && (

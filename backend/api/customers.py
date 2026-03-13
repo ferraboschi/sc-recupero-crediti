@@ -233,6 +233,57 @@ async def get_customer_detail(
         raise
 
 
+@router.get("/{customer_id}/neighbors")
+async def get_customer_neighbors(
+    customer_id: int,
+    session: Session = Depends(get_session),
+):
+    """
+    Get previous and next customer IDs for navigation.
+    Based on overdue customers sorted by total_overdue desc.
+    """
+    from sqlalchemy import case
+    try:
+        # Get ordered list of customer IDs with overdue invoices (same as default sort)
+        overdue_customers = (
+            session.query(
+                Customer.id,
+                func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).label("total_overdue"),
+            )
+            .join(Invoice, Invoice.customer_id == Customer.id)
+            .filter(
+                Invoice.status != "paid",
+                Customer.excluded.is_(False),
+            )
+            .group_by(Customer.id)
+            .having(func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)) > 0)
+            .order_by(func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).desc())
+            .all()
+        )
+
+        ids = [row[0] for row in overdue_customers]
+        prev_id = None
+        next_id = None
+
+        if customer_id in ids:
+            idx = ids.index(customer_id)
+            if idx > 0:
+                prev_id = ids[idx - 1]
+            if idx < len(ids) - 1:
+                next_id = ids[idx + 1]
+
+        return {
+            "prev_id": prev_id,
+            "next_id": next_id,
+            "position": ids.index(customer_id) + 1 if customer_id in ids else None,
+            "total": len(ids),
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching customer neighbors: {e}", exc_info=True)
+        raise
+
+
 @router.put("/{customer_id}/exclude")
 async def toggle_customer_exclusion(
     customer_id: int,

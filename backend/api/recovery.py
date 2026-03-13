@@ -280,13 +280,19 @@ async def create_action(
         raise
 
 
+class ActionComplete(BaseModel):
+    outcome: Optional[str] = None  # contacted / promised / partial_payment / paid / unreachable / disputed / no_answer
+    notes: Optional[str] = None
+
+
 @router.put("/customers/{customer_id}/actions/{action_id}/complete")
 async def complete_action(
     customer_id: int,
     action_id: int,
+    body: ActionComplete = None,
     session: Session = Depends(get_session),
 ):
-    """Mark a recovery action as completed."""
+    """Mark a recovery action as completed with optional outcome."""
     try:
         action = session.query(RecoveryAction).filter(
             RecoveryAction.id == action_id,
@@ -296,11 +302,45 @@ async def complete_action(
             raise HTTPException(status_code=404, detail="Action not found")
 
         action.completed_at = datetime.utcnow()
+        if body:
+            if body.outcome:
+                action.outcome = body.outcome
+            if body.notes:
+                action.notes = (action.notes or '') + (' | Esito: ' + body.notes if action.notes else body.notes)
+
+        # If outcome is 'paid', check if all invoices are paid — if so, archive customer
+        customer = session.query(Customer).filter(Customer.id == customer_id).first()
+        if body and body.outcome == 'paid' and customer:
+            unpaid = session.query(Invoice).filter(
+                Invoice.customer_id == customer_id,
+                Invoice.status != 'paid',
+                Invoice.days_overdue > 0,
+            ).count()
+            if unpaid == 0:
+                customer.recovery_status = 'archived'
+                customer.next_action_date = None
+                customer.next_action_type = None
+
+        session.commit()
+
+        # Log activity
+        activity = ActivityLog(
+            action="recovery_completed",
+            entity_type="recovery_action",
+            entity_id=action_id,
+            details={
+                "customer_id": customer_id,
+                "outcome": body.outcome if body else None,
+                "action_type": action.action_type,
+            }
+        )
+        session.add(activity)
         session.commit()
 
         return {
             "id": action.id,
             "completed_at": action.completed_at.isoformat(),
+            "outcome": action.outcome,
         }
 
     except HTTPException:
