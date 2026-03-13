@@ -65,6 +65,9 @@ export default function Attivita() {
   // Tab state for bottom section
   const [activeTab, setActiveTab] = useState('contacted')
 
+  // Overlay modal state: null or 'contacted' | 'incassati' | 'recovered' | 'overdue'
+  const [overlayType, setOverlayType] = useState(null)
+
   const fetchCalendar = useCallback(async (y, m) => {
     try {
       setCalLoading(true)
@@ -226,29 +229,203 @@ export default function Attivita() {
         </div>
       </div>
 
-      {/* ── SUMMARY CARDS ── */}
+      {/* ── SUMMARY CARDS (clickable) ── */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div className="bg-white rounded-lg p-4 border border-slate-200">
+        <button onClick={() => setOverlayType('contacted')} className="bg-white rounded-lg p-4 border border-slate-200 text-left hover:border-blue-400 hover:shadow-md transition-all group">
           <p className="text-xs text-slate-500 uppercase tracking-wide">Account Contattati</p>
           <p className="text-2xl font-bold text-blue-700 mt-1">{summary.total_contacted || 0}</p>
-          <p className="text-xs text-slate-400 mt-1">clienti in lavorazione</p>
-        </div>
-        <div className="bg-white rounded-lg p-4 border border-green-200 bg-green-50/30">
+          <p className="text-xs text-slate-400 mt-1 group-hover:text-blue-500">clienti in lavorazione — clicca per dettagli</p>
+        </button>
+        <button onClick={() => setOverlayType('incassati')} className="rounded-lg p-4 border border-green-200 bg-green-50/30 text-left hover:border-green-400 hover:shadow-md transition-all group">
           <p className="text-xs text-green-600 uppercase tracking-wide font-medium">Incassati</p>
           <p className="text-2xl font-bold text-green-700 mt-1">{summary.fully_resolved || 0}</p>
-          <p className="text-xs text-green-500 mt-1">debiti risolti</p>
-        </div>
-        <div className="bg-white rounded-lg p-4 border border-green-200 bg-green-50/30">
+          <p className="text-xs text-green-500 mt-1 group-hover:text-green-700">debiti risolti — clicca per dettagli</p>
+        </button>
+        <button onClick={() => setOverlayType('recovered')} className="rounded-lg p-4 border border-green-200 bg-green-50/30 text-left hover:border-green-400 hover:shadow-md transition-all group">
           <p className="text-xs text-green-600 uppercase tracking-wide font-medium">Totale Recuperato</p>
           <p className="text-2xl font-bold text-green-700 mt-1">{formatCurrency(summary.total_recovered || 0)}</p>
-          <p className="text-xs text-green-500 mt-1">importo incassato</p>
-        </div>
-        <div className="bg-white rounded-lg p-4 border border-slate-200">
+          <p className="text-xs text-green-500 mt-1 group-hover:text-green-700">importo incassato — clicca per dettagli</p>
+        </button>
+        <button onClick={() => setOverlayType('overdue')} className="bg-white rounded-lg p-4 border border-slate-200 text-left hover:border-red-400 hover:shadow-md transition-all group">
           <p className="text-xs text-slate-500 uppercase tracking-wide">Azioni Scadute</p>
           <p className="text-2xl font-bold text-red-600 mt-1">{calData?.overdue_count || 0}</p>
-          <p className="text-xs text-red-400 mt-1">da completare</p>
-        </div>
+          <p className="text-xs text-red-400 mt-1 group-hover:text-red-600">da completare — clicca per dettagli</p>
+        </button>
       </div>
+
+      {/* ── OVERLAY MODAL ── */}
+      {overlayType && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={() => setOverlayType(null)}>
+          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[80vh] overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            {/* Header */}
+            <div className={`px-6 py-4 flex items-center justify-between border-b ${
+              overlayType === 'contacted' ? 'bg-blue-50 border-blue-200' :
+              overlayType === 'overdue' ? 'bg-red-50 border-red-200' :
+              'bg-green-50 border-green-200'
+            }`}>
+              <h3 className="text-lg font-bold text-slate-900">
+                {overlayType === 'contacted' && 'Account Contattati'}
+                {overlayType === 'incassati' && 'Incassati — Dettaglio'}
+                {overlayType === 'recovered' && 'Totale Recuperato — Dettaglio'}
+                {overlayType === 'overdue' && 'Azioni Scadute — Dettaglio'}
+              </h3>
+              <button onClick={() => setOverlayType(null)} className="text-slate-400 hover:text-slate-700 text-xl font-bold leading-none">&times;</button>
+            </div>
+
+            {/* Body */}
+            <div className="px-6 py-4 overflow-y-auto max-h-[65vh]">
+
+              {/* CONTATTATI: breakdown by status */}
+              {overlayType === 'contacted' && (() => {
+                const byStatus = {}
+                contacted.forEach(c => {
+                  const s = c.recovery_status || 'unknown'
+                  if (!byStatus[s]) byStatus[s] = { count: 0, amount: 0, customers: [] }
+                  byStatus[s].count++
+                  byStatus[s].amount += c.total_overdue || 0
+                  byStatus[s].customers.push(c)
+                })
+                const statusOrder = ['first_contact', 'second_contact', 'lawyer', 'waiting']
+                return (
+                  <div className="space-y-4">
+                    <p className="text-sm text-slate-500">{contacted.length} clienti in lavorazione attiva</p>
+                    {statusOrder.filter(s => byStatus[s]).map(s => (
+                      <div key={s} className="border border-slate-200 rounded-lg overflow-hidden">
+                        <div className={`px-4 py-2 flex items-center justify-between ${
+                          s === 'first_contact' ? 'bg-blue-50' :
+                          s === 'second_contact' ? 'bg-amber-50' :
+                          s === 'lawyer' ? 'bg-red-50' : 'bg-purple-50'
+                        }`}>
+                          <span className={`text-sm font-bold ${
+                            s === 'first_contact' ? 'text-blue-700' :
+                            s === 'second_contact' ? 'text-amber-700' :
+                            s === 'lawyer' ? 'text-red-700' : 'text-purple-700'
+                          }`}>{ACTION_LABELS[s] || s}</span>
+                          <span className="text-sm text-slate-600">{byStatus[s].count} clienti — {formatCurrency(byStatus[s].amount)} scaduto</span>
+                        </div>
+                        <div className="divide-y divide-slate-100">
+                          {byStatus[s].customers.map(c => (
+                            <div key={c.id} onClick={() => { setOverlayType(null); navigate(`/customers/${c.id}`) }}
+                              className="px-4 py-2 flex items-center justify-between hover:bg-slate-50 cursor-pointer">
+                              <div>
+                                <p className="text-sm font-medium text-slate-800">{c.ragione_sociale}</p>
+                                <p className="text-xs text-slate-400">Ultimo: {formatDate(c.last_contact_date)} {c.last_outcome ? `— ${OUTCOME_LABELS[c.last_outcome] || c.last_outcome}` : ''}</p>
+                              </div>
+                              <p className="text-sm font-bold text-red-600">{formatCurrency(c.total_overdue)}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    {contacted.length === 0 && <p className="text-sm text-slate-400 text-center py-4">Nessun account contattato.</p>}
+                  </div>
+                )
+              })()}
+
+              {/* INCASSATI: customer list with resolution status */}
+              {overlayType === 'incassati' && (
+                <div className="space-y-3">
+                  <p className="text-sm text-slate-500">
+                    {incassati.filter(i => i.fully_resolved).length} completamente risolti su {incassati.length} con pagamenti
+                  </p>
+                  {incassati.length === 0 && <p className="text-sm text-slate-400 text-center py-4">Nessun incasso da azioni di recupero.</p>}
+                  {incassati.map(inc => (
+                    <div key={inc.id} onClick={() => { setOverlayType(null); navigate(`/customers/${inc.id}`) }}
+                      className={`rounded-lg px-4 py-3 cursor-pointer transition-colors border ${
+                        inc.fully_resolved ? 'bg-green-50 border-green-300 hover:bg-green-100' : 'bg-amber-50 border-amber-200 hover:bg-amber-100'
+                      }`}>
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-sm font-medium text-slate-900">{inc.ragione_sociale}</p>
+                          <p className="text-xs text-slate-400 mt-0.5">
+                            {inc.paid_count} fatture pagate — ultimo: {formatDate(inc.last_payment)}
+                          </p>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-sm font-bold text-green-700">{formatCurrency(inc.total_paid)}</p>
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                            inc.fully_resolved ? 'bg-green-200 text-green-800' : 'bg-amber-200 text-amber-800'
+                          }`}>{inc.fully_resolved ? 'RISOLTO' : 'PARZIALE'}</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* TOTALE RECUPERATO: breakdown per customer with amounts */}
+              {overlayType === 'recovered' && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-sm text-slate-500">{incassati.length} clienti con pagamenti da recupero</p>
+                    <p className="text-lg font-bold text-green-700">{formatCurrency(summary.total_recovered || 0)}</p>
+                  </div>
+                  {incassati.length === 0 && <p className="text-sm text-slate-400 text-center py-4">Nessun importo recuperato.</p>}
+                  {/* Bar chart */}
+                  {incassati.map(inc => {
+                    const pct = summary.total_recovered > 0 ? Math.max((inc.total_paid / summary.total_recovered) * 100, 2) : 0
+                    return (
+                      <div key={inc.id} onClick={() => { setOverlayType(null); navigate(`/customers/${inc.id}`) }}
+                        className="cursor-pointer hover:bg-slate-50 rounded-lg p-3 border border-slate-200 transition-colors">
+                        <div className="flex items-center justify-between mb-1.5">
+                          <p className="text-sm font-medium text-slate-800">{inc.ragione_sociale}</p>
+                          <p className="text-sm font-bold text-green-700">{formatCurrency(inc.total_paid)}</p>
+                        </div>
+                        <div className="w-full bg-slate-100 rounded-full h-2.5">
+                          <div className="bg-green-500 h-2.5 rounded-full transition-all" style={{ width: `${pct}%` }} />
+                        </div>
+                        <div className="flex items-center justify-between mt-1">
+                          <p className="text-xs text-slate-400">{inc.paid_count} fatture — ultimo {formatDate(inc.last_payment)}</p>
+                          <p className="text-xs text-slate-400">{pct.toFixed(1)}%</p>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              {/* AZIONI SCADUTE: list from calendar */}
+              {overlayType === 'overdue' && (() => {
+                // Collect overdue actions from calData.days
+                const overdueActions = []
+                const todayStr2 = now.toISOString().split('T')[0]
+                if (calData?.days) {
+                  Object.entries(calData.days).forEach(([date, actions]) => {
+                    if (date < todayStr2) {
+                      actions.filter(a => !a.completed_at).forEach(a => overdueActions.push({ ...a, date }))
+                    }
+                  })
+                }
+                overdueActions.sort((a, b) => a.date.localeCompare(b.date))
+                return (
+                  <div className="space-y-2">
+                    <p className="text-sm text-slate-500">{overdueActions.length} azioni scadute da completare o ripianificare</p>
+                    {overdueActions.length === 0 && <p className="text-sm text-green-600 text-center py-4">Nessuna azione scaduta! Tutto in ordine.</p>}
+                    {overdueActions.map((a, idx) => (
+                      <div key={a.id || idx} onClick={() => { setOverlayType(null); navigate(`/customers/${a.customer_id}`) }}
+                        className="flex items-center justify-between rounded-lg px-4 py-3 cursor-pointer bg-red-50 border border-red-200 hover:bg-red-100 transition-colors">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <span className={`${STATUS_BADGE[a.action_type] || 'bg-slate-100 text-slate-600 border-slate-300'} px-2 py-1 rounded text-xs font-bold border shrink-0`}>
+                            {ACTION_LABELS[a.action_type] || a.action_type}
+                          </span>
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium text-slate-900 truncate">{a.customer_name}</p>
+                            <p className="text-xs text-red-500">Scaduta il {formatDate(a.date)}</p>
+                          </div>
+                        </div>
+                        {a.total_overdue > 0 && (
+                          <p className="text-sm font-bold text-red-600 shrink-0">{formatCurrency(a.total_overdue)}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )
+              })()}
+
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── CALENDAR ── */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
