@@ -25,11 +25,19 @@ const ACTION_BADGE_COLORS = {
 }
 
 const PRIORITY_CONFIG = {
-  overdue: { label: 'In Ritardo', bg: 'bg-red-50', border: 'border-red-200', badge: 'bg-red-600 text-white' },
-  today: { label: 'Oggi', bg: 'bg-blue-50', border: 'border-blue-200', badge: 'bg-blue-600 text-white' },
-  new: { label: 'Da Contattare', bg: 'bg-amber-50', border: 'border-amber-200', badge: 'bg-amber-600 text-white' },
-  upcoming: { label: 'Prossimamente', bg: 'bg-slate-50', border: 'border-slate-200', badge: 'bg-slate-500 text-white' },
+  overdue: { label: 'In Ritardo', bg: 'bg-red-50', border: 'border-red-200', badge: 'bg-red-600 text-white', icon: '🔴' },
+  today: { label: 'Oggi', bg: 'bg-blue-50', border: 'border-blue-200', badge: 'bg-blue-600 text-white', icon: '🔵' },
+  new: { label: 'Da Contattare', bg: 'bg-amber-50', border: 'border-amber-200', badge: 'bg-amber-600 text-white', icon: '🟡' },
+  upcoming: { label: 'Prossimamente', bg: 'bg-slate-50', border: 'border-slate-200', badge: 'bg-slate-500 text-white', icon: '⏳' },
 }
+
+const SORT_OPTIONS = [
+  { value: 'priority', label: 'Priorità' },
+  { value: 'amount_desc', label: 'Più esposto (importo)' },
+  { value: 'oldest_debt', label: 'Debito più vecchio' },
+  { value: 'days_overdue', label: 'GG scaduto' },
+  { value: 'name', label: 'Nome A-Z' },
+]
 
 export default function Dashboard() {
   const navigate = useNavigate()
@@ -43,6 +51,10 @@ export default function Dashboard() {
   const [todoCounts, setTodoCounts] = useState({})
   const [todoLoading, setTodoLoading] = useState(true)
   const [retryCount, setRetryCount] = useState(0)
+
+  // Filter & Sort state
+  const [filterPriority, setFilterPriority] = useState('all')
+  const [sortBy, setSortBy] = useState('priority')
 
   // Search state
   const [searchQuery, setSearchQuery] = useState('')
@@ -176,25 +188,56 @@ export default function Dashboard() {
 
   if (!data) return null
 
-  // Group todos by priority
-  const todosByPriority = {}
-  todos.forEach(todo => {
-    if (!todosByPriority[todo.priority]) todosByPriority[todo.priority] = []
-    todosByPriority[todo.priority].push(todo)
+  // Filter todos by priority
+  const filteredTodos = filterPriority === 'all'
+    ? todos
+    : todos.filter(t => t.priority === filterPriority)
+
+  // Sort todos
+  const sortedTodos = [...filteredTodos].sort((a, b) => {
+    if (sortBy === 'amount_desc') {
+      return (b.total_overdue || 0) - (a.total_overdue || 0)
+    }
+    if (sortBy === 'oldest_debt') {
+      const dateA = a.oldest_due_date || '9999-12-31'
+      const dateB = b.oldest_due_date || '9999-12-31'
+      return dateA.localeCompare(dateB)
+    }
+    if (sortBy === 'days_overdue') {
+      return (b.max_days_overdue || 0) - (a.max_days_overdue || 0)
+    }
+    if (sortBy === 'name') {
+      return (a.customer_name || '').localeCompare(b.customer_name || '')
+    }
+    // Default: priority
+    const priorityOrder = { overdue: 0, today: 1, new: 2, upcoming: 3 }
+    const pA = priorityOrder[a.priority] ?? 9
+    const pB = priorityOrder[b.priority] ?? 9
+    if (pA !== pB) return pA - pB
+    return (a.scheduled_date || '').localeCompare(b.scheduled_date || '')
   })
+
+  // Group by priority (only when sorted by priority)
+  const todosByPriority = {}
+  if (sortBy === 'priority') {
+    sortedTodos.forEach(todo => {
+      if (!todosByPriority[todo.priority]) todosByPriority[todo.priority] = []
+      todosByPriority[todo.priority].push(todo)
+    })
+  }
 
   const renderTodoItem = (todo) => (
     <div
       key={todo.id}
       onClick={() => navigate(`/customers/${todo.customer_id}`)}
-      className="flex items-center justify-between bg-white rounded-lg px-3 py-2 cursor-pointer hover:shadow-sm transition-shadow border border-slate-100"
+      className="flex items-center justify-between bg-white rounded-lg px-4 py-3 cursor-pointer hover:shadow-md transition-all border border-slate-100 group"
     >
       <div className="flex items-center gap-3 min-w-0">
         <span className={`${ACTION_BADGE_COLORS[todo.action_type] || ACTION_BADGE_COLORS.idle} px-2 py-0.5 rounded text-xs font-medium border shrink-0`}>
           {ACTION_LABELS[todo.action_type] || todo.action_type}
         </span>
         <div className="min-w-0">
-          <span className="text-sm font-medium text-slate-900 truncate block max-w-[200px]">
+          <span className="text-sm font-medium text-slate-900 truncate block max-w-[220px]">
             {todo.customer_name}
           </span>
           {todo.partita_iva && (
@@ -203,24 +246,34 @@ export default function Dashboard() {
         </div>
       </div>
       <div className="flex items-center gap-3 text-xs text-slate-500 shrink-0">
+        {/* Days overdue badge */}
+        {todo.max_days_overdue > 0 && (
+          <span className={`px-1.5 py-0.5 rounded font-medium ${
+            todo.max_days_overdue > 60 ? 'bg-red-100 text-red-700' :
+            todo.max_days_overdue > 30 ? 'bg-amber-100 text-amber-700' :
+            'bg-slate-100 text-slate-600'
+          }`}>
+            {todo.max_days_overdue}gg
+          </span>
+        )}
         {todo.overdue_count > 0 && (
           <span className="bg-red-50 text-red-600 px-1.5 py-0.5 rounded">
-            {todo.overdue_count} scad.
+            {todo.overdue_count} fatt.
           </span>
         )}
         {todo.total_overdue > 0 && (
-          <span className="font-medium text-red-700">{formatCurrency(todo.total_overdue)}</span>
+          <span className="font-semibold text-red-700 min-w-[70px] text-right">{formatCurrency(todo.total_overdue)}</span>
         )}
         {todo.phone && (
           <a
             href={`https://wa.me/${todo.phone.replace(/[^+\d]/g, '')}`}
             target="_blank" rel="noopener noreferrer"
             onClick={(e) => e.stopPropagation()}
-            className="w-5 h-5 bg-green-500 text-white rounded-full text-xs flex items-center justify-center hover:bg-green-600"
+            className="w-6 h-6 bg-green-500 text-white rounded-full text-xs flex items-center justify-center hover:bg-green-600 opacity-0 group-hover:opacity-100 transition-opacity"
             title="WhatsApp"
           >W</a>
         )}
-        <span>{formatDate(todo.scheduled_date)}</span>
+        <span className="text-slate-400 min-w-[80px] text-right">{formatDate(todo.scheduled_date)}</span>
       </div>
     </div>
   )
@@ -229,13 +282,20 @@ export default function Dashboard() {
     const items = todosByPriority[priority]
     if (!items || items.length === 0) return null
     const config = PRIORITY_CONFIG[priority]
+    const sectionTotal = items.reduce((sum, t) => sum + (t.total_overdue || 0), 0)
     return (
       <div key={priority} className={`${config.bg} rounded-lg p-4 border ${config.border}`}>
-        <div className="flex items-center gap-2 mb-3">
-          <span className={`${config.badge} px-2 py-0.5 rounded text-xs font-bold`}>
-            {config.label}
-          </span>
-          <span className="text-sm text-slate-500">({items.length})</span>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <span className="text-sm">{config.icon}</span>
+            <span className={`${config.badge} px-2.5 py-0.5 rounded text-xs font-bold`}>
+              {config.label}
+            </span>
+            <span className="text-sm text-slate-500">({items.length})</span>
+          </div>
+          {sectionTotal > 0 && (
+            <span className="text-sm font-semibold text-slate-700">{formatCurrency(sectionTotal)}</span>
+          )}
         </div>
         <div className="space-y-2">
           {items.map(renderTodoItem)}
@@ -329,37 +389,140 @@ export default function Dashboard() {
         <StatsWidget label="Da Gestire" value={todos.length || 0} color="blue" />
       </div>
 
-      {/* Clienti Da Fare - full width list with grouping */}
-      <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-3">
-            <h2 className="text-lg font-bold text-slate-900">Da Fare</h2>
-            {todos.length > 0 && (
-              <span className="bg-red-100 text-red-700 px-2.5 py-0.5 rounded-full text-sm font-bold">
-                {todos.length}
-              </span>
+      {/* Clienti Da Fare - with filters and sorting */}
+      <div className="bg-white rounded-lg border border-slate-200">
+        {/* Header with title and total */}
+        <div className="px-6 py-4 border-b border-slate-200">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <h2 className="text-lg font-bold text-slate-900">Da Fare</h2>
+              {todos.length > 0 && (
+                <span className="bg-red-100 text-red-700 px-2.5 py-0.5 rounded-full text-sm font-bold">
+                  {todos.length}
+                </span>
+              )}
+            </div>
+            {totalTodoOverdue > 0 && (
+              <div className="text-right">
+                <p className="text-xs text-slate-500">Totale in gestione</p>
+                <p className="text-lg font-bold text-red-600">{formatCurrency(totalTodoOverdue)}</p>
+              </div>
             )}
           </div>
-          {totalTodoOverdue > 0 && (
-            <div className="text-right">
-              <p className="text-xs text-slate-500">Totale in gestione</p>
-              <p className="text-lg font-bold text-red-600">{formatCurrency(totalTodoOverdue)}</p>
+        </div>
+
+        {/* Filter chips + Sort selector */}
+        {todos.length > 0 && (
+          <div className="px-6 py-3 border-b border-slate-100 bg-slate-50/50 flex flex-wrap items-center justify-between gap-3">
+            {/* Priority filter chips */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-xs text-slate-500 font-medium mr-1">Filtra:</span>
+              <button
+                onClick={() => setFilterPriority('all')}
+                className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                  filterPriority === 'all'
+                    ? 'bg-slate-800 text-white'
+                    : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-100'
+                }`}
+              >
+                Tutti ({todos.length})
+              </button>
+              {todoCounts.overdue > 0 && (
+                <button
+                  onClick={() => setFilterPriority('overdue')}
+                  className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                    filterPriority === 'overdue'
+                      ? 'bg-red-600 text-white'
+                      : 'bg-white text-red-600 border border-red-300 hover:bg-red-50'
+                  }`}
+                >
+                  In Ritardo ({todoCounts.overdue})
+                </button>
+              )}
+              {todoCounts.today > 0 && (
+                <button
+                  onClick={() => setFilterPriority('today')}
+                  className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                    filterPriority === 'today'
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-white text-blue-600 border border-blue-300 hover:bg-blue-50'
+                  }`}
+                >
+                  Oggi ({todoCounts.today})
+                </button>
+              )}
+              {todoCounts.new > 0 && (
+                <button
+                  onClick={() => setFilterPriority('new')}
+                  className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                    filterPriority === 'new'
+                      ? 'bg-amber-600 text-white'
+                      : 'bg-white text-amber-600 border border-amber-300 hover:bg-amber-50'
+                  }`}
+                >
+                  Da Contattare ({todoCounts.new})
+                </button>
+              )}
+              {todoCounts.upcoming > 0 && (
+                <button
+                  onClick={() => setFilterPriority('upcoming')}
+                  className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                    filterPriority === 'upcoming'
+                      ? 'bg-slate-600 text-white'
+                      : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-50'
+                  }`}
+                >
+                  Prossimi ({todoCounts.upcoming})
+                </button>
+              )}
+            </div>
+
+            {/* Sort selector */}
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-500 font-medium">Ordina:</span>
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value)}
+                className="text-xs border border-slate-300 rounded-lg px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-300"
+              >
+                {SORT_OPTIONS.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
+
+        {/* Todo list content */}
+        <div className="p-6">
+          {todoLoading ? (
+            <p className="text-slate-500 text-center py-4">Caricamento...</p>
+          ) : todos.length === 0 ? (
+            <div className="text-center py-8">
+              <p className="text-slate-500 mb-2">Nessuna azione da fare</p>
+              <p className="text-sm text-slate-400">Sincronizza le fatture e vai nella scheda Clienti per iniziare.</p>
+            </div>
+          ) : sortBy === 'priority' && filterPriority === 'all' ? (
+            /* Grouped by priority */
+            <div className="space-y-4 max-h-[700px] overflow-y-auto">
+              {['overdue', 'today', 'new', 'upcoming'].map(p => renderTodoSection(p))}
+            </div>
+          ) : (
+            /* Flat sorted list */
+            <div className="space-y-2 max-h-[700px] overflow-y-auto">
+              {sortedTodos.length === 0 ? (
+                <p className="text-slate-400 text-center py-4">Nessun risultato per questo filtro</p>
+              ) : (
+                sortedTodos.map((todo, idx) => (
+                  <div key={todo.id} className="flex items-center gap-2">
+                    <span className="text-xs text-slate-300 w-6 text-right shrink-0">{idx + 1}.</span>
+                    <div className="flex-1">{renderTodoItem(todo)}</div>
+                  </div>
+                ))
+              )}
             </div>
           )}
         </div>
-
-        {todoLoading ? (
-          <p className="text-slate-500 text-center py-4">Caricamento...</p>
-        ) : todos.length === 0 ? (
-          <div className="text-center py-8">
-            <p className="text-slate-500 mb-2">Nessuna azione da fare</p>
-            <p className="text-sm text-slate-400">Sincronizza le fatture e vai nella scheda Clienti per iniziare.</p>
-          </div>
-        ) : (
-          <div className="space-y-4 max-h-[700px] overflow-y-auto">
-            {['overdue', 'today', 'new', 'upcoming'].map(p => renderTodoSection(p))}
-          </div>
-        )}
       </div>
     </div>
   )

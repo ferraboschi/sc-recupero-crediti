@@ -5,7 +5,7 @@ from datetime import datetime, date, timedelta
 from fastapi import APIRouter
 from sqlalchemy import func, text
 
-from backend.database import get_session, get_engine, Customer, Invoice, Message, ActivityLog
+from backend.database import get_session, get_session_direct, get_engine, Customer, Invoice, Message, ActivityLog
 from backend.config import config
 from backend.scheduler import get_scheduler_status
 from backend.api.sync import _sync_status, _load_sync_state
@@ -60,7 +60,7 @@ async def get_system_status():
     # Load persisted sync state from DB (once)
     _load_sync_state()
 
-    session = get_session()
+    session = get_session_direct()
     alerts = []
 
     try:

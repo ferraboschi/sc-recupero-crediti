@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, extract
 from sqlalchemy.orm import Session, joinedload
 
-from backend.database import get_session, Invoice, Customer, Message, ActivityLog, RecoveryAction
+from backend.database import get_session, Invoice, Customer, Message, RecoveryAction
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -16,15 +16,9 @@ router = APIRouter()
 async def get_dashboard(session: Session = Depends(get_session)):
     """
     Get dashboard overview with key statistics.
-
-    Returns statistics about crediti, positions, and escalations.
+    Optimized: only returns the stats actually used by the frontend.
     """
     try:
-        # Total amount of credit (excluding paid invoices)
-        total_crediti = session.query(func.sum(Invoice.amount_due)).filter(
-            Invoice.status != "paid"
-        ).scalar() or 0.0
-
         # Total OVERDUE amount (only invoices past due date)
         total_scaduto = session.query(func.sum(Invoice.amount_due)).filter(
             Invoice.status != "paid",
@@ -36,7 +30,9 @@ async def get_dashboard(session: Session = Depends(get_session)):
             Invoice.days_overdue > 0,
         ).scalar() or 0
 
-        total_clienti_scaduti = session.query(func.count(func.distinct(Invoice.customer_id))).filter(
+        total_clienti_scaduti = session.query(
+            func.count(func.distinct(Invoice.customer_id))
+        ).filter(
             Invoice.status != "paid",
             Invoice.days_overdue > 0,
             Invoice.customer_id.isnot(None),
@@ -47,72 +43,14 @@ async def get_dashboard(session: Session = Depends(get_session)):
             Invoice.status != "paid"
         ).scalar() or 0
 
-        # Positions by status
-        positions_by_status = session.query(
-            Invoice.status,
-            func.count(Invoice.id).label("count"),
-            func.sum(Invoice.amount_due).label("amount")
-        ).group_by(Invoice.status).all()
-
-        status_breakdown = {
-            row[0]: {
-                "count": row[1],
-                "amount": float(row[2]) if row[2] else 0.0
-            }
-            for row in positions_by_status
-        }
-
-        # Positions by escalation level
-        positions_by_escalation = session.query(
-            Message.escalation_level,
-            func.count(func.distinct(Invoice.id)).label("count"),
-            func.sum(Invoice.amount_due).label("amount")
-        ).join(Invoice, Message.invoice_id == Invoice.id).group_by(
-            Message.escalation_level
-        ).all()
-
-        escalation_breakdown = {
-            row[0]: {
-                "count": row[1],
-                "amount": float(row[2]) if row[2] else 0.0
-            }
-            for row in positions_by_escalation
-        }
-
-        # Recent activity (last 10 items)
-        recent_activity = session.query(ActivityLog).order_by(
-            ActivityLog.timestamp.desc()
-        ).limit(10).all()
-
-        activity_list = [
-            {
-                "id": activity.id,
-                "timestamp": activity.timestamp.isoformat(),
-                "action": activity.action,
-                "entity_type": activity.entity_type,
-                "entity_id": activity.entity_id,
-                "details": activity.details or {},
-            }
-            for activity in recent_activity
-        ]
-
-        # Additional stats for dashboard cards
         total_customers = session.query(func.count(Customer.id)).scalar() or 0
-        draft_messages = session.query(func.count(Message.id)).filter(
-            Message.status == "draft"
-        ).scalar() or 0
 
         return {
-            "total_crediti": float(total_crediti),
             "total_scaduto": float(total_scaduto),
             "total_fatture_scadute": total_fatture_scadute,
             "total_clienti_scaduti": total_clienti_scaduti,
             "total_positions": total_positions,
             "total_customers": total_customers,
-            "draft_messages": draft_messages,
-            "positions_by_status": status_breakdown,
-            "positions_by_escalation_level": escalation_breakdown,
-            "recent_activity": activity_list,
         }
 
     except Exception as e:
@@ -186,6 +124,8 @@ async def get_todos(session: Session = Depends(get_session)):
                 Invoice.customer_id,
                 func.count(Invoice.id).label("overdue_count"),
                 func.sum(Invoice.amount_due).label("total_overdue"),
+                func.min(Invoice.due_date).label("oldest_due_date"),
+                func.max(Invoice.days_overdue).label("max_days_overdue"),
             )
             .filter(
                 Invoice.status != "paid",
@@ -196,7 +136,12 @@ async def get_todos(session: Session = Depends(get_session)):
             .all()
         )
         overdue_by_customer = {
-            row[0]: {"overdue_count": row[1], "total_overdue": float(row[2] or 0)}
+            row[0]: {
+                "overdue_count": row[1],
+                "total_overdue": float(row[2] or 0),
+                "oldest_due_date": row[3].isoformat() if row[3] else None,
+                "max_days_overdue": row[4] or 0,
+            }
             for row in overdue_stats_raw
         }
 
@@ -243,7 +188,10 @@ async def get_todos(session: Session = Depends(get_session)):
         for action in pending_actions:
             cid = action.customer_id
             seen_customer_ids.add(cid)
-            stats = overdue_by_customer.get(cid, {"overdue_count": 0, "total_overdue": 0})
+            stats = overdue_by_customer.get(cid, {
+                "overdue_count": 0, "total_overdue": 0,
+                "oldest_due_date": None, "max_days_overdue": 0,
+            })
 
             sched = action.scheduled_date
             if sched < today:
@@ -266,6 +214,8 @@ async def get_todos(session: Session = Depends(get_session)):
                 "notes": action.notes,
                 "overdue_count": stats["overdue_count"],
                 "total_overdue": stats["total_overdue"],
+                "oldest_due_date": stats["oldest_due_date"],
+                "max_days_overdue": stats["max_days_overdue"],
                 "recovery_status": action.customer.recovery_status,
             })
 
@@ -273,6 +223,9 @@ async def get_todos(session: Session = Depends(get_session)):
         for cust, overdue_count, total_overdue in idle_customers_with_overdue:
             if cust.id in seen_customer_ids:
                 continue
+            stats = overdue_by_customer.get(cust.id, {
+                "oldest_due_date": None, "max_days_overdue": 0,
+            })
             todos.append({
                 "id": f"idle_{cust.id}",
                 "type": "new_contact",
@@ -286,6 +239,8 @@ async def get_todos(session: Session = Depends(get_session)):
                 "notes": None,
                 "overdue_count": overdue_count,
                 "total_overdue": float(total_overdue or 0),
+                "oldest_due_date": stats.get("oldest_due_date"),
+                "max_days_overdue": stats.get("max_days_overdue", 0),
                 "recovery_status": "idle",
             })
 
@@ -619,6 +574,94 @@ async def get_attivita(session: Session = Depends(get_session)):
 
     except Exception as e:
         logger.error(f"Error fetching attivita data: {e}", exc_info=True)
+        raise
+
+
+@router.get("/pipeline")
+async def get_pipeline(session: Session = Depends(get_session)):
+    """
+    Get pipeline/funnel data for the Attività page.
+    Shows how many customers are at each recovery stage.
+    """
+    try:
+        # Count customers by recovery_status (only non-excluded with overdue)
+        from sqlalchemy import case  # noqa: F811
+
+        pipeline_raw = (
+            session.query(
+                Customer.recovery_status,
+                func.count(func.distinct(Customer.id)).label("count"),
+                func.sum(
+                    case((
+                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
+                        Invoice.amount_due
+                    ), else_=0)
+                ).label("total_overdue"),
+            )
+            .outerjoin(Invoice, Invoice.customer_id == Customer.id)
+            .filter(Customer.excluded.is_(False))
+            .group_by(Customer.recovery_status)
+            .all()
+        )
+
+        stages = {
+            "idle": {"label": "Da Gestire", "count": 0, "amount": 0},
+            "first_contact": {"label": "I Contatto", "count": 0, "amount": 0},
+            "second_contact": {"label": "II Contatto", "count": 0, "amount": 0},
+            "lawyer": {"label": "Avvocato", "count": 0, "amount": 0},
+            "waiting": {"label": "In Attesa", "count": 0, "amount": 0},
+            "archived": {"label": "Archiviato", "count": 0, "amount": 0},
+        }
+
+        for status, count, total in pipeline_raw:
+            if status in stages:
+                stages[status]["count"] = count or 0
+                stages[status]["amount"] = float(total or 0)
+
+        # Count resolved (paid overdue invoices)
+        from sqlalchemy import cast, Date  # noqa: F811
+        overdue_paid_filter = (
+            (Invoice.status == "paid")
+            & (Invoice.due_date.isnot(None))
+            & (Invoice.due_date < cast(Invoice.updated_at, Date))
+        )
+        resolved_count = (
+            session.query(
+                func.count(func.distinct(Invoice.customer_id))
+            )
+            .filter(overdue_paid_filter)
+            .scalar() or 0
+        )
+        resolved_amount = (
+            session.query(func.sum(Invoice.amount))
+            .filter(overdue_paid_filter)
+            .scalar() or 0
+        )
+
+        stages["resolved"] = {
+            "label": "Incassato",
+            "count": resolved_count,
+            "amount": float(resolved_amount),
+        }
+
+        # Total customers with overdue
+        total_with_overdue = (
+            session.query(func.count(func.distinct(Invoice.customer_id)))
+            .filter(
+                Invoice.status != "paid",
+                Invoice.days_overdue > 0,
+                Invoice.customer_id.isnot(None),
+            )
+            .scalar() or 0
+        )
+
+        return {
+            "stages": stages,
+            "total_with_overdue": total_with_overdue,
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching pipeline data: {e}", exc_info=True)
         raise
 
 

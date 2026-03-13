@@ -7,7 +7,7 @@ from io import StringIO
 from fastapi import APIRouter, BackgroundTasks, UploadFile, File, Form
 from datetime import datetime, date
 
-from backend.database import get_session, ActivityLog, Invoice, Customer, SyncState
+from backend.database import get_session, get_session_direct, ActivityLog, Invoice, Customer, SyncState
 from backend.connectors.fatturapro import FatturaProConnector
 from backend.connectors.fatture24 import Fattura24Connector, Fattura24SubscriptionError
 from backend.connectors.shopify import ShopifyConnector
@@ -40,7 +40,7 @@ def _load_sync_state():
     if _sync_loaded:
         return
     try:
-        session = get_session()
+        session = get_session_direct()
         rows = session.query(SyncState).all()
         for row in rows:
             if row.key in _sync_status:
@@ -60,7 +60,7 @@ def _persist_sync_status(key: str, result: dict):
     _sync_status[key]["last_sync"] = now.isoformat()
     _sync_status[key]["result"] = result
     try:
-        session = get_session()
+        session = get_session_direct()
         existing = session.query(SyncState).filter_by(key=key).first()
         if existing:
             existing.last_sync = now
@@ -85,7 +85,7 @@ def _sync_invoices_task() -> dict:
       list are marked as 'paid' (amount_due becomes 0)
     - Recalculates days_overdue dynamically for ALL unpaid invoices
     """
-    session = get_session()
+    session = get_session_direct()
     result = {
         "fatturapro": {"success": False, "created": 0, "updated": 0, "paid_detected": 0, "error": None},
         "fattura24": {"success": False, "created": 0, "updated": 0, "paid_detected": 0, "error": None},
@@ -361,7 +361,7 @@ def _sync_customers_task() -> dict:
        but no corresponding Customer record. This ensures customers like
        "F-T SRL" that only exist in FatturaPro/Fattura24 get created.
     """
-    session = get_session()
+    session = get_session_direct()
     result = {
         "success": False, "created": 0, "updated": 0,
         "auto_created_from_invoices": 0, "error": None,
@@ -549,7 +549,7 @@ def _auto_create_customers_from_invoices(session) -> int:
 
 def _run_matching_task() -> dict:
     """Background task to run invoice-customer matching."""
-    session = get_session()
+    session = get_session_direct()
     try:
         logger.info("Running invoice-customer matching...")
         result = run_matching(session)
@@ -578,7 +578,7 @@ def _run_matching_task() -> dict:
 
 def _process_escalations_task() -> dict:
     """Background task to process escalations."""
-    session = get_session()
+    session = get_session_direct()
     try:
         logger.info("Processing escalations...")
         messages = process_escalations(session)
@@ -721,7 +721,7 @@ async def cleanup_stale_f24():
 
     This is a one-off maintenance endpoint. Use CSV import to re-add F24 invoices if needed.
     """
-    session = get_session()
+    session = get_session_direct()
     try:
         stale = session.query(Invoice).filter(
             Invoice.source_platform == "fatture24",
@@ -772,7 +772,7 @@ async def import_csv(file: UploadFile = File(...)):
 
     Returns import statistics.
     """
-    session = get_session()
+    session = get_session_direct()
     result = {"created": 0, "updated": 0, "skipped": 0, "errors": [], "total_rows": 0}
 
     try:

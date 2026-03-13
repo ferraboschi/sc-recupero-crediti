@@ -178,10 +178,22 @@ def init_db():
 
 
 def get_session():
-    """Create a new database session."""
+    """Create a new database session as a FastAPI dependency with auto-close."""
     engine = get_engine()
-    Session = sessionmaker(bind=engine)
-    return Session()
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def get_session_direct():
+    """Create a new database session for non-FastAPI use (sync code).
+    Caller MUST close the session manually."""
+    engine = get_engine()
+    SessionLocal = sessionmaker(bind=engine)
+    return SessionLocal()
 
 
 # SQLite WAL mode listener — registered lazily inside get_engine()
