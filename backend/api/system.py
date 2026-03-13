@@ -17,22 +17,37 @@ router = APIRouter()
 @router.post("/migrate")
 @router.get("/migrate")
 async def run_migrations():
-    """Run schema migrations to add missing columns."""
-    session = get_session()
+    """Run schema migrations to add missing columns.
+    Uses a direct Supabase connection (port 5432) for DDL operations
+    since the session pooler (port 6543) doesn't support ALTER TABLE.
+    """
+    import re
     results = []
-    # Try to add outcome column — if it already exists, catch the error
+    db_url = config.DATABASE_URL
+
+    # Convert pooler URL (port 6543) to direct connection (port 5432)
+    # pooler: postgres.PROJECT@aws-..pooler.supabase.com:6543
+    # direct: postgres.PROJECT@aws-..pooler.supabase.com:5432
+    direct_url = re.sub(r':6543/', ':5432/', db_url)
+    if direct_url == db_url and ':5432' not in db_url:
+        direct_url = db_url  # fallback if URL format is different
+
     try:
-        session.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
-        session.commit()
-        results.append("outcome: added successfully")
+        from sqlalchemy import create_engine as _ce
+        from sqlalchemy.pool import NullPool
+        direct_engine = _ce(direct_url, poolclass=NullPool, connect_args={"connect_timeout": 10})
+        with direct_engine.begin() as conn:
+            try:
+                conn.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
+                results.append("outcome: added successfully")
+            except Exception as e:
+                if 'already exists' in str(e).lower() or 'duplicate' in str(e).lower():
+                    results.append("outcome: already exists")
+                else:
+                    results.append(f"outcome error: {str(e)}")
+        direct_engine.dispose()
     except Exception as e:
-        session.rollback()
-        if 'already exists' in str(e).lower() or 'duplicate' in str(e).lower():
-            results.append("outcome: already exists")
-        else:
-            results.append(f"outcome error: {str(e)}")
-    finally:
-        session.close()
+        results.append(f"connection error: {str(e)}")
     return {"migrations": results}
 
 
