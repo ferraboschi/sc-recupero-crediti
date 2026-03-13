@@ -288,11 +288,47 @@ class ShopifyConnector(BaseConnector):
         else:
             logger.debug(f"Customer {shopify_id} has no addresses")
 
-        # Use phone from address if customer phone is missing
-        customer_phone = phone
-        if not customer_phone and (billing_address or default_address):
-            addr_for_phone = billing_address or default_address
-            customer_phone = addr_for_phone.get("phone")
+        # Collect ALL phone numbers with source labels
+        phones = []
+        seen_numbers = set()
+
+        def _add_phone(num, source, label):
+            if not num:
+                return
+            clean = num.strip()
+            if clean and clean not in seen_numbers:
+                seen_numbers.add(clean)
+                phones.append({
+                    "number": clean,
+                    "source": source,
+                    "label": label,
+                })
+
+        # Main Shopify customer phone
+        _add_phone(phone, "shopify_customer", "Shopify")
+
+        # Phones from addresses
+        for addr in addresses:
+            addr_phone = (addr.get("phone") or "").strip()
+            if not addr_phone:
+                continue
+            is_default = addr.get("default", False)
+            company = (addr.get("company") or "").strip()
+            # Determine label
+            if addr == billing_address:
+                lbl = "Fatturazione"
+                src = "shopify_billing"
+            elif is_default:
+                lbl = "Consegna"
+                src = "shopify_shipping"
+            else:
+                city = (addr.get("city") or "").strip()
+                lbl = f"Indirizzo {city}" if city else "Altro"
+                src = "shopify_address"
+            _add_phone(addr_phone, src, lbl)
+
+        # Primary phone = first available
+        customer_phone = phones[0]["number"] if phones else None
 
         parsed = {
             "shopify_id": str(shopify_id),
@@ -301,12 +337,48 @@ class ShopifyConnector(BaseConnector):
             "codice_fiscale": piva_data.get("codice_fiscale"),
             "codice_sdi": piva_data.get("codice_sdi"),
             "phone": customer_phone,
+            "phones": phones,
             "email": email,
             "tags": tags,
         }
 
         logger.debug(f"Parsed customer {shopify_id}: {ragione_sociale}")
         return parsed
+
+    def update_customer_phone(
+        self, shopify_id: str, phone: str
+    ) -> bool:
+        """Update customer phone number on Shopify.
+
+        Args:
+            shopify_id: Shopify customer ID (numeric or gid)
+            phone: New phone number
+
+        Returns:
+            True if updated successfully
+        """
+        try:
+            numeric_id = self._extract_id_from_gid(shopify_id)
+            url = f"customers/{numeric_id}.json"
+            response = self.put(
+                url,
+                json_data={
+                    "customer": {"id": int(numeric_id), "phone": phone}
+                },
+                headers=self._get_headers(),
+            )
+            if response and isinstance(response, dict):
+                logger.info(
+                    f"Shopify customer {numeric_id} phone "
+                    f"updated to {phone}"
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.error(
+                f"Error updating Shopify customer phone: {e}"
+            )
+            return False
 
     @staticmethod
     def _extract_id_from_gid(shopify_id: str) -> str:

@@ -217,6 +217,7 @@ async def get_customer_detail(
             "partita_iva": customer.partita_iva,
             "codice_fiscale": customer.codice_fiscale,
             "phone": customer.phone,
+            "phones": customer.phones_json or [],
             "email": customer.email,
             "excluded": customer.excluded,
             "source": customer.source,
@@ -347,17 +348,55 @@ async def update_customer_phone(
     phone: str,
     session: Session = Depends(get_session),
 ):
-    """Update the phone number for a customer."""
+    """Update the phone number for a customer and sync to Shopify."""
     try:
-        customer = session.query(Customer).filter(Customer.id == customer_id).first()
+        customer = session.query(Customer).filter(
+            Customer.id == customer_id
+        ).first()
         if not customer:
-            raise HTTPException(status_code=404, detail="Customer not found")
+            raise HTTPException(
+                status_code=404, detail="Customer not found"
+            )
 
         old_phone = customer.phone
         customer.phone = phone
-        customer.phone_validated = False  # Reset validation status when phone is updated
+        customer.phone_validated = False
         customer.updated_at = datetime.utcnow()
+
+        # Add/update in phones_json
+        phones = customer.phones_json or []
+        # Check if there's already a "Manuale" entry
+        manual_found = False
+        for p in phones:
+            if p.get("source") == "manual":
+                p["number"] = phone
+                manual_found = True
+                break
+        if not manual_found:
+            phones.insert(0, {
+                "number": phone,
+                "source": "manual",
+                "label": "Manuale",
+            })
+        customer.phones_json = phones
+
         session.commit()
+
+        # Sync to Shopify if customer has shopify_id
+        shopify_synced = False
+        if customer.shopify_id:
+            try:
+                from backend.connectors.shopify import (
+                    ShopifyConnector,
+                )
+                shopify = ShopifyConnector()
+                shopify_synced = shopify.update_customer_phone(
+                    customer.shopify_id, phone
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Could not sync phone to Shopify: {e}"
+                )
 
         # Log activity
         activity = ActivityLog(
@@ -368,17 +407,24 @@ async def update_customer_phone(
                 "ragione_sociale": customer.ragione_sociale,
                 "old_phone": old_phone,
                 "new_phone": phone,
+                "shopify_synced": shopify_synced,
             }
         )
         session.add(activity)
         session.commit()
 
-        logger.info(f"Customer {customer_id} phone updated from {old_phone} to {phone}")
+        logger.info(
+            f"Customer {customer_id} phone updated: "
+            f"{old_phone} -> {phone} "
+            f"(shopify={'ok' if shopify_synced else 'skip'})"
+        )
 
         return {
             "id": customer.id,
             "phone": customer.phone,
+            "phones": customer.phones_json or [],
             "phone_validated": customer.phone_validated,
+            "shopify_synced": shopify_synced,
             "updated_at": customer.updated_at.isoformat(),
         }
 

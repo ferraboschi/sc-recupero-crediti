@@ -89,6 +89,8 @@ export default function ClientDetail() {
   const [completingAction, setCompletingAction] = useState(null)
   const [selectedOutcome, setSelectedOutcome] = useState('')
   const [copiedWhatsApp, setCopiedWhatsApp] = useState(false)
+  const [promemoria, setPromemoria] = useState(false)
+  const [selectedWhatsAppPhone, setSelectedWhatsAppPhone] = useState(null)
 
   const fetchData = useCallback(async () => {
     try {
@@ -190,6 +192,32 @@ export default function ClientDetail() {
     }
   }
 
+  // Download promemoria (riassunto fatture con IBAN e giorni ritardo)
+  const handleDownloadPromemoria = async () => {
+    if (selectedInvoices.size === 0) return
+    setPromemoria(true)
+    try {
+      const ids = Array.from(selectedInvoices).join(',')
+      const response = await client.get(`/recovery/customers/${customerId}/pdf-selected`, {
+        responseType: 'blob',
+        params: { invoice_ids: ids },
+      })
+      const url = window.URL.createObjectURL(new Blob([response.data]))
+      const link = document.createElement('a')
+      link.href = url
+      link.setAttribute('download', `promemoria_${data?.ragione_sociale?.replace(/\s/g, '_')}.pdf`)
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      window.URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error('Error downloading promemoria:', err)
+      alert('Errore nella generazione del promemoria')
+    } finally {
+      setPromemoria(false)
+    }
+  }
+
   // Download single invoice PDF
   const handleDownloadSinglePdf = async (invoiceId, invoiceNumber) => {
     setSinglePdfLoading(invoiceId)
@@ -288,9 +316,14 @@ export default function ClientDetail() {
     return msg
   }
 
+  const getWhatsAppNumber = () => {
+    const raw = selectedWhatsAppPhone || data?.phone || ''
+    return raw.replace(/[^+\d]/g, '')
+  }
+
   const handleWhatsAppSend = () => {
-    if (!data?.phone) return
-    const number = data.phone.replace(/[^+\d]/g, '')
+    const number = getWhatsAppNumber()
+    if (!number) return
     const message = buildWhatsAppMessage()
     const url = `https://wa.me/${number}?text=${encodeURIComponent(message)}`
     window.open(url, '_blank')
@@ -354,7 +387,7 @@ export default function ClientDetail() {
   const overdueInvoices = data.invoices?.items?.filter(inv => inv.days_overdue > 0 && inv.status !== 'paid') || []
   const totalOverdue = overdueInvoices.reduce((sum, inv) => sum + inv.amount_due, 0)
   const allUnpaid = data.invoices?.items?.filter(inv => inv.status !== 'paid') || []
-  const whatsappNumber = data.phone ? data.phone.replace(/[^+\d]/g, '') : null
+  const whatsappNumber = getWhatsAppNumber() || null
 
   // By default show only overdue, unless user toggles
   let visibleInvoices = showAllInvoices
@@ -430,10 +463,19 @@ export default function ClientDetail() {
               {data.partita_iva && <p>P.IVA: <span className="font-mono">{data.partita_iva}</span></p>}
               {data.codice_fiscale && <p>C.F.: <span className="font-mono">{data.codice_fiscale}</span></p>}
               {data.email && <p>Email: {data.email}</p>}
-              <div className="flex items-center gap-2">
-                <span>Tel:</span>
+              {/* Phone numbers with source labels */}
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <span>Telefono:</span>
+                  <button
+                    onClick={() => setPhoneEdit(data.phone || '')}
+                    className="text-blue-600 text-xs underline"
+                  >
+                    {data.phone ? 'Modifica' : 'Aggiungi'}
+                  </button>
+                </div>
                 {phoneEdit !== null ? (
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 ml-2">
                     <input
                       type="text"
                       value={phoneEdit}
@@ -445,14 +487,28 @@ export default function ClientDetail() {
                     <button onClick={() => setPhoneEdit(null)} className="text-slate-400 text-sm">Annulla</button>
                   </div>
                 ) : (
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono">{data.phone || 'Non disponibile'}</span>
-                    <button
-                      onClick={() => setPhoneEdit(data.phone || '')}
-                      className="text-blue-600 text-xs underline"
-                    >
-                      Modifica
-                    </button>
+                  <div className="ml-2 space-y-0.5">
+                    {(data.phones && data.phones.length > 0) ? (
+                      data.phones.map((p, idx) => (
+                        <div key={idx} className="flex items-center gap-2">
+                          <span className="font-mono text-slate-900">{p.number}</span>
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">{p.label}</span>
+                          {p.number.replace(/[^+\d]/g, '') !== (selectedWhatsAppPhone || data.phone || '').replace(/[^+\d]/g, '') && (
+                            <button
+                              onClick={() => setSelectedWhatsAppPhone(p.number)}
+                              className="text-xs text-green-600 hover:underline"
+                            >
+                              Usa per WhatsApp
+                            </button>
+                          )}
+                          {p.number.replace(/[^+\d]/g, '') === (selectedWhatsAppPhone || data.phone || '').replace(/[^+\d]/g, '') && (
+                            <span className="text-xs text-green-600 font-medium">WhatsApp</span>
+                          )}
+                        </div>
+                      ))
+                    ) : (
+                      <span className="font-mono text-slate-400">{data.phone || 'Non disponibile'}</span>
+                    )}
                   </div>
                 )}
               </div>
@@ -643,20 +699,27 @@ export default function ClientDetail() {
                   {selectedInvoices.size} fattur{selectedInvoices.size === 1 ? 'a' : 'e'} selezionat{selectedInvoices.size === 1 ? 'a' : 'e'} — {formatCurrency(selectedTotal)}
                 </p>
               </div>
-              <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex items-center gap-2 flex-wrap">
                 <button
                   onClick={handleDownloadInvoicesZip}
                   disabled={pdfLoading}
-                  className="px-5 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 disabled:opacity-50"
                 >
                   {pdfLoading ? '...' : `Scarica ${selectedInvoices.size} Fattur${selectedInvoices.size === 1 ? 'a' : 'e'}`}
                 </button>
                 <button
+                  onClick={handleDownloadPromemoria}
+                  disabled={promemoria}
+                  className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-bold hover:bg-amber-700 disabled:opacity-50"
+                >
+                  {promemoria ? '...' : 'Scarica Promemoria'}
+                </button>
+                <button
                   onClick={handleCopyWhatsApp}
-                  className={`px-5 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors ${
+                  className={`px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
                     copiedWhatsApp
-                      ? 'bg-green-100 text-green-700 border-2 border-green-400'
-                      : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border-2 border-slate-300'
+                      ? 'bg-green-100 text-green-700 border border-green-400'
+                      : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-300'
                   }`}
                 >
                   {copiedWhatsApp ? 'Copiato!' : 'Copia Messaggio'}
@@ -664,16 +727,16 @@ export default function ClientDetail() {
                 {whatsappNumber ? (
                   <button
                     onClick={handleWhatsAppSend}
-                    className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-bold hover:bg-green-700 flex items-center gap-2"
+                    className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-bold hover:bg-green-700"
                   >
-                    Invia WhatsApp
+                    WhatsApp
                   </button>
                 ) : (
                   <button
                     onClick={() => setPhoneEdit(data.phone || '')}
-                    className="px-5 py-2 bg-yellow-500 text-white rounded-lg text-sm font-bold hover:bg-yellow-600"
+                    className="px-4 py-2 bg-yellow-500 text-white rounded-lg text-sm font-bold hover:bg-yellow-600"
                   >
-                    Aggiungi Tel per WhatsApp
+                    Aggiungi Tel
                   </button>
                 )}
               </div>
@@ -912,7 +975,7 @@ export default function ClientDetail() {
         </div>
 
         {/* Quick actions from riepilogo */}
-        <div className="mt-4 pt-4 border-t border-slate-200 flex flex-wrap gap-3">
+        <div className="mt-4 pt-4 border-t border-slate-200 flex flex-wrap gap-2">
           {selectedInvoices.size > 0 && (
             <>
               <button
@@ -921,6 +984,13 @@ export default function ClientDetail() {
                 className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
               >
                 {pdfLoading ? '...' : `Scarica ${selectedInvoices.size} Fattur${selectedInvoices.size === 1 ? 'a' : 'e'}`}
+              </button>
+              <button
+                onClick={handleDownloadPromemoria}
+                disabled={promemoria}
+                className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700 disabled:opacity-50"
+              >
+                {promemoria ? '...' : 'Promemoria'}
               </button>
               <button
                 onClick={handleCopyWhatsApp}
@@ -935,7 +1005,7 @@ export default function ClientDetail() {
                   onClick={handleWhatsAppSend}
                   className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700"
                 >
-                  Invia WhatsApp
+                  WhatsApp
                 </button>
               )}
             </>

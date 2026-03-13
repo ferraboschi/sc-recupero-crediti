@@ -23,6 +23,7 @@ class Customer(Base):
     codice_sdi = Column(String, nullable=True)
     phone = Column(String, nullable=True)
     phone_validated = Column(Boolean, default=False)
+    phones_json = Column(JSON, nullable=True)  # [{"number": "+39...", "source": "shopify_billing", "label": "Fatturazione"}]
     email = Column(String, nullable=True)
     excluded = Column(Boolean, default=False)
     source = Column(String, default="shopify")  # shopify / fatturapro / fatture24
@@ -171,10 +172,27 @@ def get_engine():
 
 
 def init_db():
-    """Initialize database tables."""
+    """Initialize database tables and run lightweight migrations."""
     engine = get_engine()
     Base.metadata.create_all(engine)
+    _run_migrations(engine)
     return engine
+
+
+def _run_migrations(engine):
+    """Add missing columns to existing tables (lightweight migration)."""
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    existing = {
+        c["name"] for c in inspector.get_columns("customers")
+    }
+    with engine.connect() as conn:
+        if "phones_json" not in existing:
+            conn.execute(text(
+                "ALTER TABLE customers "
+                "ADD COLUMN phones_json JSONB"
+            ))
+            conn.commit()
 
 
 def get_session():

@@ -399,6 +399,8 @@ def _sync_customers_task() -> dict:
                         existing.phone = cust.get("phone") or existing.phone
                         existing.email = cust.get("email") or existing.email
                         existing.tags = cust.get("tags") or existing.tags
+                        if cust.get("phones"):
+                            existing.phones_json = cust["phones"]
                         updated += 1
                     else:
                         new_customer = Customer(
@@ -411,6 +413,7 @@ def _sync_customers_task() -> dict:
                             codice_fiscale=cust.get("codice_fiscale"),
                             codice_sdi=cust.get("codice_sdi"),
                             phone=cust.get("phone"),
+                            phones_json=cust.get("phones"),
                             email=cust.get("email"),
                             tags=cust.get("tags"),
                             source="shopify",
