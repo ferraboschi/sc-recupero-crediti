@@ -17,44 +17,30 @@ router = APIRouter()
 @router.post("/migrate")
 @router.get("/migrate")
 async def run_migrations():
-    """Run schema migrations to add missing columns.
-    Uses a direct Supabase connection (port 5432) for DDL operations
-    since the session pooler (port 6543) doesn't support ALTER TABLE.
-    """
-    import re
+    """Run schema migrations to add missing columns."""
     results = []
-    db_url = config.DATABASE_URL
-
-    # Convert pooler URL to direct Supabase connection for DDL
-    # pooler: postgresql://postgres.PROJECT:PASS@aws-*.pooler.supabase.com:6543/postgres
-    # direct: postgresql://postgres.PROJECT:PASS@db.PROJECT.supabase.co:5432/postgres
-    project_match = re.search(r'postgres\.([a-z0-9]+):', db_url)
-    if project_match and 'pooler.supabase.com' in db_url:
-        project_id = project_match.group(1)
-        direct_url = re.sub(
-            r'@[^:]+:\d+/',
-            f'@db.{project_id}.supabase.co:5432/',
-            db_url
-        )
-    else:
-        direct_url = db_url  # fallback
-
     try:
         from sqlalchemy import create_engine as _ce
         from sqlalchemy.pool import NullPool
-        direct_engine = _ce(direct_url, poolclass=NullPool, connect_args={"connect_timeout": 10})
-        with direct_engine.begin() as conn:
+        # Use the same pooler URL but with short timeouts
+        migration_engine = _ce(
+            config.DATABASE_URL,
+            poolclass=NullPool,
+            connect_args={"connect_timeout": 10, "options": "-c statement_timeout=15000"},
+        )
+        with migration_engine.begin() as conn:
             try:
                 conn.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
                 results.append("outcome: added successfully")
             except Exception as e:
-                if 'already exists' in str(e).lower() or 'duplicate' in str(e).lower():
+                err = str(e).lower()
+                if 'already exists' in err or 'duplicate' in err:
                     results.append("outcome: already exists")
                 else:
-                    results.append(f"outcome error: {str(e)}")
-        direct_engine.dispose()
+                    results.append(f"outcome error: {str(e)[:200]}")
+        migration_engine.dispose()
     except Exception as e:
-        results.append(f"connection error: {str(e)}")
+        results.append(f"error: {str(e)[:200]}")
     return {"migrations": results}
 
 
