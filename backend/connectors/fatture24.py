@@ -10,8 +10,18 @@ from backend.config import config
 logger = logging.getLogger(__name__)
 
 
+class Fattura24SubscriptionError(Exception):
+    """Raised when Fattura24 subscription is expired or API access is denied."""
+    pass
+
+
 class Fattura24Connector(BaseConnector):
-    """Connector for Fattura24 legacy billing API (XML-based)."""
+    """Connector for Fattura24 legacy billing API (XML-based).
+
+    API docs: https://www.fattura24.com/api/introduzione/
+    Base URL: https://www.app.fattura24.com/api/v0.3
+    All requests must use POST with Content-Type: application/x-www-form-urlencoded
+    """
 
     def __init__(self):
         """Initialize Fattura24 connector."""
@@ -33,9 +43,14 @@ class Fattura24Connector(BaseConnector):
         json_data: Optional[dict] = None,
         data: Optional[Any] = None,
     ) -> Dict:
-        """Override to handle XML responses."""
+        """Override to handle XML responses and authorization errors."""
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         last_error = None
+
+        # Fattura24 API requires this Content-Type
+        if headers is None:
+            headers = {}
+        headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -56,26 +71,69 @@ class Fattura24Connector(BaseConnector):
                     time.sleep(retry_after)
                     continue
 
+                # 404 = endpoint doesn't exist
+                if response.status_code == 404:
+                    raise Exception(
+                        f"Endpoint {endpoint} non trovato (404). "
+                        f"L'API Fattura24 v0.3 potrebbe non supportare questo endpoint."
+                    )
+
                 response.raise_for_status()
 
                 # Try to parse as XML first
                 try:
                     root = ET.fromstring(response.text)
-                    return self._xml_to_dict(root)
+                    parsed = self._xml_to_dict(root)
+
+                    # Check for authorization errors (subscription expired)
+                    if isinstance(parsed, dict) and "root" in parsed:
+                        root_data = parsed["root"]
+                        if isinstance(root_data, dict):
+                            return_code = root_data.get("returnCode", "")
+                            description = root_data.get("description", "")
+                            # returnCode -1 or -10 = not authorized
+                            if return_code in ("-1", "-10"):
+                                raise Fattura24SubscriptionError(
+                                    f"Fattura24 API non autorizzata (codice {return_code}): {description}. "
+                                    f"L'abbonamento Fattura24 potrebbe essere scaduto. "
+                                    f"Riattivare l'abbonamento su fattura24.com."
+                                )
+
+                    return parsed
+                except Fattura24SubscriptionError:
+                    raise
                 except ET.ParseError:
                     # Fallback to raw text if XML parsing fails
                     return {"raw": response.text}
 
+            except Fattura24SubscriptionError:
+                raise
             except Exception as e:
                 last_error = e
                 logger.error(f"Request error on {url} (attempt {attempt}): {e}")
                 if attempt < self.max_retries:
+                    # Don't retry subscription errors or 404s
+                    if isinstance(e, Fattura24SubscriptionError) or "404" in str(e):
+                        raise
                     import time
                     time.sleep(2 ** attempt)
                     continue
                 raise
 
         raise last_error or Exception(f"Failed after {self.max_retries} retries")
+
+    def test_connection(self) -> Dict:
+        """Test API key and connection. Returns status info."""
+        try:
+            response = self.post(
+                "TestKey",
+                data={"apiKey": self.api_key}
+            )
+            return {"success": True, "response": response}
+        except Fattura24SubscriptionError as e:
+            return {"success": False, "error": str(e), "subscription_expired": True}
+        except Exception as e:
+            return {"success": False, "error": str(e), "subscription_expired": False}
 
     def _xml_to_dict(self, element: ET.Element) -> Dict:
         """Convert XML element to dictionary."""
@@ -115,13 +173,31 @@ class Fattura24Connector(BaseConnector):
         """
         Fetch invoices in date range.
 
+        Note: Fattura24 API v0.3 does NOT have a native endpoint to list invoices.
+        The API only supports creating documents and retrieving individual files.
+        We use GetCustomer to get the customer list, then cross-reference.
+
+        If a 'GetDc' endpoint is available (some accounts may have it), we try it.
+        Otherwise we raise a clear error.
+
         Args:
             date_from: Start date (YYYY-MM-DD)
             date_to: End date (YYYY-MM-DD)
 
         Returns:
             List of invoice dictionaries
+
+        Raises:
+            Fattura24SubscriptionError: If subscription is expired
         """
+        # First test connection to detect subscription issues early
+        test = self.test_connection()
+        if not test["success"]:
+            if test.get("subscription_expired"):
+                raise Fattura24SubscriptionError(test["error"])
+            raise Exception(test["error"])
+
+        # Try GetDc endpoint (may exist for some account types)
         try:
             response = self.post(
                 "GetDc",
@@ -147,12 +223,22 @@ class Fattura24Connector(BaseConnector):
                         if invoice:
                             invoices.append(invoice)
 
-            logger.info(f"Fetched {len(invoices)} invoices from Fattura24")
+            logger.info(f"Fetched {len(invoices)} invoices from Fattura24 (GetDc)")
             return invoices
 
+        except Fattura24SubscriptionError:
+            raise
         except Exception as e:
-            logger.error(f"Error fetching invoices from Fattura24: {e}")
-            return []
+            logger.warning(
+                f"GetDc endpoint non disponibile: {e}. "
+                f"L'API Fattura24 v0.3 potrebbe non supportare l'elenco fatture. "
+                f"Utilizzare l'importazione CSV manuale."
+            )
+            raise Exception(
+                "L'API Fattura24 non supporta l'elenco fatture (endpoint GetDc non disponibile). "
+                "Per importare le fatture da Fattura24, esportarle in CSV dal pannello Fattura24 "
+                "e caricarle nella sezione Importa CSV della piattaforma."
+            )
 
     def fetch_overdue_invoices(self) -> List[Dict]:
         """

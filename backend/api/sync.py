@@ -9,7 +9,7 @@ from datetime import datetime, date
 
 from backend.database import get_session, ActivityLog, Invoice, Customer, SyncState
 from backend.connectors.fatturapro import FatturaProConnector
-from backend.connectors.fatture24 import Fattura24Connector
+from backend.connectors.fatture24 import Fattura24Connector, Fattura24SubscriptionError
 from backend.connectors.shopify import ShopifyConnector
 from backend.engine.matching import run_matching
 from backend.engine.escalation import process_escalations
@@ -169,8 +169,11 @@ def _sync_invoices_task() -> dict:
             logger.error(f"Error syncing FatturaPro: {e}", exc_info=True)
 
         # Fattura24
+        # NOTE: Fattura24 API subscription is expired and no new invoices are expected.
+        # Invoices were manually imported from the Fattura24 web UI (34 unpaid invoices).
+        # Disabling API sync to prevent the stale-detection logic from marking them as paid.
         try:
-            if config.FATTURA24_API_KEY:
+            if False and config.FATTURA24_API_KEY:  # Disabled — subscription expired
                 logger.info("Syncing invoices from Fattura24...")
                 fattura24 = Fattura24Connector()
 
