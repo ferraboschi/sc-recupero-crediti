@@ -4,7 +4,7 @@ import logging
 from datetime import date, timedelta
 from fastapi import APIRouter, Depends
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from backend.database import get_session, Invoice, Customer, Message, ActivityLog, RecoveryAction
 
@@ -201,10 +201,12 @@ async def get_todos(session: Session = Depends(get_session)):
         }
 
         # 1. Pending recovery actions (not completed, scheduled within 14 days)
+        # Use joinedload to avoid N+1 lazy-load queries with NullPool
         cutoff_date = today + timedelta(days=14)
         pending_actions = (
             session.query(RecoveryAction)
             .join(Customer)
+            .options(joinedload(RecoveryAction.customer))
             .filter(
                 RecoveryAction.completed_at.is_(None),
                 RecoveryAction.scheduled_date.isnot(None),
@@ -338,9 +340,11 @@ async def get_calendar(
         end = last_day + timedelta(days=(6 - last_day.weekday()))  # Sunday of last week
 
         # Get all scheduled actions in range (both pending and completed)
+        # Use joinedload to avoid N+1 lazy-load queries with NullPool
         actions = (
             session.query(RecoveryAction)
             .join(Customer)
+            .options(joinedload(RecoveryAction.customer))
             .filter(
                 RecoveryAction.scheduled_date >= start,
                 RecoveryAction.scheduled_date <= end,
