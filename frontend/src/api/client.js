@@ -16,13 +16,14 @@ client.interceptors.request.use(
   }
 )
 
-// Retry logic for cold starts (503) and network errors
-const MAX_RETRIES = 3
-const RETRY_DELAY = 5000 // 5 seconds between retries
+// Retry logic for cold starts (502/503) and network errors
+// Render free tier can take 30-60s+ to wake from sleep
+const MAX_RETRIES = 6
+const RETRY_DELAY = 5000 // 5 seconds between retries (6 retries × 5s = 30s max wait)
 
 function shouldRetry(error) {
-  // Retry on 503 (Render cold start)
-  if (error.response && error.response.status === 503) return true
+  // Retry on 502/503 (Render cold start returns 502 HTML page)
+  if (error.response && [502, 503].includes(error.response.status)) return true
   // Retry on network errors (server not yet responding)
   if (!error.response && error.request) return true
   return false
