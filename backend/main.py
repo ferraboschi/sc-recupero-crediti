@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 
-from backend.database import init_db, get_engine
+from backend.database import init_db
 from backend.config import config
 from backend.scheduler import start_scheduler, stop_scheduler
 from backend.api import dashboard, positions, messages, customers, sync, webhooks, recovery, system
@@ -36,40 +36,6 @@ app.add_middleware(
 )
 
 
-def _run_migrations():
-    """Run lightweight schema migrations for new columns.
-    Uses raw DBAPI connection to avoid SQLAlchemy ORM mapping issues.
-    """
-    try:
-        engine = get_engine()
-        raw_conn = engine.raw_connection()
-        try:
-            cursor = raw_conn.cursor()
-            # Check if outcome column exists via information_schema (PostgreSQL)
-            # or pragma (SQLite)
-            db_url = config.DATABASE_URL
-            if db_url.startswith('sqlite'):
-                cursor.execute("PRAGMA table_info(recovery_actions)")
-                cols = [row[1] for row in cursor.fetchall()]
-            else:
-                cursor.execute("""
-                    SELECT column_name FROM information_schema.columns
-                    WHERE table_name = 'recovery_actions' AND column_name = 'outcome'
-                """)
-                cols = [row[0] for row in cursor.fetchall()]
-
-            if 'outcome' not in cols:
-                cursor.execute('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR')
-                raw_conn.commit()
-                logger.info("Migration: added 'outcome' column to recovery_actions")
-            else:
-                logger.info("Migration: 'outcome' column already exists")
-        finally:
-            raw_conn.close()
-    except Exception as e:
-        logger.warning(f"Migration warning (non-fatal): {e}")
-
-
 # Ultra-lightweight health check for Render (must respond < 1s)
 @app.get("/health")
 @app.get("/api/health")
@@ -81,28 +47,42 @@ async def health_check():
 # Startup event
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database and start scheduler on app startup."""
-    for attempt in range(3):
-        try:
-            logger.info(f"Initializing database (attempt {attempt + 1})...")
-            init_db()
-            logger.info("Database initialized successfully")
-            break
-        except Exception as e:
-            logger.error(f"Failed to initialize database (attempt {attempt + 1}): {e}")
-            if attempt < 2:
-                import asyncio
-                await asyncio.sleep(2)
-            else:
-                raise
+    """Initialize database and start scheduler on app startup.
 
-    try:
-        logger.info("Starting scheduler...")
-        start_scheduler()
-        logger.info("Scheduler started successfully")
-    except Exception as e:
-        logger.error(f"Failed to start scheduler: {e}")
-        # Don't raise - scheduler failure shouldn't prevent app startup
+    Runs DB init in a background thread so it does not block the
+    event loop — the /health endpoint can respond immediately while
+    the database connects (critical for Render's 5-second window).
+    """
+    import threading
+
+    def _background_init():
+        for attempt in range(3):
+            try:
+                logger.info(
+                    f"Initializing database "
+                    f"(attempt {attempt + 1})..."
+                )
+                init_db()
+                logger.info("Database initialized successfully")
+                break
+            except Exception as e:
+                logger.error(
+                    f"Failed to initialize database "
+                    f"(attempt {attempt + 1}): {e}"
+                )
+                if attempt < 2:
+                    import time
+                    time.sleep(2)
+
+        try:
+            logger.info("Starting scheduler...")
+            start_scheduler()
+            logger.info("Scheduler started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start scheduler: {e}")
+
+    t = threading.Thread(target=_background_init, daemon=True)
+    t.start()
 
 
 # Shutdown event

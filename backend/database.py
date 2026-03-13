@@ -182,34 +182,36 @@ def init_db():
 
 
 def _run_migrations(engine):
-    """Add missing columns to existing tables (lightweight migration)."""
-    from sqlalchemy import inspect, text
-    inspector = inspect(engine)
-    cust_cols = {
-        c["name"] for c in inspector.get_columns("customers")
-    }
-    inv_cols = {
-        c["name"] for c in inspector.get_columns("invoices")
-    }
-    with engine.connect() as conn:
-        if "phones_json" not in cust_cols:
-            conn.execute(text(
-                "ALTER TABLE customers "
-                "ADD COLUMN phones_json JSONB"
-            ))
-            conn.commit()
-        if "shopify_order_id" not in inv_cols:
-            conn.execute(text(
-                "ALTER TABLE invoices "
-                "ADD COLUMN shopify_order_id VARCHAR"
-            ))
-            conn.commit()
-        if "shopify_order_number" not in inv_cols:
-            conn.execute(text(
-                "ALTER TABLE invoices "
-                "ADD COLUMN shopify_order_number VARCHAR"
-            ))
-            conn.commit()
+    """Add missing columns to existing tables (lightweight migration).
+
+    Uses a single raw DBAPI connection to minimise round-trips to Supabase.
+    Each ALTER TABLE is wrapped in a try/except so that 'already exists'
+    errors are silently ignored (idempotent).
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+    _alters = [
+        "ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR",
+        "ALTER TABLE customers ADD COLUMN phones_json JSONB",
+        "ALTER TABLE invoices ADD COLUMN shopify_order_id VARCHAR",
+        "ALTER TABLE invoices ADD COLUMN shopify_order_number VARCHAR",
+    ]
+    try:
+        raw = engine.raw_connection()
+        try:
+            cur = raw.cursor()
+            for stmt in _alters:
+                try:
+                    cur.execute(stmt)
+                    raw.commit()
+                except Exception:
+                    raw.rollback()  # column already exists
+            cur.close()
+        finally:
+            raw.close()
+        _logger.info("Migrations checked (lightweight)")
+    except Exception as e:
+        _logger.warning(f"Migration warning (non-fatal): {e}")
 
 
 def get_session():
