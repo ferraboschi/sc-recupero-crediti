@@ -14,6 +14,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+@router.post("/migrate")
+async def run_migrations():
+    """Run schema migrations to add missing columns."""
+    engine = get_engine()
+    results = []
+    try:
+        with engine.connect() as conn:
+            # Add 'outcome' column to recovery_actions
+            try:
+                conn.execute(text('SELECT outcome FROM recovery_actions LIMIT 1'))
+                results.append("outcome: already exists")
+            except Exception:
+                conn.rollback()
+                conn.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
+                conn.commit()
+                results.append("outcome: added successfully")
+    except Exception as e:
+        results.append(f"error: {str(e)}")
+    return {"migrations": results}
+
+
 @router.get("")
 async def get_system_status():
     """
