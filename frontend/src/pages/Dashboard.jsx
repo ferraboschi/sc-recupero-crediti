@@ -60,9 +60,9 @@ export default function Dashboard() {
       if (savedLastSync) setLastSync(new Date(savedLastSync))
     } catch (err) {
       console.error(err)
-      if (retry < 2) {
+      if (retry < 5) {
         setRetryCount(retry + 1)
-        setTimeout(() => fetchData(retry + 1), 10000)
+        setTimeout(() => fetchData(retry + 1), 3000)
       } else {
         setError('Errore nel caricamento dei dati del dashboard')
       }
