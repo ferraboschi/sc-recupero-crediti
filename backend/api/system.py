@@ -25,12 +25,19 @@ async def run_migrations():
     results = []
     db_url = config.DATABASE_URL
 
-    # Convert pooler URL (port 6543) to direct connection (port 5432)
-    # pooler: postgres.PROJECT@aws-..pooler.supabase.com:6543
-    # direct: postgres.PROJECT@aws-..pooler.supabase.com:5432
-    direct_url = re.sub(r':6543/', ':5432/', db_url)
-    if direct_url == db_url and ':5432' not in db_url:
-        direct_url = db_url  # fallback if URL format is different
+    # Convert pooler URL to direct Supabase connection for DDL
+    # pooler: postgresql://postgres.PROJECT:PASS@aws-*.pooler.supabase.com:6543/postgres
+    # direct: postgresql://postgres.PROJECT:PASS@db.PROJECT.supabase.co:5432/postgres
+    project_match = re.search(r'postgres\.([a-z0-9]+):', db_url)
+    if project_match and 'pooler.supabase.com' in db_url:
+        project_id = project_match.group(1)
+        direct_url = re.sub(
+            r'@[^:]+:\d+/',
+            f'@db.{project_id}.supabase.co:5432/',
+            db_url
+        )
+    else:
+        direct_url = db_url  # fallback
 
     try:
         from sqlalchemy import create_engine as _ce
