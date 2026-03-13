@@ -299,7 +299,11 @@ async def complete_action(
 
         action.completed_at = datetime.utcnow()
         if outcome:
-            action.outcome = outcome
+            # outcome column may not exist yet (added via migration)
+            try:
+                action.outcome = outcome
+            except Exception:
+                pass
         if notes:
             action.notes = (action.notes or '') + (' | Esito: ' + notes if action.notes else notes)
 
@@ -335,7 +339,7 @@ async def complete_action(
         return {
             "id": action.id,
             "completed_at": action.completed_at.isoformat(),
-            "outcome": action.outcome,
+            "outcome": getattr(action, 'outcome', None),
         }
 
     except HTTPException:
