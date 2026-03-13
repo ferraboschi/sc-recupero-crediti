@@ -4,6 +4,7 @@ import Dashboard from './pages/Dashboard'
 import Positions from './pages/Positions'
 import Customers from './pages/Customers'
 import ClientDetail from './pages/ClientDetail'
+import Attivita from './pages/Attivita'
 import System from './pages/System'
 import SyncButton from './components/SyncButton'
 
@@ -13,6 +14,7 @@ export default function App() {
 
   const navItems = [
     { path: '/', label: 'Dashboard', icon: '📊' },
+    { path: '/attivita', label: 'Attività', icon: '📅' },
     { path: '/customers', label: 'Clienti', icon: '👥' },
     { path: '/positions', label: 'Fatture', icon: '📋' },
     { path: '/system', label: 'Sistema', icon: '⚙️' },
@@ -21,6 +23,9 @@ export default function App() {
   const isActive = (path) => {
     if (path === '/customers') {
       return location.pathname === '/customers' || location.pathname.startsWith('/customers/')
+    }
+    if (path === '/attivita') {
+      return location.pathname === '/attivita'
     }
     return location.pathname === path
   }
@@ -92,6 +97,7 @@ export default function App() {
         <div className="flex-1 overflow-auto p-8">
           <Routes>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/attivita" element={<Attivita />} />
             <Route path="/customers" element={<Customers />} />
             <Route path="/customers/:customerId" element={<ClientDetail />} />
             <Route path="/positions" element={<Positions />} />

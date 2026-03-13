@@ -82,9 +82,7 @@ export default function Dashboard() {
   const [calLoading, setCalLoading] = useState(true)
   const [selectedDay, setSelectedDay] = useState(null)
 
-  // Incassato state
-  const [incassatoData, setIncassatoData] = useState(null)
-  const [incassatoLoading, setIncassatoLoading] = useState(true)
+  // Incassato state (removed from dashboard, moved to Attività page)
 
   const fetchData = async (retry = 0) => {
     try {
@@ -132,17 +130,6 @@ export default function Dashboard() {
     }
   }
 
-  const fetchIncassato = async () => {
-    try {
-      setIncassatoLoading(true)
-      const response = await client.get('/dashboard/incassato')
-      setIncassatoData(response.data)
-    } catch (err) {
-      console.error('Error fetching incassato:', err)
-    } finally {
-      setIncassatoLoading(false)
-    }
-  }
 
   const handleSearch = async (q) => {
     if (!q || q.trim().length < 2) {
@@ -169,7 +156,6 @@ export default function Dashboard() {
   useEffect(() => {
     fetchData()
     fetchTodos()
-    fetchIncassato()
   }, [])
 
   useEffect(() => {
@@ -188,7 +174,6 @@ export default function Dashboard() {
       await fetchData()
       await fetchTodos()
       await fetchCalendar(calYear, calMonth)
-      await fetchIncassato()
       setTimeout(() => setSyncMessage(''), 3000)
     } catch (err) {
       setSyncMessage('Errore nella sincronizzazione')
@@ -681,87 +666,6 @@ export default function Dashboard() {
             </>
           )}
         </div>
-      </div>
-      {/* ═══════════════════════════════════════════════════════ */}
-      {/* INCASSATO PER ANNO — Collected payments by year */}
-      {/* ═══════════════════════════════════════════════════════ */}
-      <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-bold text-slate-900">Incassato per Anno</h2>
-          {incassatoData && (
-            <span className="text-sm text-green-700 font-bold">
-              Totale: {formatCurrency(incassatoData.grand_total || 0)}
-            </span>
-          )}
-        </div>
-
-        {incassatoLoading ? (
-          <p className="text-slate-500 text-center py-4">Caricamento...</p>
-        ) : incassatoData ? (
-          <>
-            {/* Year cards */}
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">
-              {[2022, 2023, 2024, 2025, 2026].map(year => {
-                const yearData = incassatoData.yearly?.[year] || { count: 0, total: 0 }
-                const hasData = yearData.total > 0
-                return (
-                  <div
-                    key={year}
-                    className={`rounded-lg p-4 text-center border-2 transition-colors ${
-                      hasData
-                        ? 'bg-green-50 border-green-300'
-                        : 'bg-slate-50 border-slate-200'
-                    }`}
-                  >
-                    <p className={`text-sm font-bold ${hasData ? 'text-green-800' : 'text-slate-400'}`}>{year}</p>
-                    <p className={`text-xl font-bold mt-1 ${hasData ? 'text-green-700' : 'text-slate-300'}`}>
-                      {formatCurrency(yearData.total)}
-                    </p>
-                    {hasData && (
-                      <p className="text-xs text-green-600 mt-1">{yearData.count} fatture</p>
-                    )}
-                  </div>
-                )
-              })}
-            </div>
-
-            {/* Recent paid invoices list */}
-            {incassatoData.recent_paid && incassatoData.recent_paid.length > 0 && (
-              <div>
-                <h3 className="text-sm font-bold text-slate-700 mb-2">Ultimi Incassi</h3>
-                <div className="space-y-1 max-h-[250px] overflow-y-auto">
-                  {incassatoData.recent_paid.map(inv => (
-                    <div
-                      key={inv.id}
-                      onClick={() => inv.customer_id && navigate(`/customers/${inv.customer_id}`)}
-                      className={`flex items-center justify-between bg-green-50 rounded-lg px-3 py-2 border border-green-200 ${
-                        inv.customer_id ? 'cursor-pointer hover:bg-green-100' : ''
-                      }`}
-                    >
-                      <div className="flex items-center gap-3 min-w-0">
-                        <span className="bg-green-200 text-green-800 px-2 py-0.5 rounded text-xs font-bold shrink-0">PAGATO</span>
-                        <div className="min-w-0">
-                          <span className="text-sm font-medium text-slate-900 truncate block">{inv.customer_name || 'N/D'}</span>
-                          <span className="text-xs text-slate-400">Fatt. {inv.invoice_number}</span>
-                        </div>
-                      </div>
-                      <div className="text-right shrink-0">
-                        <span className="text-sm font-bold text-green-700">{formatCurrency(inv.amount)}</span>
-                        {inv.paid_date && (
-                          <p className="text-xs text-slate-400">
-                            {new Date(inv.paid_date).toLocaleDateString('it-IT')}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </>
-        ) : (
-          <p className="text-slate-400 text-center py-4">Nessun dato disponibile</p>
-        )}
       </div>
     </div>
   )

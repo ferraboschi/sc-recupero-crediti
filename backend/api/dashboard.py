@@ -475,6 +475,140 @@ async def get_stats(session: Session = Depends(get_session)):
         raise
 
 
+@router.get("/attivita")
+async def get_attivita(session: Session = Depends(get_session)):
+    """
+    Get data for the Attività page:
+    1. contacted: customers with recovery actions (not idle/archived), with status, last contact, next action
+    2. incassati: customers whose overdue invoices have been resolved (paid)
+    """
+    from sqlalchemy import case, cast, Date
+    try:
+        today = date.today()
+
+        # ── CONTACTED ACCOUNTS ──
+        # Customers with recovery_status != idle and != archived, who have overdue invoices
+        contacted_raw = (
+            session.query(
+                Customer,
+                func.count(func.distinct(
+                    case((
+                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
+                        Invoice.id
+                    ), else_=None)
+                )).label("overdue_count"),
+                func.sum(
+                    case((
+                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
+                        Invoice.amount_due
+                    ), else_=0)
+                ).label("total_overdue"),
+            )
+            .outerjoin(Invoice, Invoice.customer_id == Customer.id)
+            .filter(
+                Customer.excluded.is_(False),
+                Customer.recovery_status.notin_(["idle", "archived"]),
+            )
+            .group_by(Customer.id)
+            .order_by(Customer.next_action_date.asc().nullslast())
+            .all()
+        )
+
+        contacted = []
+        for cust, overdue_count, total_overdue in contacted_raw:
+            # Get last completed action
+            last_action = (
+                session.query(RecoveryAction)
+                .filter(
+                    RecoveryAction.customer_id == cust.id,
+                    RecoveryAction.completed_at.isnot(None),
+                )
+                .order_by(RecoveryAction.completed_at.desc())
+                .first()
+            )
+
+            contacted.append({
+                "id": cust.id,
+                "ragione_sociale": cust.ragione_sociale,
+                "partita_iva": cust.partita_iva,
+                "phone": cust.phone,
+                "recovery_status": cust.recovery_status,
+                "next_action_date": cust.next_action_date.isoformat() if cust.next_action_date else None,
+                "next_action_type": cust.next_action_type,
+                "last_contact_date": last_action.completed_at.strftime("%Y-%m-%d") if last_action and last_action.completed_at else None,
+                "last_action_type": last_action.action_type if last_action else None,
+                "last_outcome": last_action.outcome if last_action else None,
+                "overdue_count": int(overdue_count or 0),
+                "total_overdue": float(total_overdue or 0),
+            })
+
+        # ── INCASSATI ──
+        # Customers who had overdue invoices that are now paid (due_date < payment date)
+        overdue_paid_filter = (
+            (Invoice.status == "paid")
+            & (Invoice.due_date.isnot(None))
+            & (Invoice.due_date < cast(Invoice.updated_at, Date))
+        )
+
+        incassati_raw = (
+            session.query(
+                Customer.id,
+                Customer.ragione_sociale,
+                Customer.partita_iva,
+                Customer.recovery_status,
+                func.count(Invoice.id).label("paid_count"),
+                func.sum(Invoice.amount).label("total_paid"),
+                func.max(Invoice.updated_at).label("last_payment"),
+            )
+            .join(Invoice, Invoice.customer_id == Customer.id)
+            .filter(
+                overdue_paid_filter,
+                Customer.excluded.is_(False),
+            )
+            .group_by(Customer.id, Customer.ragione_sociale, Customer.partita_iva, Customer.recovery_status)
+            .order_by(func.max(Invoice.updated_at).desc())
+            .all()
+        )
+
+        incassati = []
+        for row in incassati_raw:
+            # Check if this customer still has overdue invoices
+            remaining_overdue = (
+                session.query(func.count(Invoice.id))
+                .filter(
+                    Invoice.customer_id == row[0],
+                    Invoice.status != "paid",
+                    Invoice.days_overdue > 0,
+                )
+                .scalar() or 0
+            )
+            incassati.append({
+                "id": row[0],
+                "ragione_sociale": row[1],
+                "partita_iva": row[2],
+                "recovery_status": row[3],
+                "paid_count": row[4],
+                "total_paid": float(row[5] or 0),
+                "last_payment": row[6].strftime("%Y-%m-%d") if row[6] else None,
+                "fully_resolved": remaining_overdue == 0,
+            })
+
+        return {
+            "contacted": contacted,
+            "incassati": incassati,
+            "summary": {
+                "total_contacted": len(contacted),
+                "total_incassati": len(incassati),
+                "total_recovered": sum(i["total_paid"] for i in incassati),
+                "fully_resolved": sum(1 for i in incassati if i["fully_resolved"]),
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching attivita data: {e}", exc_info=True)
+        raise
+
+
 @router.get("/incassato")
 async def get_incassato_per_anno(session: Session = Depends(get_session)):
     """
