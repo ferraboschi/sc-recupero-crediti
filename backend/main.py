@@ -10,7 +10,8 @@ from fastapi.responses import JSONResponse
 from backend.database import init_db
 from backend.config import config
 from backend.scheduler import start_scheduler, stop_scheduler
-from backend.api import dashboard, positions, messages, customers, sync, webhooks, recovery, system
+from backend.api import auth, dashboard, positions, messages, customers, sync, webhooks, recovery, system
+from backend.api.auth import verify_token
 
 # Configure logging
 logging.basicConfig(
@@ -98,14 +99,18 @@ async def shutdown_event():
 
 
 # Include routers
-app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
-app.include_router(positions.router, prefix="/api/positions", tags=["positions"])
-app.include_router(messages.router, prefix="/api/messages", tags=["messages"])
-app.include_router(customers.router, prefix="/api/customers", tags=["customers"])
-app.include_router(sync.router, prefix="/api/sync", tags=["sync"])
-app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])
-app.include_router(recovery.router, prefix="/api/recovery", tags=["recovery"])
-app.include_router(system.router, prefix="/api/system", tags=["system"])
+# Auth — public (no token required)
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+
+# Protected routes — all require JWT token
+app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"], dependencies=[Depends(verify_token)])
+app.include_router(positions.router, prefix="/api/positions", tags=["positions"], dependencies=[Depends(verify_token)])
+app.include_router(messages.router, prefix="/api/messages", tags=["messages"], dependencies=[Depends(verify_token)])
+app.include_router(customers.router, prefix="/api/customers", tags=["customers"], dependencies=[Depends(verify_token)])
+app.include_router(sync.router, prefix="/api/sync", tags=["sync"], dependencies=[Depends(verify_token)])
+app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])  # Webhooks stay public (Twilio/Shopify)
+app.include_router(recovery.router, prefix="/api/recovery", tags=["recovery"], dependencies=[Depends(verify_token)])
+app.include_router(system.router, prefix="/api/system", tags=["system"], dependencies=[Depends(verify_token)])
 
 
 # Mount static files for frontend (if they exist)

@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import Positions from './pages/Positions'
@@ -6,6 +6,7 @@ import Customers from './pages/Customers'
 import ClientDetail from './pages/ClientDetail'
 import Attivita from './pages/Attivita'
 import System from './pages/System'
+import Login from './pages/Login'
 import SyncButton from './components/SyncButton'
 
 /* ── SVG icon components ─────────────────────────────────────────── */
@@ -49,6 +50,41 @@ function IconSystem() {
 export default function App() {
   const location = useLocation()
   const [sidebarOpen, setSidebarOpen] = useState(true)
+
+  // ── Auth state ──────────────────────────────────────────────────
+  const [isAuthenticated, setIsAuthenticated] = useState(() => {
+    const token = localStorage.getItem('sc_token')
+    const expires = localStorage.getItem('sc_token_expires')
+    if (!token || !expires) return false
+    return new Date(expires) > new Date()
+  })
+
+  const handleLogin = useCallback((data) => {
+    setIsAuthenticated(true)
+  }, [])
+
+  const handleLogout = useCallback(() => {
+    localStorage.removeItem('sc_token')
+    localStorage.removeItem('sc_user')
+    localStorage.removeItem('sc_token_expires')
+    setIsAuthenticated(false)
+  }, [])
+
+  // Check token expiration periodically
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const expires = localStorage.getItem('sc_token_expires')
+      if (expires && new Date(expires) <= new Date()) {
+        handleLogout()
+      }
+    }, 60000) // check every minute
+    return () => clearInterval(interval)
+  }, [handleLogout])
+
+  // If not authenticated, show login
+  if (!isAuthenticated) {
+    return <Login onLogin={handleLogin} />
+  }
 
   const navItems = [
     { path: '/', label: 'Dashboard', icon: <IconDashboard />, hint: 'Panoramica crediti' },
@@ -143,6 +179,15 @@ export default function App() {
               <div className="w-1.5 h-1.5 bg-accent-green rounded-full pulse-glow"></div>
               Attivo
             </div>
+            <button
+              onClick={handleLogout}
+              title="Esci"
+              className="p-1.5 rounded-lg hover:bg-dark-card text-txt-muted hover:text-accent-red transition-colors"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+              </svg>
+            </button>
           </div>
         </div>
 

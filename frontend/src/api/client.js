@@ -6,9 +6,13 @@ const client = axios.create({
   timeout: 90000,
 })
 
-// Request interceptor
+// Request interceptor — attach JWT token
 client.interceptors.request.use(
   config => {
+    const token = localStorage.getItem('sc_token')
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`
+    }
     return config
   },
   error => {
@@ -47,6 +51,15 @@ client.interceptors.response.use(
       console.log(`[Retry ${cfg.__retryCount}/${MAX_RETRIES}] ${cfg.method?.toUpperCase()} ${cfg.url} — waiting ${RETRY_DELAY / 1000}s...`)
       await delay(RETRY_DELAY)
       return client(cfg)
+    }
+
+    // Handle 401 — token expired or invalid → logout
+    if (error.response && error.response.status === 401) {
+      localStorage.removeItem('sc_token')
+      localStorage.removeItem('sc_user')
+      localStorage.removeItem('sc_token_expires')
+      window.location.reload()
+      return Promise.reject(error)
     }
 
     // Final failure — log and reject

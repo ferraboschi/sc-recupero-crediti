@@ -58,9 +58,14 @@ export default function System() {
   const [error, setError] = useState(null)
   const [syncing, setSyncing] = useState(false)
 
+  const authHeaders = () => {
+    const token = localStorage.getItem('sc_token')
+    return token ? { Authorization: `Bearer ${token}` } : {}
+  }
+
   const fetchData = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/system`)
+      const res = await fetch(`${API}/system`, { headers: authHeaders() })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setData(await res.json())
       setError(null)
@@ -77,12 +82,12 @@ export default function System() {
     setSyncing(true)
     const beforeSync = data?.sync?.invoices?.last_sync || ''
     try {
-      await fetch(`${API}/sync/full`, { method: 'POST' })
+      await fetch(`${API}/sync/full`, { method: 'POST', headers: authHeaders() })
       let attempts = 0
       const poll = setInterval(async () => {
         attempts++
         try {
-          const res = await fetch(`${API}/system`)
+          const res = await fetch(`${API}/system`, { headers: authHeaders() })
           if (res.ok) {
             const d = await res.json()
             setData(d)
