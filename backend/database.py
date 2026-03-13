@@ -167,8 +167,9 @@ def get_engine():
             poolclass=NullPool,
         )
 
-    # Register SQLite pragma listener (no-op for PostgreSQL)
+    # Register connection listeners
     event.listen(_engine, "connect", _set_sqlite_pragma)
+    event.listen(_engine, "connect", _set_pg_timeouts)
 
     return _engine
 
@@ -244,3 +245,23 @@ def _set_sqlite_pragma(dbapi_conn, connection_record):
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
+
+
+def _set_pg_timeouts(dbapi_conn, connection_record):
+    """Set PostgreSQL session timeouts to prevent stale connections."""
+    db_url = config.DATABASE_URL
+    if db_url.startswith("sqlite"):
+        return
+    try:
+        cursor = dbapi_conn.cursor()
+        # Kill idle-in-transaction sessions after 5 minutes
+        cursor.execute(
+            "SET idle_in_transaction_session_timeout = '300000'"
+        )
+        # Kill any statement running longer than 10 minutes
+        cursor.execute(
+            "SET statement_timeout = '600000'"
+        )
+        cursor.close()
+    except Exception:
+        pass  # Non-fatal
