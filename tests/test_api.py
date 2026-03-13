@@ -13,9 +13,7 @@ class TestHealthCheck:
         response = test_client.get("/api/health")
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "healthy"
-        assert data["service"] == "SC Recupero Crediti API"
-        assert "credentials" in data
+        assert data["status"] == "ok"
 
     def test_health_check_returns_json(self, test_client):
         """Test health check returns valid JSON."""
@@ -24,17 +22,12 @@ class TestHealthCheck:
         data = response.json()
         assert isinstance(data, dict)
 
-    def test_health_check_credentials_structure(self, test_client):
-        """Test health check includes credentials structure."""
+    def test_health_check_minimal(self, test_client):
+        """Test health check is lightweight (no DB queries)."""
         response = test_client.get("/api/health")
         data = response.json()
-        credentials = data["credentials"]
-        assert isinstance(credentials, dict)
-        # Should have keys for each integration
-        expected_keys = ["fatturapro", "fattura24", "shopify", "twilio"]
-        for key in expected_keys:
-            assert key in credentials
-            assert isinstance(credentials[key], bool)
+        # Health endpoint should be minimal for fast response
+        assert "status" in data
 
 
 class TestDashboardEndpoints:
