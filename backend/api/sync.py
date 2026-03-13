@@ -4,10 +4,14 @@ import logging
 import csv
 import threading
 from io import StringIO
-from fastapi import APIRouter, BackgroundTasks, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, Depends, UploadFile, File
+from sqlalchemy.orm import Session
 from datetime import datetime, date
 
-from backend.database import get_session_direct, ActivityLog, Invoice, Customer, SyncState
+from backend.database import (
+    get_session, get_session_direct, ActivityLog,
+    Invoice, Customer, SyncState,
+)
 from backend.connectors.fatturapro import FatturaProConnector
 from backend.connectors.fatture24 import Fattura24Connector
 from backend.connectors.shopify import ShopifyConnector
@@ -806,6 +810,39 @@ async def sync_order_matching(background_tasks: BackgroundTasks):
         "status": "sync_started",
         "message": "Order matching started in background",
     }
+
+
+@router.get("/debug-orders/{customer_id}")
+async def debug_orders(
+    customer_id: int,
+    session: Session = Depends(get_session),
+):
+    """Debug: show Shopify orders for a customer."""
+    cust = session.query(Customer).get(customer_id)
+    if not cust or not cust.shopify_id:
+        return {"error": "Customer not found or no shopify_id"}
+    try:
+        shopify = ShopifyConnector()
+        orders = shopify.fetch_customer_orders(cust.shopify_id)
+        dates = sorted([o["created_at"][:10] for o in orders])
+        return {
+            "customer": cust.ragione_sociale,
+            "shopify_id": cust.shopify_id,
+            "order_count": len(orders),
+            "date_range": (
+                f"{dates[0]} to {dates[-1]}" if dates else "none"
+            ),
+            "orders": [
+                {
+                    "name": o["name"],
+                    "total": o["total_price"],
+                    "date": o["created_at"][:10],
+                }
+                for o in orders[:20]
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @router.post("/escalations")
