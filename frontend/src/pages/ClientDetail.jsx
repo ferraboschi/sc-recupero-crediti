@@ -149,8 +149,8 @@ export default function ClientDetail() {
 
   const handleCompleteAction = async (actionId, outcome) => {
     try {
-      await client.put(`/recovery/customers/${customerId}/actions/${actionId}/complete`, {
-        outcome: outcome || null,
+      await client.put(`/recovery/customers/${customerId}/actions/${actionId}/complete`, null, {
+        params: { outcome: outcome || undefined },
       })
       setCompletingAction(null)
       setSelectedOutcome('')
