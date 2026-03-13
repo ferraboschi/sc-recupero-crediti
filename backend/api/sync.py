@@ -812,39 +812,6 @@ async def sync_order_matching(background_tasks: BackgroundTasks):
     }
 
 
-@router.get("/debug-orders/{customer_id}")
-async def debug_orders(
-    customer_id: int,
-    session: Session = Depends(get_session),
-):
-    """Debug: show Shopify orders for a customer."""
-    cust = session.query(Customer).get(customer_id)
-    if not cust or not cust.shopify_id:
-        return {"error": "Customer not found or no shopify_id"}
-    try:
-        shopify = ShopifyConnector()
-        orders = shopify.fetch_customer_orders(cust.shopify_id)
-        dates = sorted([o["created_at"][:10] for o in orders])
-        return {
-            "customer": cust.ragione_sociale,
-            "shopify_id": cust.shopify_id,
-            "order_count": len(orders),
-            "date_range": (
-                f"{dates[0]} to {dates[-1]}" if dates else "none"
-            ),
-            "orders": [
-                {
-                    "name": o["name"],
-                    "total": o["total_price"],
-                    "date": o["created_at"][:10],
-                }
-                for o in orders[:20]
-            ],
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
 @router.post("/escalations")
 async def sync_escalations(background_tasks: BackgroundTasks):
     """Trigger manual escalation processing."""
