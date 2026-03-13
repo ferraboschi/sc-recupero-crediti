@@ -88,6 +88,7 @@ export default function ClientDetail() {
   // Action completion state
   const [completingAction, setCompletingAction] = useState(null)
   const [selectedOutcome, setSelectedOutcome] = useState('')
+  const [copiedWhatsApp, setCopiedWhatsApp] = useState(false)
 
   const fetchData = useCallback(async () => {
     try {
@@ -294,6 +295,33 @@ export default function ClientDetail() {
     const url = `https://wa.me/${number}?text=${encodeURIComponent(message)}`
     window.open(url, '_blank')
   }
+
+  const handleCopyWhatsApp = async () => {
+    const message = buildWhatsAppMessage()
+    if (!message) return
+    try {
+      await navigator.clipboard.writeText(message)
+      setCopiedWhatsApp(true)
+      setTimeout(() => setCopiedWhatsApp(false), 2000)
+    } catch {
+      // Fallback for older browsers
+      const textarea = document.createElement('textarea')
+      textarea.value = message
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+      setCopiedWhatsApp(true)
+      setTimeout(() => setCopiedWhatsApp(false), 2000)
+    }
+  }
+
+  // Progressive action numbering
+  const ACTION_NUMBER_LABELS = ['PRIMA', 'SECONDA', 'TERZA', 'QUARTA', 'QUINTA', 'SESTA', 'SETTIMA', 'OTTAVA', 'NONA', 'DECIMA']
+  const contactActionCount = data?.contact_action_count || 0
+  const nextActionNumber = contactActionCount + 1
+  const nextActionLabel = ACTION_NUMBER_LABELS[contactActionCount] || `${nextActionNumber}ª`
+  const shouldSuggestLawyer = contactActionCount >= 3
 
   // Invoice sorting
   const handleInvoiceSort = (field) => {
@@ -615,13 +643,23 @@ export default function ClientDetail() {
                   {selectedInvoices.size} fattur{selectedInvoices.size === 1 ? 'a' : 'e'} selezionat{selectedInvoices.size === 1 ? 'a' : 'e'} — {formatCurrency(selectedTotal)}
                 </p>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3 flex-wrap">
                 <button
                   onClick={handleDownloadPdfSelected}
                   disabled={pdfLoading}
                   className="px-5 py-2 bg-amber-600 text-white rounded-lg text-sm font-bold hover:bg-amber-700 disabled:opacity-50 flex items-center gap-2"
                 >
                   {pdfLoading ? '...' : 'Genera PDF Riepilogativo'}
+                </button>
+                <button
+                  onClick={handleCopyWhatsApp}
+                  className={`px-5 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors ${
+                    copiedWhatsApp
+                      ? 'bg-green-100 text-green-700 border-2 border-green-400'
+                      : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border-2 border-slate-300'
+                  }`}
+                >
+                  {copiedWhatsApp ? 'Copiato!' : 'Copia Messaggio'}
                 </button>
                 {whatsappNumber ? (
                   <button
@@ -648,26 +686,78 @@ export default function ClientDetail() {
       {/* SEZIONE 2: AZIONI DI RECUPERO */}
       {/* ═══════════════════════════════════════════════════════ */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <h2 className="text-lg font-bold text-slate-900 mb-4">Azioni di Recupero</h2>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-bold text-slate-900">Azioni di Recupero</h2>
+          {contactActionCount > 0 && (
+            <span className="text-sm text-slate-500">
+              Azioni registrate: <span className="font-bold text-slate-700">{contactActionCount}</span>
+            </span>
+          )}
+        </div>
 
-        {/* Action buttons */}
-        <div className="flex flex-wrap gap-3 mb-4">
-          {Object.entries(ACTION_COLORS).map(([type, colorClass]) => (
+        {/* Lawyer suggestion banner */}
+        {shouldSuggestLawyer && data.recovery_status !== 'lawyer' && data.recovery_status !== 'archived' && (
+          <div className="mb-4 bg-red-50 border-2 border-red-300 rounded-lg p-4 flex items-center justify-between">
+            <div>
+              <p className="text-sm font-bold text-red-800">Suggerimento: passare all'Avvocato</p>
+              <p className="text-xs text-red-600 mt-1">
+                Sono state effettuate {contactActionCount} azioni di contatto senza esito. Si consiglia di procedere con l'avvocato.
+              </p>
+            </div>
             <button
-              key={type}
-              onClick={() => handleAction(type)}
+              onClick={() => handleAction('lawyer')}
               disabled={actionLoading}
-              className={`px-4 py-2 text-white rounded-lg text-sm font-medium disabled:opacity-50 ${colorClass}`}
+              className="px-5 py-2 bg-red-600 text-white rounded-lg text-sm font-bold hover:bg-red-700 disabled:opacity-50 shrink-0"
             >
-              {actionLoading ? '...' : ACTION_LABELS[type]}
+              Passa ad Avvocato
             </button>
-          ))}
-          <button
-            onClick={() => setShowNoteInput(!showNoteInput)}
-            className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium hover:bg-slate-200"
-          >
-            + Nota
-          </button>
+          </div>
+        )}
+
+        {/* REGISTRA AZIONE — main action button with progressive numbering */}
+        <div className="mb-4">
+          <div className="flex flex-wrap gap-3 items-center">
+            {data.recovery_status !== 'lawyer' && data.recovery_status !== 'archived' && (
+              <button
+                onClick={() => {
+                  // Determine the correct action type based on count
+                  const actionType = contactActionCount === 0 ? 'first_contact' : 'second_contact'
+                  handleAction(actionType)
+                }}
+                disabled={actionLoading}
+                className="px-6 py-3 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2 shadow-sm"
+              >
+                {actionLoading ? '...' : `REGISTRA ${nextActionLabel} AZIONE`}
+              </button>
+            )}
+            <button
+              onClick={() => handleAction('lawyer')}
+              disabled={actionLoading}
+              className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50"
+            >
+              {actionLoading ? '...' : 'Avvocato'}
+            </button>
+            <button
+              onClick={() => handleAction('wait')}
+              disabled={actionLoading}
+              className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 disabled:opacity-50"
+            >
+              {actionLoading ? '...' : 'Attendi'}
+            </button>
+            <button
+              onClick={() => handleAction('archive')}
+              disabled={actionLoading}
+              className="px-4 py-2 bg-slate-500 text-white rounded-lg text-sm font-medium hover:bg-slate-600 disabled:opacity-50"
+            >
+              {actionLoading ? '...' : 'Archivia'}
+            </button>
+            <button
+              onClick={() => setShowNoteInput(!showNoteInput)}
+              className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium hover:bg-slate-200"
+            >
+              + Nota
+            </button>
+          </div>
         </div>
 
         {/* Note input */}
@@ -831,6 +921,14 @@ export default function ClientDetail() {
                 className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700 disabled:opacity-50"
               >
                 {pdfLoading ? '...' : 'Genera PDF Riepilogativo'}
+              </button>
+              <button
+                onClick={handleCopyWhatsApp}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                  copiedWhatsApp ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                }`}
+              >
+                {copiedWhatsApp ? 'Copiato!' : 'Copia Messaggio'}
               </button>
               {whatsappNumber && (
                 <button

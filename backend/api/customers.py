@@ -194,11 +194,22 @@ async def get_customer_detail(
                 "action_type": a.action_type,
                 "scheduled_date": a.scheduled_date.isoformat() if a.scheduled_date else None,
                 "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+                "outcome": a.outcome,
                 "notes": a.notes,
                 "created_at": a.created_at.isoformat(),
             }
             for a in actions
         ]
+
+        # Count contact actions (first_contact, second_contact) for progressive numbering
+        contact_action_count = (
+            session.query(func.count(RecoveryAction.id))
+            .filter(
+                RecoveryAction.customer_id == customer_id,
+                RecoveryAction.action_type.in_(["first_contact", "second_contact"]),
+            )
+            .scalar() or 0
+        )
 
         return {
             "id": customer.id,
@@ -224,6 +235,7 @@ async def get_customer_detail(
                 "items": invoice_list,
             },
             "recovery_actions": action_list,
+            "contact_action_count": contact_action_count,
         }
 
     except HTTPException:

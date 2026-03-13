@@ -3,7 +3,7 @@
 import logging
 from datetime import date, timedelta
 from fastapi import APIRouter, Depends
-from sqlalchemy import func
+from sqlalchemy import func, extract
 from sqlalchemy.orm import Session, joinedload
 
 from backend.database import get_session, Invoice, Customer, Message, ActivityLog, RecoveryAction
@@ -472,4 +472,79 @@ async def get_stats(session: Session = Depends(get_session)):
 
     except Exception as e:
         logger.error(f"Error fetching statistics: {e}", exc_info=True)
+        raise
+
+
+@router.get("/incassato")
+async def get_incassato_per_anno(session: Session = Depends(get_session)):
+    """
+    Get collected (paid) amounts grouped by year.
+    Returns yearly totals for paid invoices, plus a list of recent payments.
+    """
+    try:
+        # Paid invoices grouped by year (using issue_date or updated_at for payment year)
+        yearly_raw = (
+            session.query(
+                extract('year', Invoice.updated_at).label("year"),
+                func.count(Invoice.id).label("count"),
+                func.sum(Invoice.amount).label("total"),
+            )
+            .filter(Invoice.status == "paid")
+            .group_by(extract('year', Invoice.updated_at))
+            .order_by(extract('year', Invoice.updated_at).asc())
+            .all()
+        )
+
+        yearly = {}
+        grand_total = 0.0
+        for row in yearly_raw:
+            y = int(row[0]) if row[0] else 0
+            amount = float(row[2] or 0)
+            yearly[y] = {
+                "count": row[1] or 0,
+                "total": amount,
+            }
+            grand_total += amount
+
+        # Ensure years 2022-2026 are always present
+        for y in range(2022, 2027):
+            if y not in yearly:
+                yearly[y] = {"count": 0, "total": 0.0}
+
+        # Recent paid invoices (last 20) for the "incassato" view
+        recent_paid = (
+            session.query(Invoice)
+            .filter(Invoice.status == "paid")
+            .order_by(Invoice.updated_at.desc())
+            .limit(20)
+            .all()
+        )
+
+        recent_list = []
+        for inv in recent_paid:
+            customer_name = None
+            if inv.customer_id:
+                cust = session.query(Customer.ragione_sociale).filter(Customer.id == inv.customer_id).first()
+                customer_name = cust[0] if cust else inv.customer_name_raw
+            else:
+                customer_name = inv.customer_name_raw
+
+            recent_list.append({
+                "id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "amount": float(inv.amount),
+                "customer_name": customer_name,
+                "customer_id": inv.customer_id,
+                "paid_date": inv.updated_at.isoformat() if inv.updated_at else None,
+                "source_platform": inv.source_platform,
+            })
+
+        return {
+            "yearly": yearly,
+            "grand_total": grand_total,
+            "recent_paid": recent_list,
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching incassato data: {e}", exc_info=True)
         raise
