@@ -38,17 +38,21 @@ app.add_middleware(
 
 def _run_migrations():
     """Run lightweight schema migrations for new columns."""
-    from sqlalchemy import text, inspect
-    engine = get_engine()
-    inspector = inspect(engine)
-    with engine.connect() as conn:
-        # Add 'outcome' column to recovery_actions if missing
-        if 'recovery_actions' in inspector.get_table_names():
-            cols = [c['name'] for c in inspector.get_columns('recovery_actions')]
-            if 'outcome' not in cols:
+    try:
+        from sqlalchemy import text
+        engine = get_engine()
+        with engine.connect() as conn:
+            # Add 'outcome' column to recovery_actions if missing
+            try:
+                conn.execute(text('SELECT outcome FROM recovery_actions LIMIT 1'))
+                logger.info("Migration: 'outcome' column already exists")
+            except Exception:
+                conn.rollback()
                 conn.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
                 conn.commit()
                 logger.info("Migration: added 'outcome' column to recovery_actions")
+    except Exception as e:
+        logger.warning(f"Migration warning (non-fatal): {e}")
 
 
 # Ultra-lightweight health check for Render (must respond < 1s)

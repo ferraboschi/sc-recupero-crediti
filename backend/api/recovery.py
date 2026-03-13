@@ -280,16 +280,12 @@ async def create_action(
         raise
 
 
-class ActionComplete(BaseModel):
-    outcome: Optional[str] = None  # contacted / promised / partial_payment / paid / unreachable / disputed / no_answer
-    notes: Optional[str] = None
-
-
 @router.put("/customers/{customer_id}/actions/{action_id}/complete")
 async def complete_action(
     customer_id: int,
     action_id: int,
-    body: ActionComplete = None,
+    outcome: Optional[str] = Query(None, description="Action outcome: contacted/promised/partial_payment/paid/unreachable/disputed/no_answer"),
+    notes: Optional[str] = Query(None, description="Additional notes"),
     session: Session = Depends(get_session),
 ):
     """Mark a recovery action as completed with optional outcome."""
@@ -302,15 +298,14 @@ async def complete_action(
             raise HTTPException(status_code=404, detail="Action not found")
 
         action.completed_at = datetime.utcnow()
-        if body:
-            if body.outcome:
-                action.outcome = body.outcome
-            if body.notes:
-                action.notes = (action.notes or '') + (' | Esito: ' + body.notes if action.notes else body.notes)
+        if outcome:
+            action.outcome = outcome
+        if notes:
+            action.notes = (action.notes or '') + (' | Esito: ' + notes if action.notes else notes)
 
         # If outcome is 'paid', check if all invoices are paid — if so, archive customer
         customer = session.query(Customer).filter(Customer.id == customer_id).first()
-        if body and body.outcome == 'paid' and customer:
+        if outcome == 'paid' and customer:
             unpaid = session.query(Invoice).filter(
                 Invoice.customer_id == customer_id,
                 Invoice.status != 'paid',
@@ -330,7 +325,7 @@ async def complete_action(
             entity_id=action_id,
             details={
                 "customer_id": customer_id,
-                "outcome": body.outcome if body else None,
+                "outcome": outcome,
                 "action_type": action.action_type,
             }
         )
