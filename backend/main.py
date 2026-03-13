@@ -86,8 +86,6 @@ async def startup_event():
         try:
             logger.info(f"Initializing database (attempt {attempt + 1})...")
             init_db()
-            # Run lightweight migrations for new columns
-            _run_migrations()
             logger.info("Database initialized successfully")
             break
         except Exception as e:
