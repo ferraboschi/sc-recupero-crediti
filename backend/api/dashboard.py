@@ -478,18 +478,21 @@ async def get_stats(session: Session = Depends(get_session)):
 @router.get("/incassato")
 async def get_incassato_per_anno(session: Session = Depends(get_session)):
     """
-    Get collected (paid) amounts grouped by year.
-    Returns yearly totals for paid invoices, plus a list of recent payments.
+    Get collected (paid) amounts grouped by year — only from overdue invoices (fatture insolute).
+    Filters: status == 'paid' AND days_overdue > 0 (was overdue when collected).
+    Returns yearly totals plus a list of recent recovered payments.
     """
     try:
-        # Paid invoices grouped by year (using issue_date or updated_at for payment year)
+        # Only count invoices that were overdue (insolute) and then got paid
+        overdue_paid_filter = (Invoice.status == "paid") & (Invoice.days_overdue > 0)
+
         yearly_raw = (
             session.query(
                 extract('year', Invoice.updated_at).label("year"),
                 func.count(Invoice.id).label("count"),
-                func.sum(Invoice.amount).label("total"),
+                func.sum(Invoice.amount_due).label("total"),
             )
-            .filter(Invoice.status == "paid")
+            .filter(overdue_paid_filter)
             .group_by(extract('year', Invoice.updated_at))
             .order_by(extract('year', Invoice.updated_at).asc())
             .all()
@@ -511,10 +514,10 @@ async def get_incassato_per_anno(session: Session = Depends(get_session)):
             if y not in yearly:
                 yearly[y] = {"count": 0, "total": 0.0}
 
-        # Recent paid invoices (last 20) for the "incassato" view
+        # Recent recovered payments (overdue invoices that got paid)
         recent_paid = (
             session.query(Invoice)
-            .filter(Invoice.status == "paid")
+            .filter(overdue_paid_filter)
             .order_by(Invoice.updated_at.desc())
             .limit(20)
             .all()
@@ -532,11 +535,12 @@ async def get_incassato_per_anno(session: Session = Depends(get_session)):
             recent_list.append({
                 "id": inv.id,
                 "invoice_number": inv.invoice_number,
-                "amount": float(inv.amount),
+                "amount": float(inv.amount_due),
                 "customer_name": customer_name,
                 "customer_id": inv.customer_id,
                 "paid_date": inv.updated_at.isoformat() if inv.updated_at else None,
                 "source_platform": inv.source_platform,
+                "days_overdue": inv.days_overdue,
             })
 
         return {
