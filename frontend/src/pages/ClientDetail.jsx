@@ -126,7 +126,9 @@ export default function ClientDetail() {
 
   const formatDate = (dateStr) => {
     if (!dateStr) return '-'
-    return new Date(dateStr).toLocaleDateString('it-IT')
+    // Append T00:00:00 to date-only strings to avoid UTC timezone shift (off-by-one day)
+    const d = dateStr.length === 10 ? new Date(dateStr + 'T00:00:00') : new Date(dateStr)
+    return d.toLocaleDateString('it-IT')
   }
 
   const handleAction = async (actionType) => {
@@ -274,7 +276,7 @@ export default function ClientDetail() {
     msg += `le scriviamo per ricordarle che risultano in sospeso le seguenti fatture:\n\n`
 
     selected.forEach(inv => {
-      const dueDate = inv.due_date ? new Date(inv.due_date).toLocaleDateString('it-IT') : 'N/D'
+      const dueDate = inv.due_date ? new Date(inv.due_date + 'T00:00:00').toLocaleDateString('it-IT') : 'N/D'
       msg += `- Fatt. ${inv.invoice_number}: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(inv.amount_due)} (scad. ${dueDate})\n`
     })
 
@@ -595,23 +597,7 @@ export default function ClientDetail() {
                       >
                         {singlePdfLoading === inv.id ? '...' : 'PDF'}
                       </button>
-                      {inv.status !== 'paid' ? (
-                        <button
-                          onClick={() => handleMarkPaid(inv.id)}
-                          disabled={updatingInvoice === inv.id}
-                          className="px-2 py-1 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700 disabled:opacity-50"
-                        >
-                          {updatingInvoice === inv.id ? '...' : 'Pagato'}
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() => handleReopenInvoice(inv.id)}
-                          disabled={updatingInvoice === inv.id}
-                          className="px-2 py-1 bg-slate-200 text-slate-600 rounded text-xs font-medium hover:bg-slate-300 disabled:opacity-50"
-                        >
-                          {updatingInvoice === inv.id ? '...' : 'Riapri'}
-                        </button>
-                      )}
+                      {/* Pagato/Riapri rimossi: lo stato pagamento arriva solo dal refresh sync */}
                     </div>
                   </td>
                 </tr>

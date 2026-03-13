@@ -125,7 +125,8 @@ export default function Positions() {
 
   const formatDate = (dateStr) => {
     if (!dateStr) return '-'
-    return new Date(dateStr).toLocaleDateString('it-IT')
+    const d = dateStr.length === 10 ? new Date(dateStr + 'T00:00:00') : new Date(dateStr)
+    return d.toLocaleDateString('it-IT')
   }
 
   const getStatusLabel = (status) => {
@@ -447,7 +448,7 @@ export default function Positions() {
                       GG{sortArrow('days_overdue')}
                     </th>
                     <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
-                    <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Azioni</th>
+                    {/* Colonna azioni rimossa */}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200">
@@ -506,27 +507,7 @@ export default function Positions() {
                           {getStatusLabel(pos.status)}
                         </span>
                       </td>
-                      <td className="px-3 py-3 text-sm text-center">
-                        {pos.status !== 'paid' ? (
-                          <button
-                            onClick={(e) => handleMarkAsPaid(pos.id, e)}
-                            disabled={updatingId === pos.id}
-                            className="px-2 py-1 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700 disabled:opacity-50"
-                            title="Segna come pagato"
-                          >
-                            {updatingId === pos.id ? '...' : 'Pagato'}
-                          </button>
-                        ) : (
-                          <button
-                            onClick={(e) => handleStatusChange(pos.id, 'open', e)}
-                            disabled={updatingId === pos.id}
-                            className="px-2 py-1 bg-slate-200 text-slate-600 rounded text-xs font-medium hover:bg-slate-300 disabled:opacity-50"
-                            title="Riapri posizione"
-                          >
-                            {updatingId === pos.id ? '...' : 'Riapri'}
-                          </button>
-                        )}
-                      </td>
+                      {/* Colonna azioni rimossa: lo stato pagamento arriva solo dal refresh sync */}
                     </tr>
                   ))}
                 </tbody>

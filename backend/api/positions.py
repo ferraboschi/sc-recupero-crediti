@@ -288,7 +288,8 @@ async def update_position_status(
     session: Session = Depends(get_session),
 ):
     """Update the status of a position."""
-    valid_statuses = ["open", "contacted", "promised", "paid", "disputed", "escalated"]
+    valid_statuses = ["open", "contacted", "promised", "disputed", "escalated"]
+    # "paid" rimosso: lo stato pagamento arriva solo dal sync/refresh automatico
 
     if new_status not in valid_statuses:
         raise HTTPException(

@@ -279,7 +279,7 @@ export default function Messages() {
                           </span>
                         )}
                         {message.invoice_due_date && (
-                          <span>Scad. {new Date(message.invoice_due_date).toLocaleDateString('it-IT')}</span>
+                          <span>Scad. {new Date(message.invoice_due_date + 'T00:00:00').toLocaleDateString('it-IT')}</span>
                         )}
                       </div>
                     </div>

@@ -289,7 +289,13 @@ async def complete_action(
     notes: Optional[str] = Query(None, description="Additional notes"),
     session: Session = Depends(get_session),
 ):
-    """Mark a recovery action as completed with optional outcome."""
+    """Mark a recovery action as completed and auto-create the next action in the progression.
+
+    Progression: first_contact → second_contact → lawyer
+    - first_contact completato → crea second_contact schedulato +14gg
+    - second_contact completato → crea lawyer schedulato +30gg
+    - lawyer completato → follow-up lawyer +30gg
+    """
     try:
         action = session.query(RecoveryAction).filter(
             RecoveryAction.id == action_id,
@@ -304,18 +310,34 @@ async def complete_action(
         if notes:
             action.notes = (action.notes or '') + (' | Esito: ' + notes if action.notes else notes)
 
-        # If outcome is 'paid', check if all invoices are paid — if so, archive customer
         customer = session.query(Customer).filter(Customer.id == customer_id).first()
-        if outcome == 'paid' and customer:
-            unpaid = session.query(Invoice).filter(
-                Invoice.customer_id == customer_id,
-                Invoice.status != 'paid',
-                Invoice.days_overdue > 0,
-            ).count()
-            if unpaid == 0:
-                customer.recovery_status = 'archived'
-                customer.next_action_date = None
-                customer.next_action_type = None
+
+        # --- Auto-progression: crea la prossima azione automaticamente ---
+        today = date.today()
+        next_action = None
+        PROGRESSION = {
+            "first_contact": ("second_contact", 14),
+            "second_contact": ("lawyer", 30),
+            "lawyer": ("lawyer", 30),  # follow-up avvocato
+        }
+
+        if action.action_type in PROGRESSION and customer:
+            next_type, next_days = PROGRESSION[action.action_type]
+            next_date = today + timedelta(days=next_days)
+
+            next_action = RecoveryAction(
+                customer_id=customer_id,
+                action_type=next_type,
+                scheduled_date=next_date,
+                notes=f"Auto-generato dopo completamento {action.action_type}",
+            )
+            session.add(next_action)
+
+            # Aggiorna stato cliente
+            customer.recovery_status = next_type
+            customer.next_action_date = next_date
+            customer.next_action_type = next_type
+            customer.updated_at = datetime.utcnow()
 
         session.commit()
 
@@ -328,16 +350,25 @@ async def complete_action(
                 "customer_id": customer_id,
                 "outcome": outcome,
                 "action_type": action.action_type,
+                "next_action_type": next_action.action_type if next_action else None,
+                "next_action_date": next_action.scheduled_date.isoformat() if next_action else None,
             }
         )
         session.add(activity)
         session.commit()
 
-        return {
+        result = {
             "id": action.id,
             "completed_at": action.completed_at.isoformat(),
             "outcome": action.outcome,
         }
+        if next_action:
+            result["next_action"] = {
+                "id": next_action.id,
+                "action_type": next_action.action_type,
+                "scheduled_date": next_action.scheduled_date.isoformat(),
+            }
+        return result
 
     except HTTPException:
         raise
@@ -534,6 +565,7 @@ def _build_riepilogativo_pdf(customer, invoices):
     pdf.cell(0, 8, "Coordinate per il pagamento:", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(2)
     pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7, "Pagamento: a vista", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, "Intestatario: Sake Company srl", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, "IBAN: IT44N0200801671000105175151", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, "Banca: UniCredit", new_x="LMARGIN", new_y="NEXT")
@@ -544,8 +576,8 @@ def _build_riepilogativo_pdf(customer, invoices):
     pdf.set_font("Helvetica", "I", 9)
     pdf.multi_cell(
         0, 5,
-        "Vi preghiamo di provvedere al pagamento entro 7 giorni dalla ricezione "
-        "di questo riepilogo. Per qualsiasi chiarimento, non esitate a contattarci."
+        "Vi preghiamo di provvedere al pagamento a vista. "
+        "Per qualsiasi chiarimento, non esitate a contattarci."
     )
 
     return pdf.output()

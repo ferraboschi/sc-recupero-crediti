@@ -201,7 +201,7 @@ export default function Activity() {
                           <td className="px-4 py-3 text-right font-medium text-red-600">{formatCurrency(c.total_due)}</td>
                           <td className="px-4 py-3 text-center">{c.invoice_count}</td>
                           <td className="px-4 py-3 text-slate-600">
-                            {c.next_action_date ? new Date(c.next_action_date).toLocaleDateString('it-IT') : '-'}
+                            {c.next_action_date ? new Date(c.next_action_date + 'T00:00:00').toLocaleDateString('it-IT') : '-'}
                             {c.next_action_type && <span className="ml-2 text-xs text-slate-400">({getActionLabel(c.next_action_type)})</span>}
                           </td>
                         </tr>
@@ -275,7 +275,7 @@ export default function Activity() {
                           <td className="px-4 py-3 text-slate-600">{c.partita_iva || '-'}</td>
                           <td className="px-4 py-3 text-right font-medium text-orange-600">{formatCurrency(c.total_due)}</td>
                           <td className="px-4 py-3 text-center">{c.invoice_count}</td>
-                          <td className="px-4 py-3 text-slate-600">{c.next_action_date ? new Date(c.next_action_date).toLocaleDateString('it-IT') : '-'}</td>
+                          <td className="px-4 py-3 text-slate-600">{c.next_action_date ? new Date(c.next_action_date + 'T00:00:00').toLocaleDateString('it-IT') : '-'}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -310,7 +310,7 @@ export default function Activity() {
                           <td className="px-4 py-3 text-slate-600">{c.partita_iva || '-'}</td>
                           <td className="px-4 py-3 text-right font-medium text-red-600">{formatCurrency(c.total_due)}</td>
                           <td className="px-4 py-3 text-center">{c.invoice_count}</td>
-                          <td className="px-4 py-3 text-slate-600">{c.next_action_date ? new Date(c.next_action_date).toLocaleDateString('it-IT') : '-'}</td>
+                          <td className="px-4 py-3 text-slate-600">{c.next_action_date ? new Date(c.next_action_date + 'T00:00:00').toLocaleDateString('it-IT') : '-'}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -341,7 +341,7 @@ export default function Activity() {
                       {report.prossime_scadenze.map((a, idx) => (
                         <tr key={a.id || idx} className="hover:bg-slate-50 cursor-pointer" onClick={() => navigate(`/customers/${a.customer_id}`)}>
                           <td className="px-4 py-3 font-medium text-slate-900">
-                            {new Date(a.scheduled_date).toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric', month: 'short' })}
+                            {new Date(a.scheduled_date + 'T00:00:00').toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric', month: 'short' })}
                           </td>
                           <td className="px-4 py-3 text-slate-600">{a.customer_name}</td>
                           <td className="px-4 py-3">{getStatusBadge(a.action_type)}</td>

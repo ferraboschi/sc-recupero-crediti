@@ -185,7 +185,8 @@ export default function Dashboard() {
 
   const formatDate = (dateStr) => {
     if (!dateStr) return '-'
-    return new Date(dateStr).toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric', month: 'short' })
+    const d = dateStr.length === 10 ? new Date(dateStr + 'T00:00:00') : new Date(dateStr)
+    return d.toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric', month: 'short' })
   }
 
   const prevMonth = () => {
