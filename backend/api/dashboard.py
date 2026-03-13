@@ -478,19 +478,25 @@ async def get_stats(session: Session = Depends(get_session)):
 @router.get("/incassato")
 async def get_incassato_per_anno(session: Session = Depends(get_session)):
     """
-    Get collected (paid) amounts grouped by year — only from overdue invoices (fatture insolute).
-    Filters: status == 'paid' AND days_overdue > 0 (was overdue when collected).
-    Returns yearly totals plus a list of recent recovered payments.
+    Get collected amounts from overdue invoices (fatture insolute) grouped by year.
+    Only counts invoices that were past due when paid (due_date < payment date).
+    Uses amount (original invoice amount) since amount_due is zeroed on payment.
     """
     try:
-        # Only count invoices that were overdue (insolute) and then got paid
-        overdue_paid_filter = (Invoice.status == "paid") & (Invoice.days_overdue > 0)
+        from sqlalchemy import cast, Date
+
+        # Only count invoices that were overdue (insolute): paid AND due_date < payment date
+        overdue_paid_filter = (
+            (Invoice.status == "paid")
+            & (Invoice.due_date.isnot(None))
+            & (Invoice.due_date < cast(Invoice.updated_at, Date))
+        )
 
         yearly_raw = (
             session.query(
                 extract('year', Invoice.updated_at).label("year"),
                 func.count(Invoice.id).label("count"),
-                func.sum(Invoice.amount_due).label("total"),
+                func.sum(Invoice.amount).label("total"),
             )
             .filter(overdue_paid_filter)
             .group_by(extract('year', Invoice.updated_at))
@@ -535,12 +541,11 @@ async def get_incassato_per_anno(session: Session = Depends(get_session)):
             recent_list.append({
                 "id": inv.id,
                 "invoice_number": inv.invoice_number,
-                "amount": float(inv.amount_due),
+                "amount": float(inv.amount),
                 "customer_name": customer_name,
                 "customer_id": inv.customer_id,
                 "paid_date": inv.updated_at.isoformat() if inv.updated_at else None,
                 "source_platform": inv.source_platform,
-                "days_overdue": inv.days_overdue,
             })
 
         return {
