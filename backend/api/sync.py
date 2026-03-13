@@ -650,11 +650,12 @@ def _find_best_order_match(
 
     Matching criteria:
     1. Amount match: order total within 1% of invoice amount
-    2. Date proximity: order date within 7 days of invoice date
+    2. Date proximity: order within 30 days of invoice date
+       (invoices are often issued days/weeks after the order)
 
     Returns the best matching order or None.
     """
-    from datetime import timedelta
+    from datetime import timedelta  # noqa: F811
 
     if not invoice.issue_date:
         # Without a date, match by amount only
@@ -693,7 +694,7 @@ def _find_best_order_match(
         day_diff = abs(
             (invoice.issue_date - order_date).days
         )
-        if day_diff > 7:
+        if day_diff > 30:
             continue
 
         # Score: lower is better (prefer closer date +

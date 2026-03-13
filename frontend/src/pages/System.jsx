@@ -73,13 +73,31 @@ export default function System() {
 
   const triggerSync = async () => {
     setSyncing(true)
+    const beforeSync = data?.sync?.invoices?.last_sync || ''
     try {
       await fetch(`${API}/sync/full`, { method: 'POST' })
-      // Poll status after delay
-      setTimeout(fetchData, 5000)
-      setTimeout(fetchData, 30000)
-      setTimeout(fetchData, 90000)
-      setTimeout(() => setSyncing(false), 90000)
+      // Poll every 5s, stop when sync timestamp changes or max 3 min
+      let attempts = 0
+      const poll = setInterval(async () => {
+        attempts++
+        try {
+          const res = await fetch(`${API}/system`)
+          if (res.ok) {
+            const d = await res.json()
+            setData(d)
+            const afterSync = d?.sync?.invoices?.last_sync || ''
+            if (afterSync && afterSync !== beforeSync) {
+              clearInterval(poll)
+              setSyncing(false)
+            }
+          }
+        } catch { /* ignore polling errors */ }
+        if (attempts >= 36) {
+          clearInterval(poll)
+          setSyncing(false)
+          fetchData()
+        }
+      }, 5000)
     } catch {
       setSyncing(false)
     }

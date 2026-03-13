@@ -226,14 +226,29 @@ export default function Dashboard() {
     })
   }
 
+  const renderTodoHeader = () => (
+    <div className="flex items-center px-4 py-2 text-xs text-slate-400 uppercase tracking-wider font-semibold border-b border-slate-100 mb-1">
+      <div className="flex items-center gap-3 min-w-0 flex-1">
+        <span className="w-[80px] shrink-0">Azione</span>
+        <span>Cliente</span>
+      </div>
+      <div className="flex items-center shrink-0">
+        <span className="w-[50px] text-center">GG</span>
+        <span className="w-[55px] text-center">Fatt.</span>
+        <span className="w-[85px] text-right">Importo</span>
+        <span className="w-[28px]"></span>
+      </div>
+    </div>
+  )
+
   const renderTodoItem = (todo) => (
     <div
       key={todo.id}
       onClick={() => navigate(`/customers/${todo.customer_id}`)}
-      className="flex items-center justify-between bg-white rounded-lg px-4 py-3 cursor-pointer hover:shadow-md transition-all border border-slate-100 group"
+      className="flex items-center bg-white rounded-lg px-4 py-3 cursor-pointer hover:shadow-md transition-all border border-slate-100 group"
     >
-      <div className="flex items-center gap-3 min-w-0">
-        <span className={`${ACTION_BADGE_COLORS[todo.action_type] || ACTION_BADGE_COLORS.idle} px-2 py-0.5 rounded text-xs font-medium border shrink-0`}>
+      <div className="flex items-center gap-3 min-w-0 flex-1">
+        <span className={`${ACTION_BADGE_COLORS[todo.action_type] || ACTION_BADGE_COLORS.idle} px-2 py-0.5 rounded text-xs font-medium border shrink-0 w-[80px] text-center`}>
           {ACTION_LABELS[todo.action_type] || todo.action_type}
         </span>
         <div className="min-w-0">
@@ -245,40 +260,36 @@ export default function Dashboard() {
           )}
         </div>
       </div>
-      <div className="flex items-center gap-3 text-xs text-slate-500 shrink-0">
-        {/* Days overdue badge */}
-        {todo.max_days_overdue > 0 && (
-          <span className={`px-1.5 py-0.5 rounded font-medium ${
-            todo.max_days_overdue > 60 ? 'bg-red-100 text-red-700' :
-            todo.max_days_overdue > 30 ? 'bg-amber-100 text-amber-700' :
-            'bg-slate-100 text-slate-600'
-          }`}>
-            {todo.max_days_overdue}gg
-          </span>
-        )}
-        {todo.overdue_count > 0 && (
-          <span className="bg-red-50 text-red-600 px-1.5 py-0.5 rounded">
-            {todo.overdue_count} fatt.
-          </span>
-        )}
-        {todo.total_overdue > 0 && (
-          <span className="font-semibold text-red-700 min-w-[70px] text-right">{formatCurrency(todo.total_overdue)}</span>
-        )}
-        {todo.phone && (
-          <a
-            href={`https://wa.me/${todo.phone.replace(/[^+\d]/g, '')}`}
-            target="_blank" rel="noopener noreferrer"
-            onClick={(e) => e.stopPropagation()}
-            className="w-6 h-6 bg-green-500 text-white rounded-full text-xs flex items-center justify-center hover:bg-green-600 opacity-0 group-hover:opacity-100 transition-opacity"
-            title="WhatsApp"
-          >W</a>
-        )}
-        <span className="text-slate-400 min-w-[80px] text-right">{formatDate(todo.scheduled_date)}</span>
+      <div className="flex items-center shrink-0 text-xs">
+        <span className={`w-[50px] text-center font-medium ${
+          todo.max_days_overdue > 60 ? 'text-red-700' :
+          todo.max_days_overdue > 30 ? 'text-amber-700' :
+          'text-slate-500'
+        }`}>
+          {todo.max_days_overdue > 0 ? `${todo.max_days_overdue}` : '-'}
+        </span>
+        <span className="w-[55px] text-center text-slate-600">
+          {todo.overdue_count > 0 ? todo.overdue_count : '-'}
+        </span>
+        <span className="w-[85px] text-right font-semibold text-red-700">
+          {todo.total_overdue > 0 ? formatCurrency(todo.total_overdue) : '-'}
+        </span>
+        <span className="w-[28px] flex justify-center">
+          {todo.phone && (
+            <a
+              href={`https://wa.me/${todo.phone.replace(/[^+\d]/g, '')}`}
+              target="_blank" rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className="w-6 h-6 bg-green-500 text-white rounded-full text-xs flex items-center justify-center hover:bg-green-600 opacity-0 group-hover:opacity-100 transition-opacity"
+              title="WhatsApp"
+            >W</a>
+          )}
+        </span>
       </div>
     </div>
   )
 
-  const renderTodoSection = (priority) => {
+  const renderTodoSection = (priority, showHeader = false) => {
     const items = todosByPriority[priority]
     if (!items || items.length === 0) return null
     const config = PRIORITY_CONFIG[priority]
@@ -297,6 +308,7 @@ export default function Dashboard() {
             <span className="text-sm font-semibold text-slate-700">{formatCurrency(sectionTotal)}</span>
           )}
         </div>
+        {showHeader && renderTodoHeader()}
         <div className="space-y-2">
           {items.map(renderTodoItem)}
         </div>
@@ -505,7 +517,7 @@ export default function Dashboard() {
           ) : sortBy === 'priority' && filterPriority === 'all' ? (
             /* Grouped by priority */
             <div className="space-y-4 max-h-[700px] overflow-y-auto">
-              {['overdue', 'today', 'new', 'upcoming'].map(p => renderTodoSection(p))}
+              {['overdue', 'today', 'new', 'upcoming'].map((p, idx) => renderTodoSection(p, idx === 0))}
             </div>
           ) : (
             /* Flat sorted list */
@@ -513,12 +525,15 @@ export default function Dashboard() {
               {sortedTodos.length === 0 ? (
                 <p className="text-slate-400 text-center py-4">Nessun risultato per questo filtro</p>
               ) : (
-                sortedTodos.map((todo, idx) => (
-                  <div key={todo.id} className="flex items-center gap-2">
-                    <span className="text-xs text-slate-300 w-6 text-right shrink-0">{idx + 1}.</span>
-                    <div className="flex-1">{renderTodoItem(todo)}</div>
-                  </div>
-                ))
+                <>
+                  {renderTodoHeader()}
+                  {sortedTodos.map((todo, idx) => (
+                    <div key={todo.id} className="flex items-center gap-2">
+                      <span className="text-xs text-slate-300 w-6 text-right shrink-0">{idx + 1}.</span>
+                      <div className="flex-1">{renderTodoItem(todo)}</div>
+                    </div>
+                  ))}
+                </>
               )}
             </div>
           )}

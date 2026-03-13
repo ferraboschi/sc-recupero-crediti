@@ -228,17 +228,33 @@ async def get_system_status():
             "description": "Fatture scadute con days_overdue=0 (calcolo non aggiornato)",
         }
 
-        # Check: paid invoices still linked to active recovery
-        paid_in_active = session.query(func.count(Invoice.id)).filter(
-            Invoice.status == "paid",
-            Invoice.customer_id.isnot(None),
-        ).join(Customer).filter(
-            Customer.recovery_status.in_(["first_contact", "second_contact"]),
-        ).scalar() or 0
+        # Check: customers in active recovery with NO remaining overdue
+        # (all overdue invoices paid → status should be updated)
+        from sqlalchemy import and_
+        active_cust_ids = session.query(Customer.id).filter(
+            Customer.excluded.is_(False),
+            Customer.recovery_status.in_(
+                ["first_contact", "second_contact", "lawyer"]
+            ),
+        ).all()
+        fully_resolved_count = 0
+        for (cid,) in active_cust_ids:
+            remaining = session.query(func.count(Invoice.id)).filter(
+                Invoice.customer_id == cid,
+                Invoice.status != "paid",
+                Invoice.days_overdue > 0,
+            ).scalar() or 0
+            if remaining == 0:
+                fully_resolved_count += 1
         integrity["paid_in_active_recovery"] = {
-            "count": paid_in_active,
-            "status": "warning" if paid_in_active > 5 else "ok",
-            "description": "Fatture pagate con cliente ancora in recupero attivo",
+            "count": fully_resolved_count,
+            "status": (
+                "warning" if fully_resolved_count > 0 else "ok"
+            ),
+            "description": (
+                "Clienti in recupero attivo senza fatture scadute "
+                "residue (stato da aggiornare)"
+            ),
         }
 
         # --- 5. Scheduler ---
