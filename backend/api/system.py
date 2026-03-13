@@ -161,18 +161,26 @@ async def get_system_status():
             }
 
             f24 = inv_result.get("fattura24", {})
-            if config.FATTURA24_API_KEY:
-                connectors["fattura24"]["status"] = "ok" if f24.get("success") else "error"
-            elif invoices_f24 > 0:
-                # API subscription expired but invoices were imported via CSV
+            # Fattura24 API sync is disabled (subscription expired).
+            # If we have invoices in DB, show "imported" status regardless of API key.
+            if invoices_f24 > 0 and not f24.get("success"):
                 connectors["fattura24"]["status"] = "imported"
+                connectors["fattura24"]["last_result"] = {
+                    "success": True,
+                    "imported_count": invoices_f24,
+                }
+            elif f24.get("success"):
+                connectors["fattura24"]["status"] = "ok"
+                connectors["fattura24"]["last_result"] = {
+                    "success": True,
+                    "error": None,
+                }
             else:
                 connectors["fattura24"]["status"] = "not_configured"
-            connectors["fattura24"]["last_result"] = {
-                "success": f24.get("success") if config.FATTURA24_API_KEY else True,
-                "error": f24.get("error") if config.FATTURA24_API_KEY else None,
-                "imported_count": invoices_f24 if not config.FATTURA24_API_KEY and invoices_f24 > 0 else None,
-            }
+                connectors["fattura24"]["last_result"] = {
+                    "success": False,
+                    "error": f24.get("error"),
+                }
 
         cust_result = _sync_status.get("customers", {}).get("result")
         if cust_result:
