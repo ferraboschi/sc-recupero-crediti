@@ -513,16 +513,25 @@ async def get_attivita(session: Session = Depends(get_session)):
 
         contacted = []
         for cust, overdue_count, total_overdue in contacted_raw:
-            # Get last completed action
+            # Get last action (completed first, then any action)
             last_action = (
                 session.query(RecoveryAction)
                 .filter(
                     RecoveryAction.customer_id == cust.id,
-                    RecoveryAction.completed_at.isnot(None),
+                    RecoveryAction.action_type.in_(
+                        ["first_contact", "second_contact", "lawyer"]
+                    ),
                 )
-                .order_by(RecoveryAction.completed_at.desc())
+                .order_by(RecoveryAction.created_at.desc())
                 .first()
             )
+
+            last_date = None
+            if last_action:
+                if last_action.completed_at:
+                    last_date = last_action.completed_at.strftime("%Y-%m-%d")
+                else:
+                    last_date = last_action.created_at.strftime("%Y-%m-%d")
 
             contacted.append({
                 "id": cust.id,
@@ -530,14 +539,18 @@ async def get_attivita(session: Session = Depends(get_session)):
                 "partita_iva": cust.partita_iva,
                 "phone": cust.phone,
                 "recovery_status": cust.recovery_status,
-                "next_action_date": cust.next_action_date.isoformat() if cust.next_action_date else None,
-                "next_action_type": cust.next_action_type,
-                "last_contact_date": (
-                    last_action.completed_at.strftime("%Y-%m-%d")
-                    if last_action and last_action.completed_at else None
+                "next_action_date": (
+                    cust.next_action_date.isoformat()
+                    if cust.next_action_date else None
                 ),
-                "last_action_type": last_action.action_type if last_action else None,
-                "last_outcome": last_action.outcome if last_action else None,
+                "next_action_type": cust.next_action_type,
+                "last_contact_date": last_date,
+                "last_action_type": (
+                    last_action.action_type if last_action else None
+                ),
+                "last_outcome": (
+                    last_action.outcome if last_action else None
+                ),
                 "overdue_count": int(overdue_count or 0),
                 "total_overdue": float(total_overdue or 0),
             })
