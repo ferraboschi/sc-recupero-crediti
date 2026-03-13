@@ -381,12 +381,16 @@ class ShopifyConnector(BaseConnector):
             return False
 
     def fetch_customer_orders(
-        self, shopify_id: str
+        self, shopify_id: str,
+        since_date: str = "2022-01-01",
     ) -> List[Dict[str, Any]]:
         """Fetch all orders for a given customer from Shopify.
 
         Args:
             shopify_id: Shopify customer ID (numeric or gid)
+            since_date: Fetch orders created on or after this date
+                (YYYY-MM-DD). Default: 2022-01-01.
+                Shopify only returns last 60 days by default.
 
         Returns:
             List of order dicts with: id, order_number, name,
@@ -398,6 +402,7 @@ class ShopifyConnector(BaseConnector):
             "customer_id": numeric_id,
             "status": "any",
             "limit": 250,
+            "created_at_min": f"{since_date}T00:00:00+00:00",
             "fields": (
                 "id,order_number,name,total_price,"
                 "created_at,financial_status"
