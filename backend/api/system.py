@@ -15,24 +15,28 @@ router = APIRouter()
 
 
 @router.post("/migrate")
+@router.get("/migrate")
 async def run_migrations():
     """Run schema migrations to add missing columns."""
-    engine = get_engine()
+    session = get_session()
     results = []
     try:
-        with engine.begin() as conn:
-            # Check if outcome column exists
-            row = conn.execute(text("""
-                SELECT COUNT(*) FROM information_schema.columns
-                WHERE table_name = 'recovery_actions' AND column_name = 'outcome'
-            """)).scalar()
-            if row == 0:
-                conn.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
-                results.append("outcome: added successfully")
-            else:
-                results.append("outcome: already exists")
+        # Check if outcome column exists using session.execute(text())
+        row = session.execute(text("""
+            SELECT COUNT(*) FROM information_schema.columns
+            WHERE table_name = 'recovery_actions' AND column_name = 'outcome'
+        """)).scalar()
+        if row == 0:
+            session.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
+            session.commit()
+            results.append("outcome: added successfully")
+        else:
+            results.append("outcome: already exists")
     except Exception as e:
+        session.rollback()
         results.append(f"error: {str(e)}")
+    finally:
+        session.close()
     return {"migrations": results}
 
 
