@@ -167,6 +167,7 @@ async def get_customer_actions(
                     "action_type": a.action_type,
                     "scheduled_date": a.scheduled_date.isoformat() if a.scheduled_date else None,
                     "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+                    "outcome": a.outcome,
                     "notes": a.notes,
                     "created_at": a.created_at.isoformat(),
                 }
@@ -299,11 +300,7 @@ async def complete_action(
 
         action.completed_at = datetime.utcnow()
         if outcome:
-            # outcome column may not exist yet (added via migration)
-            try:
-                action.outcome = outcome
-            except Exception:
-                pass
+            action.outcome = outcome
         if notes:
             action.notes = (action.notes or '') + (' | Esito: ' + notes if action.notes else notes)
 
@@ -339,7 +336,7 @@ async def complete_action(
         return {
             "id": action.id,
             "completed_at": action.completed_at.isoformat(),
-            "outcome": getattr(action, 'outcome', None),
+            "outcome": action.outcome,
         }
 
     except HTTPException:

@@ -389,7 +389,7 @@ async def get_calendar(
                 "overdue_count": stats["count"],
                 "total_overdue": stats["total"],
                 "completed_at": a.completed_at.isoformat() if a.completed_at else None,
-                "outcome": getattr(a, 'outcome', None),
+                "outcome": a.outcome,
             })
 
         # Count overdue actions (scheduled before today, not completed)
