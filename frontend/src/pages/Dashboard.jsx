@@ -24,29 +24,12 @@ const ACTION_BADGE_COLORS = {
   waiting: 'bg-purple-100 text-purple-700 border-purple-200',
 }
 
-const OUTCOME_LABELS = {
-  contacted: 'Contattato',
-  promised: 'Promessa Pagamento',
-  partial_payment: 'Pagamento Parziale',
-  paid: 'Pagato',
-  unreachable: 'Irraggiungibile',
-  disputed: 'Contestazione',
-  no_answer: 'Non Risponde',
+const PRIORITY_CONFIG = {
+  overdue: { label: 'In Ritardo', bg: 'bg-red-50', border: 'border-red-200', badge: 'bg-red-600 text-white' },
+  today: { label: 'Oggi', bg: 'bg-blue-50', border: 'border-blue-200', badge: 'bg-blue-600 text-white' },
+  new: { label: 'Da Contattare', bg: 'bg-amber-50', border: 'border-amber-200', badge: 'bg-amber-600 text-white' },
+  upcoming: { label: 'Prossimamente', bg: 'bg-slate-50', border: 'border-slate-200', badge: 'bg-slate-500 text-white' },
 }
-
-const OUTCOME_COLORS = {
-  contacted: 'bg-blue-100 text-blue-700',
-  promised: 'bg-amber-100 text-amber-700',
-  partial_payment: 'bg-teal-100 text-teal-700',
-  paid: 'bg-green-100 text-green-700',
-  unreachable: 'bg-slate-100 text-slate-600',
-  disputed: 'bg-red-100 text-red-700',
-  no_answer: 'bg-orange-100 text-orange-700',
-}
-
-const WEEKDAYS = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom']
-const MONTH_NAMES = ['Gennaio', 'Febbraio', 'Marzo', 'Aprile', 'Maggio', 'Giugno',
-  'Luglio', 'Agosto', 'Settembre', 'Ottobre', 'Novembre', 'Dicembre']
 
 export default function Dashboard() {
   const navigate = useNavigate()
@@ -56,6 +39,9 @@ export default function Dashboard() {
   const [syncing, setSyncing] = useState(false)
   const [syncMessage, setSyncMessage] = useState('')
   const [lastSync, setLastSync] = useState(null)
+  const [todos, setTodos] = useState([])
+  const [todoCounts, setTodoCounts] = useState({})
+  const [todoLoading, setTodoLoading] = useState(true)
   const [retryCount, setRetryCount] = useState(0)
 
   // Search state
@@ -63,14 +49,6 @@ export default function Dashboard() {
   const [searchResults, setSearchResults] = useState(null)
   const [searchLoading, setSearchLoading] = useState(false)
   const searchTimeout = useRef(null)
-
-  // Calendar state
-  const now = new Date()
-  const [calYear, setCalYear] = useState(now.getFullYear())
-  const [calMonth, setCalMonth] = useState(now.getMonth() + 1)
-  const [calData, setCalData] = useState(null)
-  const [calLoading, setCalLoading] = useState(true)
-  const [selectedDay, setSelectedDay] = useState(null)
 
   const fetchData = async (retry = 0) => {
     try {
@@ -93,15 +71,16 @@ export default function Dashboard() {
     }
   }
 
-  const fetchCalendar = async (y, m) => {
+  const fetchTodos = async () => {
     try {
-      setCalLoading(true)
-      const response = await client.get('/dashboard/calendar', { params: { year: y, month: m } })
-      setCalData(response.data)
+      setTodoLoading(true)
+      const response = await client.get('/dashboard/todos')
+      setTodos(response.data.todos || [])
+      setTodoCounts(response.data.counts || {})
     } catch (err) {
-      console.error('Error fetching calendar:', err)
+      console.error('Error fetching todos:', err)
     } finally {
-      setCalLoading(false)
+      setTodoLoading(false)
     }
   }
 
@@ -129,11 +108,8 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchData()
+    fetchTodos()
   }, [])
-
-  useEffect(() => {
-    fetchCalendar(calYear, calMonth)
-  }, [calYear, calMonth])
 
   const handleSync = async () => {
     setSyncing(true)
@@ -145,7 +121,7 @@ export default function Dashboard() {
       setLastSync(syncNow)
       localStorage.setItem('lastSyncTime', syncNow.toISOString())
       await fetchData()
-      await fetchCalendar(calYear, calMonth)
+      await fetchTodos()
       setTimeout(() => setSyncMessage(''), 3000)
     } catch (err) {
       setSyncMessage('Errore nella sincronizzazione')
@@ -163,40 +139,6 @@ export default function Dashboard() {
     const d = dateStr.length === 10 ? new Date(dateStr + 'T00:00:00') : new Date(dateStr)
     return d.toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric', month: 'short' })
   }
-
-  const prevMonth = () => {
-    if (calMonth === 1) { setCalMonth(12); setCalYear(calYear - 1) }
-    else setCalMonth(calMonth - 1)
-    setSelectedDay(null)
-  }
-  const nextMonth = () => {
-    if (calMonth === 12) { setCalMonth(1); setCalYear(calYear + 1) }
-    else setCalMonth(calMonth + 1)
-    setSelectedDay(null)
-  }
-
-  // Build calendar grid
-  const buildCalendarDays = () => {
-    if (!calData) return []
-    const start = new Date(calData.start)
-    const end = new Date(calData.end)
-    const days = []
-    const d = new Date(start)
-    while (d <= end) {
-      const iso = d.toISOString().split('T')[0]
-      days.push({
-        date: iso,
-        day: d.getDate(),
-        isCurrentMonth: d.getMonth() + 1 === calMonth,
-        isToday: iso === new Date().toISOString().split('T')[0],
-        actions: calData.days[iso] || [],
-      })
-      d.setDate(d.getDate() + 1)
-    }
-    return days
-  }
-
-  const todayStr = new Date().toISOString().split('T')[0]
 
   if (loading) {
     return (
@@ -223,7 +165,7 @@ export default function Dashboard() {
             <h3 className="font-semibold text-amber-800 text-lg">Server in avvio...</h3>
           </div>
           <p className="text-amber-700 mb-3">Il server si sta risvegliando (fino a 60 secondi).</p>
-          <button onClick={() => { setError(null); fetchData(); }}
+          <button onClick={() => { setError(null); fetchData(); fetchTodos(); }}
             className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700">
             Riprova Ora
           </button>
@@ -234,8 +176,75 @@ export default function Dashboard() {
 
   if (!data) return null
 
-  const calendarDays = buildCalendarDays()
-  const selectedDayActions = selectedDay && calData?.days?.[selectedDay] ? calData.days[selectedDay] : null
+  // Group todos by priority
+  const todosByPriority = {}
+  todos.forEach(todo => {
+    if (!todosByPriority[todo.priority]) todosByPriority[todo.priority] = []
+    todosByPriority[todo.priority].push(todo)
+  })
+
+  const renderTodoItem = (todo) => (
+    <div
+      key={todo.id}
+      onClick={() => navigate(`/customers/${todo.customer_id}`)}
+      className="flex items-center justify-between bg-white rounded-lg px-3 py-2 cursor-pointer hover:shadow-sm transition-shadow border border-slate-100"
+    >
+      <div className="flex items-center gap-3 min-w-0">
+        <span className={`${ACTION_BADGE_COLORS[todo.action_type] || ACTION_BADGE_COLORS.idle} px-2 py-0.5 rounded text-xs font-medium border shrink-0`}>
+          {ACTION_LABELS[todo.action_type] || todo.action_type}
+        </span>
+        <div className="min-w-0">
+          <span className="text-sm font-medium text-slate-900 truncate block max-w-[200px]">
+            {todo.customer_name}
+          </span>
+          {todo.partita_iva && (
+            <span className="text-xs text-slate-400 font-mono">{todo.partita_iva}</span>
+          )}
+        </div>
+      </div>
+      <div className="flex items-center gap-3 text-xs text-slate-500 shrink-0">
+        {todo.overdue_count > 0 && (
+          <span className="bg-red-50 text-red-600 px-1.5 py-0.5 rounded">
+            {todo.overdue_count} scad.
+          </span>
+        )}
+        {todo.total_overdue > 0 && (
+          <span className="font-medium text-red-700">{formatCurrency(todo.total_overdue)}</span>
+        )}
+        {todo.phone && (
+          <a
+            href={`https://wa.me/${todo.phone.replace(/[^+\d]/g, '')}`}
+            target="_blank" rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="w-5 h-5 bg-green-500 text-white rounded-full text-xs flex items-center justify-center hover:bg-green-600"
+            title="WhatsApp"
+          >W</a>
+        )}
+        <span>{formatDate(todo.scheduled_date)}</span>
+      </div>
+    </div>
+  )
+
+  const renderTodoSection = (priority) => {
+    const items = todosByPriority[priority]
+    if (!items || items.length === 0) return null
+    const config = PRIORITY_CONFIG[priority]
+    return (
+      <div key={priority} className={`${config.bg} rounded-lg p-4 border ${config.border}`}>
+        <div className="flex items-center gap-2 mb-3">
+          <span className={`${config.badge} px-2 py-0.5 rounded text-xs font-bold`}>
+            {config.label}
+          </span>
+          <span className="text-sm text-slate-500">({items.length})</span>
+        </div>
+        <div className="space-y-2">
+          {items.map(renderTodoItem)}
+        </div>
+      </div>
+    )
+  }
+
+  const totalTodoOverdue = todos.reduce((sum, t) => sum + (t.total_overdue || 0), 0)
 
   return (
     <div className="space-y-6">
@@ -317,141 +326,39 @@ export default function Dashboard() {
         <StatsWidget label="Totale Scaduto" value={formatCurrency(data.total_scaduto || 0)} color="red" />
         <StatsWidget label="Fatture Scadute" value={data.total_fatture_scadute || 0} color="orange" />
         <StatsWidget label="Clienti con Scaduto" value={data.total_clienti_scaduti || 0} color="purple" />
-        <StatsWidget label="Fatture Totali" value={data.total_positions || 0} color="blue" />
+        <StatsWidget label="Da Gestire" value={todos.length || 0} color="blue" />
       </div>
 
-      {/* Calendar - full width */}
+      {/* Clienti Da Fare - full width list with grouping */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-bold text-slate-900">Calendario Azioni</h2>
-          <div className="flex items-center gap-2">
-            <button onClick={prevMonth} className="p-1.5 hover:bg-slate-100 rounded text-slate-600 text-sm font-bold">&lt;</button>
-            <span className="text-sm font-medium text-slate-700 min-w-[130px] text-center">
-              {MONTH_NAMES[calMonth - 1]} {calYear}
-            </span>
-            <button onClick={nextMonth} className="p-1.5 hover:bg-slate-100 rounded text-slate-600 text-sm font-bold">&gt;</button>
+          <div className="flex items-center gap-3">
+            <h2 className="text-lg font-bold text-slate-900">Da Fare</h2>
+            {todos.length > 0 && (
+              <span className="bg-red-100 text-red-700 px-2.5 py-0.5 rounded-full text-sm font-bold">
+                {todos.length}
+              </span>
+            )}
           </div>
+          {totalTodoOverdue > 0 && (
+            <div className="text-right">
+              <p className="text-xs text-slate-500">Totale in gestione</p>
+              <p className="text-lg font-bold text-red-600">{formatCurrency(totalTodoOverdue)}</p>
+            </div>
+          )}
         </div>
 
-        {calLoading ? (
+        {todoLoading ? (
           <p className="text-slate-500 text-center py-4">Caricamento...</p>
+        ) : todos.length === 0 ? (
+          <div className="text-center py-8">
+            <p className="text-slate-500 mb-2">Nessuna azione da fare</p>
+            <p className="text-sm text-slate-400">Sincronizza le fatture e vai nella scheda Clienti per iniziare.</p>
+          </div>
         ) : (
-          <>
-            {/* Weekday headers */}
-            <div className="grid grid-cols-7 mb-1">
-              {WEEKDAYS.map(d => (
-                <div key={d} className="text-center text-xs font-medium text-slate-400 py-1">{d}</div>
-              ))}
-            </div>
-
-            {/* Calendar grid */}
-            <div className="grid grid-cols-7 gap-1">
-              {calendarDays.map((day) => {
-                const allActions = day.actions
-                const pendingActions = allActions.filter(a => !a.completed_at)
-                const hasActions = allActions.length > 0
-                const isSelected = selectedDay === day.date
-                const isPast = day.date < todayStr
-                const allDone = hasActions && pendingActions.length === 0
-                return (
-                  <button
-                    key={day.date}
-                    onClick={() => hasActions ? setSelectedDay(isSelected ? null : day.date) : null}
-                    className={`relative p-2 text-center text-sm rounded-lg transition-colors min-h-[48px]
-                      ${!day.isCurrentMonth ? 'text-slate-300' : 'text-slate-700'}
-                      ${day.isToday ? 'ring-2 ring-blue-400 font-bold' : ''}
-                      ${isSelected ? 'bg-blue-100 ring-2 ring-blue-500' : ''}
-                      ${allDone && !isSelected ? 'bg-green-50' : ''}
-                      ${hasActions && !allDone && !isSelected ? (isPast ? 'bg-red-50 hover:bg-red-100' : 'bg-blue-50 hover:bg-blue-100') : ''}
-                      ${hasActions ? 'cursor-pointer' : 'cursor-default'}
-                    `}
-                  >
-                    {day.day}
-                    {hasActions && (
-                      <div className="flex justify-center mt-0.5 gap-0.5">
-                        {allDone ? (
-                          <span className="text-[10px] text-green-600 font-bold">&#10003;</span>
-                        ) : pendingActions.length <= 3 ? (
-                          pendingActions.map((_, i) => (
-                            <div key={i} className={`w-1.5 h-1.5 rounded-full ${isPast ? 'bg-red-400' : 'bg-blue-400'}`} />
-                          ))
-                        ) : (
-                          <span className={`text-[10px] font-bold ${isPast ? 'text-red-500' : 'text-blue-500'}`}>
-                            {pendingActions.length}
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </button>
-                )
-              })}
-            </div>
-
-            {/* Selected day detail */}
-            {selectedDayActions && (
-              <div className="mt-4 border-t border-slate-200 pt-4">
-                <p className="text-sm font-medium text-slate-700 mb-2">
-                  {new Date(selectedDay + 'T00:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' })}
-                  <span className="text-slate-400 ml-2">({selectedDayActions.length} azioni)</span>
-                </p>
-                <div className="space-y-2 max-h-[300px] overflow-y-auto">
-                  {selectedDayActions.map((a) => (
-                    <div
-                      key={a.id}
-                      onClick={() => navigate(`/customers/${a.customer_id}`)}
-                      className={`flex items-center justify-between rounded-lg px-3 py-2 cursor-pointer transition-colors border ${
-                        a.completed_at
-                          ? 'bg-green-50 border-green-200 opacity-75'
-                          : 'bg-slate-50 border-slate-100 hover:bg-blue-50'
-                      }`}
-                    >
-                      <div className="flex items-center gap-2 min-w-0">
-                        {a.completed_at ? (
-                          <span className={`${a.outcome ? (OUTCOME_COLORS[a.outcome] || 'bg-green-100 text-green-700') : 'bg-green-100 text-green-700'} px-2 py-0.5 rounded text-xs font-medium shrink-0`}>
-                            {a.outcome ? (OUTCOME_LABELS[a.outcome] || a.outcome) : 'Fatto'}
-                          </span>
-                        ) : (
-                          <span className={`${ACTION_BADGE_COLORS[a.action_type] || ACTION_BADGE_COLORS.idle} px-2 py-0.5 rounded text-xs font-medium border shrink-0`}>
-                            {ACTION_LABELS[a.action_type] || a.action_type}
-                          </span>
-                        )}
-                        <span className={`text-sm font-medium truncate ${a.completed_at ? 'text-slate-500 line-through' : 'text-slate-900'}`}>
-                          {a.customer_name}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        {a.total_overdue > 0 && !a.completed_at && (
-                          <span className="text-xs font-medium text-red-600">{formatCurrency(a.total_overdue)}</span>
-                        )}
-                        {a.phone && !a.completed_at && (
-                          <a href={`https://wa.me/${a.phone.replace(/[^+\d]/g, '')}`}
-                            target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()}
-                            className="w-5 h-5 bg-green-500 text-white rounded-full text-xs flex items-center justify-center hover:bg-green-600"
-                            title="WhatsApp">W</a>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Legend */}
-            <div className="mt-3 flex items-center gap-4 text-xs text-slate-400 flex-wrap">
-              <div className="flex items-center gap-1">
-                <div className="w-2 h-2 rounded-full bg-red-400" /> Scadute
-              </div>
-              <div className="flex items-center gap-1">
-                <div className="w-2 h-2 rounded-full bg-blue-400" /> Pianificate
-              </div>
-              <div className="flex items-center gap-1">
-                <span className="text-green-600 font-bold text-[10px]">&#10003;</span> Completate
-              </div>
-              <div className="flex items-center gap-1">
-                <div className="w-2 h-2 ring-2 ring-blue-400 rounded-full" /> Oggi
-              </div>
-            </div>
-          </>
+          <div className="space-y-4 max-h-[700px] overflow-y-auto">
+            {['overdue', 'today', 'new', 'upcoming'].map(p => renderTodoSection(p))}
+          </div>
         )}
       </div>
     </div>
