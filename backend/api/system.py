@@ -1,11 +1,11 @@
 """System health and diagnostics API endpoint."""
 
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from fastapi import APIRouter
 from sqlalchemy import func, text
 
-from backend.database import get_session, get_session_direct, get_engine, Customer, Invoice, Message, ActivityLog
+from backend.database import get_session_direct, Customer, Invoice, Message, ActivityLog
 from backend.config import config
 from backend.scheduler import get_scheduler_status
 from backend.api.sync import _sync_status, _load_sync_state
@@ -272,7 +272,8 @@ async def get_system_status():
                 alerts.append({
                     "level": "error",
                     "component": "shopify",
-                    "message": "Shopify non raggiungibile — verificare SHOPIFY_CLIENT_ID e SHOPIFY_CLIENT_SECRET su Render"
+                    "message": "Shopify non raggiungibile — verificare "
+                    "SHOPIFY_CLIENT_ID e SHOPIFY_CLIENT_SECRET su Render"
                 })
             else:
                 alerts.append({
@@ -372,7 +373,10 @@ def _summarize_sync_result(key: str, result: dict) -> str:
         f24 = result.get("fattura24", {})
         parts = []
         if fp.get("success"):
-            parts.append(f"FP: {fp.get('updated', 0)} agg, {fp.get('created', 0)} nuove, {fp.get('paid_detected', 0)} pagate")
+            parts.append(
+                f"FP: {fp.get('updated', 0)} agg, {fp.get('created', 0)} nuove, "
+                f"{fp.get('paid_detected', 0)} pagate"
+            )
         else:
             parts.append("FP: errore")
         if f24.get("success"):

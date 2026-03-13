@@ -4,12 +4,12 @@ import logging
 import csv
 import threading
 from io import StringIO
-from fastapi import APIRouter, BackgroundTasks, UploadFile, File, Form
+from fastapi import APIRouter, BackgroundTasks, UploadFile, File
 from datetime import datetime, date
 
-from backend.database import get_session, get_session_direct, ActivityLog, Invoice, Customer, SyncState
+from backend.database import get_session_direct, ActivityLog, Invoice, Customer, SyncState
 from backend.connectors.fatturapro import FatturaProConnector
-from backend.connectors.fatture24 import Fattura24Connector, Fattura24SubscriptionError
+from backend.connectors.fatture24 import Fattura24Connector
 from backend.connectors.shopify import ShopifyConnector
 from backend.engine.matching import run_matching
 from backend.engine.escalation import process_escalations
@@ -162,7 +162,9 @@ def _sync_invoices_task() -> dict:
                 result["fatturapro"]["paid_detected"] = paid_detected
                 logger.info(f"FatturaPro sync: created={created}, updated={updated}, paid_detected={paid_detected}")
             else:
-                result["fatturapro"]["error"] = "Login failed — check FATTURAPRO_USERNAME/PASSWORD env vars and server logs"
+                result["fatturapro"]["error"] = (
+                    "Login failed — check FATTURAPRO_USERNAME/PASSWORD env vars"
+                )
                 logger.error("FatturaPro login failed — cannot sync invoices")
         except Exception as e:
             result["fatturapro"]["error"] = str(e)
@@ -280,7 +282,10 @@ def _sync_invoices_task() -> dict:
                 result["fattura24"]["updated"] = updated
                 result["fattura24"]["paid_detected"] = paid_detected
                 result["fattura24"]["stale_paid"] = stale_paid
-                logger.info(f"Fattura24 sync: created={created}, updated={updated}, paid_detected={paid_detected}, stale_paid={stale_paid}")
+                logger.info(
+                    f"Fattura24 sync: created={created}, updated={updated}, "
+                    f"paid_detected={paid_detected}, stale_paid={stale_paid}"
+                )
             else:
                 logger.debug("Fattura24 not configured")
         except Exception as e:

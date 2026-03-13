@@ -34,6 +34,16 @@ const WEEKDAYS = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom']
 const MONTH_NAMES = ['Gennaio', 'Febbraio', 'Marzo', 'Aprile', 'Maggio', 'Giugno',
   'Luglio', 'Agosto', 'Settembre', 'Ottobre', 'Novembre', 'Dicembre']
 
+// Pipeline stage config
+const PIPELINE_STAGES = [
+  { key: 'idle', label: 'Da Gestire', color: 'bg-slate-400', textColor: 'text-slate-700', lightBg: 'bg-slate-50' },
+  { key: 'first_contact', label: 'I Contatto', color: 'bg-blue-500', textColor: 'text-blue-700', lightBg: 'bg-blue-50' },
+  { key: 'second_contact', label: 'II Contatto', color: 'bg-amber-500', textColor: 'text-amber-700', lightBg: 'bg-amber-50' },
+  { key: 'lawyer', label: 'Avvocato', color: 'bg-red-500', textColor: 'text-red-700', lightBg: 'bg-red-50' },
+  { key: 'waiting', label: 'In Attesa', color: 'bg-purple-500', textColor: 'text-purple-700', lightBg: 'bg-purple-50' },
+  { key: 'resolved', label: 'Incassato', color: 'bg-green-500', textColor: 'text-green-700', lightBg: 'bg-green-50' },
+]
+
 export default function Attivita() {
   const navigate = useNavigate()
   const now = new Date()
@@ -48,6 +58,9 @@ export default function Attivita() {
   // Attivita data
   const [attivita, setAttivita] = useState(null)
   const [attivitaLoading, setAttivitaLoading] = useState(true)
+
+  // Pipeline data
+  const [pipeline, setPipeline] = useState(null)
 
   // Tab state for bottom section
   const [activeTab, setActiveTab] = useState('contacted')
@@ -76,9 +89,19 @@ export default function Attivita() {
     }
   }, [])
 
+  const fetchPipeline = useCallback(async () => {
+    try {
+      const response = await client.get('/dashboard/pipeline')
+      setPipeline(response.data)
+    } catch (err) {
+      console.error('Error fetching pipeline:', err)
+    }
+  }, [])
+
   useEffect(() => {
     fetchAttivita()
-  }, [fetchAttivita])
+    fetchPipeline()
+  }, [fetchAttivita, fetchPipeline])
 
   useEffect(() => {
     fetchCalendar(calYear, calMonth)
@@ -146,35 +169,96 @@ export default function Attivita() {
   const contacted = attivita?.contacted || []
   const incassati = attivita?.incassati || []
   const summary = attivita?.summary || {}
+  const stages = pipeline?.stages || {}
+
+  // Calculate pipeline total for progress bar
+  const pipelineTotal = PIPELINE_STAGES.reduce((sum, s) => sum + (stages[s.key]?.count || 0), 0)
+
+  // Suggest next action based on contacted accounts
+  const suggestNextAction = (c) => {
+    if (c.recovery_status === 'first_contact') return 'Invia II Contatto'
+    if (c.recovery_status === 'second_contact') return 'Valuta Avvocato'
+    if (c.recovery_status === 'lawyer') return 'Verifica risposta legale'
+    return 'Contatta'
+  }
 
   return (
     <div className="space-y-6">
 
-      {/* ── SUMMARY CARDS ── */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div className="bg-white rounded-lg p-4 border border-slate-200 text-center">
-          <p className="text-xs text-slate-500 uppercase tracking-wide">Account Contattati</p>
-          <p className="text-2xl font-bold text-blue-700 mt-1">{summary.total_contacted || 0}</p>
+      {/* ── PIPELINE FUNNEL ── */}
+      <div className="bg-white rounded-lg p-6 border border-slate-200">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900">Pipeline Recupero</h2>
+            <p className="text-xs text-slate-500 mt-0.5">Stato di avanzamento di tutti i clienti con debiti scaduti</p>
+          </div>
+          {pipeline?.total_with_overdue > 0 && (
+            <span className="text-sm text-slate-500">
+              {pipeline.total_with_overdue} clienti con scaduto
+            </span>
+          )}
         </div>
-        <div className="bg-white rounded-lg p-4 border border-slate-200 text-center">
-          <p className="text-xs text-slate-500 uppercase tracking-wide">Incassati</p>
-          <p className="text-2xl font-bold text-green-700 mt-1">{summary.fully_resolved || 0}</p>
-        </div>
-        <div className="bg-white rounded-lg p-4 border border-slate-200 text-center">
-          <p className="text-xs text-slate-500 uppercase tracking-wide">Totale Recuperato</p>
-          <p className="text-2xl font-bold text-green-700 mt-1">{formatCurrency(summary.total_recovered || 0)}</p>
-        </div>
-        <div className="bg-white rounded-lg p-4 border border-slate-200 text-center">
-          <p className="text-xs text-slate-500 uppercase tracking-wide">Azioni in Calendario</p>
-          <p className="text-2xl font-bold text-amber-700 mt-1">{calData?.overdue_count || 0}</p>
-          <p className="text-xs text-slate-400">scadute</p>
+
+        {/* Funnel bars */}
+        <div className="space-y-2">
+          {PIPELINE_STAGES.map((stage) => {
+            const data = stages[stage.key] || { count: 0, amount: 0 }
+            const pct = pipelineTotal > 0 ? Math.max((data.count / pipelineTotal) * 100, data.count > 0 ? 4 : 0) : 0
+            return (
+              <div key={stage.key} className="flex items-center gap-3">
+                <span className={`text-xs font-medium w-24 text-right ${stage.textColor}`}>{stage.label}</span>
+                <div className="flex-1 bg-slate-100 rounded-full h-7 relative overflow-hidden">
+                  <div
+                    className={`${stage.color} h-full rounded-full transition-all duration-700 flex items-center justify-end pr-2`}
+                    style={{ width: `${pct}%`, minWidth: data.count > 0 ? '40px' : '0' }}
+                  >
+                    {data.count > 0 && (
+                      <span className="text-xs text-white font-bold">{data.count}</span>
+                    )}
+                  </div>
+                </div>
+                <span className="text-xs text-slate-500 w-24">
+                  {data.amount > 0 ? formatCurrency(data.amount) : '-'}
+                </span>
+              </div>
+            )
+          })}
         </div>
       </div>
 
-      {/* ── FULL-PAGE CALENDAR ── */}
+      {/* ── SUMMARY CARDS ── */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="bg-white rounded-lg p-4 border border-slate-200">
+          <p className="text-xs text-slate-500 uppercase tracking-wide">Account Contattati</p>
+          <p className="text-2xl font-bold text-blue-700 mt-1">{summary.total_contacted || 0}</p>
+          <p className="text-xs text-slate-400 mt-1">clienti in lavorazione</p>
+        </div>
+        <div className="bg-white rounded-lg p-4 border border-green-200 bg-green-50/30">
+          <p className="text-xs text-green-600 uppercase tracking-wide font-medium">Incassati</p>
+          <p className="text-2xl font-bold text-green-700 mt-1">{summary.fully_resolved || 0}</p>
+          <p className="text-xs text-green-500 mt-1">debiti risolti</p>
+        </div>
+        <div className="bg-white rounded-lg p-4 border border-green-200 bg-green-50/30">
+          <p className="text-xs text-green-600 uppercase tracking-wide font-medium">Totale Recuperato</p>
+          <p className="text-2xl font-bold text-green-700 mt-1">{formatCurrency(summary.total_recovered || 0)}</p>
+          <p className="text-xs text-green-500 mt-1">importo incassato</p>
+        </div>
+        <div className="bg-white rounded-lg p-4 border border-slate-200">
+          <p className="text-xs text-slate-500 uppercase tracking-wide">Azioni Scadute</p>
+          <p className="text-2xl font-bold text-red-600 mt-1">{calData?.overdue_count || 0}</p>
+          <p className="text-xs text-red-400 mt-1">da completare</p>
+        </div>
+      </div>
+
+      {/* ── CALENDAR ── */}
       <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-bold text-slate-900">Calendario Attività</h2>
+        <div className="flex items-center justify-between mb-1">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900">Calendario Attività</h2>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Clicca su un giorno con azioni per vederne i dettagli. Le azioni scadute sono in rosso.
+            </p>
+          </div>
           <div className="flex items-center gap-3">
             <button onClick={prevMonth} className="px-3 py-1.5 hover:bg-slate-100 rounded text-slate-600 font-bold">&lt;</button>
             <span className="text-base font-semibold text-slate-700 min-w-[160px] text-center">
@@ -189,13 +273,13 @@ export default function Attivita() {
         ) : (
           <>
             {/* Weekday headers */}
-            <div className="grid grid-cols-7 mb-2">
+            <div className="grid grid-cols-7 mb-2 mt-4">
               {WEEKDAYS.map(d => (
                 <div key={d} className="text-center text-sm font-semibold text-slate-500 py-2">{d}</div>
               ))}
             </div>
 
-            {/* Calendar grid — full width */}
+            {/* Calendar grid */}
             <div className="grid grid-cols-7 gap-1">
               {calendarDays.map((day) => {
                 const allActions = day.actions
@@ -243,7 +327,7 @@ export default function Attivita() {
             {/* Legend */}
             <div className="mt-4 flex items-center gap-6 text-xs text-slate-500">
               <div className="flex items-center gap-1.5">
-                <div className="w-2.5 h-2.5 rounded-full bg-red-400" /> Scadute
+                <div className="w-2.5 h-2.5 rounded-full bg-red-400" /> Scadute (da completare)
               </div>
               <div className="flex items-center gap-1.5">
                 <div className="w-2.5 h-2.5 rounded-full bg-blue-400" /> Pianificate
@@ -259,10 +343,17 @@ export default function Attivita() {
             {/* Selected day detail */}
             {selectedDayActions && (
               <div className="mt-4 border-t border-slate-200 pt-4">
-                <p className="text-sm font-semibold text-slate-700 mb-3">
-                  {new Date(selectedDay + 'T00:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
-                  <span className="text-slate-400 ml-2 font-normal">({selectedDayActions.length} azioni)</span>
-                </p>
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-sm font-semibold text-slate-700">
+                    {new Date(selectedDay + 'T00:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+                    <span className="text-slate-400 ml-2 font-normal">({selectedDayActions.length} azioni)</span>
+                  </p>
+                  {selectedDay < todayStr && selectedDayActions.some(a => !a.completed_at) && (
+                    <span className="text-xs bg-red-100 text-red-700 px-2 py-1 rounded font-medium">
+                      Azioni scadute — vanno completate o ripianificate
+                    </span>
+                  )}
+                </div>
                 <div className="space-y-2 max-h-[300px] overflow-y-auto">
                   {selectedDayActions.map((a) => (
                     <div
@@ -336,7 +427,10 @@ export default function Attivita() {
           {activeTab === 'contacted' && (
             <>
               {contacted.length === 0 ? (
-                <p className="text-slate-400 text-center py-8">Nessun account contattato. Registra la prima azione dalla scheda cliente.</p>
+                <div className="text-center py-8">
+                  <p className="text-slate-400 mb-2">Nessun account contattato.</p>
+                  <p className="text-sm text-slate-400">Vai nella scheda cliente e registra la prima azione per iniziare il recupero.</p>
+                </div>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full">
@@ -382,9 +476,10 @@ export default function Attivita() {
                               <p className={`text-sm font-medium ${isOverdue ? 'text-red-600' : 'text-slate-700'}`}>
                                 {formatDate(c.next_action_date)}
                               </p>
-                              {c.next_action_type && (
-                                <p className="text-xs text-slate-400">{ACTION_LABELS[c.next_action_type] || c.next_action_type}</p>
-                              )}
+                              {/* System-suggested next step */}
+                              <p className="text-xs text-blue-500 font-medium mt-0.5">
+                                {suggestNextAction(c)}
+                              </p>
                               {isOverdue && (
                                 <span className="text-[10px] text-red-500 font-bold">SCADUTA</span>
                               )}
@@ -420,7 +515,10 @@ export default function Attivita() {
           {activeTab === 'incassati' && (
             <>
               {incassati.length === 0 ? (
-                <p className="text-slate-400 text-center py-8">Nessun incasso registrato. Quando le fatture vengono pagate e sincronizzate, appariranno qui in verde.</p>
+                <div className="text-center py-8">
+                  <p className="text-slate-400 mb-2">Nessun incasso registrato.</p>
+                  <p className="text-sm text-slate-400">Quando le fatture vengono pagate e sincronizzate, appariranno qui.</p>
+                </div>
               ) : (
                 <div className="space-y-2">
                   {incassati.map(inc => (

@@ -39,21 +39,21 @@ class TestDashboardEndpoints:
         assert response.status_code == 200
         data = response.json()
 
-        assert data["total_crediti"] == 0.0
+        assert data["total_scaduto"] == 0.0
+        assert data["total_fatture_scadute"] == 0
+        assert data["total_clienti_scaduti"] == 0
         assert data["total_positions"] == 0
-        assert data["positions_by_status"] == {}
-        assert data["positions_by_escalation_level"] == {}
-        assert data["recent_activity"] == []
+        assert data["total_customers"] == 0
 
     def test_get_dashboard_with_invoices(self, test_client, test_db_session):
-        """Test dashboard with invoices."""
-        # Add some invoices
+        """Test dashboard with overdue invoices."""
         for i in range(3):
             invoice = Invoice(
                 invoice_number=f"INV{i:03d}",
                 amount=1000.0 * (i + 1),
                 amount_due=1000.0 * (i + 1),
                 issue_date=date(2024, 1, 15),
+                days_overdue=30,
                 status="open",
                 source_platform="fatturapro"
             )
@@ -65,9 +65,9 @@ class TestDashboardEndpoints:
         assert response.status_code == 200
         data = response.json()
 
-        assert data["total_crediti"] == 6000.0  # 1000 + 2000 + 3000
+        assert data["total_scaduto"] == 6000.0
+        assert data["total_fatture_scadute"] == 3
         assert data["total_positions"] == 3
-        assert "open" in data["positions_by_status"]
 
     def test_get_dashboard_with_multiple_statuses(self, test_client, test_db_session):
         """Test dashboard with invoices in different statuses."""
@@ -85,6 +85,7 @@ class TestDashboardEndpoints:
                 amount=amount,
                 amount_due=amount,
                 issue_date=date(2024, 1, 15),
+                days_overdue=10,
                 status=status,
                 source_platform="fatturapro"
             )
@@ -96,30 +97,26 @@ class TestDashboardEndpoints:
         assert response.status_code == 200
         data = response.json()
 
-        status_breakdown = data["positions_by_status"]
-        assert "open" in status_breakdown
-        assert status_breakdown["open"]["count"] == 2
-        assert status_breakdown["open"]["amount"] == 2500.0
-        assert "contacted" in status_breakdown
-        assert "escalated" in status_breakdown
-        assert "paid" in status_breakdown
+        # paid excluded from total_positions
+        assert data["total_positions"] == 4
+        # paid excluded from total_scaduto
+        assert data["total_scaduto"] == 7500.0
+        assert data["total_fatture_scadute"] == 4
 
     def test_get_dashboard_with_activity_log(self, test_client, test_db_session, activity_log):
-        """Test dashboard includes recent activity."""
+        """Test dashboard returns correct structure even with activity log data."""
         response = test_client.get("/api/dashboard")
         assert response.status_code == 200
         data = response.json()
 
-        assert len(data["recent_activity"]) > 0
-        activity = data["recent_activity"][0]
-        assert "id" in activity
-        assert "timestamp" in activity
-        assert "action" in activity
-        assert activity["action"] == "sync"
+        # Simplified dashboard no longer returns recent_activity
+        assert "total_scaduto" in data
+        assert "total_positions" in data
+        assert "total_customers" in data
 
     def test_get_dashboard_recent_activity_limit(self, test_client, test_db_session):
-        """Test that recent activity is limited to 10 items."""
-        # Add more than 10 activity logs
+        """Test dashboard returns correct structure."""
+        # Add some activity logs (dashboard no longer returns them)
         for i in range(15):
             log = ActivityLog(
                 timestamp=datetime.utcnow() - timedelta(hours=i),
@@ -135,7 +132,9 @@ class TestDashboardEndpoints:
         assert response.status_code == 200
         data = response.json()
 
-        assert len(data["recent_activity"]) <= 10
+        # Simplified endpoint returns only key stats
+        assert "total_scaduto" in data
+        assert "total_positions" in data
 
     def test_get_stats_empty_database(self, test_client):
         """Test stats endpoint with empty database."""
@@ -273,74 +272,59 @@ class TestDashboardEndpoints:
         data = response.json()
         assert isinstance(data, dict)
 
-    def test_dashboard_escalation_breakdown(self, test_client, test_db_session, sample_customer):
-        """Test dashboard includes escalation level breakdown."""
-        # Add invoice with messages at different escalation levels
+    def test_dashboard_with_customers(self, test_client, test_db_session, sample_customer):
+        """Test dashboard counts customers correctly."""
+        # Add overdue invoices for the customer
         invoice1 = Invoice(
             invoice_number="INV001",
             amount=1000.0,
             amount_due=1000.0,
             issue_date=date(2024, 1, 15),
+            days_overdue=30,
             customer_id=sample_customer.id,
             source_platform="fatturapro",
             status="open"
         )
-        invoice2 = Invoice(
+        test_db_session.add(invoice1)
+        test_db_session.commit()
+
+        response = test_client.get("/api/dashboard")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["total_clienti_scaduti"] == 1
+        assert data["total_customers"] >= 1
+
+    def test_dashboard_excludes_paid_from_totals(self, test_client, test_db_session):
+        """Test that paid invoices are excluded from overdue totals."""
+        inv_open = Invoice(
+            invoice_number="INV001",
+            amount=1000.0,
+            amount_due=1000.0,
+            days_overdue=10,
+            status="open",
+            source_platform="fatturapro"
+        )
+        inv_paid = Invoice(
             invoice_number="INV002",
             amount=2000.0,
-            amount_due=2000.0,
-            issue_date=date(2024, 1, 20),
-            customer_id=sample_customer.id,
-            source_platform="fatturapro",
-            status="open"
+            amount_due=0.0,
+            days_overdue=10,
+            status="paid",
+            source_platform="fatturapro"
         )
-        test_db_session.add_all([invoice1, invoice2])
-        test_db_session.commit()
-
-        message1 = Message(
-            invoice_id=invoice1.id,
-            customer_id=sample_customer.id,
-            escalation_level=1,
-            status="draft"
-        )
-        message2 = Message(
-            invoice_id=invoice2.id,
-            customer_id=sample_customer.id,
-            escalation_level=2,
-            status="draft"
-        )
-        test_db_session.add_all([message1, message2])
+        test_db_session.add_all([inv_open, inv_paid])
         test_db_session.commit()
 
         response = test_client.get("/api/dashboard")
         assert response.status_code == 200
         data = response.json()
 
-        # The response may be empty if the grouping query doesn't find matches
-        # Just verify the structure is present
-        assert "positions_by_escalation_level" in data
-        escalation_breakdown = data["positions_by_escalation_level"]
-        # May be empty dict or have entries
-        assert isinstance(escalation_breakdown, dict)
-
-    def test_dashboard_activity_timestamp_format(self, test_client, test_db_session):
-        """Test that activity timestamps are in ISO format."""
-        log = ActivityLog(
-            timestamp=datetime.utcnow(),
-            action="sync",
-            entity_type="invoice"
-        )
-        test_db_session.add(log)
-        test_db_session.commit()
-
-        response = test_client.get("/api/dashboard")
-        assert response.status_code == 200
-        data = response.json()
-
-        if data["recent_activity"]:
-            activity = data["recent_activity"][0]
-            # Should be ISO format
-            assert "T" in activity["timestamp"]  # ISO format contains T
+        # Only open invoice counts as overdue
+        assert data["total_scaduto"] == 1000.0
+        assert data["total_fatture_scadute"] == 1
+        # Paid excluded from total_positions
+        assert data["total_positions"] == 1
 
 
 class TestErrorHandling:
