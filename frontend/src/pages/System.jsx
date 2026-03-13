@@ -4,15 +4,15 @@ const API = import.meta.env.VITE_API_URL || 'https://sc-recupero-api.onrender.co
 
 function StatusBadge({ status }) {
   const colors = {
-    ok: 'bg-green-100 text-green-800',
-    healthy: 'bg-green-100 text-green-800',
-    configured: 'bg-green-100 text-green-800',
-    error: 'bg-red-100 text-red-800',
-    degraded: 'bg-yellow-100 text-yellow-800',
-    warning: 'bg-yellow-100 text-yellow-800',
-    not_configured: 'bg-slate-100 text-slate-600',
-    unknown: 'bg-slate-100 text-slate-500',
-    info: 'bg-blue-100 text-blue-800',
+    ok: 'bg-accent-green/15 text-accent-green',
+    healthy: 'bg-accent-green/15 text-accent-green',
+    configured: 'bg-accent-green/15 text-accent-green',
+    error: 'bg-accent-red/15 text-accent-red',
+    degraded: 'bg-accent-amber/15 text-accent-amber',
+    warning: 'bg-accent-amber/15 text-accent-amber',
+    not_configured: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
+    unknown: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
+    info: 'bg-accent-blue/15 text-accent-blue',
   }
   const labels = {
     ok: 'Attivo',
@@ -33,10 +33,10 @@ function StatusBadge({ status }) {
 }
 
 function AlertIcon({ level }) {
-  if (level === 'critical') return <span className="text-red-600 text-lg">&#9888;</span>
-  if (level === 'error') return <span className="text-red-500 text-lg">&#9888;</span>
-  if (level === 'warning') return <span className="text-yellow-500 text-lg">&#9888;</span>
-  return <span className="text-blue-500 text-lg">&#9432;</span>
+  if (level === 'critical') return <span className="text-accent-red text-lg">&#9888;</span>
+  if (level === 'error') return <span className="text-accent-red text-lg">&#9888;</span>
+  if (level === 'warning') return <span className="text-accent-amber text-lg">&#9888;</span>
+  return <span className="text-accent-blue text-lg">&#9432;</span>
 }
 
 function timeAgo(isoStr) {
@@ -76,7 +76,6 @@ export default function System() {
     const beforeSync = data?.sync?.invoices?.last_sync || ''
     try {
       await fetch(`${API}/sync/full`, { method: 'POST' })
-      // Poll every 5s, stop when sync timestamp changes or max 3 min
       let attempts = 0
       const poll = setInterval(async () => {
         attempts++
@@ -106,18 +105,18 @@ export default function System() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-        <span className="ml-3 text-slate-600">Caricamento diagnostica...</span>
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-accent-teal"></div>
+        <span className="ml-3 text-txt-muted">Caricamento diagnostica...</span>
       </div>
     )
   }
 
   if (error && !data) {
     return (
-      <div className="bg-red-50 border border-red-200 rounded-xl p-6 text-red-700">
+      <div className="bg-accent-red/10 border border-accent-red/20 rounded-xl p-6 text-accent-red">
         <p className="font-bold">Errore di connessione</p>
         <p className="text-sm mt-1">{error}</p>
-        <button onClick={fetchData} className="mt-3 px-4 py-2 bg-red-600 text-white rounded-lg text-sm hover:bg-red-700">
+        <button onClick={fetchData} className="mt-3 px-4 py-2 bg-accent-red text-dark-bg rounded-lg text-sm hover:brightness-110 font-medium">
           Riprova
         </button>
       </div>
@@ -135,8 +134,7 @@ export default function System() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-2xl font-bold text-slate-900">Sistema</h2>
-          <p className="text-sm text-slate-500 mt-1">
+          <p className="text-sm text-txt-muted mt-1">
             Diagnostica e stato di allineamento — aggiornato {timeAgo(data.timestamp)}
           </p>
         </div>
@@ -145,17 +143,13 @@ export default function System() {
           <button
             onClick={triggerSync}
             disabled={syncing}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-              syncing
-                ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
-                : 'bg-blue-600 text-white hover:bg-blue-700'
-            }`}
+            className={`sc-btn-primary ${syncing ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
             {syncing ? 'Sync in corso...' : 'Forza Sync Completo'}
           </button>
           <button
             onClick={fetchData}
-            className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium hover:bg-slate-200 transition-colors"
+            className="sc-btn-secondary"
           >
             Aggiorna
           </button>
@@ -166,29 +160,29 @@ export default function System() {
       {alerts.length > 0 && (
         <div className="space-y-2">
           {criticals.map((a, i) => (
-            <div key={`c-${i}`} className="bg-red-50 border border-red-200 rounded-xl p-4 flex items-start gap-3">
+            <div key={`c-${i}`} className="bg-accent-red/10 border border-accent-red/20 rounded-xl p-4 flex items-start gap-3">
               <AlertIcon level="critical" />
               <div>
-                <p className="font-semibold text-red-800 text-sm">{a.component}</p>
-                <p className="text-red-700 text-sm">{a.message}</p>
+                <p className="font-semibold text-accent-red text-sm">{a.component}</p>
+                <p className="text-accent-red/80 text-sm">{a.message}</p>
               </div>
             </div>
           ))}
           {errors.map((a, i) => (
-            <div key={`e-${i}`} className="bg-red-50 border border-red-200 rounded-xl p-4 flex items-start gap-3">
+            <div key={`e-${i}`} className="bg-accent-red/10 border border-accent-red/20 rounded-xl p-4 flex items-start gap-3">
               <AlertIcon level="error" />
               <div>
-                <p className="font-semibold text-red-700 text-sm">{a.component}</p>
-                <p className="text-red-600 text-sm">{a.message}</p>
+                <p className="font-semibold text-accent-red text-sm">{a.component}</p>
+                <p className="text-accent-red/80 text-sm">{a.message}</p>
               </div>
             </div>
           ))}
           {warnings.map((a, i) => (
-            <div key={`w-${i}`} className="bg-yellow-50 border border-yellow-200 rounded-xl p-4 flex items-start gap-3">
+            <div key={`w-${i}`} className="bg-accent-amber/10 border border-accent-amber/20 rounded-xl p-4 flex items-start gap-3">
               <AlertIcon level="warning" />
               <div>
-                <p className="font-semibold text-yellow-800 text-sm">{a.component}</p>
-                <p className="text-yellow-700 text-sm">{a.message}</p>
+                <p className="font-semibold text-accent-amber text-sm">{a.component}</p>
+                <p className="text-accent-amber/80 text-sm">{a.message}</p>
               </div>
             </div>
           ))}
@@ -196,34 +190,34 @@ export default function System() {
       )}
 
       {alerts.length === 0 && (
-        <div className="bg-green-50 border border-green-200 rounded-xl p-4 flex items-center gap-3">
-          <span className="text-green-600 text-xl">&#10003;</span>
-          <p className="text-green-800 font-medium">Tutto operativo — nessun problema rilevato</p>
+        <div className="bg-accent-green/10 border border-accent-green/20 rounded-xl p-4 flex items-center gap-3">
+          <span className="text-accent-green text-xl">&#10003;</span>
+          <p className="text-accent-green font-medium">Tutto operativo — nessun problema rilevato</p>
         </div>
       )}
 
       {/* Connectors */}
-      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="px-6 py-4 border-b border-slate-200 bg-slate-50">
-          <h3 className="font-bold text-slate-800">Connettori</h3>
+      <div className="sc-card overflow-hidden">
+        <div className="sc-card-header bg-dark-surface">
+          <h3 className="sc-section-title">Connettori</h3>
         </div>
-        <div className="divide-y divide-slate-100">
+        <div className="divide-y divide-dark-border">
           {Object.entries(connectors).map(([name, conn]) => (
             <div key={name} className="px-6 py-4 flex items-center justify-between">
               <div className="flex items-center gap-4">
-                <div className="w-10 h-10 rounded-lg bg-slate-100 flex items-center justify-center text-lg font-bold text-slate-600">
+                <div className="w-10 h-10 rounded-lg bg-dark-surface flex items-center justify-center text-lg font-bold text-txt-secondary">
                   {name === 'fatturapro' ? 'FP' : name === 'fattura24' ? 'F24' : name === 'shopify' ? 'SH' : 'TW'}
                 </div>
                 <div>
-                  <p className="font-semibold text-slate-800 capitalize">{name}</p>
+                  <p className="font-semibold text-txt-primary capitalize">{name}</p>
                   {conn.api_version && (
-                    <p className="text-xs text-slate-500">API v{conn.api_version}</p>
+                    <p className="text-xs text-txt-muted">API v{conn.api_version}</p>
                   )}
                   {conn.last_result && conn.last_result.error && (
-                    <p className="text-xs text-red-500 mt-0.5 max-w-md truncate">{conn.last_result.error}</p>
+                    <p className="text-xs text-accent-red mt-0.5 max-w-md truncate">{conn.last_result.error}</p>
                   )}
                   {conn.error && (
-                    <p className="text-xs text-red-500 mt-0.5 max-w-lg truncate">{conn.error}</p>
+                    <p className="text-xs text-accent-red mt-0.5 max-w-lg truncate">{conn.error}</p>
                   )}
                 </div>
               </div>
@@ -236,72 +230,72 @@ export default function System() {
       {/* Database & Data */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {/* Database */}
-        <div className="bg-white rounded-xl border border-slate-200 shadow-sm">
-          <div className="px-6 py-4 border-b border-slate-200 bg-slate-50">
-            <h3 className="font-bold text-slate-800">Database</h3>
+        <div className="sc-card">
+          <div className="sc-card-header bg-dark-surface">
+            <h3 className="sc-section-title">Database</h3>
           </div>
           <div className="p-6 space-y-4">
             <div className="flex justify-between items-center">
-              <span className="text-sm text-slate-600">Connessione</span>
+              <span className="text-sm text-txt-secondary">Connessione</span>
               <StatusBadge status={database.connected ? 'ok' : 'error'} />
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-sm text-slate-600">Latenza</span>
-              <span className="text-sm font-mono text-slate-800">{database.latency_ms}ms</span>
+              <span className="text-sm text-txt-secondary">Latenza</span>
+              <span className="text-sm font-mono text-txt-primary">{database.latency_ms}ms</span>
             </div>
-            <hr className="border-slate-100" />
+            <hr className="border-dark-border" />
             <div className="space-y-2">
               <div className="flex justify-between">
-                <span className="text-sm text-slate-600">Clienti totali</span>
-                <span className="text-sm font-semibold">{database.tables.customers.total}</span>
+                <span className="text-sm text-txt-secondary">Clienti totali</span>
+                <span className="text-sm font-semibold text-txt-primary">{database.tables.customers.total}</span>
               </div>
               <div className="flex justify-between pl-4">
-                <span className="text-xs text-slate-500">da Shopify</span>
-                <span className="text-xs text-slate-600">{database.tables.customers.shopify}</span>
+                <span className="text-xs text-txt-muted">da Shopify</span>
+                <span className="text-xs text-txt-secondary">{database.tables.customers.shopify}</span>
               </div>
               <div className="flex justify-between pl-4">
-                <span className="text-xs text-slate-500">auto-creati da fatture</span>
-                <span className="text-xs text-slate-600">{database.tables.customers.auto_created}</span>
+                <span className="text-xs text-txt-muted">auto-creati da fatture</span>
+                <span className="text-xs text-txt-secondary">{database.tables.customers.auto_created}</span>
               </div>
             </div>
             <div className="space-y-2">
               <div className="flex justify-between">
-                <span className="text-sm text-slate-600">Fatture totali</span>
-                <span className="text-sm font-semibold">{database.tables.invoices.total}</span>
+                <span className="text-sm text-txt-secondary">Fatture totali</span>
+                <span className="text-sm font-semibold text-txt-primary">{database.tables.invoices.total}</span>
               </div>
               <div className="flex justify-between pl-4">
-                <span className="text-xs text-slate-500">aperte</span>
-                <span className="text-xs text-slate-600">{database.tables.invoices.open}</span>
+                <span className="text-xs text-txt-muted">aperte</span>
+                <span className="text-xs text-txt-secondary">{database.tables.invoices.open}</span>
               </div>
               <div className="flex justify-between pl-4">
-                <span className="text-xs text-slate-500">pagate</span>
-                <span className="text-xs text-green-600">{database.tables.invoices.paid}</span>
+                <span className="text-xs text-txt-muted">pagate</span>
+                <span className="text-xs text-accent-green">{database.tables.invoices.paid}</span>
               </div>
               <div className="flex justify-between pl-4">
-                <span className="text-xs text-slate-500">associate a cliente</span>
-                <span className="text-xs text-slate-600">{database.tables.invoices.matched}</span>
+                <span className="text-xs text-txt-muted">associate a cliente</span>
+                <span className="text-xs text-txt-secondary">{database.tables.invoices.matched}</span>
               </div>
               <div className="flex justify-between pl-4">
-                <span className="text-xs text-slate-500">senza cliente</span>
-                <span className="text-xs text-yellow-600">{database.tables.invoices.unmatched}</span>
+                <span className="text-xs text-txt-muted">senza cliente</span>
+                <span className="text-xs text-accent-amber">{database.tables.invoices.unmatched}</span>
               </div>
               <div className="flex justify-between pl-4">
-                <span className="text-xs text-slate-500">FatturaPro</span>
-                <span className="text-xs text-slate-600">{database.tables.invoices.fatturapro}</span>
+                <span className="text-xs text-txt-muted">FatturaPro</span>
+                <span className="text-xs text-txt-secondary">{database.tables.invoices.fatturapro}</span>
               </div>
               <div className="flex justify-between pl-4">
-                <span className="text-xs text-slate-500">Fattura24</span>
-                <span className="text-xs text-slate-600">{database.tables.invoices.fattura24}</span>
+                <span className="text-xs text-txt-muted">Fattura24</span>
+                <span className="text-xs text-txt-secondary">{database.tables.invoices.fattura24}</span>
               </div>
             </div>
             <div className="flex justify-between">
-              <span className="text-sm text-slate-600">Messaggi</span>
-              <span className="text-sm font-semibold">{database.tables.messages.total}</span>
+              <span className="text-sm text-txt-secondary">Messaggi</span>
+              <span className="text-sm font-semibold text-txt-primary">{database.tables.messages.total}</span>
             </div>
-            <hr className="border-slate-100" />
+            <hr className="border-dark-border" />
             <div className="flex justify-between items-center">
-              <span className="text-sm font-semibold text-slate-700">Crediti aperti</span>
-              <span className="text-lg font-bold text-blue-700">
+              <span className="text-sm font-semibold text-txt-primary">Crediti aperti</span>
+              <span className="text-lg font-bold text-accent-teal">
                 EUR {database.totals.crediti_aperti.toLocaleString('it-IT', { minimumFractionDigits: 2 })}
               </span>
             </div>
@@ -309,9 +303,9 @@ export default function System() {
         </div>
 
         {/* Sync Pipeline */}
-        <div className="bg-white rounded-xl border border-slate-200 shadow-sm">
-          <div className="px-6 py-4 border-b border-slate-200 bg-slate-50">
-            <h3 className="font-bold text-slate-800">Pipeline Sync</h3>
+        <div className="sc-card">
+          <div className="sc-card-header bg-dark-surface">
+            <h3 className="sc-section-title">Pipeline Sync</h3>
           </div>
           <div className="p-6 space-y-4">
             {['invoices', 'customers', 'matching', 'escalations'].map(key => {
@@ -323,29 +317,29 @@ export default function System() {
                 escalations: 'Escalation',
               }
               return (
-                <div key={key} className="border border-slate-100 rounded-lg p-3">
+                <div key={key} className="border border-dark-border rounded-lg p-3">
                   <div className="flex justify-between items-center">
-                    <span className="text-sm font-semibold text-slate-700">{labels[key]}</span>
-                    <span className="text-xs text-slate-500">{timeAgo(s.last_sync)}</span>
+                    <span className="text-sm font-semibold text-txt-primary">{labels[key]}</span>
+                    <span className="text-xs text-txt-muted">{timeAgo(s.last_sync)}</span>
                   </div>
-                  <p className="text-xs text-slate-600 mt-1">{s.result_summary}</p>
+                  <p className="text-xs text-txt-secondary mt-1">{s.result_summary}</p>
                   {s.stale && (
-                    <p className="text-xs text-yellow-600 mt-1 font-medium">
+                    <p className="text-xs text-accent-amber mt-1 font-medium">
                       Dati non aggiornati da più di 24h
                     </p>
                   )}
                 </div>
               )
             })}
-            <hr className="border-slate-100" />
+            <hr className="border-dark-border" />
             <div className="space-y-2">
               <div className="flex justify-between items-center">
-                <span className="text-sm text-slate-600">Scheduler</span>
+                <span className="text-sm text-txt-secondary">Scheduler</span>
                 <StatusBadge status={scheduler.running ? 'ok' : 'error'} />
               </div>
               <div className="flex justify-between">
-                <span className="text-xs text-slate-500">Sync giornaliero</span>
-                <span className="text-xs text-slate-600">
+                <span className="text-xs text-txt-muted">Sync giornaliero</span>
+                <span className="text-xs text-txt-secondary">
                   {String(scheduler.scheduler_hour).padStart(2, '0')}:{String(scheduler.scheduler_minute).padStart(2, '0')} ({scheduler.timezone})
                 </span>
               </div>
@@ -355,18 +349,18 @@ export default function System() {
       </div>
 
       {/* Data Integrity */}
-      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="px-6 py-4 border-b border-slate-200 bg-slate-50">
-          <h3 className="font-bold text-slate-800">Integrità Dati</h3>
+      <div className="sc-card overflow-hidden">
+        <div className="sc-card-header bg-dark-surface">
+          <h3 className="sc-section-title">Integrità Dati</h3>
         </div>
-        <div className="divide-y divide-slate-100">
+        <div className="divide-y divide-dark-border">
           {Object.entries(integrity).map(([key, check]) => (
             <div key={key} className="px-6 py-3 flex items-center justify-between">
               <div>
-                <p className="text-sm text-slate-700">{check.description}</p>
+                <p className="text-sm text-txt-secondary">{check.description}</p>
               </div>
               <div className="flex items-center gap-3">
-                <span className="text-sm font-mono font-semibold text-slate-800">{check.count}</span>
+                <span className="text-sm font-mono font-semibold text-txt-primary">{check.count}</span>
                 <StatusBadge status={check.status} />
               </div>
             </div>

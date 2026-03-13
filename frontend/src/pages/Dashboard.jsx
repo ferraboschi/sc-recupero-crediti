@@ -15,20 +15,20 @@ const ACTION_LABELS = {
 }
 
 const ACTION_BADGE_COLORS = {
-  first_contact: 'bg-blue-100 text-blue-700 border-blue-200',
-  second_contact: 'bg-amber-100 text-amber-700 border-amber-200',
-  lawyer: 'bg-red-100 text-red-700 border-red-200',
-  archive: 'bg-slate-100 text-slate-600 border-slate-200',
-  wait: 'bg-purple-100 text-purple-700 border-purple-200',
-  idle: 'bg-slate-100 text-slate-600 border-slate-200',
-  waiting: 'bg-purple-100 text-purple-700 border-purple-200',
+  first_contact: 'badge-open',
+  second_contact: 'badge-contacted',
+  lawyer: 'badge-disputed',
+  archive: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
+  wait: 'badge-promised',
+  idle: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
+  waiting: 'badge-promised',
 }
 
 const PRIORITY_CONFIG = {
-  overdue: { label: 'In Ritardo', bg: 'bg-red-50', border: 'border-red-200', badge: 'bg-red-600 text-white', icon: '🔴' },
-  today: { label: 'Oggi', bg: 'bg-blue-50', border: 'border-blue-200', badge: 'bg-blue-600 text-white', icon: '🔵' },
-  new: { label: 'Da Contattare', bg: 'bg-amber-50', border: 'border-amber-200', badge: 'bg-amber-600 text-white', icon: '🟡' },
-  upcoming: { label: 'Prossimamente', bg: 'bg-slate-50', border: 'border-slate-200', badge: 'bg-slate-500 text-white', icon: '⏳' },
+  overdue: { label: 'In Ritardo', bg: 'bg-accent-red/5', border: 'border-accent-red/20', badge: 'bg-accent-red text-dark-bg', dot: 'bg-accent-red' },
+  today: { label: 'Oggi', bg: 'bg-accent-blue/5', border: 'border-accent-blue/20', badge: 'bg-accent-blue text-dark-bg', dot: 'bg-accent-blue' },
+  new: { label: 'Da Contattare', bg: 'bg-accent-amber/5', border: 'border-accent-amber/20', badge: 'bg-accent-amber text-dark-bg', dot: 'bg-accent-amber' },
+  upcoming: { label: 'Prossimamente', bg: 'bg-dark-surface', border: 'border-dark-border', badge: 'bg-txt-muted text-dark-bg', dot: 'bg-txt-muted' },
 }
 
 const SORT_OPTIONS = [
@@ -156,10 +156,10 @@ export default function Dashboard() {
     return (
       <div className="flex items-center justify-center h-full">
         <div className="text-center">
-          <svg className="animate-spin-slow w-12 h-12 text-blue-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg className="animate-spin-slow w-12 h-12 text-accent-teal mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
           </svg>
-          <p className="text-slate-600">Caricamento dati...</p>
+          <p className="text-txt-muted">Caricamento dati...</p>
         </div>
       </div>
     )
@@ -168,17 +168,17 @@ export default function Dashboard() {
   if (error) {
     return (
       <div className="space-y-6">
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-6">
+        <div className="bg-accent-amber/10 border border-accent-amber/30 rounded-xl p-6">
           <div className="flex items-center gap-3 mb-2">
-            <svg className="animate-spin w-5 h-5 text-amber-600" fill="none" viewBox="0 0 24 24">
+            <svg className="animate-spin w-5 h-5 text-accent-amber" fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
             </svg>
-            <h3 className="font-semibold text-amber-800 text-lg">Server in avvio...</h3>
+            <h3 className="font-semibold text-accent-amber text-lg">Server in avvio...</h3>
           </div>
-          <p className="text-amber-700 mb-3">Il server si sta risvegliando (fino a 60 secondi).</p>
+          <p className="text-txt-secondary mb-3">Il server si sta risvegliando (fino a 60 secondi).</p>
           <button onClick={() => { setError(null); fetchData(); fetchTodos(); }}
-            className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700">
+            className="sc-btn-primary">
             Riprova Ora
           </button>
         </div>
@@ -227,7 +227,7 @@ export default function Dashboard() {
   }
 
   const renderTodoHeader = () => (
-    <div className="flex items-center px-4 py-2 text-xs text-slate-400 uppercase tracking-wider font-semibold border-b border-slate-100 mb-1">
+    <div className="flex items-center px-4 py-2 text-xs text-txt-muted uppercase tracking-wider font-semibold border-b border-dark-border mb-1">
       <div className="flex items-center gap-3 min-w-0 flex-1">
         <span className="w-[80px] shrink-0">Azione</span>
         <span>Cliente</span>
@@ -245,33 +245,33 @@ export default function Dashboard() {
     <div
       key={todo.id}
       onClick={() => navigate(`/customers/${todo.customer_id}`)}
-      className="flex items-center bg-white rounded-lg px-4 py-3 cursor-pointer hover:shadow-md transition-all border border-slate-100 group"
+      className="flex items-center bg-dark-card rounded-lg px-4 py-3 cursor-pointer hover:bg-dark-cardHover transition-all border border-dark-border group"
     >
       <div className="flex items-center gap-3 min-w-0 flex-1">
-        <span className={`${ACTION_BADGE_COLORS[todo.action_type] || ACTION_BADGE_COLORS.idle} px-2 py-0.5 rounded text-xs font-medium border shrink-0 w-[80px] text-center`}>
+        <span className={`${ACTION_BADGE_COLORS[todo.action_type] || ACTION_BADGE_COLORS.idle} sc-badge shrink-0 w-[80px] text-center`}>
           {ACTION_LABELS[todo.action_type] || todo.action_type}
         </span>
         <div className="min-w-0">
-          <span className="text-sm font-medium text-slate-900 truncate block max-w-[220px]">
+          <span className="text-sm font-medium text-txt-primary truncate block max-w-[220px]">
             {todo.customer_name}
           </span>
           {todo.partita_iva && (
-            <span className="text-xs text-slate-400 font-mono">{todo.partita_iva}</span>
+            <span className="text-xs text-txt-muted font-mono">{todo.partita_iva}</span>
           )}
         </div>
       </div>
       <div className="flex items-center shrink-0 text-xs">
         <span className={`w-[50px] text-center font-medium ${
-          todo.max_days_overdue > 60 ? 'text-red-700' :
-          todo.max_days_overdue > 30 ? 'text-amber-700' :
-          'text-slate-500'
+          todo.max_days_overdue > 60 ? 'text-accent-red' :
+          todo.max_days_overdue > 30 ? 'text-accent-amber' :
+          'text-txt-muted'
         }`}>
           {todo.max_days_overdue > 0 ? `${todo.max_days_overdue}` : '-'}
         </span>
-        <span className="w-[55px] text-center text-slate-600">
+        <span className="w-[55px] text-center text-txt-secondary">
           {todo.overdue_count > 0 ? todo.overdue_count : '-'}
         </span>
-        <span className="w-[85px] text-right font-semibold text-red-700">
+        <span className="w-[85px] text-right font-semibold text-accent-red">
           {todo.total_overdue > 0 ? formatCurrency(todo.total_overdue) : '-'}
         </span>
         <span className="w-[28px] flex justify-center">
@@ -280,7 +280,7 @@ export default function Dashboard() {
               href={`https://wa.me/${todo.phone.replace(/[^+\d]/g, '')}`}
               target="_blank" rel="noopener noreferrer"
               onClick={(e) => e.stopPropagation()}
-              className="w-6 h-6 bg-green-500 text-white rounded-full text-xs flex items-center justify-center hover:bg-green-600 opacity-0 group-hover:opacity-100 transition-opacity"
+              className="w-6 h-6 bg-accent-green text-dark-bg rounded-full text-xs flex items-center justify-center hover:brightness-110 opacity-0 group-hover:opacity-100 transition-opacity font-bold"
               title="WhatsApp"
             >W</a>
           )}
@@ -295,17 +295,17 @@ export default function Dashboard() {
     const config = PRIORITY_CONFIG[priority]
     const sectionTotal = items.reduce((sum, t) => sum + (t.total_overdue || 0), 0)
     return (
-      <div key={priority} className={`${config.bg} rounded-lg p-4 border ${config.border}`}>
+      <div key={priority} className={`${config.bg} rounded-xl p-4 border ${config.border}`}>
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
-            <span className="text-sm">{config.icon}</span>
+            <div className={`w-2.5 h-2.5 rounded-full ${config.dot}`} />
             <span className={`${config.badge} px-2.5 py-0.5 rounded text-xs font-bold`}>
               {config.label}
             </span>
-            <span className="text-sm text-slate-500">({items.length})</span>
+            <span className="text-sm text-txt-muted">({items.length})</span>
           </div>
           {sectionTotal > 0 && (
-            <span className="text-sm font-semibold text-slate-700">{formatCurrency(sectionTotal)}</span>
+            <span className="text-sm font-semibold text-txt-secondary">{formatCurrency(sectionTotal)}</span>
           )}
         </div>
         {showHeader && renderTodoHeader()}
@@ -320,8 +320,8 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
-      {/* Search Bar + Sync Bar */}
-      <div className="bg-white rounded-lg p-4 border border-slate-200">
+      {/* Search Bar */}
+      <div className="sc-card p-4">
         <div className="flex items-center gap-4">
           {/* Search */}
           <div className="relative flex-1 max-w-md">
@@ -330,14 +330,14 @@ export default function Dashboard() {
               value={searchQuery}
               onChange={(e) => onSearchInput(e.target.value)}
               placeholder="Cerca per ragione sociale o P.IVA..."
-              className="w-full px-4 py-2 pl-10 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-300 focus:border-blue-400"
+              className="sc-input w-full pl-10"
             />
-            <svg className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg className="absolute left-3 top-2.5 w-4 h-4 text-txt-muted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
             {searchLoading && (
               <div className="absolute right-3 top-2.5">
-                <svg className="animate-spin w-4 h-4 text-blue-500" fill="none" viewBox="0 0 24 24">
+                <svg className="animate-spin w-4 h-4 text-accent-teal" fill="none" viewBox="0 0 24 24">
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
                 </svg>
@@ -345,26 +345,26 @@ export default function Dashboard() {
             )}
             {/* Search dropdown */}
             {searchResults !== null && (
-              <div className="absolute top-full left-0 right-0 mt-1 bg-white rounded-lg shadow-lg border border-slate-200 z-50 max-h-80 overflow-y-auto">
+              <div className="absolute top-full left-0 right-0 mt-1 bg-dark-card rounded-lg shadow-lg border border-dark-border z-50 max-h-80 overflow-y-auto">
                 {searchResults.length === 0 ? (
-                  <p className="p-3 text-sm text-slate-500">Nessun risultato</p>
+                  <p className="p-3 text-sm text-txt-muted">Nessun risultato</p>
                 ) : (
                   searchResults.map(r => (
                     <button
                       key={r.id}
                       onClick={() => { navigate(`/customers/${r.id}`); setSearchResults(null); setSearchQuery(''); }}
-                      className="w-full flex items-center justify-between px-4 py-3 hover:bg-blue-50 transition-colors text-left border-b border-slate-100 last:border-0"
+                      className="w-full flex items-center justify-between px-4 py-3 hover:bg-dark-cardHover transition-colors text-left border-b border-dark-border last:border-0"
                     >
                       <div>
-                        <p className="text-sm font-medium text-slate-900">{r.ragione_sociale}</p>
-                        {r.partita_iva && <p className="text-xs text-slate-400 font-mono">{r.partita_iva}</p>}
+                        <p className="text-sm font-medium text-txt-primary">{r.ragione_sociale}</p>
+                        {r.partita_iva && <p className="text-xs text-txt-muted font-mono">{r.partita_iva}</p>}
                       </div>
                       <div className="text-right">
                         {r.total_overdue > 0 && (
-                          <p className="text-sm font-bold text-red-600">{formatCurrency(r.total_overdue)}</p>
+                          <p className="text-sm font-bold text-accent-red">{formatCurrency(r.total_overdue)}</p>
                         )}
                         {r.overdue_count > 0 && (
-                          <p className="text-xs text-slate-500">{r.overdue_count} scadute</p>
+                          <p className="text-xs text-txt-muted">{r.overdue_count} scadute</p>
                         )}
                       </div>
                     </button>
@@ -375,17 +375,17 @@ export default function Dashboard() {
           </div>
 
           <div className="flex items-center gap-4 ml-auto">
-            <p className="text-sm text-slate-500 hidden md:block">
+            <p className="text-sm text-txt-muted hidden md:block">
               {lastSync ? `Agg: ${lastSync.toLocaleString('it-IT')}` : ''}
             </p>
             {syncMessage && (
-              <p className={`text-sm font-medium ${syncMessage.includes('Errore') ? 'text-red-600' : 'text-green-600'}`}>
+              <p className={`text-sm font-medium ${syncMessage.includes('Errore') ? 'text-accent-red' : 'text-accent-green'}`}>
                 {syncMessage}
               </p>
             )}
             <button onClick={handleSync} disabled={syncing}
-              className={`px-4 py-2 rounded-lg font-medium text-sm transition-colors flex items-center gap-2 ${
-                syncing ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700'
+              className={`sc-btn-primary flex items-center gap-2 ${
+                syncing ? 'opacity-50 cursor-not-allowed' : ''
               }`}>
               {syncing ? 'Sync...' : 'Sincronizza'}
             </button>
@@ -402,39 +402,37 @@ export default function Dashboard() {
       </div>
 
       {/* Clienti Da Fare - with filters and sorting */}
-      <div className="bg-white rounded-lg border border-slate-200">
+      <div className="sc-card">
         {/* Header with title and total */}
-        <div className="px-6 py-4 border-b border-slate-200">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <h2 className="text-lg font-bold text-slate-900">Da Fare</h2>
-              {todos.length > 0 && (
-                <span className="bg-red-100 text-red-700 px-2.5 py-0.5 rounded-full text-sm font-bold">
-                  {todos.length}
-                </span>
-              )}
-            </div>
-            {totalTodoOverdue > 0 && (
-              <div className="text-right">
-                <p className="text-xs text-slate-500">Totale in gestione</p>
-                <p className="text-lg font-bold text-red-600">{formatCurrency(totalTodoOverdue)}</p>
-              </div>
+        <div className="sc-card-header">
+          <div className="flex items-center gap-3">
+            <h2 className="text-base font-bold text-txt-primary">Da Fare</h2>
+            {todos.length > 0 && (
+              <span className="bg-accent-red/20 text-accent-red px-2.5 py-0.5 rounded-full text-sm font-bold">
+                {todos.length}
+              </span>
             )}
           </div>
+          {totalTodoOverdue > 0 && (
+            <div className="text-right">
+              <p className="text-xs text-txt-muted">Totale in gestione</p>
+              <p className="text-lg font-bold text-accent-red">{formatCurrency(totalTodoOverdue)}</p>
+            </div>
+          )}
         </div>
 
         {/* Filter chips + Sort selector */}
         {todos.length > 0 && (
-          <div className="px-6 py-3 border-b border-slate-100 bg-slate-50/50 flex flex-wrap items-center justify-between gap-3">
+          <div className="px-5 py-3 border-b border-dark-border bg-dark-surface/50 flex flex-wrap items-center justify-between gap-3">
             {/* Priority filter chips */}
             <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-xs text-slate-500 font-medium mr-1">Filtra:</span>
+              <span className="text-xs text-txt-muted font-medium mr-1">Filtra:</span>
               <button
                 onClick={() => setFilterPriority('all')}
                 className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
                   filterPriority === 'all'
-                    ? 'bg-slate-800 text-white'
-                    : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-100'
+                    ? 'bg-accent-teal text-dark-bg'
+                    : 'bg-dark-card text-txt-secondary border border-dark-border hover:bg-dark-cardHover'
                 }`}
               >
                 Tutti ({todos.length})
@@ -444,8 +442,8 @@ export default function Dashboard() {
                   onClick={() => setFilterPriority('overdue')}
                   className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
                     filterPriority === 'overdue'
-                      ? 'bg-red-600 text-white'
-                      : 'bg-white text-red-600 border border-red-300 hover:bg-red-50'
+                      ? 'bg-accent-red text-dark-bg'
+                      : 'bg-dark-card text-accent-red border border-accent-red/30 hover:bg-accent-red/10'
                   }`}
                 >
                   In Ritardo ({todoCounts.overdue})
@@ -456,8 +454,8 @@ export default function Dashboard() {
                   onClick={() => setFilterPriority('today')}
                   className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
                     filterPriority === 'today'
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-white text-blue-600 border border-blue-300 hover:bg-blue-50'
+                      ? 'bg-accent-blue text-dark-bg'
+                      : 'bg-dark-card text-accent-blue border border-accent-blue/30 hover:bg-accent-blue/10'
                   }`}
                 >
                   Oggi ({todoCounts.today})
@@ -468,8 +466,8 @@ export default function Dashboard() {
                   onClick={() => setFilterPriority('new')}
                   className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
                     filterPriority === 'new'
-                      ? 'bg-amber-600 text-white'
-                      : 'bg-white text-amber-600 border border-amber-300 hover:bg-amber-50'
+                      ? 'bg-accent-amber text-dark-bg'
+                      : 'bg-dark-card text-accent-amber border border-accent-amber/30 hover:bg-accent-amber/10'
                   }`}
                 >
                   Da Contattare ({todoCounts.new})
@@ -480,8 +478,8 @@ export default function Dashboard() {
                   onClick={() => setFilterPriority('upcoming')}
                   className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
                     filterPriority === 'upcoming'
-                      ? 'bg-slate-600 text-white'
-                      : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-50'
+                      ? 'bg-txt-muted text-dark-bg'
+                      : 'bg-dark-card text-txt-secondary border border-dark-border hover:bg-dark-cardHover'
                   }`}
                 >
                   Prossimi ({todoCounts.upcoming})
@@ -491,11 +489,11 @@ export default function Dashboard() {
 
             {/* Sort selector */}
             <div className="flex items-center gap-2">
-              <span className="text-xs text-slate-500 font-medium">Ordina:</span>
+              <span className="text-xs text-txt-muted font-medium">Ordina:</span>
               <select
                 value={sortBy}
                 onChange={(e) => setSortBy(e.target.value)}
-                className="text-xs border border-slate-300 rounded-lg px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-300"
+                className="sc-input text-xs px-2 py-1.5"
               >
                 {SORT_OPTIONS.map(opt => (
                   <option key={opt.value} value={opt.value}>{opt.label}</option>
@@ -506,13 +504,13 @@ export default function Dashboard() {
         )}
 
         {/* Todo list content */}
-        <div className="p-6">
+        <div className="sc-card-body">
           {todoLoading ? (
-            <p className="text-slate-500 text-center py-4">Caricamento...</p>
+            <p className="text-txt-muted text-center py-4">Caricamento...</p>
           ) : todos.length === 0 ? (
             <div className="text-center py-8">
-              <p className="text-slate-500 mb-2">Nessuna azione da fare</p>
-              <p className="text-sm text-slate-400">Sincronizza le fatture e vai nella scheda Clienti per iniziare.</p>
+              <p className="text-txt-muted mb-2">Nessuna azione da fare</p>
+              <p className="text-sm text-txt-muted">Sincronizza le fatture e vai nella scheda Clienti per iniziare.</p>
             </div>
           ) : sortBy === 'priority' && filterPriority === 'all' ? (
             /* Grouped by priority */
@@ -523,13 +521,13 @@ export default function Dashboard() {
             /* Flat sorted list */
             <div className="space-y-2 max-h-[700px] overflow-y-auto">
               {sortedTodos.length === 0 ? (
-                <p className="text-slate-400 text-center py-4">Nessun risultato per questo filtro</p>
+                <p className="text-txt-muted text-center py-4">Nessun risultato per questo filtro</p>
               ) : (
                 <>
                   {renderTodoHeader()}
                   {sortedTodos.map((todo, idx) => (
                     <div key={todo.id} className="flex items-center gap-2">
-                      <span className="text-xs text-slate-300 w-6 text-right shrink-0">{idx + 1}.</span>
+                      <span className="text-xs text-txt-muted w-6 text-right shrink-0">{idx + 1}.</span>
                       <div className="flex-1">{renderTodoItem(todo)}</div>
                     </div>
                   ))}

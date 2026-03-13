@@ -48,7 +48,7 @@ export default function Positions() {
   const [total, setTotal] = useState(0)
   const [limit] = useState(50)
 
-  // Filters - show only overdue invoices by default
+  // Filters
   const [statusFilter, setStatusFilter] = useState('exclude_paid')
   const [escalationFilter, setEscalationFilter] = useState('')
   const [minAmountFilter, setMinAmountFilter] = useState('')
@@ -77,7 +77,6 @@ export default function Positions() {
       try {
         setLoading(true)
         const params = { skip, limit }
-        // Handle special "exclude_paid" filter
         if (statusFilter === 'exclude_paid') {
           params.exclude_status = 'paid'
         } else if (statusFilter) {
@@ -134,16 +133,16 @@ export default function Positions() {
     return statusObj?.label || status
   }
 
-  const getStatusColor = (status) => {
-    const colors = {
-      open: 'bg-blue-100 text-blue-700',
-      contacted: 'bg-amber-100 text-amber-700',
-      promised: 'bg-purple-100 text-purple-700',
-      paid: 'bg-green-100 text-green-700',
-      disputed: 'bg-red-100 text-red-700',
-      escalated: 'bg-orange-100 text-orange-700',
+  const getStatusBadge = (status) => {
+    const map = {
+      open: 'badge-open',
+      contacted: 'badge-contacted',
+      promised: 'badge-promised',
+      paid: 'badge-paid',
+      disputed: 'badge-disputed',
+      escalated: 'badge-escalated',
     }
-    return colors[status] || 'bg-slate-100 text-slate-600'
+    return map[status] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'
   }
 
   const getSourceLabel = (source) => {
@@ -152,13 +151,11 @@ export default function Positions() {
     return source || '-'
   }
 
-  const getSourceColor = (source) => {
-    if (source === 'fatturapro') return 'bg-indigo-100 text-indigo-700'
-    if (source === 'fatture24') return 'bg-teal-100 text-teal-700'
-    return 'bg-slate-100 text-slate-600'
+  const getSourceBadge = (source) => {
+    if (source === 'fatturapro') return 'bg-[rgba(167,139,250,0.15)] text-accent-purple'
+    if (source === 'fatture24') return 'bg-[rgba(45,212,191,0.15)] text-accent-teal'
+    return 'bg-[rgba(148,163,184,0.15)] text-txt-muted'
   }
-
-  const totalAmountDue = positions.reduce((sum, pos) => sum + (pos.amount_due || 0), 0)
 
   const handleSort = (field) => {
     if (sortBy === field) {
@@ -198,48 +195,15 @@ export default function Positions() {
     }
   }
 
-  const handleMarkAsPaid = async (posId, e) => {
-    e.stopPropagation()
-    setUpdatingId(posId)
-    try {
-      await client.put(`/positions/${posId}/status`, null, { params: { new_status: 'paid' } })
-      // Update local state
-      setPositions(prev => prev.map(p =>
-        p.id === posId ? { ...p, status: 'paid' } : p
-      ))
-    } catch (err) {
-      console.error('Error marking as paid:', err)
-      alert('Errore nell\'aggiornamento dello stato')
-    } finally {
-      setUpdatingId(null)
-    }
-  }
-
-  const handleStatusChange = async (posId, newStatus, e) => {
-    e.stopPropagation()
-    setUpdatingId(posId)
-    try {
-      await client.put(`/positions/${posId}/status`, null, { params: { new_status: newStatus } })
-      setPositions(prev => prev.map(p =>
-        p.id === posId ? { ...p, status: newStatus } : p
-      ))
-    } catch (err) {
-      console.error('Error changing status:', err)
-      alert('Errore nell\'aggiornamento dello stato')
-    } finally {
-      setUpdatingId(null)
-    }
-  }
-
   return (
     <div className="space-y-6">
       {/* Filters */}
-      <div className="bg-white rounded-lg p-6 border border-slate-200">
+      <div className="sc-card p-5">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-bold text-slate-900">Filtri e Ricerca</h2>
+          <h2 className="sc-section-title">Filtri e Ricerca</h2>
           <div className="flex items-center gap-3">
-            <label className={`px-4 py-2 rounded-lg text-sm font-medium cursor-pointer
-              ${importing ? 'bg-slate-200 text-slate-400' : 'bg-teal-600 text-white hover:bg-teal-700'}`}>
+            <label className={`px-4 py-2 rounded-lg text-sm font-medium cursor-pointer transition-colors
+              ${importing ? 'bg-dark-card text-txt-muted' : 'sc-btn-primary'}`}>
               {importing ? 'Importando...' : 'Importa CSV (Fattura24)'}
               <input
                 type="file"
@@ -254,13 +218,13 @@ export default function Positions() {
 
         {importResult && (
           <div className={`mb-4 p-3 rounded-lg text-sm ${importResult.errors?.length > 0 && !importResult.created
-            ? 'bg-red-50 text-red-700 border border-red-200'
-            : 'bg-green-50 text-green-700 border border-green-200'}`}>
+            ? 'bg-accent-red/10 text-accent-red border border-accent-red/20'
+            : 'bg-accent-green/10 text-accent-green border border-accent-green/20'}`}>
             {importResult.created !== undefined && (
               <p>Importazione completata: {importResult.created} create, {importResult.updated} aggiornate, {importResult.skipped} saltate su {importResult.total_rows} righe.</p>
             )}
             {importResult.errors?.length > 0 && importResult.errors.map((err, i) => (
-              <p key={i} className="text-red-600">{err}</p>
+              <p key={i} className="text-accent-red">{err}</p>
             ))}
             <button onClick={() => setImportResult(null)} className="mt-1 text-xs underline">Chiudi</button>
           </div>
@@ -268,22 +232,22 @@ export default function Positions() {
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Ricerca Cliente/Fattura</label>
+            <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Ricerca Cliente/Fattura</label>
             <input
               type="text"
               value={searchFilter}
               onChange={(e) => { setSearchFilter(e.target.value); setSkip(0) }}
               placeholder="Nome cliente, P.IVA, Fattura..."
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="sc-input w-full"
             />
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Fonte</label>
+            <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Fonte</label>
             <select
               value={sourceFilter}
               onChange={(e) => { setSourceFilter(e.target.value); setSkip(0) }}
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="sc-input w-full"
             >
               {SOURCES.map(s => (
                 <option key={s.value} value={s.value}>{s.label}</option>
@@ -292,11 +256,11 @@ export default function Positions() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Scaduto</label>
+            <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Scaduto</label>
             <select
               value={overdueFilter}
               onChange={(e) => { setOverdueFilter(e.target.value); setSkip(0) }}
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="sc-input w-full"
             >
               {OVERDUE_OPTIONS.map(o => (
                 <option key={o.value} value={o.value}>{o.label}</option>
@@ -305,11 +269,11 @@ export default function Positions() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Cliente Associato</label>
+            <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Cliente Associato</label>
             <select
               value={hasCustomerFilter}
               onChange={(e) => { setHasCustomerFilter(e.target.value); setSkip(0) }}
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="sc-input w-full"
             >
               {CUSTOMER_OPTIONS.map(c => (
                 <option key={c.value} value={c.value}>{c.label}</option>
@@ -320,11 +284,11 @@ export default function Positions() {
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Stato Pagamento</label>
+            <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Stato Pagamento</label>
             <select
               value={statusFilter}
               onChange={(e) => { setStatusFilter(e.target.value); setSkip(0) }}
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="sc-input w-full"
             >
               {PAYMENT_OPTIONS.map(p => (
                 <option key={p.value} value={p.value}>{p.label}</option>
@@ -333,22 +297,22 @@ export default function Positions() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Importo Minimo</label>
+            <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Importo Minimo</label>
             <input
               type="number"
               value={minAmountFilter}
               onChange={(e) => { setMinAmountFilter(e.target.value); setSkip(0) }}
               placeholder="0"
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="sc-input w-full"
             />
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">Ordina Per</label>
+            <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Ordina Per</label>
             <select
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value)}
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="sc-input w-full"
             >
               <option value="">Nessuno</option>
               <option value="amount_due">Importo Dovuto</option>
@@ -363,7 +327,7 @@ export default function Positions() {
         <div className="mt-4">
           <button
             onClick={() => setShowDateFilters(!showDateFilters)}
-            className="text-sm font-medium text-blue-600 hover:text-blue-800 flex items-center gap-1"
+            className="text-sm font-medium text-accent-teal hover:text-accent-cyan flex items-center gap-1 transition-colors"
           >
             {showDateFilters ? '▼' : '▶'} Filtri per Data
           </button>
@@ -371,24 +335,24 @@ export default function Positions() {
           {showDateFilters && (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-3">
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-2">Emissione Dal</label>
+                <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Emissione Dal</label>
                 <input type="date" value={issueDateFrom} onChange={(e) => { setIssueDateFrom(e.target.value); setSkip(0) }}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  className="sc-input w-full" />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-2">Emissione Al</label>
+                <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Emissione Al</label>
                 <input type="date" value={issueDateTo} onChange={(e) => { setIssueDateTo(e.target.value); setSkip(0) }}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  className="sc-input w-full" />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-2">Scadenza Dal</label>
+                <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Scadenza Dal</label>
                 <input type="date" value={dueDateFrom} onChange={(e) => { setDueDateFrom(e.target.value); setSkip(0) }}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  className="sc-input w-full" />
               </div>
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-2">Scadenza Al</label>
+                <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Scadenza Al</label>
                 <input type="date" value={dueDateTo} onChange={(e) => { setDueDateTo(e.target.value); setSkip(0) }}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  className="sc-input w-full" />
               </div>
             </div>
           )}
@@ -397,117 +361,115 @@ export default function Positions() {
 
       {/* Summary Stats */}
       {positions.length > 0 && (
-        <div className="bg-blue-50 rounded-lg p-4 border border-blue-200 flex items-center gap-6">
+        <div className="bg-accent-blue/5 rounded-xl p-4 border border-accent-blue/20 flex items-center gap-6">
           <div>
-            <p className="text-sm font-medium text-blue-900">Totale Scaduto (filtro attivo)</p>
-            <p className="text-2xl font-bold text-blue-600">{formatCurrency(summaryTotalAmountDue)}</p>
+            <p className="text-sm font-medium text-accent-blue">Totale Scaduto (filtro attivo)</p>
+            <p className="text-2xl font-bold text-accent-blue">{formatCurrency(summaryTotalAmountDue)}</p>
           </div>
           <div>
-            <p className="text-sm font-medium text-blue-900">Posizioni Totali (filtro attivo)</p>
-            <p className="text-2xl font-bold text-blue-600">{total}</p>
+            <p className="text-sm font-medium text-accent-blue">Posizioni Totali</p>
+            <p className="text-2xl font-bold text-accent-blue">{total}</p>
           </div>
           <div>
-            <p className="text-sm font-medium text-blue-900">Mostrate in Pagina</p>
-            <p className="text-2xl font-bold text-blue-600">{positions.length} di {total}</p>
+            <p className="text-sm font-medium text-accent-blue">Mostrate in Pagina</p>
+            <p className="text-2xl font-bold text-accent-blue">{positions.length} di {total}</p>
           </div>
         </div>
       )}
 
       {/* Table */}
-      <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+      <div className="sc-card overflow-hidden">
         {loading ? (
           <div className="flex items-center justify-center h-96">
-            <svg className="animate-spin-slow w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg className="animate-spin-slow w-8 h-8 text-accent-teal" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
             </svg>
           </div>
         ) : error ? (
-          <div className="p-6 text-red-600">{error}</div>
+          <div className="p-6 text-accent-red">{error}</div>
         ) : positions.length === 0 ? (
-          <div className="p-6 text-center text-slate-500">Nessuna posizione trovata</div>
+          <div className="p-6 text-center text-txt-muted">Nessuna posizione trovata</div>
         ) : (
           <>
             <div className="overflow-x-auto">
               <table className="w-full">
-                <thead className="bg-slate-50 border-b border-slate-200">
+                <thead className="bg-dark-surface border-b border-dark-border">
                   <tr>
-                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fonte</th>
-                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Cliente</th>
-                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">P.IVA</th>
-                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fattura</th>
-                    <th className="px-3 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('amount_due')}>
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Fonte</th>
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Cliente</th>
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">P.IVA</th>
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Fattura</th>
+                    <th className="px-3 py-3 text-right text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleSort('amount_due')}>
                       Saldo{sortArrow('amount_due')}
                     </th>
-                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('issue_date')}>
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleSort('issue_date')}>
                       Emissione{sortArrow('issue_date')}
                     </th>
-                    <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('due_date')}>
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleSort('due_date')}>
                       Scadenza{sortArrow('due_date')}
                     </th>
-                    <th className="px-3 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100" onClick={() => handleSort('days_overdue')}>
+                    <th className="px-3 py-3 text-right text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleSort('days_overdue')}>
                       GG{sortArrow('days_overdue')}
                     </th>
-                    <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
-                    {/* Colonna azioni rimossa */}
+                    <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider">Stato</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-200">
+                <tbody className="divide-y divide-dark-border">
                   {positions.map(pos => (
-                    <tr key={pos.id} className={`hover:bg-slate-50 ${pos.status === 'paid' ? 'bg-green-50 opacity-60' : ''}`}>
+                    <tr key={pos.id} className={`sc-table-row ${pos.status === 'paid' ? 'bg-accent-green/5 opacity-60' : ''}`}>
                       <td className="px-3 py-3 text-sm">
-                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${getSourceColor(pos.source_platform)}`}>
+                        <span className={`sc-badge ${getSourceBadge(pos.source_platform)}`}>
                           {getSourceLabel(pos.source_platform)}
                         </span>
                       </td>
-                      <td className="px-3 py-3 text-sm text-slate-900">
+                      <td className="px-3 py-3 text-sm text-txt-primary">
                         <div className="flex flex-col">
                           {pos.customer?.id ? (
                             <span
-                              className="text-blue-700 cursor-pointer hover:text-blue-900 hover:underline"
+                              className="text-accent-teal cursor-pointer hover:text-accent-cyan"
                               onClick={(e) => { e.stopPropagation(); navigate(`/customers/${pos.customer.id}`) }}
                             >
                               {pos.customer.ragione_sociale}
                             </span>
                           ) : (
-                            <span>{pos.customer_name_raw || 'Non assegnato'}</span>
+                            <span className="text-txt-secondary">{pos.customer_name_raw || 'Non assegnato'}</span>
                           )}
                           {!pos.customer && pos.customer_name_raw && (
-                            <span className="text-xs text-amber-600">da verificare</span>
+                            <span className="text-xs text-accent-amber">da verificare</span>
                           )}
                         </div>
                       </td>
-                      <td className="px-3 py-3 text-sm text-slate-500 font-mono text-xs">
+                      <td className="px-3 py-3 text-txt-muted font-mono text-xs">
                         {pos.customer?.partita_iva || '-'}
                       </td>
-                      <td className="px-3 py-3 text-sm text-slate-600">
+                      <td className="px-3 py-3 text-sm text-txt-secondary">
                         {pos.invoice_number}
                       </td>
-                      <td className="px-3 py-3 text-sm text-right font-medium text-slate-900">
+                      <td className="px-3 py-3 text-sm text-right font-medium text-txt-primary">
                         {formatCurrency(pos.amount_due)}
                       </td>
-                      <td className="px-3 py-3 text-sm text-slate-600">
+                      <td className="px-3 py-3 text-sm text-txt-secondary">
                         {formatDate(pos.issue_date)}
                       </td>
-                      <td className="px-3 py-3 text-sm text-slate-600">
+                      <td className="px-3 py-3 text-sm text-txt-secondary">
                         {formatDate(pos.due_date)}
                       </td>
                       <td className="px-3 py-3 text-sm text-right">
                         <span className={`font-medium ${
-                          pos.days_overdue > 180 ? 'text-red-700 bg-red-50 px-1.5 py-0.5 rounded' :
-                          pos.days_overdue > 90 ? 'text-red-600' :
-                          pos.days_overdue > 30 ? 'text-amber-600' :
-                          pos.days_overdue > 0 ? 'text-yellow-600' :
-                          'text-slate-400'
+                          pos.days_overdue > 180 ? 'text-accent-red bg-accent-red/10 px-1.5 py-0.5 rounded' :
+                          pos.days_overdue > 90 ? 'text-accent-red' :
+                          pos.days_overdue > 30 ? 'text-accent-amber' :
+                          pos.days_overdue > 0 ? 'text-accent-amber' :
+                          'text-txt-muted'
                         }`}>
                           {pos.days_overdue || 0}
                         </span>
                       </td>
                       <td className="px-3 py-3 text-sm text-center">
-                        <span className={`${getStatusColor(pos.status)} px-2 py-1 rounded-full text-xs font-medium`}>
+                        <span className={`${getStatusBadge(pos.status)} sc-badge`}>
                           {getStatusLabel(pos.status)}
                         </span>
                       </td>
-                      {/* Colonna azioni rimossa: lo stato pagamento arriva solo dal refresh sync */}
                     </tr>
                   ))}
                 </tbody>
@@ -515,22 +477,22 @@ export default function Positions() {
             </div>
 
             {/* Pagination */}
-            <div className="px-6 py-4 border-t border-slate-200 flex items-center justify-between">
-              <p className="text-sm text-slate-600">
+            <div className="px-6 py-4 border-t border-dark-border flex items-center justify-between">
+              <p className="text-sm text-txt-muted">
                 Mostrando {skip + 1} a {Math.min(skip + limit, total)} di {total} posizioni
               </p>
               <div className="flex gap-2">
                 <button
                   onClick={() => setSkip(Math.max(0, skip - limit))}
                   disabled={skip === 0}
-                  className="px-4 py-2 border border-slate-300 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="sc-btn-secondary disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Precedente
                 </button>
                 <button
                   onClick={() => setSkip(skip + limit)}
                   disabled={skip + limit >= total}
-                  className="px-4 py-2 border border-slate-300 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="sc-btn-secondary disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Successivo
                 </button>

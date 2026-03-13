@@ -12,11 +12,11 @@ const ACTION_LABELS = {
 }
 
 const ACTION_COLORS = {
-  first_contact: 'bg-blue-600 hover:bg-blue-700',
-  second_contact: 'bg-amber-600 hover:bg-amber-700',
-  lawyer: 'bg-red-600 hover:bg-red-700',
-  archive: 'bg-slate-500 hover:bg-slate-600',
-  wait: 'bg-purple-600 hover:bg-purple-700',
+  first_contact: 'bg-accent-blue hover:brightness-110',
+  second_contact: 'bg-accent-amber hover:brightness-110',
+  lawyer: 'bg-accent-red hover:brightness-110',
+  archive: 'bg-slate-500 hover:brightness-110',
+  wait: 'bg-accent-purple hover:brightness-110',
 }
 
 const STATUS_LABELS = {
@@ -29,21 +29,21 @@ const STATUS_LABELS = {
 }
 
 const STATUS_COLORS = {
-  idle: 'bg-slate-100 text-slate-700',
-  first_contact: 'bg-blue-100 text-blue-700',
-  second_contact: 'bg-amber-100 text-amber-700',
-  lawyer: 'bg-red-100 text-red-700',
-  archived: 'bg-slate-200 text-slate-500',
-  waiting: 'bg-purple-100 text-purple-700',
+  idle: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
+  first_contact: 'badge-open',
+  second_contact: 'badge-contacted',
+  lawyer: 'badge-disputed',
+  archived: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
+  waiting: 'badge-promised',
 }
 
 const INVOICE_STATUS_COLORS = {
-  open: 'bg-blue-100 text-blue-700',
-  contacted: 'bg-amber-100 text-amber-700',
-  promised: 'bg-purple-100 text-purple-700',
-  paid: 'bg-green-100 text-green-700',
-  disputed: 'bg-red-100 text-red-700',
-  escalated: 'bg-orange-100 text-orange-700',
+  open: 'badge-open',
+  contacted: 'badge-contacted',
+  promised: 'badge-promised',
+  paid: 'badge-paid',
+  disputed: 'badge-disputed',
+  escalated: 'badge-escalated',
 }
 
 const OUTCOME_LABELS = {
@@ -57,13 +57,13 @@ const OUTCOME_LABELS = {
 }
 
 const OUTCOME_COLORS = {
-  contacted: 'bg-blue-100 text-blue-700',
-  promised: 'bg-amber-100 text-amber-700',
-  partial_payment: 'bg-teal-100 text-teal-700',
-  paid: 'bg-green-100 text-green-700',
-  unreachable: 'bg-slate-100 text-slate-600',
-  disputed: 'bg-red-100 text-red-700',
-  no_answer: 'bg-orange-100 text-orange-700',
+  contacted: 'bg-accent-blue/15 text-accent-blue',
+  promised: 'bg-accent-amber/15 text-accent-amber',
+  partial_payment: 'bg-accent-teal/15 text-accent-teal',
+  paid: 'bg-accent-green/15 text-accent-green',
+  unreachable: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
+  disputed: 'bg-accent-red/15 text-accent-red',
+  no_answer: 'bg-accent-amber/15 text-accent-amber',
 }
 
 export default function ClientDetail() {
@@ -83,9 +83,7 @@ export default function ClientDetail() {
   const [showAllInvoices, setShowAllInvoices] = useState(false)
   const [invoiceSortBy, setInvoiceSortBy] = useState('due_date')
   const [invoiceSortOrder, setInvoiceSortOrder] = useState('asc')
-  // Navigation state
   const [neighbors, setNeighbors] = useState({ prev_id: null, next_id: null, position: null, total: null })
-  // Action completion state
   const [completingAction, setCompletingAction] = useState(null)
   const [selectedOutcome, setSelectedOutcome] = useState('')
   const [copiedWhatsApp, setCopiedWhatsApp] = useState(false)
@@ -97,7 +95,6 @@ export default function ClientDetail() {
       setLoading(true)
       const response = await client.get(`/customers/${customerId}`)
       setData(response.data)
-      // Auto-select all overdue invoices
       const overdueIds = (response.data.invoices?.items || [])
         .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid')
         .map(inv => inv.id)
@@ -129,7 +126,6 @@ export default function ClientDetail() {
 
   const formatDate = (dateStr) => {
     if (!dateStr) return '-'
-    // Append T00:00:00 to date-only strings to avoid UTC timezone shift (off-by-one day)
     const d = dateStr.length === 10 ? new Date(dateStr + 'T00:00:00') : new Date(dateStr)
     return d.toLocaleDateString('it-IT')
   }
@@ -166,7 +162,6 @@ export default function ClientDetail() {
     }
   }
 
-  // Download selected invoices as ZIP of individual PDFs
   const handleDownloadInvoicesZip = async () => {
     if (selectedInvoices.size === 0) return
     setPdfLoading(true)
@@ -192,7 +187,6 @@ export default function ClientDetail() {
     }
   }
 
-  // Download promemoria (riassunto fatture con IBAN e giorni ritardo)
   const handleDownloadPromemoria = async () => {
     if (selectedInvoices.size === 0) return
     setPromemoria(true)
@@ -218,7 +212,6 @@ export default function ClientDetail() {
     }
   }
 
-  // Download single invoice PDF
   const handleDownloadSinglePdf = async (invoiceId, invoiceNumber) => {
     setSinglePdfLoading(invoiceId)
     try {
@@ -254,30 +247,6 @@ export default function ClientDetail() {
     }
   }
 
-  const handleMarkPaid = async (invoiceId) => {
-    setUpdatingInvoice(invoiceId)
-    try {
-      await client.put(`/positions/${invoiceId}/status`, null, { params: { new_status: 'paid' } })
-      await fetchData()
-    } catch (err) {
-      console.error('Error marking as paid:', err)
-    } finally {
-      setUpdatingInvoice(null)
-    }
-  }
-
-  const handleReopenInvoice = async (invoiceId) => {
-    setUpdatingInvoice(invoiceId)
-    try {
-      await client.put(`/positions/${invoiceId}/status`, null, { params: { new_status: 'open' } })
-      await fetchData()
-    } catch (err) {
-      console.error('Error reopening:', err)
-    } finally {
-      setUpdatingInvoice(null)
-    }
-  }
-
   const toggleInvoiceSelection = (id) => {
     setSelectedInvoices(prev => {
       const next = new Set(prev)
@@ -295,7 +264,6 @@ export default function ClientDetail() {
     setSelectedInvoices(new Set(overdueIds))
   }
 
-  // Build WhatsApp message with selected invoices
   const buildWhatsAppMessage = () => {
     if (!data || selectedInvoices.size === 0) return ''
     const selected = (data.invoices?.items || []).filter(inv => selectedInvoices.has(inv.id))
@@ -338,7 +306,6 @@ export default function ClientDetail() {
       setCopiedWhatsApp(true)
       setTimeout(() => setCopiedWhatsApp(false), 2000)
     } catch {
-      // Fallback for older browsers
       const textarea = document.createElement('textarea')
       textarea.value = message
       document.body.appendChild(textarea)
@@ -350,14 +317,12 @@ export default function ClientDetail() {
     }
   }
 
-  // Progressive action numbering
   const ACTION_NUMBER_LABELS = ['PRIMA', 'SECONDA', 'TERZA', 'QUARTA', 'QUINTA', 'SESTA', 'SETTIMA', 'OTTAVA', 'NONA', 'DECIMA']
   const contactActionCount = data?.contact_action_count || 0
   const nextActionNumber = contactActionCount + 1
   const nextActionLabel = ACTION_NUMBER_LABELS[contactActionCount] || `${nextActionNumber}ª`
   const shouldSuggestLawyer = contactActionCount >= 3
 
-  // Invoice sorting
   const handleInvoiceSort = (field) => {
     if (invoiceSortBy === field) {
       setInvoiceSortOrder(invoiceSortOrder === 'asc' ? 'desc' : 'asc')
@@ -375,14 +340,14 @@ export default function ClientDetail() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-96">
-        <svg className="animate-spin w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <svg className="animate-spin w-8 h-8 text-accent-teal" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
         </svg>
       </div>
     )
   }
 
-  if (error) return <div className="p-6 text-red-600">{error}</div>
+  if (error) return <div className="p-6 text-accent-red">{error}</div>
   if (!data) return null
 
   const overdueInvoices = data.invoices?.items?.filter(inv => inv.days_overdue > 0 && inv.status !== 'paid') || []
@@ -390,12 +355,10 @@ export default function ClientDetail() {
   const allUnpaid = data.invoices?.items?.filter(inv => inv.status !== 'paid') || []
   const whatsappNumber = getWhatsAppNumber() || null
 
-  // By default show only overdue, unless user toggles
   let visibleInvoices = showAllInvoices
     ? (data.invoices?.items || [])
     : overdueInvoices
 
-  // Sort visible invoices
   visibleInvoices = [...visibleInvoices].sort((a, b) => {
     let valA, valB
     if (invoiceSortBy === 'due_date') {
@@ -426,29 +389,25 @@ export default function ClientDetail() {
       <div className="flex items-center justify-between">
         <button
           onClick={() => navigate('/customers')}
-          className="flex items-center gap-2 text-sm text-slate-600 hover:text-blue-600"
+          className="flex items-center gap-2 text-sm text-txt-secondary hover:text-accent-teal transition-colors"
         >
           &larr; Torna ai Clienti
         </button>
         <div className="flex items-center gap-3">
           {neighbors.position && (
-            <span className="text-xs text-slate-400">{neighbors.position} di {neighbors.total}</span>
+            <span className="text-xs text-txt-muted">{neighbors.position} di {neighbors.total}</span>
           )}
           <button
             onClick={() => neighbors.prev_id && navigate(`/customers/${neighbors.prev_id}`)}
             disabled={!neighbors.prev_id}
-            className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-              neighbors.prev_id ? 'bg-slate-100 text-slate-700 hover:bg-slate-200' : 'bg-slate-50 text-slate-300 cursor-not-allowed'
-            }`}
+            className={`sc-btn-secondary ${!neighbors.prev_id ? 'opacity-30 cursor-not-allowed' : ''}`}
           >
             &larr; Precedente
           </button>
           <button
             onClick={() => neighbors.next_id && navigate(`/customers/${neighbors.next_id}`)}
             disabled={!neighbors.next_id}
-            className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-              neighbors.next_id ? 'bg-slate-100 text-slate-700 hover:bg-slate-200' : 'bg-slate-50 text-slate-300 cursor-not-allowed'
-            }`}
+            className={`sc-btn-secondary ${!neighbors.next_id ? 'opacity-30 cursor-not-allowed' : ''}`}
           >
             Successivo &rarr;
           </button>
@@ -456,21 +415,21 @@ export default function ClientDetail() {
       </div>
 
       {/* Customer Header */}
-      <div className="bg-white rounded-lg p-6 border border-slate-200">
+      <div className="sc-card p-6">
         <div className="flex items-start justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-slate-900">{data.ragione_sociale}</h1>
-            <div className="mt-2 space-y-1 text-sm text-slate-600">
-              {data.partita_iva && <p>P.IVA: <span className="font-mono">{data.partita_iva}</span></p>}
-              {data.codice_fiscale && <p>C.F.: <span className="font-mono">{data.codice_fiscale}</span></p>}
-              {data.email && <p>Email: {data.email}</p>}
-              {/* Phone numbers with source labels */}
+            <h1 className="text-2xl font-bold text-txt-primary">{data.ragione_sociale}</h1>
+            <div className="mt-2 space-y-1 text-sm text-txt-secondary">
+              {data.partita_iva && <p>P.IVA: <span className="font-mono text-txt-primary">{data.partita_iva}</span></p>}
+              {data.codice_fiscale && <p>C.F.: <span className="font-mono text-txt-primary">{data.codice_fiscale}</span></p>}
+              {data.email && <p>Email: <span className="text-txt-primary">{data.email}</span></p>}
+              {/* Phone numbers */}
               <div>
                 <div className="flex items-center gap-2 mb-1">
                   <span>Telefono:</span>
                   <button
                     onClick={() => setPhoneEdit(data.phone || '')}
-                    className="text-blue-600 text-xs underline"
+                    className="text-accent-teal text-xs underline"
                   >
                     {data.phone ? 'Modifica' : 'Aggiungi'}
                   </button>
@@ -481,49 +440,48 @@ export default function ClientDetail() {
                       type="text"
                       value={phoneEdit}
                       onChange={(e) => setPhoneEdit(e.target.value)}
-                      className="px-2 py-1 border border-slate-300 rounded text-sm w-48"
+                      className="sc-input w-48 text-sm"
                       placeholder="+39..."
                     />
-                    <button onClick={handlePhoneUpdate} className="text-green-600 text-sm font-medium">Salva</button>
-                    <button onClick={() => setPhoneEdit(null)} className="text-slate-400 text-sm">Annulla</button>
+                    <button onClick={handlePhoneUpdate} className="text-accent-green text-sm font-medium">Salva</button>
+                    <button onClick={() => setPhoneEdit(null)} className="text-txt-muted text-sm">Annulla</button>
                   </div>
                 ) : (
                   <div className="ml-2 space-y-0.5">
                     {(data.phones && data.phones.length > 0) ? (
                       data.phones.map((p, idx) => (
                         <div key={idx} className="flex items-center gap-2">
-                          <span className="font-mono text-slate-900">{p.number}</span>
-                          <span className="text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">{p.label}</span>
+                          <span className="font-mono text-txt-primary">{p.number}</span>
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-dark-surface text-txt-muted">{p.label}</span>
                           {p.number.replace(/[^+\d]/g, '') !== (selectedWhatsAppPhone || data.phone || '').replace(/[^+\d]/g, '') && (
                             <button
                               onClick={() => setSelectedWhatsAppPhone(p.number)}
-                              className="text-xs text-green-600 hover:underline"
+                              className="text-xs text-accent-green hover:underline"
                             >
                               Usa per WhatsApp
                             </button>
                           )}
                           {p.number.replace(/[^+\d]/g, '') === (selectedWhatsAppPhone || data.phone || '').replace(/[^+\d]/g, '') && (
-                            <span className="text-xs text-green-600 font-medium">WhatsApp</span>
+                            <span className="text-xs text-accent-green font-medium">WhatsApp</span>
                           )}
                         </div>
                       ))
                     ) : (
-                      <span className="font-mono text-slate-400">{data.phone || 'Non disponibile'}</span>
+                      <span className="font-mono text-txt-muted">{data.phone || 'Non disponibile'}</span>
                     )}
                   </div>
                 )}
               </div>
-              {data.source && <p>Fonte: <span className="capitalize">{data.source}</span></p>}
+              {data.source && <p>Fonte: <span className="capitalize text-txt-primary">{data.source}</span></p>}
             </div>
           </div>
           <div className="flex flex-col items-end gap-3">
-            {/* Recovery status badge */}
-            <span className={`${STATUS_COLORS[data.recovery_status] || STATUS_COLORS.idle} px-3 py-1 rounded-full text-sm font-medium`}>
+            <span className={`${STATUS_COLORS[data.recovery_status] || STATUS_COLORS.idle} sc-badge text-sm`}>
               {STATUS_LABELS[data.recovery_status] || 'Da Gestire'}
             </span>
             {data.next_action_date && (
-              <p className="text-sm text-slate-500">
-                Prossima azione: <span className="font-medium">{formatDate(data.next_action_date)}</span>
+              <p className="text-sm text-txt-muted">
+                Prossima azione: <span className="font-medium text-txt-secondary">{formatDate(data.next_action_date)}</span>
               </p>
             )}
           </div>
@@ -531,56 +489,52 @@ export default function ClientDetail() {
 
         {/* Summary stats */}
         <div className="mt-6 grid grid-cols-2 md:grid-cols-4 gap-4">
-          <div className="bg-red-50 rounded-lg p-3 text-center">
-            <p className="text-xs text-red-600">Fatture Scadute</p>
-            <p className="text-xl font-bold text-red-700">{overdueInvoices.length}</p>
+          <div className="bg-accent-red/5 border border-accent-red/20 rounded-lg p-3 text-center">
+            <p className="text-xs text-accent-red">Fatture Scadute</p>
+            <p className="text-xl font-bold text-accent-red">{overdueInvoices.length}</p>
           </div>
-          <div className="bg-amber-50 rounded-lg p-3 text-center">
-            <p className="text-xs text-amber-600">Totale Scaduto</p>
-            <p className="text-xl font-bold text-amber-700">{formatCurrency(totalOverdue)}</p>
+          <div className="bg-accent-amber/5 border border-accent-amber/20 rounded-lg p-3 text-center">
+            <p className="text-xs text-accent-amber">Totale Scaduto</p>
+            <p className="text-xl font-bold text-accent-amber">{formatCurrency(totalOverdue)}</p>
           </div>
-          <div className="bg-blue-50 rounded-lg p-3 text-center">
-            <p className="text-xs text-blue-600">Totale Dovuto</p>
-            <p className="text-xl font-bold text-blue-700">{formatCurrency(data.invoices?.total_due || 0)}</p>
+          <div className="bg-accent-blue/5 border border-accent-blue/20 rounded-lg p-3 text-center">
+            <p className="text-xs text-accent-blue">Totale Dovuto</p>
+            <p className="text-xl font-bold text-accent-blue">{formatCurrency(data.invoices?.total_due || 0)}</p>
           </div>
-          <div className="bg-slate-50 rounded-lg p-3 text-center">
-            <p className="text-xs text-slate-500">Fatture Totali</p>
-            <p className="text-xl font-bold text-slate-900">{data.invoices?.count || 0}</p>
+          <div className="bg-dark-surface border border-dark-border rounded-lg p-3 text-center">
+            <p className="text-xs text-txt-muted">Fatture Totali</p>
+            <p className="text-xl font-bold text-txt-primary">{data.invoices?.count || 0}</p>
           </div>
         </div>
       </div>
 
-      {/* ═══════════════════════════════════════════════════════ */}
-      {/* SEZIONE 1: FATTURE — select invoices, per-row PDF, riepilogativo */}
-      {/* ═══════════════════════════════════════════════════════ */}
-      <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
-        <div className="px-6 py-4 border-b border-slate-200">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <h2 className="text-lg font-bold text-slate-900">
-                {showAllInvoices ? `Tutte le Fatture (${data.invoices?.count || 0})` : `Fatture Scadute (${overdueInvoices.length})`}
-              </h2>
-              <button
-                onClick={() => setShowAllInvoices(!showAllInvoices)}
-                className="text-sm text-blue-600 hover:text-blue-800 font-medium"
-              >
-                {showAllInvoices ? 'Solo Scadute' : 'Mostra Tutte'}
-              </button>
-            </div>
+      {/* SEZIONE 1: FATTURE */}
+      <div className="sc-card overflow-hidden">
+        <div className="sc-card-header">
+          <div className="flex items-center gap-4">
+            <h2 className="text-base font-bold text-txt-primary">
+              {showAllInvoices ? `Tutte le Fatture (${data.invoices?.count || 0})` : `Fatture Scadute (${overdueInvoices.length})`}
+            </h2>
             <button
-              onClick={selectAllOverdue}
-              className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+              onClick={() => setShowAllInvoices(!showAllInvoices)}
+              className="text-sm text-accent-teal hover:text-accent-cyan font-medium transition-colors"
             >
-              Seleziona Scadute
+              {showAllInvoices ? 'Solo Scadute' : 'Mostra Tutte'}
             </button>
           </div>
+          <button
+            onClick={selectAllOverdue}
+            className="text-sm text-accent-teal hover:text-accent-cyan font-medium transition-colors"
+          >
+            Seleziona Scadute
+          </button>
         </div>
 
         <div className="overflow-x-auto">
           <table className="w-full">
-            <thead className="bg-slate-50 border-b border-slate-200">
+            <thead className="bg-dark-surface border-b border-dark-border">
               <tr>
-                <th className="px-3 py-3 text-center text-sm font-semibold text-slate-600 w-10">
+                <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider w-10">
                   <input
                     type="checkbox"
                     checked={selectedInvoices.size === allUnpaid.length && allUnpaid.length > 0}
@@ -591,48 +545,36 @@ export default function ClientDetail() {
                         setSelectedInvoices(new Set(allUnpaid.map(i => i.id)))
                       }
                     }}
-                    className="rounded"
+                    className="rounded border-dark-border bg-dark-bg"
                   />
                 </th>
-                <th
-                  className="px-3 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
-                  onClick={() => handleInvoiceSort('invoice_number')}
-                >
+                <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleInvoiceSort('invoice_number')}>
                   Fattura{invoiceSortArrow('invoice_number')}
                 </th>
-                <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Ordine</th>
-                <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fonte</th>
-                <th
-                  className="px-3 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
-                  onClick={() => handleInvoiceSort('amount_due')}
-                >
+                <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Ordine</th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Fonte</th>
+                <th className="px-3 py-3 text-right text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleInvoiceSort('amount_due')}>
                   Dovuto{invoiceSortArrow('amount_due')}
                 </th>
-                <th
-                  className="px-3 py-3 text-left text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
-                  onClick={() => handleInvoiceSort('due_date')}
-                >
+                <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleInvoiceSort('due_date')}>
                   Scadenza{invoiceSortArrow('due_date')}
                 </th>
-                <th
-                  className="px-3 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
-                  onClick={() => handleInvoiceSort('days_overdue')}
-                >
+                <th className="px-3 py-3 text-right text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleInvoiceSort('days_overdue')}>
                   GG{invoiceSortArrow('days_overdue')}
                 </th>
-                <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Stato</th>
-                <th className="px-3 py-3 text-center text-sm font-semibold text-slate-900">Azioni</th>
+                <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider">Stato</th>
+                <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider">Azioni</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-200">
+            <tbody className="divide-y divide-dark-border">
               {visibleInvoices.map(inv => (
                 <tr
                   key={inv.id}
                   className={`
-                    ${inv.status === 'paid' ? 'bg-green-50 opacity-60' : ''}
-                    ${inv.days_overdue > 0 && inv.status !== 'paid' ? 'bg-red-50' : ''}
-                    ${selectedInvoices.has(inv.id) ? 'ring-2 ring-inset ring-blue-300' : ''}
-                    hover:bg-slate-50
+                    ${inv.status === 'paid' ? 'bg-accent-green/5 opacity-60' : ''}
+                    ${inv.days_overdue > 0 && inv.status !== 'paid' ? 'bg-accent-red/5' : ''}
+                    ${selectedInvoices.has(inv.id) ? 'ring-2 ring-inset ring-accent-teal/30' : ''}
+                    hover:bg-dark-cardHover transition-colors
                   `}
                 >
                   <td className="px-3 py-3 text-center">
@@ -640,60 +582,56 @@ export default function ClientDetail() {
                       type="checkbox"
                       checked={selectedInvoices.has(inv.id)}
                       onChange={() => toggleInvoiceSelection(inv.id)}
-                      className="rounded"
+                      className="rounded border-dark-border bg-dark-bg"
                       disabled={inv.status === 'paid'}
                     />
                   </td>
-                  <td className="px-3 py-3 text-sm font-medium text-slate-900">{inv.invoice_number}</td>
+                  <td className="px-3 py-3 text-sm font-medium text-txt-primary">{inv.invoice_number}</td>
                   <td className="px-3 py-3 text-sm">
                     {inv.shopify_order_number ? (
-                      <span className="px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700">
+                      <span className="badge-paid sc-badge">
                         {inv.shopify_order_number}
                       </span>
                     ) : (
-                      <span className="text-slate-300">—</span>
+                      <span className="text-txt-muted">—</span>
                     )}
                   </td>
                   <td className="px-3 py-3 text-sm">
-                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${
-                      inv.source_platform === 'fatturapro' ? 'bg-indigo-100 text-indigo-700' : 'bg-teal-100 text-teal-700'
+                    <span className={`sc-badge ${
+                      inv.source_platform === 'fatturapro' ? 'bg-accent-purple/15 text-accent-purple' : 'bg-accent-teal/15 text-accent-teal'
                     }`}>
                       {inv.source_platform === 'fatturapro' ? 'FPro' : 'F24'}
                     </span>
                   </td>
-                  <td className="px-3 py-3 text-sm text-right font-medium">{formatCurrency(inv.amount_due)}</td>
-                  <td className="px-3 py-3 text-sm text-slate-600">{formatDate(inv.due_date)}</td>
+                  <td className="px-3 py-3 text-sm text-right font-medium text-txt-primary">{formatCurrency(inv.amount_due)}</td>
+                  <td className="px-3 py-3 text-sm text-txt-secondary">{formatDate(inv.due_date)}</td>
                   <td className="px-3 py-3 text-sm text-right">
                     {(inv.days_overdue || 0) > 0 ? (
-                      <span className={inv.days_overdue > 30 ? 'text-red-600 font-medium' : 'text-amber-600'}>
+                      <span className={inv.days_overdue > 30 ? 'text-accent-red font-medium' : 'text-accent-amber'}>
                         {inv.days_overdue}
                       </span>
                     ) : (inv.days_overdue || 0) < 0 ? (
-                      <span className="text-green-600 font-medium">
+                      <span className="text-accent-green font-medium">
                         {inv.days_overdue}
                       </span>
                     ) : (
-                      <span className="text-slate-400">0</span>
+                      <span className="text-txt-muted">0</span>
                     )}
                   </td>
                   <td className="px-3 py-3 text-sm text-center">
-                    <span className={`${INVOICE_STATUS_COLORS[inv.status] || 'bg-slate-100 text-slate-600'} px-2 py-1 rounded-full text-xs font-medium`}>
+                    <span className={`${INVOICE_STATUS_COLORS[inv.status] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'} sc-badge`}>
                       {inv.status === 'open' ? 'Aperto' : inv.status === 'paid' ? 'Pagato' : inv.status}
                     </span>
                   </td>
                   <td className="px-3 py-3 text-sm text-center">
-                    <div className="flex items-center justify-center gap-1">
-                      {/* Per-row PDF download */}
-                      <button
-                        onClick={() => handleDownloadSinglePdf(inv.id, inv.invoice_number)}
-                        disabled={singlePdfLoading === inv.id}
-                        className="px-2 py-1 bg-amber-100 text-amber-700 rounded text-xs font-medium hover:bg-amber-200 disabled:opacity-50"
-                        title="Scarica PDF"
-                      >
-                        {singlePdfLoading === inv.id ? '...' : 'PDF'}
-                      </button>
-                      {/* Pagato/Riapri rimossi: lo stato pagamento arriva solo dal refresh sync */}
-                    </div>
+                    <button
+                      onClick={() => handleDownloadSinglePdf(inv.id, inv.invoice_number)}
+                      disabled={singlePdfLoading === inv.id}
+                      className="px-2 py-1 bg-accent-amber/15 text-accent-amber rounded text-xs font-medium hover:bg-accent-amber/25 disabled:opacity-50 transition-colors"
+                      title="Scarica PDF"
+                    >
+                      {singlePdfLoading === inv.id ? '...' : 'PDF'}
+                    </button>
                   </td>
                 </tr>
               ))}
@@ -703,10 +641,10 @@ export default function ClientDetail() {
 
         {/* Action bar for selected invoices */}
         {selectedInvoices.size > 0 && (
-          <div className="px-6 py-4 bg-green-50 border-t border-green-200">
+          <div className="px-6 py-4 bg-accent-green/5 border-t border-accent-green/20">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm font-medium text-green-900">
+                <p className="text-sm font-medium text-accent-green">
                   {selectedInvoices.size} fattur{selectedInvoices.size === 1 ? 'a' : 'e'} selezionat{selectedInvoices.size === 1 ? 'a' : 'e'} — {formatCurrency(selectedTotal)}
                 </p>
               </div>
@@ -714,23 +652,21 @@ export default function ClientDetail() {
                 <button
                   onClick={handleDownloadInvoicesZip}
                   disabled={pdfLoading}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 disabled:opacity-50"
+                  className="sc-btn-primary text-sm font-bold disabled:opacity-50"
                 >
                   {pdfLoading ? '...' : `Scarica ${selectedInvoices.size} Fattur${selectedInvoices.size === 1 ? 'a' : 'e'}`}
                 </button>
                 <button
                   onClick={handleDownloadPromemoria}
                   disabled={promemoria}
-                  className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-bold hover:bg-amber-700 disabled:opacity-50"
+                  className="px-4 py-2 bg-accent-amber text-dark-bg rounded-lg text-sm font-bold hover:brightness-110 disabled:opacity-50"
                 >
                   {promemoria ? '...' : 'Scarica Promemoria'}
                 </button>
                 <button
                   onClick={handleCopyWhatsApp}
-                  className={`px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
-                    copiedWhatsApp
-                      ? 'bg-green-100 text-green-700 border border-green-400'
-                      : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-300'
+                  className={`sc-btn-secondary text-sm font-bold transition-colors ${
+                    copiedWhatsApp ? 'border-accent-green text-accent-green' : ''
                   }`}
                 >
                   {copiedWhatsApp ? 'Copiato!' : 'Copia Messaggio'}
@@ -738,14 +674,14 @@ export default function ClientDetail() {
                 {whatsappNumber ? (
                   <button
                     onClick={handleWhatsAppSend}
-                    className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-bold hover:bg-green-700"
+                    className="px-4 py-2 bg-accent-green text-dark-bg rounded-lg text-sm font-bold hover:brightness-110"
                   >
                     WhatsApp
                   </button>
                 ) : (
                   <button
                     onClick={() => setPhoneEdit(data.phone || '')}
-                    className="px-4 py-2 bg-yellow-500 text-white rounded-lg text-sm font-bold hover:bg-yellow-600"
+                    className="px-4 py-2 bg-accent-amber text-dark-bg rounded-lg text-sm font-bold hover:brightness-110"
                   >
                     Aggiungi Tel
                   </button>
@@ -756,50 +692,47 @@ export default function ClientDetail() {
         )}
       </div>
 
-      {/* ═══════════════════════════════════════════════════════ */}
       {/* SEZIONE 2: AZIONI DI RECUPERO */}
-      {/* ═══════════════════════════════════════════════════════ */}
-      <div className="bg-white rounded-lg p-6 border border-slate-200">
+      <div className="sc-card p-6">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-bold text-slate-900">Azioni di Recupero</h2>
+          <h2 className="text-base font-bold text-txt-primary">Azioni di Recupero</h2>
           {contactActionCount > 0 && (
-            <span className="text-sm text-slate-500">
-              Azioni registrate: <span className="font-bold text-slate-700">{contactActionCount}</span>
+            <span className="text-sm text-txt-muted">
+              Azioni registrate: <span className="font-bold text-txt-primary">{contactActionCount}</span>
             </span>
           )}
         </div>
 
         {/* Lawyer suggestion banner */}
         {shouldSuggestLawyer && data.recovery_status !== 'lawyer' && data.recovery_status !== 'archived' && (
-          <div className="mb-4 bg-red-50 border-2 border-red-300 rounded-lg p-4 flex items-center justify-between">
+          <div className="mb-4 bg-accent-red/10 border-2 border-accent-red/30 rounded-lg p-4 flex items-center justify-between">
             <div>
-              <p className="text-sm font-bold text-red-800">Suggerimento: passare all'Avvocato</p>
-              <p className="text-xs text-red-600 mt-1">
+              <p className="text-sm font-bold text-accent-red">Suggerimento: passare all'Avvocato</p>
+              <p className="text-xs text-accent-red/70 mt-1">
                 Sono state effettuate {contactActionCount} azioni di contatto senza esito. Si consiglia di procedere con l'avvocato.
               </p>
             </div>
             <button
               onClick={() => handleAction('lawyer')}
               disabled={actionLoading}
-              className="px-5 py-2 bg-red-600 text-white rounded-lg text-sm font-bold hover:bg-red-700 disabled:opacity-50 shrink-0"
+              className="px-5 py-2 bg-accent-red text-dark-bg rounded-lg text-sm font-bold hover:brightness-110 disabled:opacity-50 shrink-0"
             >
               Passa ad Avvocato
             </button>
           </div>
         )}
 
-        {/* REGISTRA AZIONE — main action button with progressive numbering */}
+        {/* REGISTRA AZIONE */}
         <div className="mb-4">
           <div className="flex flex-wrap gap-3 items-center">
             {data.recovery_status !== 'lawyer' && data.recovery_status !== 'archived' && (
               <button
                 onClick={() => {
-                  // Determine the correct action type based on count
                   const actionType = contactActionCount === 0 ? 'first_contact' : 'second_contact'
                   handleAction(actionType)
                 }}
                 disabled={actionLoading}
-                className="px-6 py-3 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2 shadow-sm"
+                className="px-6 py-3 bg-accent-teal text-dark-bg rounded-lg text-sm font-bold hover:brightness-110 disabled:opacity-50 flex items-center gap-2 shadow-sm"
               >
                 {actionLoading ? '...' : `REGISTRA ${nextActionLabel} AZIONE`}
               </button>
@@ -807,27 +740,27 @@ export default function ClientDetail() {
             <button
               onClick={() => handleAction('lawyer')}
               disabled={actionLoading}
-              className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50"
+              className="px-4 py-2 bg-accent-red text-dark-bg rounded-lg text-sm font-medium hover:brightness-110 disabled:opacity-50"
             >
               {actionLoading ? '...' : 'Avvocato'}
             </button>
             <button
               onClick={() => handleAction('wait')}
               disabled={actionLoading}
-              className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm font-medium hover:bg-purple-700 disabled:opacity-50"
+              className="px-4 py-2 bg-accent-purple text-dark-bg rounded-lg text-sm font-medium hover:brightness-110 disabled:opacity-50"
             >
               {actionLoading ? '...' : 'Attendi'}
             </button>
             <button
               onClick={() => handleAction('archive')}
               disabled={actionLoading}
-              className="px-4 py-2 bg-slate-500 text-white rounded-lg text-sm font-medium hover:bg-slate-600 disabled:opacity-50"
+              className="px-4 py-2 bg-slate-500 text-dark-bg rounded-lg text-sm font-medium hover:brightness-110 disabled:opacity-50"
             >
               {actionLoading ? '...' : 'Archivia'}
             </button>
             <button
               onClick={() => setShowNoteInput(!showNoteInput)}
-              className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium hover:bg-slate-200"
+              className="sc-btn-secondary"
             >
               + Nota
             </button>
@@ -842,12 +775,12 @@ export default function ClientDetail() {
               value={actionNotes}
               onChange={(e) => setActionNotes(e.target.value)}
               placeholder="Note sull'azione..."
-              className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm"
+              className="sc-input flex-1"
             />
             <button
               onClick={() => handleAction('note')}
               disabled={!actionNotes || actionLoading}
-              className="px-4 py-2 bg-slate-700 text-white rounded-lg text-sm font-medium disabled:opacity-50"
+              className="sc-btn-secondary disabled:opacity-50"
             >
               Salva Nota
             </button>
@@ -856,26 +789,25 @@ export default function ClientDetail() {
 
         {/* Action history timeline */}
         {data.recovery_actions && data.recovery_actions.length > 0 && (
-          <div className="mt-4 border-l-2 border-slate-200 pl-4 space-y-3">
+          <div className="mt-4 border-l-2 border-dark-border pl-4 space-y-3">
             {data.recovery_actions.map(action => (
               <div key={action.id} className="relative">
-                <div className={`absolute -left-[21px] top-1 w-3 h-3 rounded-full border-2 border-white ${
-                  action.completed_at ? 'bg-green-500' : 'bg-slate-400'
+                <div className={`absolute -left-[21px] top-1 w-3 h-3 rounded-full border-2 border-dark-card ${
+                  action.completed_at ? 'bg-accent-green' : 'bg-txt-muted'
                 }`}></div>
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-sm font-medium text-slate-900">
+                  <span className="text-sm font-medium text-txt-primary">
                     {ACTION_LABELS[action.action_type] || action.action_type}
                   </span>
-                  <span className="text-xs text-slate-400">{formatDate(action.created_at)}</span>
+                  <span className="text-xs text-txt-muted">{formatDate(action.created_at)}</span>
                   {action.completed_at && action.outcome && (
-                    <span className={`text-xs px-1.5 py-0.5 rounded ${OUTCOME_COLORS[action.outcome] || 'bg-green-100 text-green-700'}`}>
+                    <span className={`text-xs px-1.5 py-0.5 rounded ${OUTCOME_COLORS[action.outcome] || 'bg-accent-green/15 text-accent-green'}`}>
                       {OUTCOME_LABELS[action.outcome] || action.outcome}
                     </span>
                   )}
                   {action.completed_at && !action.outcome && (
-                    <span className="text-xs bg-green-100 text-green-600 px-1.5 py-0.5 rounded">completata</span>
+                    <span className="text-xs bg-accent-green/15 text-accent-green px-1.5 py-0.5 rounded">completata</span>
                   )}
-                  {/* Complete button for pending actions */}
                   {!action.completed_at && (
                     <>
                       {completingAction === action.id ? (
@@ -884,8 +816,8 @@ export default function ClientDetail() {
                             <button
                               key={key}
                               onClick={() => handleCompleteAction(action.id, key)}
-                              className={`text-xs px-2 py-0.5 rounded border transition-colors ${
-                                OUTCOME_COLORS[key] || 'bg-slate-100 text-slate-600'
+                              className={`text-xs px-2 py-0.5 rounded border border-dark-border transition-colors ${
+                                OUTCOME_COLORS[key] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'
                               } hover:opacity-80`}
                             >
                               {label}
@@ -893,7 +825,7 @@ export default function ClientDetail() {
                           ))}
                           <button
                             onClick={() => setCompletingAction(null)}
-                            className="text-xs text-slate-400 ml-1"
+                            className="text-xs text-txt-muted ml-1"
                           >
                             Annulla
                           </button>
@@ -901,7 +833,7 @@ export default function ClientDetail() {
                       ) : (
                         <button
                           onClick={() => setCompletingAction(action.id)}
-                          className="text-xs bg-green-50 text-green-700 px-2 py-0.5 rounded border border-green-200 hover:bg-green-100"
+                          className="text-xs bg-accent-green/10 text-accent-green px-2 py-0.5 rounded border border-accent-green/20 hover:bg-accent-green/20 transition-colors"
                         >
                           Completa
                         </button>
@@ -910,10 +842,10 @@ export default function ClientDetail() {
                   )}
                 </div>
                 {action.notes && (
-                  <p className="text-sm text-slate-500 mt-0.5">{action.notes}</p>
+                  <p className="text-sm text-txt-muted mt-0.5">{action.notes}</p>
                 )}
                 {action.scheduled_date && !action.completed_at && (
-                  <p className="text-xs text-blue-500 mt-0.5">Pianificata: {formatDate(action.scheduled_date)}</p>
+                  <p className="text-xs text-accent-teal mt-0.5">Pianificata: {formatDate(action.scheduled_date)}</p>
                 )}
               </div>
             ))}
@@ -921,92 +853,85 @@ export default function ClientDetail() {
         )}
       </div>
 
-      {/* ═══════════════════════════════════════════════════════ */}
-      {/* SEZIONE 3: RIEPILOGO — summary status after actions */}
-      {/* ═══════════════════════════════════════════════════════ */}
-      <div className="bg-white rounded-lg p-6 border border-slate-200">
-        <h2 className="text-lg font-bold text-slate-900 mb-4">Riepilogo</h2>
+      {/* SEZIONE 3: RIEPILOGO */}
+      <div className="sc-card p-6">
+        <h2 className="text-base font-bold text-txt-primary mb-4">Riepilogo</h2>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          {/* Status */}
-          <div className="border border-slate-200 rounded-lg p-4">
-            <p className="text-xs text-slate-500 mb-1">Stato Recupero</p>
-            <span className={`${STATUS_COLORS[data.recovery_status] || STATUS_COLORS.idle} px-3 py-1 rounded-full text-sm font-medium`}>
+          <div className="border border-dark-border rounded-lg p-4">
+            <p className="text-xs text-txt-muted mb-1">Stato Recupero</p>
+            <span className={`${STATUS_COLORS[data.recovery_status] || STATUS_COLORS.idle} sc-badge text-sm`}>
               {STATUS_LABELS[data.recovery_status] || 'Da Gestire'}
             </span>
           </div>
-
-          {/* Next action */}
-          <div className="border border-slate-200 rounded-lg p-4">
-            <p className="text-xs text-slate-500 mb-1">Prossima Azione</p>
+          <div className="border border-dark-border rounded-lg p-4">
+            <p className="text-xs text-txt-muted mb-1">Prossima Azione</p>
             {data.next_action_date ? (
               <div>
-                <p className="text-sm font-medium text-slate-900">
+                <p className="text-sm font-medium text-txt-primary">
                   {ACTION_LABELS[data.next_action_type] || data.next_action_type || '-'}
                 </p>
-                <p className="text-xs text-blue-600">{formatDate(data.next_action_date)}</p>
+                <p className="text-xs text-accent-teal">{formatDate(data.next_action_date)}</p>
               </div>
             ) : (
-              <p className="text-sm text-slate-400">Nessuna pianificata</p>
+              <p className="text-sm text-txt-muted">Nessuna pianificata</p>
             )}
           </div>
-
-          {/* Actions taken */}
-          <div className="border border-slate-200 rounded-lg p-4">
-            <p className="text-xs text-slate-500 mb-1">Azioni Effettuate</p>
-            <p className="text-xl font-bold text-slate-900">{data.recovery_actions?.length || 0}</p>
+          <div className="border border-dark-border rounded-lg p-4">
+            <p className="text-xs text-txt-muted mb-1">Azioni Effettuate</p>
+            <p className="text-xl font-bold text-txt-primary">{data.recovery_actions?.length || 0}</p>
           </div>
         </div>
 
         {/* Financial summary */}
         <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="border border-red-200 rounded-lg p-4 bg-red-50">
-            <p className="text-xs text-red-600 mb-1">Scaduto</p>
-            <p className="text-lg font-bold text-red-700">{formatCurrency(totalOverdue)}</p>
-            <p className="text-xs text-red-500">{overdueInvoices.length} fatture</p>
+          <div className="border border-accent-red/20 rounded-lg p-4 bg-accent-red/5">
+            <p className="text-xs text-accent-red mb-1">Scaduto</p>
+            <p className="text-lg font-bold text-accent-red">{formatCurrency(totalOverdue)}</p>
+            <p className="text-xs text-accent-red/60">{overdueInvoices.length} fatture</p>
           </div>
-          <div className="border border-blue-200 rounded-lg p-4 bg-blue-50">
-            <p className="text-xs text-blue-600 mb-1">Totale Dovuto</p>
-            <p className="text-lg font-bold text-blue-700">{formatCurrency(data.invoices?.total_due || 0)}</p>
-            <p className="text-xs text-blue-500">{allUnpaid.length} fatture non pagate</p>
+          <div className="border border-accent-blue/20 rounded-lg p-4 bg-accent-blue/5">
+            <p className="text-xs text-accent-blue mb-1">Totale Dovuto</p>
+            <p className="text-lg font-bold text-accent-blue">{formatCurrency(data.invoices?.total_due || 0)}</p>
+            <p className="text-xs text-accent-blue/60">{allUnpaid.length} fatture non pagate</p>
           </div>
-          <div className="border border-green-200 rounded-lg p-4 bg-green-50">
-            <p className="text-xs text-green-600 mb-1">Pagato</p>
-            <p className="text-lg font-bold text-green-700">
+          <div className="border border-accent-green/20 rounded-lg p-4 bg-accent-green/5">
+            <p className="text-xs text-accent-green mb-1">Pagato</p>
+            <p className="text-lg font-bold text-accent-green">
               {formatCurrency(
                 (data.invoices?.items || [])
                   .filter(inv => inv.status === 'paid')
                   .reduce((sum, inv) => sum + inv.amount_due, 0)
               )}
             </p>
-            <p className="text-xs text-green-500">
+            <p className="text-xs text-accent-green/60">
               {(data.invoices?.items || []).filter(inv => inv.status === 'paid').length} fatture pagate
             </p>
           </div>
         </div>
 
-        {/* Quick actions from riepilogo */}
-        <div className="mt-4 pt-4 border-t border-slate-200 flex flex-wrap gap-2">
+        {/* Quick actions */}
+        <div className="mt-4 pt-4 border-t border-dark-border flex flex-wrap gap-2">
           {selectedInvoices.size > 0 && (
             <>
               <button
                 onClick={handleDownloadInvoicesZip}
                 disabled={pdfLoading}
-                className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+                className="sc-btn-primary text-sm font-medium disabled:opacity-50"
               >
                 {pdfLoading ? '...' : `Scarica ${selectedInvoices.size} Fattur${selectedInvoices.size === 1 ? 'a' : 'e'}`}
               </button>
               <button
                 onClick={handleDownloadPromemoria}
                 disabled={promemoria}
-                className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700 disabled:opacity-50"
+                className="px-4 py-2 bg-accent-amber text-dark-bg rounded-lg text-sm font-medium hover:brightness-110 disabled:opacity-50"
               >
                 {promemoria ? '...' : 'Promemoria'}
               </button>
               <button
                 onClick={handleCopyWhatsApp}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                  copiedWhatsApp ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                className={`sc-btn-secondary text-sm font-medium transition-colors ${
+                  copiedWhatsApp ? 'border-accent-green text-accent-green' : ''
                 }`}
               >
                 {copiedWhatsApp ? 'Copiato!' : 'Copia Messaggio'}
@@ -1014,7 +939,7 @@ export default function ClientDetail() {
               {whatsappNumber && (
                 <button
                   onClick={handleWhatsAppSend}
-                  className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700"
+                  className="px-4 py-2 bg-accent-green text-dark-bg rounded-lg text-sm font-medium hover:brightness-110"
                 >
                   WhatsApp
                 </button>
@@ -1023,7 +948,7 @@ export default function ClientDetail() {
           )}
           <button
             onClick={() => navigate('/customers')}
-            className="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-sm font-medium hover:bg-slate-200"
+            className="sc-btn-secondary text-sm font-medium"
           >
             Torna alla Lista
           </button>

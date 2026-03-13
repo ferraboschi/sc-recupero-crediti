@@ -9,47 +9,36 @@ export default function SyncButton() {
     setLoading(true)
     setMessage('')
     try {
-      const response = await client.post('/sync/full')
-      setMessage('Sincronizzazione avviata con successo')
+      await client.post('/sync/full')
+      setMessage('Sync avviato')
       setTimeout(() => setMessage(''), 3000)
     } catch (error) {
-      setMessage(`Errore nella sincronizzazione: ${error.message}`)
+      setMessage(`Errore: ${error.message}`)
     } finally {
       setLoading(false)
     }
   }
 
   return (
-    <div className="flex items-center gap-3">
+    <div className="flex items-center gap-2">
       <button
         onClick={handleSync}
         disabled={loading}
-        className={`px-4 py-2 rounded-lg font-medium text-sm transition-colors ${
+        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
           loading
-            ? 'bg-slate-300 text-slate-500 cursor-not-allowed'
-            : 'bg-blue-600 text-white hover:bg-blue-700 active:bg-blue-800'
+            ? 'bg-dark-card text-txt-muted cursor-not-allowed'
+            : 'sc-btn-secondary'
         }`}
       >
-        {loading ? (
-          <span className="flex items-center gap-2">
-            <svg className="animate-spin-slow w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-            </svg>
-            Sincronizzazione...
-          </span>
-        ) : (
-          <span className="flex items-center gap-2">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-            </svg>
-            Sincronizza Dati
-          </span>
-        )}
+        <svg className={`w-3.5 h-3.5 ${loading ? 'animate-spin-slow' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+        </svg>
+        {loading ? 'Sync...' : 'Sync'}
       </button>
       {message && (
-        <p className={`text-sm ${message.includes('Errore') ? 'text-red-600' : 'text-green-600'}`}>
+        <span className={`text-xs ${message.includes('Errore') ? 'text-accent-red' : 'text-accent-green'}`}>
           {message}
-        </p>
+        </span>
       )}
     </div>
   )
