@@ -20,21 +20,17 @@ async def run_migrations():
     """Run schema migrations to add missing columns."""
     session = get_session()
     results = []
+    # Try to add outcome column — if it already exists, catch the error
     try:
-        # Check if outcome column exists using session.execute(text())
-        row = session.execute(text("""
-            SELECT COUNT(*) FROM information_schema.columns
-            WHERE table_name = 'recovery_actions' AND column_name = 'outcome'
-        """)).scalar()
-        if row == 0:
-            session.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
-            session.commit()
-            results.append("outcome: added successfully")
-        else:
-            results.append("outcome: already exists")
+        session.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
+        session.commit()
+        results.append("outcome: added successfully")
     except Exception as e:
         session.rollback()
-        results.append(f"error: {str(e)}")
+        if 'already exists' in str(e).lower() or 'duplicate' in str(e).lower():
+            results.append("outcome: already exists")
+        else:
+            results.append(f"outcome error: {str(e)}")
     finally:
         session.close()
     return {"migrations": results}
