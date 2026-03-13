@@ -320,7 +320,6 @@ async def get_calendar(
     Returns actions grouped by date for a given month.
     Also returns overdue counts (past actions not completed).
     """
-    from sqlalchemy import extract, case
     try:
         today = date.today()
         if not year:
@@ -482,10 +481,8 @@ async def get_attivita(session: Session = Depends(get_session)):
     1. contacted: customers with recovery actions (not idle/archived), with status, last contact, next action
     2. incassati: customers whose overdue invoices have been resolved (paid)
     """
-    from sqlalchemy import case, cast, Date
+    from sqlalchemy import case, cast, Date  # noqa: F811
     try:
-        today = date.today()
-
         # ── CONTACTED ACCOUNTS ──
         # Customers with recovery_status != idle and != archived, who have overdue invoices
         contacted_raw = (
@@ -535,7 +532,10 @@ async def get_attivita(session: Session = Depends(get_session)):
                 "recovery_status": cust.recovery_status,
                 "next_action_date": cust.next_action_date.isoformat() if cust.next_action_date else None,
                 "next_action_type": cust.next_action_type,
-                "last_contact_date": last_action.completed_at.strftime("%Y-%m-%d") if last_action and last_action.completed_at else None,
+                "last_contact_date": (
+                    last_action.completed_at.strftime("%Y-%m-%d")
+                    if last_action and last_action.completed_at else None
+                ),
                 "last_action_type": last_action.action_type if last_action else None,
                 "last_outcome": last_action.outcome if last_action else None,
                 "overdue_count": int(overdue_count or 0),
