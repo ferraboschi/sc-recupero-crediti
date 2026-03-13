@@ -279,7 +279,7 @@ export default function ClientDetail() {
     })
 
     msg += `\nTotale: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(totalSelected)}\n\n`
-    msg += `Coordinate bancarie:\nIBAN: IT60F0306909606100000194066\nIntestatario: Wagyu Company S.R.L.\nCausale: Saldo fatture ${data.ragione_sociale}\n\n`
+    msg += `Coordinate bancarie:\nIBAN: IT44N0200801671000105175151\nIntestatario: Sake Company srl\nCausale: Saldo fatture ${data.ragione_sociale}\n\n`
     msg += `La preghiamo di provvedere al saldo o contattarci per chiarimenti.\n\nGrazie,\nSake Company`
 
     return msg

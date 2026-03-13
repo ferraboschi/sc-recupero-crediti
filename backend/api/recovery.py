@@ -484,7 +484,7 @@ def _build_riepilogativo_pdf(customer, invoices):
     pdf.set_font("Helvetica", "B", 18)
     pdf.cell(0, 12, "Sake Company", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, "Wagyu Company S.R.L.", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 6, "Sake Company srl", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(8)
 
     # Title
@@ -534,9 +534,9 @@ def _build_riepilogativo_pdf(customer, invoices):
     pdf.cell(0, 8, "Coordinate per il pagamento:", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(2)
     pdf.set_font("Helvetica", "", 11)
-    pdf.cell(0, 7, "Intestatario: Wagyu Company S.R.L.", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 7, "IBAN: IT60F0306909606100000194066", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 7, "Banca: Intesa Sanpaolo", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, "Intestatario: Sake Company srl", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, "IBAN: IT44N0200801671000105175151", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, "Banca: UniCredit", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, f"Causale: Saldo fatture {customer.ragione_sociale}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(8)
 
