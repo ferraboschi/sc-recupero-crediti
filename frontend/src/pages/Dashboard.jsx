@@ -317,7 +317,7 @@ export default function Dashboard() {
         <StatsWidget label="Totale Scaduto" value={formatCurrency(data.total_scaduto || 0)} color="red" />
         <StatsWidget label="Fatture Scadute" value={data.total_fatture_scadute || 0} color="orange" />
         <StatsWidget label="Clienti con Scaduto" value={data.total_clienti_scaduti || 0} color="purple" />
-        <StatsWidget label="Fatture Totali" value={data.total_fatture || 0} color="blue" />
+        <StatsWidget label="Fatture Totali" value={data.total_positions || 0} color="blue" />
       </div>
 
       {/* Calendar - full width */}
