@@ -37,20 +37,35 @@ app.add_middleware(
 
 
 def _run_migrations():
-    """Run lightweight schema migrations for new columns."""
+    """Run lightweight schema migrations for new columns.
+    Uses raw DBAPI connection to avoid SQLAlchemy ORM mapping issues.
+    """
     try:
-        from sqlalchemy import text
         engine = get_engine()
-        with engine.connect() as conn:
-            # Add 'outcome' column to recovery_actions if missing
-            try:
-                conn.execute(text('SELECT outcome FROM recovery_actions LIMIT 1'))
-                logger.info("Migration: 'outcome' column already exists")
-            except Exception:
-                conn.rollback()
-                conn.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
-                conn.commit()
+        raw_conn = engine.raw_connection()
+        try:
+            cursor = raw_conn.cursor()
+            # Check if outcome column exists via information_schema (PostgreSQL)
+            # or pragma (SQLite)
+            db_url = config.DATABASE_URL
+            if db_url.startswith('sqlite'):
+                cursor.execute("PRAGMA table_info(recovery_actions)")
+                cols = [row[1] for row in cursor.fetchall()]
+            else:
+                cursor.execute("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'recovery_actions' AND column_name = 'outcome'
+                """)
+                cols = [row[0] for row in cursor.fetchall()]
+
+            if 'outcome' not in cols:
+                cursor.execute('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR')
+                raw_conn.commit()
                 logger.info("Migration: added 'outcome' column to recovery_actions")
+            else:
+                logger.info("Migration: 'outcome' column already exists")
+        finally:
+            raw_conn.close()
     except Exception as e:
         logger.warning(f"Migration warning (non-fatal): {e}")
 
