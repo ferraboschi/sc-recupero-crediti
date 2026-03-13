@@ -164,27 +164,27 @@ export default function ClientDetail() {
     }
   }
 
-  // Download PDF riepilogativo for SELECTED invoices
-  const handleDownloadPdfSelected = async () => {
+  // Download selected invoices as ZIP of individual PDFs
+  const handleDownloadInvoicesZip = async () => {
     if (selectedInvoices.size === 0) return
     setPdfLoading(true)
     try {
       const ids = Array.from(selectedInvoices).join(',')
-      const response = await client.get(`/recovery/customers/${customerId}/pdf-selected`, {
+      const response = await client.get(`/recovery/customers/${customerId}/invoices-zip`, {
         responseType: 'blob',
         params: { invoice_ids: ids },
       })
       const url = window.URL.createObjectURL(new Blob([response.data]))
       const link = document.createElement('a')
       link.href = url
-      link.setAttribute('download', `riepilogativo_${data?.ragione_sociale?.replace(/\s/g, '_')}.pdf`)
+      link.setAttribute('download', `fatture_${data?.ragione_sociale?.replace(/\s/g, '_')}.zip`)
       document.body.appendChild(link)
       link.click()
       link.remove()
       window.URL.revokeObjectURL(url)
     } catch (err) {
-      console.error('Error downloading PDF:', err)
-      alert('Errore nella generazione del PDF')
+      console.error('Error downloading invoices ZIP:', err)
+      alert('Errore nello scaricamento delle fatture')
     } finally {
       setPdfLoading(false)
     }
@@ -645,11 +645,11 @@ export default function ClientDetail() {
               </div>
               <div className="flex items-center gap-3 flex-wrap">
                 <button
-                  onClick={handleDownloadPdfSelected}
+                  onClick={handleDownloadInvoicesZip}
                   disabled={pdfLoading}
-                  className="px-5 py-2 bg-amber-600 text-white rounded-lg text-sm font-bold hover:bg-amber-700 disabled:opacity-50 flex items-center gap-2"
+                  className="px-5 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
                 >
-                  {pdfLoading ? '...' : 'Genera PDF Riepilogativo'}
+                  {pdfLoading ? '...' : `Scarica ${selectedInvoices.size} Fattur${selectedInvoices.size === 1 ? 'a' : 'e'}`}
                 </button>
                 <button
                   onClick={handleCopyWhatsApp}
@@ -916,11 +916,11 @@ export default function ClientDetail() {
           {selectedInvoices.size > 0 && (
             <>
               <button
-                onClick={handleDownloadPdfSelected}
+                onClick={handleDownloadInvoicesZip}
                 disabled={pdfLoading}
-                className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700 disabled:opacity-50"
+                className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
               >
-                {pdfLoading ? '...' : 'Genera PDF Riepilogativo'}
+                {pdfLoading ? '...' : `Scarica ${selectedInvoices.size} Fattur${selectedInvoices.size === 1 ? 'a' : 'e'}`}
               </button>
               <button
                 onClick={handleCopyWhatsApp}

@@ -443,8 +443,10 @@ async def generate_single_invoice_pdf(
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
 
-        pdf_bytes = _build_riepilogativo_pdf(customer, [invoice])
-        filename = f"fattura_{invoice.invoice_number.replace('/', '_')}_{customer.ragione_sociale.replace(' ', '_')}.pdf"
+        pdf_bytes = _build_invoice_pdf(customer, invoice)
+        safe_num = invoice.invoice_number.replace('/', '_')
+        safe_name = customer.ragione_sociale.replace(' ', '_')
+        filename = f"fattura_{safe_num}_{safe_name}.pdf"
 
         return StreamingResponse(
             BytesIO(pdf_bytes),
@@ -581,6 +583,235 @@ def _build_riepilogativo_pdf(customer, invoices):
     )
 
     return pdf.output()
+
+
+def _build_invoice_pdf(customer, invoice):
+    """Build a courtesy copy PDF for a single invoice."""
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # --- Company header ---
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Sake Company srl", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 5, "P.IVA: 04aborita6 | Milano, Italia",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Line separator
+    pdf.set_draw_color(200, 200, 200)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(6)
+
+    # --- FATTURA title + number ---
+    pdf.set_font("Helvetica", "B", 20)
+    pdf.cell(0, 12, "FATTURA", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7,
+             f"N. {invoice.invoice_number}",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # --- Two-column: dates left, customer right ---
+    y_start = pdf.get_y()
+
+    # Left: dates
+    pdf.set_font("Helvetica", "", 10)
+    issue_str = (invoice.issue_date.strftime("%d/%m/%Y")
+                 if invoice.issue_date else "-")
+    due_str = (invoice.due_date.strftime("%d/%m/%Y")
+               if invoice.due_date else "-")
+    pdf.cell(95, 6, f"Data emissione: {issue_str}",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(95, 6, f"Data scadenza: {due_str}",
+             new_x="LMARGIN", new_y="NEXT")
+    if invoice.days_overdue and invoice.days_overdue > 0:
+        pdf.set_text_color(200, 0, 0)
+        pdf.cell(95, 6,
+                 f"Giorni di ritardo: {invoice.days_overdue}",
+                 new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+    pdf.cell(95, 6,
+             f"Fonte: {invoice.source_platform or '-'}",
+             new_x="LMARGIN", new_y="NEXT")
+    y_after_left = pdf.get_y()
+
+    # Right: customer box
+    pdf.set_y(y_start)
+    pdf.set_x(110)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(90, 6, "Destinatario:", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(110)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(90, 6, customer.ragione_sociale or "-",
+             new_x="LMARGIN", new_y="NEXT")
+    if customer.partita_iva:
+        pdf.set_x(110)
+        pdf.cell(90, 6, f"P.IVA: {customer.partita_iva}",
+                 new_x="LMARGIN", new_y="NEXT")
+    if customer.codice_fiscale:
+        pdf.set_x(110)
+        pdf.cell(90, 6, f"C.F.: {customer.codice_fiscale}",
+                 new_x="LMARGIN", new_y="NEXT")
+    if customer.email:
+        pdf.set_x(110)
+        pdf.cell(90, 6, f"Email: {customer.email}",
+                 new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_y(max(y_after_left, pdf.get_y()) + 8)
+
+    # --- Invoice line table ---
+    pdf.set_draw_color(180, 180, 180)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(245, 245, 245)
+    pdf.cell(90, 8, "Descrizione", border=1, fill=True, align="L")
+    pdf.cell(35, 8, "Importo", border=1, fill=True, align="R")
+    pdf.cell(35, 8, "Dovuto", border=1, fill=True, align="R")
+    pdf.cell(30, 8, "Stato", border=1, fill=True, align="C")
+    pdf.ln()
+
+    pdf.set_font("Helvetica", "", 10)
+    desc = f"Fattura n. {invoice.invoice_number}"
+    status_label = {
+        "open": "Aperto", "paid": "Pagato",
+        "contacted": "Contattato", "promised": "Promesso",
+        "disputed": "Contestato", "escalated": "Escalation",
+    }.get(invoice.status, invoice.status or "-")
+
+    pdf.cell(90, 7, desc[:45], border=1, align="L")
+    pdf.cell(35, 7,
+             f"{float(invoice.amount):,.2f}".replace(",", "."),
+             border=1, align="R")
+    pdf.cell(35, 7,
+             f"{float(invoice.amount_due):,.2f}".replace(",", "."),
+             border=1, align="R")
+    pdf.cell(30, 7, status_label, border=1, align="C")
+    pdf.ln()
+
+    # Totals
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(90, 9, "", border=0)
+    pdf.cell(35, 9, "TOTALE:", border=1, fill=True, align="R")
+    pdf.cell(35, 9,
+             f"{float(invoice.amount_due):,.2f} EUR".replace(",", "."),
+             border=1, fill=True, align="R")
+    pdf.cell(30, 9, "", border=1, fill=True)
+    pdf.ln(14)
+
+    # --- Payment info ---
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "Coordinate per il pagamento:",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, "Intestatario: Sake Company srl",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, "IBAN: IT44N0200801671000105175151",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, "Banca: UniCredit",
+             new_x="LMARGIN", new_y="NEXT")
+    causale = f"Saldo fattura {invoice.invoice_number}"
+    pdf.cell(0, 6, f"Causale: {causale}",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(10)
+
+    # Footer
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(120, 120, 120)
+    pdf.cell(0, 5,
+             "Copia di cortesia generata da SC Recupero Crediti",
+             new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 5,
+             f"Generata il {date.today().strftime('%d/%m/%Y')}",
+             new_x="LMARGIN", new_y="NEXT", align="C")
+
+    return pdf.output()
+
+
+@router.get("/customers/{customer_id}/invoices-zip")
+async def download_invoices_zip(
+    customer_id: int,
+    invoice_ids: str = Query(
+        ..., description="Comma-separated invoice IDs"
+    ),
+    session: Session = Depends(get_session),
+):
+    """
+    Download selected invoices as individual PDFs in a ZIP file.
+    Each PDF is a courtesy copy of the original invoice.
+    """
+    import zipfile
+
+    try:
+        customer = session.query(Customer).filter(
+            Customer.id == customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(
+                status_code=404, detail="Customer not found"
+            )
+
+        ids = [
+            int(x.strip())
+            for x in invoice_ids.split(",") if x.strip()
+        ]
+        if not ids:
+            raise HTTPException(
+                status_code=400, detail="No invoice IDs provided"
+            )
+
+        invoices = (
+            session.query(Invoice)
+            .filter(
+                Invoice.id.in_(ids),
+                Invoice.customer_id == customer_id,
+            )
+            .order_by(Invoice.due_date.asc())
+            .all()
+        )
+
+        if not invoices:
+            raise HTTPException(
+                status_code=404, detail="No invoices found"
+            )
+
+        # Build ZIP with individual PDFs
+        zip_buffer = BytesIO()
+        with zipfile.ZipFile(
+            zip_buffer, "w", zipfile.ZIP_DEFLATED
+        ) as zf:
+            for inv in invoices:
+                pdf_bytes = _build_invoice_pdf(customer, inv)
+                safe_num = (
+                    inv.invoice_number.replace("/", "_")
+                    .replace("\\", "_")
+                )
+                fname = f"fattura_{safe_num}.pdf"
+                zf.writestr(fname, pdf_bytes)
+
+        zip_buffer.seek(0)
+        safe_name = customer.ragione_sociale.replace(" ", "_")
+        filename = f"fatture_{safe_name}.zip"
+
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition":
+                f'attachment; filename="{filename}"'
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error generating invoices ZIP: {e}",
+            exc_info=True,
+        )
+        raise
 
 
 # --- Recovery Report / Attività ---
