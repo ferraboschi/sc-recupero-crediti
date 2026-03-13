@@ -175,6 +175,7 @@ async def get_customer_detail(
                 "days_overdue": inv.days_overdue,
                 "status": inv.status,
                 "source_platform": inv.source_platform,
+                "shopify_order_number": inv.shopify_order_number,
             }
             for inv in invoices
         ]

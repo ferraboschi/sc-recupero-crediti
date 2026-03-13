@@ -306,7 +306,8 @@ export default function ClientDetail() {
 
     selected.forEach(inv => {
       const dueDate = inv.due_date ? new Date(inv.due_date + 'T00:00:00').toLocaleDateString('it-IT') : 'N/D'
-      msg += `- Fatt. ${inv.invoice_number}: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(inv.amount_due)} (scad. ${dueDate})\n`
+      const orderRef = inv.shopify_order_number ? ` [Ordine ${inv.shopify_order_number}]` : ''
+      msg += `- Fatt. ${inv.invoice_number}${orderRef}: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(inv.amount_due)} (scad. ${dueDate})\n`
     })
 
     msg += `\nTotale: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(totalSelected)}\n\n`
@@ -599,6 +600,7 @@ export default function ClientDetail() {
                 >
                   Fattura{invoiceSortArrow('invoice_number')}
                 </th>
+                <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Ordine</th>
                 <th className="px-3 py-3 text-left text-sm font-semibold text-slate-900">Fonte</th>
                 <th
                   className="px-3 py-3 text-right text-sm font-semibold text-slate-900 cursor-pointer hover:bg-slate-100"
@@ -643,6 +645,15 @@ export default function ClientDetail() {
                     />
                   </td>
                   <td className="px-3 py-3 text-sm font-medium text-slate-900">{inv.invoice_number}</td>
+                  <td className="px-3 py-3 text-sm">
+                    {inv.shopify_order_number ? (
+                      <span className="px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700">
+                        {inv.shopify_order_number}
+                      </span>
+                    ) : (
+                      <span className="text-slate-300">—</span>
+                    )}
+                  </td>
                   <td className="px-3 py-3 text-sm">
                     <span className={`px-2 py-0.5 rounded text-xs font-medium ${
                       inv.source_platform === 'fatturapro' ? 'bg-indigo-100 text-indigo-700' : 'bg-teal-100 text-teal-700'

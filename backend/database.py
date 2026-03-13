@@ -54,6 +54,8 @@ class Invoice(Base):
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
     source_platform = Column(String, nullable=False)  # fatturapro / fatture24
     source_id = Column(String, nullable=True)
+    shopify_order_id = Column(String, nullable=True)
+    shopify_order_number = Column(String, nullable=True)  # e.g. "#SAK1234"
     status = Column(String, default="open")  # open / contacted / promised / paid / disputed / escalated
     customer_name_raw = Column(String, nullable=True)  # Original name from invoice
     customer_piva_raw = Column(String, nullable=True)  # Original P.IVA from invoice
@@ -183,14 +185,29 @@ def _run_migrations(engine):
     """Add missing columns to existing tables (lightweight migration)."""
     from sqlalchemy import inspect, text
     inspector = inspect(engine)
-    existing = {
+    cust_cols = {
         c["name"] for c in inspector.get_columns("customers")
     }
+    inv_cols = {
+        c["name"] for c in inspector.get_columns("invoices")
+    }
     with engine.connect() as conn:
-        if "phones_json" not in existing:
+        if "phones_json" not in cust_cols:
             conn.execute(text(
                 "ALTER TABLE customers "
                 "ADD COLUMN phones_json JSONB"
+            ))
+            conn.commit()
+        if "shopify_order_id" not in inv_cols:
+            conn.execute(text(
+                "ALTER TABLE invoices "
+                "ADD COLUMN shopify_order_id VARCHAR"
+            ))
+            conn.commit()
+        if "shopify_order_number" not in inv_cols:
+            conn.execute(text(
+                "ALTER TABLE invoices "
+                "ADD COLUMN shopify_order_number VARCHAR"
             ))
             conn.commit()
 

@@ -380,6 +380,77 @@ class ShopifyConnector(BaseConnector):
             )
             return False
 
+    def fetch_customer_orders(
+        self, shopify_id: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch all orders for a given customer from Shopify.
+
+        Args:
+            shopify_id: Shopify customer ID (numeric or gid)
+
+        Returns:
+            List of order dicts with: id, order_number, name,
+            total_price, created_at, financial_status
+        """
+        numeric_id = self._extract_id_from_gid(shopify_id)
+        orders: List[Dict[str, Any]] = []
+        params: Dict[str, Any] = {
+            "customer_id": numeric_id,
+            "status": "any",
+            "limit": 250,
+            "fields": (
+                "id,order_number,name,total_price,"
+                "created_at,financial_status"
+            ),
+        }
+        page = 0
+        while True:
+            page += 1
+            try:
+                resp = self.get(
+                    "orders.json",
+                    headers=self._get_headers(),
+                    params=params,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error fetching orders for customer "
+                    f"{numeric_id}: {e}"
+                )
+                break
+
+            batch = resp.get("orders", [])
+            if not batch:
+                break
+
+            for o in batch:
+                orders.append({
+                    "id": str(o["id"]),
+                    "order_number": o.get("order_number"),
+                    "name": o.get("name", ""),
+                    "total_price": float(
+                        o.get("total_price", 0)
+                    ),
+                    "created_at": o.get("created_at", ""),
+                    "financial_status": o.get(
+                        "financial_status", ""
+                    ),
+                })
+
+            if len(batch) < 250:
+                break
+
+            # Shopify REST pagination via Link header
+            # For simplicity, use since_id
+            last_id = batch[-1]["id"]
+            params["since_id"] = last_id
+
+        logger.info(
+            f"Fetched {len(orders)} orders for customer "
+            f"{numeric_id}"
+        )
+        return orders
+
     @staticmethod
     def _extract_id_from_gid(shopify_id: str) -> str:
         """

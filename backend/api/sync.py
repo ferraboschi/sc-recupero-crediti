@@ -555,6 +555,157 @@ def _auto_create_customers_from_invoices(session) -> int:
     return auto_created
 
 
+def _match_orders_task() -> dict:
+    """Match invoices to Shopify orders by customer + amount + date.
+
+    For each customer with a shopify_id, fetches their Shopify orders
+    and matches unlinked invoices by amount (±1% tolerance) and date
+    proximity (invoice issue_date within 7 days of order created_at).
+    """
+    session = get_session_direct()
+    result = {
+        "matched": 0, "customers_processed": 0,
+        "errors": [], "already_matched": 0,
+    }
+    try:
+        # Get all customers that have a shopify_id
+        customers = session.query(Customer).filter(
+            Customer.shopify_id.isnot(None),
+        ).all()
+
+        if not customers:
+            result["message"] = "No customers with shopify_id"
+            return result
+
+        shopify = ShopifyConnector()
+
+        for cust in customers:
+            # Get unmatched invoices for this customer
+            unmatched_invoices = session.query(Invoice).filter(
+                Invoice.customer_id == cust.id,
+                Invoice.shopify_order_id.is_(None),
+            ).all()
+
+            if not unmatched_invoices:
+                continue
+
+            result["customers_processed"] += 1
+
+            try:
+                orders = shopify.fetch_customer_orders(
+                    cust.shopify_id
+                )
+            except Exception as e:
+                result["errors"].append(
+                    f"{cust.ragione_sociale}: {e}"
+                )
+                continue
+
+            if not orders:
+                continue
+
+            # Build order lookup for matching
+            for inv in unmatched_invoices:
+                best_match = _find_best_order_match(
+                    inv, orders
+                )
+                if best_match:
+                    inv.shopify_order_id = best_match["id"]
+                    inv.shopify_order_number = (
+                        best_match["name"]
+                    )
+                    result["matched"] += 1
+                    logger.info(
+                        f"Matched invoice {inv.invoice_number}"
+                        f" → order {best_match['name']}"
+                    )
+
+        session.commit()
+
+        _persist_sync_status("order_matching", result)
+        activity = ActivityLog(
+            action="order_matching",
+            entity_type="invoice",
+            details=result,
+        )
+        session.add(activity)
+        session.commit()
+
+        logger.info(f"Order matching complete: {result}")
+    except Exception as e:
+        result["error"] = str(e)
+        logger.error(
+            f"Error in order matching: {e}", exc_info=True
+        )
+    finally:
+        session.close()
+
+    return result
+
+
+def _find_best_order_match(
+    invoice, orders
+):
+    """Find the best Shopify order match for an invoice.
+
+    Matching criteria:
+    1. Amount match: order total within 1% of invoice amount
+    2. Date proximity: order date within 7 days of invoice date
+
+    Returns the best matching order or None.
+    """
+    from datetime import timedelta
+
+    if not invoice.issue_date:
+        # Without a date, match by amount only
+        for order in orders:
+            amt_diff = abs(
+                order["total_price"] - invoice.amount
+            )
+            tolerance = max(
+                invoice.amount * 0.01, 0.50
+            )
+            if amt_diff <= tolerance:
+                return order
+        return None
+
+    best = None
+    best_score = float("inf")
+
+    for order in orders:
+        # Amount check (1% tolerance, minimum €0.50)
+        amt_diff = abs(
+            order["total_price"] - invoice.amount
+        )
+        tolerance = max(invoice.amount * 0.01, 0.50)
+        if amt_diff > tolerance:
+            continue
+
+        # Date check — parse order date
+        try:
+            order_date_str = order["created_at"][:10]
+            order_date = datetime.strptime(
+                order_date_str, "%Y-%m-%d"
+            ).date()
+        except (ValueError, TypeError):
+            continue
+
+        day_diff = abs(
+            (invoice.issue_date - order_date).days
+        )
+        if day_diff > 7:
+            continue
+
+        # Score: lower is better (prefer closer date +
+        # closer amount)
+        score = day_diff + (amt_diff / max(tolerance, 1))
+        if score < best_score:
+            best_score = score
+            best = order
+
+    return best
+
+
 def _run_matching_task() -> dict:
     """Background task to run invoice-customer matching."""
     session = get_session_direct()
@@ -646,6 +797,16 @@ async def sync_matching(background_tasks: BackgroundTasks):
     }
 
 
+@router.post("/order-matching")
+async def sync_order_matching(background_tasks: BackgroundTasks):
+    """Match invoices to Shopify orders by amount + date."""
+    background_tasks.add_task(_match_orders_task)
+    return {
+        "status": "sync_started",
+        "message": "Order matching started in background",
+    }
+
+
 @router.post("/escalations")
 async def sync_escalations(background_tasks: BackgroundTasks):
     """Trigger manual escalation processing."""
@@ -689,6 +850,15 @@ def _full_sync_task() -> dict:
         except Exception as e:
             logger.error(f"Matching failed: {e}", exc_info=True)
             results["matching"] = {"error": str(e)}
+
+        # Step 3b: Match invoices to Shopify orders
+        try:
+            results["order_matching"] = _match_orders_task()
+        except Exception as e:
+            logger.error(
+                f"Order matching failed: {e}", exc_info=True
+            )
+            results["order_matching"] = {"error": str(e)}
 
         # Step 4: Process escalations (depends on matched invoices)
         try:
