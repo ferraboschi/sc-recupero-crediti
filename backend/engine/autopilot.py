@@ -42,12 +42,31 @@ logger = logging.getLogger(__name__)
 # ── Main Autopilot Entry Point ──────────────────────────────────────
 
 def run_autopilot() -> Dict[str, Any]:
-    """Run the full autopilot cycle synchronously (called from scheduler).
+    """Run the full autopilot cycle.
 
+    Handles both sync context (scheduler/thread) and async context (FastAPI).
     Returns dict with stats: messages_sent, replies_processed, escalated.
     """
     logger.info("=== AUTOPILOT: Starting automated recovery cycle ===")
-    result = asyncio.run(_autopilot_cycle())
+    try:
+        # If there's already an event loop running (FastAPI), use it
+        loop = asyncio.get_running_loop()
+        # We're inside an async context — can't use asyncio.run()
+        # Create a new thread to run the async code
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            result = pool.submit(lambda: asyncio.run(_autopilot_cycle())).result(timeout=120)
+    except RuntimeError:
+        # No running event loop — safe to use asyncio.run()
+        result = asyncio.run(_autopilot_cycle())
+    logger.info(f"=== AUTOPILOT: Cycle complete — {result} ===")
+    return result
+
+
+async def run_autopilot_async() -> Dict[str, Any]:
+    """Async version for direct await from FastAPI endpoints."""
+    logger.info("=== AUTOPILOT: Starting automated recovery cycle (async) ===")
+    result = await _autopilot_cycle()
     logger.info(f"=== AUTOPILOT: Cycle complete — {result} ===")
     return result
 

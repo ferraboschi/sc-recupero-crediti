@@ -510,8 +510,8 @@ async def run_autopilot_manual():
         return {"status": "disabled", "message": "Autopilot non abilitato. Imposta AUTOPILOT_ENABLED=true."}
 
     try:
-        from backend.engine.autopilot import run_autopilot
-        result = run_autopilot()
+        from backend.engine.autopilot import run_autopilot_async
+        result = await run_autopilot_async()
         return {"status": "ok", "result": result}
     except Exception as e:
         logger.error(f"Manual autopilot run failed: {e}", exc_info=True)
