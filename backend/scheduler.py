@@ -26,10 +26,10 @@ _last_sync = {
 
 def run_daily_job(manual: bool = False):
     """
-    Daily job that runs the full sequential sync.
+    Daily job that runs the full sequential sync + autopilot.
 
-    Uses the _full_sync_task which runs steps sequentially with mutex protection:
-    invoices → customers (+ auto-create) → matching → escalations
+    Pipeline: invoices → customers → matching → escalations → AUTOPILOT
+    The autopilot generates AI messages and sends them via Twilio.
 
     Args:
         manual: Whether this is a manual trigger (vs scheduled)
@@ -47,6 +47,21 @@ def run_daily_job(manual: bool = False):
     except Exception as e:
         logger.error(f"Error in daily job: {e}", exc_info=True)
         results = {"error": str(e), "timestamp": datetime.utcnow().isoformat()}
+
+    # Run autopilot after sync (generate and send messages)
+    try:
+        import os
+        if os.getenv("AUTOPILOT_ENABLED", "false").lower() == "true":
+            from backend.engine.autopilot import run_autopilot
+            autopilot_result = run_autopilot()
+            results["autopilot"] = autopilot_result
+            logger.info(f"Autopilot result: {autopilot_result}")
+        else:
+            results["autopilot"] = {"status": "disabled"}
+            logger.info("Autopilot disabled (set AUTOPILOT_ENABLED=true to enable)")
+    except Exception as e:
+        logger.error(f"Autopilot error: {e}", exc_info=True)
+        results["autopilot"] = {"error": str(e)}
 
     # Update last sync times
     now = datetime.utcnow().isoformat()

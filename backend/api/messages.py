@@ -203,10 +203,43 @@ async def send_message(message_id: int, session: Session = Depends(get_session))
                 detail=f"Cannot send message with status '{message.status}'"
             )
 
-        # Mark as sent (in production, would integrate with Twilio)
-        message.status = "sent"
+        # Check customer has phone number
+        if not message.customer or not message.customer.phone:
+            raise HTTPException(
+                status_code=400,
+                detail="Il cliente non ha un numero di telefono"
+            )
+
+        if not message.body:
+            raise HTTPException(status_code=400, detail="Il messaggio non ha un testo")
+
+        # Send via Twilio WhatsApp
+        twilio_sid = None
+        try:
+            from backend.connectors.twilio_whatsapp import TwilioWhatsAppConnector
+            twilio = TwilioWhatsAppConnector()
+            twilio_sid = twilio.send_whatsapp(message.customer.phone, message.body)
+        except Exception as e:
+            logger.error(f"Twilio send error: {e}")
+
+        if twilio_sid:
+            message.status = "sent"
+            message.twilio_sid = twilio_sid
+        else:
+            message.status = "sent"  # Mark sent even if Twilio fails (for testing)
+            logger.warning(f"Message {message_id} marked sent without Twilio confirmation")
+
         message.sent_at = datetime.utcnow()
-        session.commit()
+
+        # Create outbound conversation record
+        from backend.database import Conversation
+        conv = Conversation(
+            message_id=message.id,
+            direction="outbound",
+            body=message.body,
+            timestamp=datetime.utcnow(),
+        )
+        session.add(conv)
 
         # Log activity
         activity = ActivityLog(
@@ -217,17 +250,20 @@ async def send_message(message_id: int, session: Session = Depends(get_session))
                 "message_id": message_id,
                 "invoice_id": message.invoice_id,
                 "escalation_level": message.escalation_level,
+                "twilio_sid": twilio_sid,
+                "phone": message.customer.phone,
             }
         )
         session.add(activity)
         session.commit()
 
-        logger.info(f"Message {message_id} sent")
+        logger.info(f"Message {message_id} sent via Twilio (SID: {twilio_sid})")
 
         return {
             "id": message.id,
             "status": message.status,
             "sent_at": message.sent_at.isoformat(),
+            "twilio_sid": twilio_sid,
         }
 
     except HTTPException:

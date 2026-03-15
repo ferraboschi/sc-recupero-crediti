@@ -57,6 +57,8 @@ export default function System() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [syncing, setSyncing] = useState(false)
+  const [autopilot, setAutopilot] = useState(null)
+  const [runningAutopilot, setRunningAutopilot] = useState(false)
 
   const authHeaders = () => {
     const token = localStorage.getItem('sc_token')
@@ -76,7 +78,27 @@ export default function System() {
     }
   }, [])
 
-  useEffect(() => { fetchData() }, [fetchData])
+  useEffect(() => { fetchData(); fetchAutopilot() }, [fetchData])
+
+  const fetchAutopilot = async () => {
+    try {
+      const res = await fetch(`${API}/system/autopilot`, { headers: authHeaders() })
+      if (res.ok) setAutopilot(await res.json())
+    } catch { /* ignore */ }
+  }
+
+  const triggerAutopilot = async () => {
+    setRunningAutopilot(true)
+    try {
+      const res = await fetch(`${API}/system/autopilot/run`, { method: 'POST', headers: authHeaders() })
+      const result = await res.json()
+      setRunningAutopilot(false)
+      fetchAutopilot()
+      fetchData()
+    } catch {
+      setRunningAutopilot(false)
+    }
+  }
 
   const triggerSync = async () => {
     setSyncing(true)
@@ -236,6 +258,82 @@ export default function System() {
           ))}
         </div>
       </div>
+
+      {/* Autopilot AI */}
+      {autopilot && (
+        <div className="sc-card overflow-hidden">
+          <div className="sc-card-header bg-dark-surface flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <h3 className="sc-section-title">Autopilot AI</h3>
+              <StatusBadge status={autopilot.enabled ? 'ok' : 'not_configured'} />
+            </div>
+            <button
+              onClick={triggerAutopilot}
+              disabled={runningAutopilot || !autopilot.enabled}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                autopilot.enabled
+                  ? 'bg-accent-purple/20 text-accent-purple hover:bg-accent-purple/30'
+                  : 'bg-dark-surface text-txt-muted cursor-not-allowed'
+              }`}
+            >
+              {runningAutopilot ? 'Invio in corso...' : 'Lancia Ciclo'}
+            </button>
+          </div>
+          <div className="p-6 space-y-4">
+            <div className="grid grid-cols-3 gap-4">
+              <div className="text-center">
+                <p className="text-2xl font-bold text-accent-purple">{autopilot.stats?.messages_sent || 0}</p>
+                <p className="text-xs text-txt-muted mt-1">Messaggi inviati</p>
+              </div>
+              <div className="text-center">
+                <p className="text-2xl font-bold text-accent-green">{autopilot.stats?.replies_received || 0}</p>
+                <p className="text-xs text-txt-muted mt-1">Risposte ricevute</p>
+              </div>
+              <div className="text-center">
+                <p className="text-2xl font-bold text-accent-amber">{autopilot.stats?.escalations || 0}</p>
+                <p className="text-xs text-txt-muted mt-1">Escalation umane</p>
+              </div>
+            </div>
+            <div className="border-t border-dark-border pt-4 space-y-2">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-txt-label">Claude AI</span>
+                <StatusBadge status={autopilot.anthropic_configured ? 'ok' : 'not_configured'} />
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-txt-label">Twilio WhatsApp</span>
+                <StatusBadge status={autopilot.twilio_configured ? 'ok' : 'not_configured'} />
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-txt-label">Email escalation</span>
+                <span className="text-xs text-txt-secondary">{autopilot.escalation_email}</span>
+              </div>
+            </div>
+            {autopilot.recent_activity?.length > 0 && (
+              <div className="border-t border-dark-border pt-4">
+                <p className="text-xs text-txt-label uppercase tracking-wider mb-2">Attività recente</p>
+                <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                  {autopilot.recent_activity.slice(0, 8).map((a, i) => (
+                    <div key={i} className="flex items-center justify-between text-xs">
+                      <span className={`${
+                        a.action === 'escalation_triggered' ? 'text-accent-amber' :
+                        a.action === 'autopilot_sent' ? 'text-accent-purple' :
+                        'text-accent-green'
+                      }`}>
+                        {a.action === 'autopilot_sent' ? '📤 Inviato' :
+                         a.action === 'autopilot_reply_processed' ? '📥 Risposta' :
+                         a.action === 'escalation_triggered' ? '⚠️ Escalation' :
+                         a.action}
+                        {a.details?.customer && ` — ${a.details.customer}`}
+                      </span>
+                      <span className="text-txt-muted">{a.timestamp ? timeAgo(a.timestamp) : ''}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Database & Data */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

@@ -448,3 +448,71 @@ def _summarize_sync_result(key: str, result: dict) -> str:
         return f"{n} escalation create" if n > 0 else "Nessuna nuova escalation"
 
     return str(result)
+
+
+@router.get("/autopilot")
+async def get_autopilot_status():
+    """Get autopilot status and recent activity."""
+    import os
+
+    session = get_session_direct()
+    try:
+        # Recent autopilot activity
+        recent = session.query(ActivityLog).filter(
+            ActivityLog.action.in_([
+                "autopilot_sent", "autopilot_reply_processed",
+                "escalation_triggered", "reply_processed_fallback",
+            ])
+        ).order_by(ActivityLog.timestamp.desc()).limit(20).all()
+
+        # Message stats
+        total_sent = session.query(func.count(Message.id)).filter(
+            Message.approved_by == "autopilot",
+        ).scalar() or 0
+
+        total_replied = session.query(func.count(Message.id)).filter(
+            Message.status == "replied",
+            Message.approved_by == "autopilot",
+        ).scalar() or 0
+
+        escalations = session.query(func.count(ActivityLog.id)).filter(
+            ActivityLog.action == "escalation_triggered",
+        ).scalar() or 0
+
+        return {
+            "enabled": os.getenv("AUTOPILOT_ENABLED", "false").lower() == "true",
+            "anthropic_configured": bool(os.getenv("ANTHROPIC_API_KEY")),
+            "twilio_configured": bool(config.TWILIO_ACCOUNT_SID and config.TWILIO_AUTH_TOKEN),
+            "escalation_email": os.getenv("ESCALATION_EMAIL", "lorenzo@ef-ti.com"),
+            "stats": {
+                "messages_sent": total_sent,
+                "replies_received": total_replied,
+                "escalations": escalations,
+            },
+            "recent_activity": [
+                {
+                    "action": a.action,
+                    "timestamp": a.timestamp.isoformat() if a.timestamp else None,
+                    "details": a.details,
+                }
+                for a in recent
+            ],
+        }
+    finally:
+        session.close()
+
+
+@router.post("/autopilot/run")
+async def run_autopilot_manual():
+    """Manually trigger one autopilot cycle."""
+    import os
+    if os.getenv("AUTOPILOT_ENABLED", "false").lower() != "true":
+        return {"status": "disabled", "message": "Autopilot non abilitato. Imposta AUTOPILOT_ENABLED=true."}
+
+    try:
+        from backend.engine.autopilot import run_autopilot
+        result = run_autopilot()
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        logger.error(f"Manual autopilot run failed: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}

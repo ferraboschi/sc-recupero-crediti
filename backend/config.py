@@ -53,6 +53,13 @@ class Config:
     # CORS - frontend origin (GitHub Pages)
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "https://recupero.sakecompany.com,http://localhost:5173").split(",")
 
+    # Anthropic AI
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+    # Autopilot
+    AUTOPILOT_ENABLED = os.getenv("AUTOPILOT_ENABLED", "false").lower() == "true"
+    ESCALATION_EMAIL = os.getenv("ESCALATION_EMAIL", "lorenzo@ef-ti.com")
+
     # Business rules
     FUZZY_MATCH_THRESHOLD = 75  # Minimum score for fuzzy matching (lowered from 85 for short names like F-T SRL)
     BUSINESS_HOURS_START = 9
