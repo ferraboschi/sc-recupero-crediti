@@ -50,7 +50,7 @@ def run_autopilot() -> Dict[str, Any]:
     logger.info("=== AUTOPILOT: Starting automated recovery cycle ===")
     try:
         # If there's already an event loop running (FastAPI), use it
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
         # We're inside an async context — can't use asyncio.run()
         # Create a new thread to run the async code
         import concurrent.futures
@@ -93,7 +93,7 @@ async def _autopilot_cycle() -> Dict[str, Any]:
 
         for customer, invoices in customers_to_contact:
             try:
-                result = await _process_customer(session, twilio, customer, invoices, stats)
+                await _process_customer(session, twilio, customer, invoices, stats)
             except Exception as e:
                 logger.error(f"AUTOPILOT: Error processing customer {customer.id}: {e}")
                 stats["send_errors"] += 1
@@ -474,23 +474,23 @@ def _send_escalation_email(
 
     # Build email body
     lines = [
-        f"⚠️ ESCALATION — Recupero Crediti",
-        f"",
+        "⚠️ ESCALATION — Recupero Crediti",
+        "",
         f"Cliente: {customer.ragione_sociale}",
         f"P.IVA: {customer.piva or 'N/A'}",
         f"Telefono: {customer.phone or 'N/A'}",
         f"Email: {customer.email or 'N/A'}",
-        f"",
+        "",
         f"Fattura: {invoice.invoice_number}",
         f"Importo: €{invoice.amount_due:,.2f}" if invoice.amount_due else "Importo: N/A",
         f"Scaduta da: {invoice.days_overdue} giorni",
-        f"",
-        f"--- CLASSIFICAZIONE AI ---",
+        "",
+        "--- CLASSIFICAZIONE AI ---",
         f"Intent: {classification.get('intent', 'N/A')}",
         f"Confidenza: {classification.get('confidence', 'N/A')}",
         f"Motivo escalation: {classification.get('summary', 'N/A')}",
-        f"",
-        f"--- CONVERSAZIONE COMPLETA ---",
+        "",
+        "--- CONVERSAZIONE COMPLETA ---",
     ]
 
     for conv in conversations:
@@ -507,8 +507,7 @@ def _send_escalation_email(
 
     email_body = "\n".join(lines)
 
-    # Send via SMTP
-    smtp_user = config.TWILIO_ACCOUNT_SID  # Reuse for now — or add SMTP config
+    # Send via SMTP (future: configure proper SMTP credentials)
     try:
         # Try sending via Anthropic-free simple approach
         # In production, configure proper SMTP

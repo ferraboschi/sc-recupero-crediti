@@ -1,7 +1,7 @@
 """System health and diagnostics API endpoint."""
 
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from fastapi import APIRouter
 from sqlalchemy import func, text
 
@@ -515,4 +515,147 @@ async def run_autopilot_manual():
         return {"status": "ok", "result": result}
     except Exception as e:
         logger.error(f"Manual autopilot run failed: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/autopilot/preview")
+async def preview_autopilot():
+    """Dry-run: show what messages WOULD be sent without sending anything.
+
+    Returns a list of customers and the messages that would be generated.
+    """
+    from backend.engine.autopilot import _get_customers_for_today
+    from backend.engine.ai_engine import generate_message
+    from backend.engine.escalation import get_escalation_level
+
+    session = get_session_direct()
+    try:
+        customers_to_contact = _get_customers_for_today(session)
+
+        previews = []
+        for customer, invoices in customers_to_contact:
+            if not customer.phone:
+                previews.append({
+                    "customer": customer.ragione_sociale,
+                    "phone": None,
+                    "skip_reason": "Nessun telefono",
+                    "message": None,
+                })
+                continue
+
+            total_due = sum(inv.amount_due or 0 for inv in invoices)
+            max_overdue = max(inv.days_overdue for inv in invoices)
+            main_invoice = max(invoices, key=lambda i: i.amount_due or 0)
+            level = get_escalation_level(main_invoice)
+
+            if level == 0:
+                previews.append({
+                    "customer": customer.ragione_sociale,
+                    "phone": customer.phone,
+                    "skip_reason": "Non ancora in escalation",
+                    "message": None,
+                })
+                continue
+
+            # Check if already sent recently
+            recent_msg = session.query(Message).filter(
+                Message.customer_id == customer.id,
+                Message.escalation_level == level,
+                Message.sent_at.isnot(None),
+                Message.sent_at >= datetime.utcnow() - timedelta(days=5),
+            ).first()
+
+            if recent_msg:
+                previews.append({
+                    "customer": customer.ragione_sociale,
+                    "phone": customer.phone,
+                    "skip_reason": f"Già inviato livello {level} di recente",
+                    "message": None,
+                    "level": level,
+                })
+                continue
+
+            # Generate message preview
+            invoice_refs = ", ".join(inv.invoice_number for inv in invoices[:3])
+            if len(invoices) > 3:
+                invoice_refs += f" (+{len(invoices) - 3} altre)"
+
+            body = await generate_message(
+                customer_name=customer.ragione_sociale or "Cliente",
+                invoice_number=invoice_refs,
+                amount_due=total_due,
+                days_overdue=max_overdue,
+                escalation_level=level,
+            )
+
+            previews.append({
+                "customer": customer.ragione_sociale,
+                "phone": customer.phone,
+                "level": level,
+                "total_due": total_due,
+                "days_overdue": max_overdue,
+                "invoices": [inv.invoice_number for inv in invoices],
+                "message": body,
+                "skip_reason": None,
+            })
+
+        return {
+            "status": "ok",
+            "total_customers": len(previews),
+            "would_send": len([p for p in previews if p["message"]]),
+            "would_skip": len([p for p in previews if p["skip_reason"]]),
+            "previews": previews,
+        }
+    except Exception as e:
+        logger.error(f"Preview failed: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+@router.post("/autopilot/test")
+async def test_autopilot_message():
+    """Send a test message to the admin phone number.
+
+    Generates a sample message and sends it to the configured test number.
+    """
+    from backend.engine.ai_engine import generate_message
+    from backend.connectors.twilio_whatsapp import TwilioWhatsAppConnector
+
+    test_phone = config.ESCALATION_PHONE or "+393515978498"
+
+    try:
+        # Generate a sample message
+        body = await generate_message(
+            customer_name="Test Cliente S.R.L.",
+            invoice_number="TEST-001",
+            amount_due=1250.00,
+            days_overdue=15,
+            escalation_level=1,
+        )
+
+        if not body:
+            return {"status": "error", "message": "Impossibile generare il messaggio (AI non configurata?)"}
+
+        # Send via Twilio
+        twilio = TwilioWhatsAppConnector()
+        sid = twilio.send_whatsapp(test_phone, body)
+
+        if sid:
+            return {
+                "status": "ok",
+                "message": body,
+                "phone": test_phone,
+                "twilio_sid": sid,
+                "note": f"Messaggio di test inviato a {test_phone}",
+            }
+        else:
+            return {
+                "status": "error",
+                "message": body,
+                "phone": test_phone,
+                "note": "Twilio non è riuscito a inviare il messaggio",
+            }
+    except Exception as e:
+        logger.error(f"Test message failed: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}

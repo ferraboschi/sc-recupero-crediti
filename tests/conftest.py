@@ -9,6 +9,7 @@ from pathlib import Path
 
 from backend.database import Base, Invoice, Customer, Message, Conversation, ActivityLog
 from backend.main import app
+from backend.api.auth import verify_token
 from fastapi.testclient import TestClient
 
 
@@ -47,6 +48,8 @@ def test_client(test_db_session, monkeypatch):
 
     from backend.database import get_session
     app.dependency_overrides[get_session] = override_get_session
+    # Bypass JWT auth for tests
+    app.dependency_overrides[verify_token] = lambda: "test_user"
 
     client = TestClient(app)
     yield client

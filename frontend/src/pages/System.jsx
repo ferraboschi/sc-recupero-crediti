@@ -59,6 +59,10 @@ export default function System() {
   const [syncing, setSyncing] = useState(false)
   const [autopilot, setAutopilot] = useState(null)
   const [runningAutopilot, setRunningAutopilot] = useState(false)
+  const [preview, setPreview] = useState(null)
+  const [loadingPreview, setLoadingPreview] = useState(false)
+  const [testResult, setTestResult] = useState(null)
+  const [sendingTest, setSendingTest] = useState(false)
 
   const authHeaders = () => {
     const token = localStorage.getItem('sc_token')
@@ -98,6 +102,26 @@ export default function System() {
     } catch {
       setRunningAutopilot(false)
     }
+  }
+
+  const loadPreview = async () => {
+    setLoadingPreview(true)
+    setPreview(null)
+    try {
+      const res = await fetch(`${API}/system/autopilot/preview`, { headers: authHeaders() })
+      if (res.ok) setPreview(await res.json())
+    } catch { /* ignore */ }
+    setLoadingPreview(false)
+  }
+
+  const sendTest = async () => {
+    setSendingTest(true)
+    setTestResult(null)
+    try {
+      const res = await fetch(`${API}/system/autopilot/test`, { method: 'POST', headers: authHeaders() })
+      if (res.ok) setTestResult(await res.json())
+    } catch { /* ignore */ }
+    setSendingTest(false)
   }
 
   const triggerSync = async () => {
@@ -267,17 +291,33 @@ export default function System() {
               <h3 className="sc-section-title">Autopilot AI</h3>
               <StatusBadge status={autopilot.enabled ? 'ok' : 'not_configured'} />
             </div>
-            <button
-              onClick={triggerAutopilot}
-              disabled={runningAutopilot || !autopilot.enabled}
-              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
-                autopilot.enabled
-                  ? 'bg-accent-purple/20 text-accent-purple hover:bg-accent-purple/30'
-                  : 'bg-dark-surface text-txt-muted cursor-not-allowed'
-              }`}
-            >
-              {runningAutopilot ? 'Invio in corso...' : 'Lancia Ciclo'}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={loadPreview}
+                disabled={loadingPreview}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-blue/20 text-accent-blue hover:bg-accent-blue/30 transition-colors"
+              >
+                {loadingPreview ? 'Caricamento...' : 'Anteprima'}
+              </button>
+              <button
+                onClick={sendTest}
+                disabled={sendingTest}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-green/20 text-accent-green hover:bg-accent-green/30 transition-colors"
+              >
+                {sendingTest ? 'Invio...' : 'Test WhatsApp'}
+              </button>
+              <button
+                onClick={triggerAutopilot}
+                disabled={runningAutopilot || !autopilot.enabled}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                  autopilot.enabled
+                    ? 'bg-accent-purple/20 text-accent-purple hover:bg-accent-purple/30'
+                    : 'bg-dark-surface text-txt-muted cursor-not-allowed'
+                }`}
+              >
+                {runningAutopilot ? 'Invio in corso...' : 'Lancia Ciclo'}
+              </button>
+            </div>
           </div>
           <div className="p-6 space-y-4">
             <div className="grid grid-cols-3 gap-4">
@@ -308,6 +348,55 @@ export default function System() {
                 <span className="text-xs text-txt-secondary">{autopilot.escalation_email}</span>
               </div>
             </div>
+            {/* Test Result */}
+            {testResult && (
+              <div className={`p-3 rounded-lg border ${testResult.status === 'ok' ? 'border-accent-green/30 bg-accent-green/5' : 'border-accent-red/30 bg-accent-red/5'}`}>
+                <p className={`text-xs font-semibold mb-1 ${testResult.status === 'ok' ? 'text-accent-green' : 'text-accent-red'}`}>
+                  {testResult.status === 'ok' ? '✓ Messaggio di test inviato!' : '✗ Errore invio test'}
+                </p>
+                {testResult.phone && <p className="text-xs text-txt-muted">Destinatario: {testResult.phone}</p>}
+                {testResult.message && (
+                  <p className="text-xs text-txt-secondary mt-1 whitespace-pre-wrap bg-dark-bg/50 p-2 rounded mt-2">{testResult.message}</p>
+                )}
+                {testResult.note && <p className="text-xs text-txt-muted mt-1">{testResult.note}</p>}
+              </div>
+            )}
+
+            {/* Preview Results */}
+            {preview && (
+              <div className="border border-dark-border rounded-lg overflow-hidden">
+                <div className="bg-accent-blue/10 px-3 py-2 flex items-center justify-between">
+                  <p className="text-xs font-semibold text-accent-blue">
+                    Anteprima: {preview.would_send} messaggi da inviare, {preview.would_skip} da saltare
+                  </p>
+                  <button onClick={() => setPreview(null)} className="text-xs text-txt-muted hover:text-txt-primary">✕</button>
+                </div>
+                <div className="max-h-80 overflow-y-auto divide-y divide-dark-border">
+                  {preview.previews?.map((p, i) => (
+                    <div key={i} className="px-3 py-2">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-xs font-semibold text-txt-primary">{p.customer}</span>
+                        {p.skip_reason ? (
+                          <span className="text-xs text-txt-muted">{p.skip_reason}</span>
+                        ) : (
+                          <span className="text-xs text-accent-purple">Livello {p.level} — €{p.total_due?.toLocaleString('it-IT', { minimumFractionDigits: 2 })}</span>
+                        )}
+                      </div>
+                      {p.message && (
+                        <p className="text-xs text-txt-secondary whitespace-pre-wrap bg-dark-bg/50 p-2 rounded">{p.message}</p>
+                      )}
+                      {p.phone && !p.skip_reason && (
+                        <p className="text-xs text-txt-muted mt-1">📱 {p.phone} — Fatture: {p.invoices?.join(', ')}</p>
+                      )}
+                    </div>
+                  ))}
+                  {(!preview.previews || preview.previews.length === 0) && (
+                    <div className="px-3 py-4 text-center text-xs text-txt-muted">Nessun cliente da contattare oggi</div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {autopilot.recent_activity?.length > 0 && (
               <div className="border-t border-dark-border pt-4">
                 <p className="text-xs text-txt-label uppercase tracking-wider mb-2">Attività recente</p>

@@ -59,6 +59,7 @@ class Config:
     # Autopilot
     AUTOPILOT_ENABLED = os.getenv("AUTOPILOT_ENABLED", "false").lower() == "true"
     ESCALATION_EMAIL = os.getenv("ESCALATION_EMAIL", "lorenzo@ef-ti.com")
+    ESCALATION_PHONE = os.getenv("ESCALATION_PHONE", "")
 
     # Business rules
     FUZZY_MATCH_THRESHOLD = 75  # Minimum score for fuzzy matching (lowered from 85 for short names like F-T SRL)
