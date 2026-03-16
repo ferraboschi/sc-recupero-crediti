@@ -89,6 +89,9 @@ export default function ClientDetail() {
   const [copiedWhatsApp, setCopiedWhatsApp] = useState(false)
   const [promemoria, setPromemoria] = useState(false)
   const [selectedWhatsAppPhone, setSelectedWhatsAppPhone] = useState(null)
+  const [showDatePicker, setShowDatePicker] = useState(false)
+  const [pendingActionType, setPendingActionType] = useState(null)
+  const [scheduledDate, setScheduledDate] = useState('')
 
   const fetchData = useCallback(async () => {
     try {
@@ -131,14 +134,30 @@ export default function ClientDetail() {
   }
 
   const handleAction = async (actionType) => {
+    // For contact/lawyer actions, show date picker first
+    if (['first_contact', 'second_contact', 'lawyer'].includes(actionType) && !showDatePicker) {
+      setPendingActionType(actionType)
+      // Default date based on action type
+      const defaults = { first_contact: 7, second_contact: 14, lawyer: 30 }
+      const d = new Date()
+      d.setDate(d.getDate() + (defaults[actionType] || 7))
+      setScheduledDate(d.toISOString().split('T')[0])
+      setShowDatePicker(true)
+      return
+    }
+
     setActionLoading(true)
     try {
       await client.post(`/recovery/customers/${customerId}/actions`, {
         action_type: actionType,
+        scheduled_date: scheduledDate || null,
         notes: actionNotes || null,
       })
       setActionNotes('')
       setShowNoteInput(false)
+      setShowDatePicker(false)
+      setPendingActionType(null)
+      setScheduledDate('')
       await fetchData()
     } catch (err) {
       console.error('Error creating action:', err)
@@ -766,6 +785,55 @@ export default function ClientDetail() {
             </button>
           </div>
         </div>
+
+        {/* Date picker modal for action scheduling */}
+        {showDatePicker && (
+          <div className="mb-4 sc-card p-4 border-2 border-accent-teal/30 bg-accent-teal/5">
+            <p className="text-sm font-bold text-txt-primary mb-3">
+              Quando vuoi ricontattare questo cliente?
+            </p>
+            <div className="flex flex-wrap items-end gap-3">
+              <div>
+                <label className="text-xs text-txt-label block mb-1">Data prossimo sollecito</label>
+                <input
+                  type="date"
+                  value={scheduledDate}
+                  onChange={(e) => setScheduledDate(e.target.value)}
+                  className="sc-input"
+                />
+              </div>
+              <div className="flex gap-2">
+                {[7, 14, 30].map(d => (
+                  <button
+                    key={d}
+                    onClick={() => {
+                      const dt = new Date()
+                      dt.setDate(dt.getDate() + d)
+                      setScheduledDate(dt.toISOString().split('T')[0])
+                    }}
+                    className="px-3 py-2 rounded-lg text-xs font-medium bg-dark-surface text-txt-secondary hover:bg-dark-border transition-colors"
+                  >
+                    +{d}gg
+                  </button>
+                ))}
+              </div>
+              <div className="flex-1" />
+              <button
+                onClick={() => handleAction(pendingActionType)}
+                disabled={!scheduledDate || actionLoading}
+                className="px-5 py-2 bg-accent-teal text-dark-bg rounded-lg text-sm font-bold hover:brightness-110 disabled:opacity-50"
+              >
+                {actionLoading ? '...' : 'Conferma'}
+              </button>
+              <button
+                onClick={() => { setShowDatePicker(false); setPendingActionType(null) }}
+                className="px-4 py-2 text-sm text-txt-muted hover:text-txt-primary"
+              >
+                Annulla
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Note input */}
         {showNoteInput && (

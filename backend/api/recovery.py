@@ -224,17 +224,18 @@ async def create_action(
         session.add(new_action)
 
         # Update customer recovery status and next action
+        # Use user-provided scheduled_date if available, otherwise use defaults
         if action.action_type == "first_contact":
             customer.recovery_status = "first_contact"
-            customer.next_action_date = today + timedelta(days=7)
+            customer.next_action_date = scheduled or (today + timedelta(days=7))
             customer.next_action_type = "second_contact"
         elif action.action_type == "second_contact":
             customer.recovery_status = "second_contact"
-            customer.next_action_date = today + timedelta(days=14)
+            customer.next_action_date = scheduled or (today + timedelta(days=14))
             customer.next_action_type = "lawyer"
         elif action.action_type == "lawyer":
             customer.recovery_status = "lawyer"
-            customer.next_action_date = today + timedelta(days=30)
+            customer.next_action_date = scheduled or (today + timedelta(days=30))
             customer.next_action_type = "lawyer"  # Follow-up with lawyer
         elif action.action_type == "archive":
             customer.recovery_status = "archived"
@@ -242,7 +243,7 @@ async def create_action(
             customer.next_action_type = None
         elif action.action_type == "wait":
             customer.recovery_status = "waiting"
-            customer.next_action_date = today + timedelta(days=30)
+            customer.next_action_date = scheduled or (today + timedelta(days=30))
             # Keep same next_action_type
         # "note" doesn't change status
 
@@ -855,10 +856,23 @@ async def get_recovery_report(
             Customer.excluded.is_(False),
         ).all()
 
-        # Paid invoices
+        # Paid invoices (all)
         paid_invoices = session.query(Invoice).filter(
             Invoice.status == "paid",
         ).all()
+
+        # Recuperati: paid invoices where the customer had recovery actions
+        # These are the ones we actually recovered through our efforts
+        recovered_customer_ids = set(
+            a.customer_id for a in session.query(RecoveryAction.customer_id).filter(
+                RecoveryAction.action_type.in_(["first_contact", "second_contact", "lawyer"]),
+            ).distinct().all()
+        )
+        recovered_invoices = [
+            inv for inv in paid_invoices
+            if inv.customer_id and inv.customer_id in recovered_customer_ids
+        ]
+        recovered_total = sum(float(inv.amount or 0) for inv in recovered_invoices)
 
         # Upcoming actions (next 30 days)
         upcoming_actions = (
@@ -916,6 +930,8 @@ async def get_recovery_report(
                 "lawyer_count": len(lawyer_customers),
                 "paid_count": len(paid_invoices),
                 "paid_total": float(sum(i.amount for i in paid_invoices)),
+                "recovered_count": len(recovered_invoices),
+                "recovered_total": recovered_total,
                 "upcoming_actions_count": len(upcoming_actions) + len([
                     c for c in customers_upcoming
                     if c.id not in {a.customer_id for a in upcoming_actions}
@@ -945,6 +961,17 @@ async def get_recovery_report(
                     "notes": a.notes,
                 }
                 for a in upcoming_actions
+            ],
+            "recuperati": [
+                {
+                    "id": inv.id,
+                    "invoice_number": inv.invoice_number,
+                    "amount": float(inv.amount),
+                    "customer_name": inv.customer.ragione_sociale if inv.customer else inv.customer_name_raw,
+                    "customer_id": inv.customer_id,
+                    "source_platform": inv.source_platform,
+                }
+                for inv in recovered_invoices[:50]
             ],
         }
 
