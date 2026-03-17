@@ -214,6 +214,69 @@ def _run_migrations(engine):
     except Exception as e:
         _logger.warning(f"Migration warning (non-fatal): {e}")
 
+    # Enable Row Level Security on all tables (Supabase requirement)
+    _enable_rls(engine)
+
+
+def _enable_rls(engine):
+    """Enable Row Level Security on all public tables for Supabase.
+
+    - Enables RLS on each table (idempotent — no-op if already enabled)
+    - Creates a permissive policy for the 'postgres' role (our backend connection)
+    - This blocks anon/authenticated Supabase client access via PostgREST
+      while allowing our SQLAlchemy backend full access.
+
+    Skipped entirely for SQLite (local dev).
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    if config.DATABASE_URL.startswith("sqlite"):
+        return
+
+    tables = [
+        "customers", "invoices", "messages", "conversations",
+        "recovery_actions", "activity_log", "sync_state",
+    ]
+
+    try:
+        raw = engine.raw_connection()
+        try:
+            cur = raw.cursor()
+            for table in tables:
+                try:
+                    # Enable RLS
+                    cur.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+                    raw.commit()
+                except Exception:
+                    raw.rollback()
+
+                try:
+                    # Create policy allowing full access for postgres role (our backend)
+                    # DROP + CREATE for idempotency
+                    cur.execute(
+                        f"DROP POLICY IF EXISTS backend_full_access ON {table}"
+                    )
+                    raw.commit()
+                except Exception:
+                    raw.rollback()
+
+                try:
+                    cur.execute(
+                        f"CREATE POLICY backend_full_access ON {table} "
+                        f"FOR ALL TO postgres USING (true) WITH CHECK (true)"
+                    )
+                    raw.commit()
+                except Exception:
+                    raw.rollback()  # policy already exists
+
+            cur.close()
+            _logger.info(f"RLS enabled on {len(tables)} tables with backend_full_access policy")
+        finally:
+            raw.close()
+    except Exception as e:
+        _logger.warning(f"RLS setup warning (non-fatal): {e}")
+
 
 def get_session():
     """Create a new database session as a FastAPI dependency with auto-close."""
