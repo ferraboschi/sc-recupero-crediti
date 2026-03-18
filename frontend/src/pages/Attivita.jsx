@@ -237,14 +237,14 @@ export default function Attivita() {
           <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-blue">clienti in lavorazione</p>
         </button>
         <button onClick={() => setOverlayType('incassati')} className="sc-card p-4 text-left border-accent-green/20 hover:border-accent-green/50 transition-all group">
-          <p className="sc-kpi-label text-accent-green">Incassati</p>
-          <p className="text-2xl font-bold text-accent-green mt-1">{stages.resolved?.count || summary.fully_resolved || 0}</p>
-          <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-green">debiti risolti</p>
+          <p className="sc-kpi-label text-accent-green">Recuperati</p>
+          <p className="text-2xl font-bold text-accent-green mt-1">{stages.resolved?.count || 0}</p>
+          <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-green">clienti che hanno pagato dopo azione</p>
         </button>
         <button onClick={() => setOverlayType('recovered')} className="sc-card p-4 text-left border-accent-green/20 hover:border-accent-green/50 transition-all group">
           <p className="sc-kpi-label text-accent-green">Totale Recuperato</p>
-          <p className="text-2xl font-bold text-accent-green mt-1">{formatCurrency(stages.resolved?.amount || summary.total_recovered || 0)}</p>
-          <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-green">importo incassato</p>
+          <p className="text-2xl font-bold text-accent-green mt-1">{formatCurrency(stages.resolved?.amount || 0)}</p>
+          <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-green">importo da azioni di recupero</p>
         </button>
         <button onClick={() => setOverlayType('overdue')} className="sc-card p-4 text-left hover:border-accent-red/50 transition-all group">
           <p className="sc-kpi-label">Azioni Scadute</p>

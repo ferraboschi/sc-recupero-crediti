@@ -730,9 +730,10 @@ async def get_pipeline(session: Session = Depends(get_session)):
 
         stages["resolved"] = {
             "label": "Incassato",
-            "count": resolved_count,
-            "amount": float(resolved_amount),
-            "recovered_count": recovered_count,
+            "count": recovered_count,
+            "amount": float(recovered_amount or 0),
+            "all_paid_count": resolved_count,
+            "all_paid_amount": float(resolved_amount),
             "recovered_amount": float(recovered_amount or 0),
         }
 

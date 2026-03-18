@@ -396,8 +396,8 @@ export default function Dashboard() {
       {/* Top Stats */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatsWidget label="Totale Scaduto" value={formatCurrency(data.total_scaduto || 0)} color="red" />
-        <StatsWidget label="Fatture Scadute" value={data.total_fatture_scadute || 0} color="orange" />
-        <StatsWidget label="Clienti con Scaduto" value={data.total_clienti_scaduti || 0} color="purple" />
+        <StatsWidget label="Fatture Scadute" value={data.total_fatture_scadute || 0} subtitle="numero fatture" color="orange" />
+        <StatsWidget label="Clienti con Scaduto" value={data.total_clienti_scaduti || 0} subtitle="numero aziende" color="purple" />
         <StatsWidget label="Da Gestire" value={todos.length || 0} color="blue" />
       </div>
 
@@ -437,18 +437,6 @@ export default function Dashboard() {
               >
                 Tutti ({todos.length})
               </button>
-              {todoCounts.overdue > 0 && (
-                <button
-                  onClick={() => setFilterPriority('overdue')}
-                  className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
-                    filterPriority === 'overdue'
-                      ? 'bg-accent-red text-dark-bg'
-                      : 'bg-dark-card text-accent-red border border-accent-red/30 hover:bg-accent-red/10'
-                  }`}
-                >
-                  In Ritardo ({todoCounts.overdue})
-                </button>
-              )}
               {todoCounts.today > 0 && (
                 <button
                   onClick={() => setFilterPriority('today')}

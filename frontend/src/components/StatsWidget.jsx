@@ -1,6 +1,6 @@
 import React from 'react'
 
-export default function StatsWidget({ label, value, icon: Icon, trend, trendLabel, color = 'blue' }) {
+export default function StatsWidget({ label, value, subtitle, icon: Icon, trend, trendLabel, color = 'blue' }) {
   const colorClasses = {
     blue: 'border-accent-blue/30',
     green: 'border-accent-green/30',
@@ -21,6 +21,7 @@ export default function StatsWidget({ label, value, icon: Icon, trend, trendLabe
     <div className={`sc-kpi ${colorClasses[color]}`}>
       <p className="sc-kpi-label">{label}</p>
       <p className={`sc-kpi-value mt-2 ${valueColors[color] || 'text-txt-primary'}`}>{value}</p>
+      {subtitle && <p className="text-xs text-txt-muted mt-1">{subtitle}</p>}
       {trend !== undefined && (
         <p className={`text-xs mt-2 ${trend >= 0 ? 'text-accent-green' : 'text-accent-red'}`}>
           {trend >= 0 ? '↑' : '↓'} {Math.abs(trend)}% {trendLabel && `(${trendLabel})`}
