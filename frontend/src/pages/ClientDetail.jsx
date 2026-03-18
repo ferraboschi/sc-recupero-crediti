@@ -521,6 +521,14 @@ export default function ClientDetail() {
           <div className="bg-accent-blue/5 border border-accent-blue/20 rounded-lg p-3 text-center">
             <p className="text-xs text-accent-blue">Totale Dovuto</p>
             <p className="text-xl font-bold text-accent-blue">{formatCurrency(data.invoices?.total_due || 0)}</p>
+            {(() => {
+              const notOverdue = allUnpaid.filter(inv => (inv.days_overdue || 0) <= 0 && inv.due_date)
+              if (notOverdue.length > 0) {
+                const nearest = notOverdue.sort((a, b) => a.due_date.localeCompare(b.due_date))[0]
+                return <p className="text-xs text-accent-teal mt-0.5">Scade {formatDate(nearest.due_date)}</p>
+              }
+              return null
+            })()}
           </div>
           <div className="bg-accent-green/5 border border-accent-green/20 rounded-lg p-3 text-center">
             <p className="text-xs text-accent-green">Pagato</p>
@@ -1021,7 +1029,20 @@ export default function ClientDetail() {
           <div className="border border-accent-blue/20 rounded-lg p-4 bg-accent-blue/5">
             <p className="text-xs text-accent-blue mb-1">Totale Dovuto</p>
             <p className="text-lg font-bold text-accent-blue">{formatCurrency(data.invoices?.total_due || 0)}</p>
-            <p className="text-xs text-accent-blue/60">{allUnpaid.length} fatture non pagate</p>
+            <p className="text-xs text-accent-blue/60">{allUnpaid.length} fattur{allUnpaid.length === 1 ? 'a non pagata' : 'e non pagate'}</p>
+            {(() => {
+              const notOverdue = allUnpaid.filter(inv => (inv.days_overdue || 0) <= 0 && inv.due_date)
+              if (notOverdue.length > 0) {
+                const nearest = notOverdue.sort((a, b) => a.due_date.localeCompare(b.due_date))[0]
+                return (
+                  <p className="text-xs text-accent-teal mt-1">
+                    Prossima scadenza: <span className="font-medium">{formatDate(nearest.due_date)}</span>
+                    <span className="text-accent-teal/60"> (tra {Math.abs(nearest.days_overdue)}gg)</span>
+                  </p>
+                )
+              }
+              return null
+            })()}
           </div>
           <div className="border border-accent-green/20 rounded-lg p-4 bg-accent-green/5">
             <p className="text-xs text-accent-green mb-1">Pagato</p>
