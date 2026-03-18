@@ -699,34 +699,37 @@ async def get_pipeline(session: Session = Depends(get_session)):
             .scalar() or 0
         )
 
-        # Of which: recovered (had recovery actions before paying)
-        recovered_customer_ids = (
-            session.query(func.distinct(RecoveryAction.customer_id))
+        # Of which: recovered (invoices paid AFTER first recovery action)
+        # Subquery: first recovery action date per customer
+        first_action_date = (
+            session.query(
+                RecoveryAction.customer_id,
+                func.min(RecoveryAction.created_at).label("first_action"),
+            )
             .filter(
                 RecoveryAction.action_type.in_(
                     ["first_contact", "second_contact", "lawyer"]
                 ),
             )
+            .group_by(RecoveryAction.customer_id)
             .subquery()
         )
-        recovered_count = (
-            session.query(
-                func.count(func.distinct(Invoice.customer_id))
+
+        # Only count invoices paid (updated_at) AFTER the first recovery action
+        recovered_query = (
+            session.query(Invoice)
+            .join(
+                first_action_date,
+                Invoice.customer_id == first_action_date.c.customer_id,
             )
             .filter(
                 Invoice.status == "paid",
-                Invoice.customer_id.in_(recovered_customer_ids),
+                Invoice.updated_at >= first_action_date.c.first_action,
             )
-            .scalar() or 0
         )
-        recovered_amount = (
-            session.query(func.sum(Invoice.amount))
-            .filter(
-                Invoice.status == "paid",
-                Invoice.customer_id.in_(recovered_customer_ids),
-            )
-            .scalar() or 0
-        )
+        recovered_invoices = recovered_query.all()
+        recovered_count = len(set(inv.customer_id for inv in recovered_invoices))
+        recovered_amount = sum(float(inv.amount or 0) for inv in recovered_invoices)
 
         stages["resolved"] = {
             "label": "Incassato",
