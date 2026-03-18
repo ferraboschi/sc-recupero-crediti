@@ -1025,18 +1025,54 @@ export default function ClientDetail() {
           </div>
           <div className="border border-accent-green/20 rounded-lg p-4 bg-accent-green/5">
             <p className="text-xs text-accent-green mb-1">Pagato</p>
-            <p className="text-lg font-bold text-accent-green">
-              {formatCurrency(
-                (data.invoices?.items || [])
-                  .filter(inv => inv.status === 'paid')
-                  .reduce((sum, inv) => sum + inv.amount_due, 0)
-              )}
-            </p>
+            <p className="text-lg font-bold text-accent-green">{formatCurrency(totalPaid)}</p>
             <p className="text-xs text-accent-green/60">
-              {(data.invoices?.items || []).filter(inv => inv.status === 'paid').length} fatture pagate
+              {paidInvoices.length} fattur{paidInvoices.length === 1 ? 'a pagata' : 'e pagate'}
             </p>
           </div>
         </div>
+
+        {/* Paid invoices detail in Riepilogo */}
+        {paidInvoices.length > 0 && (
+          <div className="mt-4">
+            <h3 className="text-sm font-bold text-accent-green mb-2">Dettaglio Fatture Pagate</h3>
+            <div className="overflow-x-auto rounded-lg border border-accent-green/20">
+              <table className="w-full text-sm">
+                <thead className="bg-accent-green/5">
+                  <tr>
+                    <th className="px-3 py-2 text-left text-xs font-semibold text-accent-green uppercase">Fattura</th>
+                    <th className="px-3 py-2 text-left text-xs font-semibold text-accent-green uppercase">Fonte</th>
+                    <th className="px-3 py-2 text-right text-xs font-semibold text-accent-green uppercase">Importo</th>
+                    <th className="px-3 py-2 text-left text-xs font-semibold text-accent-green uppercase">Scadenza</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-dark-border">
+                  {paidInvoices.map(inv => (
+                    <tr key={inv.id} className="hover:bg-accent-green/5 transition-colors">
+                      <td className="px-3 py-2 font-medium text-txt-primary">{inv.invoice_number}</td>
+                      <td className="px-3 py-2">
+                        <span className={`sc-badge text-xs ${
+                          inv.source_platform === 'fatturapro' ? 'bg-accent-purple/15 text-accent-purple' : 'bg-accent-teal/15 text-accent-teal'
+                        }`}>
+                          {inv.source_platform === 'fatturapro' ? 'FPro' : 'F24'}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-right font-medium text-accent-green">{formatCurrency(inv.amount)}</td>
+                      <td className="px-3 py-2 text-txt-secondary">{formatDate(inv.due_date)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot className="border-t-2 border-accent-green/30 bg-accent-green/10">
+                  <tr>
+                    <td colSpan="2" className="px-3 py-2 font-bold text-accent-green">Totale Incassato</td>
+                    <td className="px-3 py-2 text-right font-bold text-accent-green">{formatCurrency(totalPaid)}</td>
+                    <td></td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </div>
+        )}
 
         {/* Quick actions */}
         <div className="mt-4 pt-4 border-t border-dark-border flex flex-wrap gap-2">
