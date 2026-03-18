@@ -372,6 +372,8 @@ export default function ClientDetail() {
   const overdueInvoices = data.invoices?.items?.filter(inv => inv.days_overdue > 0 && inv.status !== 'paid') || []
   const totalOverdue = overdueInvoices.reduce((sum, inv) => sum + inv.amount_due, 0)
   const allUnpaid = data.invoices?.items?.filter(inv => inv.status !== 'paid') || []
+  const paidInvoices = data.invoices?.items?.filter(inv => inv.status === 'paid') || []
+  const totalPaid = paidInvoices.reduce((sum, inv) => sum + inv.amount, 0)
   const whatsappNumber = getWhatsAppNumber() || null
 
   let visibleInvoices = showAllInvoices
@@ -507,7 +509,7 @@ export default function ClientDetail() {
         </div>
 
         {/* Summary stats */}
-        <div className="mt-6 grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="mt-6 grid grid-cols-2 md:grid-cols-5 gap-4">
           <div className="bg-accent-red/5 border border-accent-red/20 rounded-lg p-3 text-center">
             <p className="text-xs text-accent-red">Fatture Scadute</p>
             <p className="text-xl font-bold text-accent-red">{overdueInvoices.length}</p>
@@ -519,6 +521,11 @@ export default function ClientDetail() {
           <div className="bg-accent-blue/5 border border-accent-blue/20 rounded-lg p-3 text-center">
             <p className="text-xs text-accent-blue">Totale Dovuto</p>
             <p className="text-xl font-bold text-accent-blue">{formatCurrency(data.invoices?.total_due || 0)}</p>
+          </div>
+          <div className="bg-accent-green/5 border border-accent-green/20 rounded-lg p-3 text-center">
+            <p className="text-xs text-accent-green">Pagato</p>
+            <p className="text-xl font-bold text-accent-green">{formatCurrency(totalPaid)}</p>
+            <p className="text-xs text-accent-green/60 mt-0.5">{paidInvoices.length} fattur{paidInvoices.length === 1 ? 'a' : 'e'}</p>
           </div>
           <div className="bg-dark-surface border border-dark-border rounded-lg p-3 text-center">
             <p className="text-xs text-txt-muted">Fatture Totali</p>
@@ -625,16 +632,18 @@ export default function ClientDetail() {
                   <td className="px-3 py-3 text-sm text-right font-medium text-txt-primary">{formatCurrency(inv.amount_due)}</td>
                   <td className="px-3 py-3 text-sm text-txt-secondary">{formatDate(inv.due_date)}</td>
                   <td className="px-3 py-3 text-sm text-right">
-                    {(inv.days_overdue || 0) > 0 ? (
+                    {inv.status === 'paid' ? (
+                      <span className="text-accent-green font-medium">Pagato</span>
+                    ) : (inv.days_overdue || 0) > 0 ? (
                       <span className={inv.days_overdue > 30 ? 'text-accent-red font-medium' : 'text-accent-amber'}>
-                        {inv.days_overdue}
+                        +{inv.days_overdue}gg
                       </span>
                     ) : (inv.days_overdue || 0) < 0 ? (
-                      <span className="text-accent-green font-medium">
-                        {inv.days_overdue}
+                      <span className="text-accent-teal text-xs" title={`Scadenza: ${formatDate(inv.due_date)}`}>
+                        Scade tra {Math.abs(inv.days_overdue)}gg
                       </span>
                     ) : (
-                      <span className="text-txt-muted">0</span>
+                      <span className="text-accent-amber font-medium">Oggi</span>
                     )}
                   </td>
                   <td className="px-3 py-3 text-sm text-center">
@@ -710,6 +719,57 @@ export default function ClientDetail() {
           </div>
         )}
       </div>
+
+      {/* SEZIONE FATTURE PAGATE */}
+      {paidInvoices.length > 0 && (
+        <div className="sc-card overflow-hidden">
+          <div className="sc-card-header">
+            <h2 className="text-base font-bold text-accent-green">
+              Fatture Pagate ({paidInvoices.length})
+            </h2>
+            <span className="text-sm font-bold text-accent-green">{formatCurrency(totalPaid)}</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-dark-surface border-b border-dark-border">
+                <tr>
+                  <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Fattura</th>
+                  <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Fonte</th>
+                  <th className="px-3 py-3 text-right text-xs font-semibold text-txt-label uppercase tracking-wider">Importo</th>
+                  <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Scadenza</th>
+                  <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider">Stato</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-dark-border">
+                {paidInvoices.map(inv => (
+                  <tr key={inv.id} className="bg-accent-green/5 hover:bg-accent-green/10 transition-colors">
+                    <td className="px-3 py-3 text-sm font-medium text-txt-primary">{inv.invoice_number}</td>
+                    <td className="px-3 py-3 text-sm">
+                      <span className={`sc-badge ${
+                        inv.source_platform === 'fatturapro' ? 'bg-accent-purple/15 text-accent-purple' : 'bg-accent-teal/15 text-accent-teal'
+                      }`}>
+                        {inv.source_platform === 'fatturapro' ? 'FPro' : 'F24'}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 text-sm text-right font-medium text-accent-green">{formatCurrency(inv.amount)}</td>
+                    <td className="px-3 py-3 text-sm text-txt-secondary">{formatDate(inv.due_date)}</td>
+                    <td className="px-3 py-3 text-sm text-center">
+                      <span className="badge-paid sc-badge">Pagato</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot className="border-t-2 border-accent-green/30">
+                <tr className="bg-accent-green/10">
+                  <td colSpan="2" className="px-3 py-3 text-sm font-bold text-accent-green">Totale Incassato</td>
+                  <td className="px-3 py-3 text-sm text-right font-bold text-accent-green">{formatCurrency(totalPaid)}</td>
+                  <td colSpan="2"></td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* SEZIONE 2: AZIONI DI RECUPERO */}
       <div className="sc-card p-6">
