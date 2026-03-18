@@ -238,12 +238,12 @@ export default function Attivita() {
         </button>
         <button onClick={() => setOverlayType('incassati')} className="sc-card p-4 text-left border-accent-green/20 hover:border-accent-green/50 transition-all group">
           <p className="sc-kpi-label text-accent-green">Incassati</p>
-          <p className="text-2xl font-bold text-accent-green mt-1">{summary.fully_resolved || 0}</p>
+          <p className="text-2xl font-bold text-accent-green mt-1">{stages.resolved?.count || summary.fully_resolved || 0}</p>
           <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-green">debiti risolti</p>
         </button>
         <button onClick={() => setOverlayType('recovered')} className="sc-card p-4 text-left border-accent-green/20 hover:border-accent-green/50 transition-all group">
           <p className="sc-kpi-label text-accent-green">Totale Recuperato</p>
-          <p className="text-2xl font-bold text-accent-green mt-1">{formatCurrency(summary.total_recovered || 0)}</p>
+          <p className="text-2xl font-bold text-accent-green mt-1">{formatCurrency(stages.resolved?.amount || summary.total_recovered || 0)}</p>
           <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-green">importo incassato</p>
         </button>
         <button onClick={() => setOverlayType('overdue')} className="sc-card p-4 text-left hover:border-accent-red/50 transition-all group">

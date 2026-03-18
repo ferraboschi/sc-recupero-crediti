@@ -685,14 +685,21 @@ async def get_pipeline(session: Session = Depends(get_session)):
                 stages[status]["count"] = count or 0
                 stages[status]["amount"] = float(total or 0)
 
-        # Resolved: ONLY customers with recovery actions who paid
-        overdue_paid_filter = (
-            (Invoice.status == "paid")
-            & (Invoice.due_date.isnot(None))
-            & (Invoice.due_date < cast(Invoice.updated_at, Date))
+        # Resolved: all paid invoices (total incassato)
+        resolved_count = (
+            session.query(
+                func.count(func.distinct(Invoice.customer_id))
+            )
+            .filter(Invoice.status == "paid")
+            .scalar() or 0
+        )
+        resolved_amount = (
+            session.query(func.sum(Invoice.amount))
+            .filter(Invoice.status == "paid")
+            .scalar() or 0
         )
 
-        # Subquery: customer IDs that had recovery actions
+        # Of which: recovered (had recovery actions before paying)
         recovered_customer_ids = (
             session.query(func.distinct(RecoveryAction.customer_id))
             .filter(
@@ -702,21 +709,20 @@ async def get_pipeline(session: Session = Depends(get_session)):
             )
             .subquery()
         )
-
-        resolved_count = (
+        recovered_count = (
             session.query(
                 func.count(func.distinct(Invoice.customer_id))
             )
             .filter(
-                overdue_paid_filter,
+                Invoice.status == "paid",
                 Invoice.customer_id.in_(recovered_customer_ids),
             )
             .scalar() or 0
         )
-        resolved_amount = (
+        recovered_amount = (
             session.query(func.sum(Invoice.amount))
             .filter(
-                overdue_paid_filter,
+                Invoice.status == "paid",
                 Invoice.customer_id.in_(recovered_customer_ids),
             )
             .scalar() or 0
@@ -726,6 +732,8 @@ async def get_pipeline(session: Session = Depends(get_session)):
             "label": "Incassato",
             "count": resolved_count,
             "amount": float(resolved_amount),
+            "recovered_count": recovered_count,
+            "recovered_amount": float(recovered_amount or 0),
         }
 
         # Total customers with overdue
