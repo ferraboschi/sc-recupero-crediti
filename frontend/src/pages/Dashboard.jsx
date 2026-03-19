@@ -121,7 +121,7 @@ export default function Dashboard() {
 
   const fetchConnectorStatus = async () => {
     try {
-      const response = await client.get('/system/status', { timeout: 10000 })
+      const response = await client.get('/system', { timeout: 10000 })
       const connectors = response.data?.connectors || {}
       const errors = []
       Object.entries(connectors).forEach(([name, info]) => {
