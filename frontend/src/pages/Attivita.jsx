@@ -230,18 +230,23 @@ export default function Attivita() {
       </div>
 
       {/* ── FUNNEL CARDS ── */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+        <button onClick={() => setOverlayType('scadenza_passata')} className="sc-card p-4 text-left hover:border-accent-red/50 transition-all group">
+          <p className="sc-kpi-label text-accent-red">Scadenza Passata</p>
+          <p className="text-2xl font-bold text-accent-red mt-1">{pipeline?.total_with_overdue || 0}</p>
+          <p className="text-xs text-txt-muted mt-1">clienti con insoluti</p>
+        </button>
         <button onClick={() => setOverlayType('idle')} className="sc-card p-4 text-left hover:border-txt-muted/50 transition-all group">
           <p className="sc-kpi-label text-txt-muted">Da Contattare</p>
           <p className="text-2xl font-bold text-txt-primary mt-1">{stages.idle?.count || 0}</p>
           <p className="text-xs text-txt-muted mt-1">mai contattati</p>
         </button>
-        <button onClick={() => setOverlayType('contacted')} className="sc-card p-4 text-left hover:border-accent-blue/50 transition-all group">
+        <button onClick={() => setOverlayType('first_contact')} className="sc-card p-4 text-left hover:border-accent-blue/50 transition-all group">
           <p className="sc-kpi-label text-accent-blue">I Contatto</p>
           <p className="text-2xl font-bold text-accent-blue mt-1">{stages.first_contact?.count || 0}</p>
           <p className="text-xs text-txt-muted mt-1">prima segnalazione</p>
         </button>
-        <button onClick={() => setOverlayType('contacted')} className="sc-card p-4 text-left hover:border-accent-amber/50 transition-all group">
+        <button onClick={() => setOverlayType('second_contact')} className="sc-card p-4 text-left hover:border-accent-amber/50 transition-all group">
           <p className="sc-kpi-label text-accent-amber">II Contatto</p>
           <p className="text-2xl font-bold text-accent-amber mt-1">{stages.second_contact?.count || 0}</p>
           <p className="text-xs text-txt-muted mt-1">seconda segnalazione</p>
@@ -251,7 +256,7 @@ export default function Attivita() {
           <p className="text-2xl font-bold text-accent-green mt-1">{formatCurrency(stages.resolved?.amount || 0)}</p>
           <p className="text-xs text-txt-muted mt-1">totale incassato</p>
         </button>
-        <button onClick={() => setOverlayType('contacted')} className="sc-card p-4 text-left hover:border-accent-red/50 transition-all group">
+        <button onClick={() => setOverlayType('lawyer_overlay')} className="sc-card p-4 text-left hover:border-accent-red/50 transition-all group">
           <p className="sc-kpi-label text-accent-red">Avvocato</p>
           <p className="text-2xl font-bold text-accent-red mt-1">{stages.lawyer?.count || 0}</p>
           <p className="text-xs text-txt-muted mt-1">in gestione legale</p>
@@ -259,176 +264,115 @@ export default function Attivita() {
       </div>
 
       {/* ── OVERLAY MODAL ── */}
-      {overlayType && (
-        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => setOverlayType(null)}>
-          <div className="bg-dark-card rounded-xl shadow-2xl border border-dark-border max-w-lg w-full max-h-[80vh] overflow-hidden" onClick={(e) => e.stopPropagation()}>
-            {/* Header */}
-            <div className={`px-6 py-4 flex items-center justify-between border-b border-dark-border ${
-              overlayType === 'contacted' ? 'bg-accent-blue/5' :
-              overlayType === 'overdue' ? 'bg-accent-red/5' :
-              'bg-accent-green/5'
-            }`}>
-              <h3 className="text-base font-bold text-txt-primary">
-                {overlayType === 'contacted' && 'Account Contattati'}
-                {overlayType === 'incassati' && 'Incassati — Dettaglio'}
-                {overlayType === 'recovered' && 'Totale Recuperato — Dettaglio'}
-                {overlayType === 'overdue' && 'Azioni Scadute — Dettaglio'}
-              </h3>
-              <button onClick={() => setOverlayType(null)} className="text-txt-muted hover:text-txt-primary text-xl font-bold leading-none">&times;</button>
-            </div>
+      {overlayType && (() => {
+        const overlayConfig = {
+          scadenza_passata: { title: 'Scadenza Passata', bg: 'bg-accent-red/5', subtitle: `${pipeline?.total_with_overdue || 0} clienti con fatture scadute non pagate` },
+          idle: { title: 'Da Contattare', bg: 'bg-dark-surface', subtitle: `${stages.idle?.count || 0} clienti mai contattati` },
+          first_contact: { title: 'I Contatto', bg: 'bg-accent-blue/5', subtitle: `${stages.first_contact?.count || 0} clienti con prima segnalazione` },
+          second_contact: { title: 'II Contatto', bg: 'bg-accent-amber/5', subtitle: `${stages.second_contact?.count || 0} clienti con seconda segnalazione` },
+          incassati: { title: 'Recuperato', bg: 'bg-accent-green/5', subtitle: `${formatCurrency(stages.resolved?.amount || 0)} incassato da azioni di recupero` },
+          lawyer_overlay: { title: 'Avvocato', bg: 'bg-accent-red/5', subtitle: `${stages.lawyer?.count || 0} clienti in gestione legale` },
+        }
+        const cfg = overlayConfig[overlayType] || { title: '', bg: '', subtitle: '' }
 
-            {/* Body */}
-            <div className="px-6 py-4 overflow-y-auto max-h-[65vh]">
+        // Filter contacted customers by status for specific overlays
+        const getCustomersForOverlay = () => {
+          if (overlayType === 'first_contact') return contacted.filter(c => c.recovery_status === 'first_contact')
+          if (overlayType === 'second_contact') return contacted.filter(c => c.recovery_status === 'second_contact')
+          if (overlayType === 'lawyer_overlay') return contacted.filter(c => c.recovery_status === 'lawyer')
+          return []
+        }
 
-              {/* CONTATTATI: breakdown by status */}
-              {overlayType === 'contacted' && (() => {
-                const byStatus = {}
-                contacted.forEach(c => {
-                  const s = c.recovery_status || 'unknown'
-                  if (!byStatus[s]) byStatus[s] = { count: 0, amount: 0, customers: [] }
-                  byStatus[s].count++
-                  byStatus[s].amount += c.total_overdue || 0
-                  byStatus[s].customers.push(c)
-                })
-                const statusOrder = ['first_contact', 'second_contact', 'lawyer', 'waiting']
-                return (
-                  <div className="space-y-4">
-                    <p className="text-sm text-txt-muted">{contacted.length} clienti in lavorazione attiva</p>
-                    {statusOrder.filter(s => byStatus[s]).map(s => (
-                      <div key={s} className="border border-dark-border rounded-lg overflow-hidden">
-                        <div className={`px-4 py-2 flex items-center justify-between ${
-                          s === 'first_contact' ? 'bg-accent-blue/5' :
-                          s === 'second_contact' ? 'bg-accent-amber/5' :
-                          s === 'lawyer' ? 'bg-accent-red/5' : 'bg-accent-purple/5'
-                        }`}>
-                          <span className={`text-sm font-bold ${
-                            s === 'first_contact' ? 'text-accent-blue' :
-                            s === 'second_contact' ? 'text-accent-amber' :
-                            s === 'lawyer' ? 'text-accent-red' : 'text-accent-purple'
-                          }`}>{ACTION_LABELS[s] || s}</span>
-                          <span className="text-sm text-txt-secondary">{byStatus[s].count} clienti — {formatCurrency(byStatus[s].amount)} scaduto</span>
-                        </div>
-                        <div className="divide-y divide-dark-border">
-                          {byStatus[s].customers.map(c => (
-                            <div key={c.id} onClick={() => { setOverlayType(null); navigate(`/customers/${c.id}`) }}
-                              className="px-4 py-2 flex items-center justify-between hover:bg-dark-cardHover cursor-pointer transition-colors">
-                              <div>
-                                <p className="text-sm font-medium text-txt-primary">{c.ragione_sociale}</p>
-                                <p className="text-xs text-txt-muted">Ultimo: {formatDate(c.last_contact_date)} {c.last_outcome ? `— ${OUTCOME_LABELS[c.last_outcome] || c.last_outcome}` : ''}</p>
-                              </div>
-                              <p className="text-sm font-bold text-accent-red">{formatCurrency(c.total_overdue)}</p>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                    {contacted.length === 0 && <p className="text-sm text-txt-muted text-center py-4">Nessun account contattato.</p>}
-                  </div>
-                )
-              })()}
+        return (
+          <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => setOverlayType(null)}>
+            <div className="bg-dark-card rounded-xl shadow-2xl border border-dark-border max-w-lg w-full max-h-[80vh] overflow-hidden" onClick={(e) => e.stopPropagation()}>
+              <div className={`px-6 py-4 flex items-center justify-between border-b border-dark-border ${cfg.bg}`}>
+                <div>
+                  <h3 className="text-base font-bold text-txt-primary">{cfg.title}</h3>
+                  <p className="text-xs text-txt-muted mt-0.5">{cfg.subtitle}</p>
+                </div>
+                <button onClick={() => setOverlayType(null)} className="text-txt-muted hover:text-txt-primary text-xl font-bold leading-none">&times;</button>
+              </div>
 
-              {/* INCASSATI */}
-              {overlayType === 'incassati' && (
-                <div className="space-y-3">
-                  <p className="text-sm text-txt-muted">
-                    {incassati.filter(i => i.fully_resolved).length} completamente risolti su {incassati.length} con pagamenti
-                  </p>
-                  {incassati.length === 0 && <p className="text-sm text-txt-muted text-center py-4">Nessun incasso da azioni di recupero.</p>}
-                  {incassati.map(inc => (
-                    <div key={inc.id} onClick={() => { setOverlayType(null); navigate(`/customers/${inc.id}`) }}
-                      className={`rounded-lg px-4 py-3 cursor-pointer transition-colors border ${
-                        inc.fully_resolved ? 'bg-accent-green/5 border-accent-green/30 hover:bg-accent-green/10' : 'bg-accent-amber/5 border-accent-amber/30 hover:bg-accent-amber/10'
-                      }`}>
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <p className="text-sm font-medium text-txt-primary">{inc.ragione_sociale}</p>
-                          <p className="text-xs text-txt-muted mt-0.5">
-                            {inc.paid_count} fatture pagate — ultimo: {formatDate(inc.last_payment)}
-                          </p>
-                        </div>
-                        <div className="text-right">
-                          <p className="text-sm font-bold text-accent-green">{formatCurrency(inc.total_paid)}</p>
-                          <span className={`text-xs font-bold px-2 py-0.5 rounded ${
-                            inc.fully_resolved ? 'bg-accent-green/20 text-accent-green' : 'bg-accent-amber/20 text-accent-amber'
-                          }`}>{inc.fully_resolved ? 'RISOLTO' : 'PARZIALE'}</span>
-                        </div>
-                      </div>
+              <div className="px-6 py-4 overflow-y-auto max-h-[65vh]">
+
+                {/* SCADENZA PASSATA: info only */}
+                {overlayType === 'scadenza_passata' && (
+                  <div className="space-y-3">
+                    <p className="text-sm text-txt-secondary">Clienti con almeno una fattura scaduta non pagata. Vai alla pagina Clienti per gestirli.</p>
+                    <div className="flex items-center justify-between p-3 rounded-lg bg-accent-red/5 border border-accent-red/20">
+                      <span className="text-sm text-txt-primary">Totale scaduto</span>
+                      <span className="text-lg font-bold text-accent-red">{formatCurrency(stages.idle?.amount + stages.first_contact?.amount + stages.second_contact?.amount + stages.lawyer?.amount + stages.waiting?.amount || 0)}</span>
                     </div>
-                  ))}
-                </div>
-              )}
-
-              {/* TOTALE RECUPERATO */}
-              {overlayType === 'recovered' && (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between mb-2">
-                    <p className="text-sm text-txt-muted">{incassati.length} clienti con pagamenti da recupero</p>
-                    <p className="text-lg font-bold text-accent-green">{formatCurrency(summary.total_recovered || 0)}</p>
+                    <button onClick={() => { setOverlayType(null); navigate('/customers') }}
+                      className="w-full sc-btn-primary text-sm font-bold mt-2">
+                      Vai ai Clienti
+                    </button>
                   </div>
-                  {incassati.length === 0 && <p className="text-sm text-txt-muted text-center py-4">Nessun importo recuperato.</p>}
-                  {incassati.map(inc => {
-                    const pct = summary.total_recovered > 0 ? Math.max((inc.total_paid / summary.total_recovered) * 100, 2) : 0
-                    return (
+                )}
+
+                {/* IDLE: Da Contattare - info + link */}
+                {overlayType === 'idle' && (
+                  <div className="space-y-3">
+                    <p className="text-sm text-txt-secondary">{stages.idle?.count || 0} clienti con fatture scadute che non hanno mai ricevuto un sollecito.</p>
+                    <div className="flex items-center justify-between p-3 rounded-lg bg-dark-surface border border-dark-border">
+                      <span className="text-sm text-txt-primary">Totale da sollecitare</span>
+                      <span className="text-lg font-bold text-txt-primary">{formatCurrency(stages.idle?.amount || 0)}</span>
+                    </div>
+                    <button onClick={() => { setOverlayType(null); navigate('/customers') }}
+                      className="w-full sc-btn-primary text-sm font-bold mt-2">
+                      Vai ai Clienti
+                    </button>
+                  </div>
+                )}
+
+                {/* I CONTATTO / II CONTATTO / AVVOCATO: customer list */}
+                {['first_contact', 'second_contact', 'lawyer_overlay'].includes(overlayType) && (() => {
+                  const customers = getCustomersForOverlay()
+                  return (
+                    <div className="space-y-2">
+                      {customers.length === 0 && <p className="text-sm text-txt-muted text-center py-4">Nessun cliente in questo stato.</p>}
+                      {customers.map(c => (
+                        <div key={c.id} onClick={() => { setOverlayType(null); navigate(`/customers/${c.id}`) }}
+                          className="flex items-center justify-between rounded-lg px-4 py-3 cursor-pointer border border-dark-border hover:bg-dark-cardHover transition-colors">
+                          <div>
+                            <p className="text-sm font-medium text-txt-primary">{c.ragione_sociale}</p>
+                            <p className="text-xs text-txt-muted">
+                              {c.overdue_count} fatture scadute
+                              {c.last_contact_date ? ` — ultimo contatto: ${formatDate(c.last_contact_date)}` : ''}
+                            </p>
+                          </div>
+                          <p className="text-sm font-bold text-accent-red">{formatCurrency(c.total_overdue)}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )
+                })()}
+
+                {/* INCASSATI / RECUPERATO */}
+                {overlayType === 'incassati' && (
+                  <div className="space-y-3">
+                    {incassati.length === 0 && <p className="text-sm text-txt-muted text-center py-4">Nessun incasso da azioni di recupero. Quando un cliente sollecitato pagherà, apparirà qui.</p>}
+                    {incassati.map(inc => (
                       <div key={inc.id} onClick={() => { setOverlayType(null); navigate(`/customers/${inc.id}`) }}
-                        className="cursor-pointer hover:bg-dark-cardHover rounded-lg p-3 border border-dark-border transition-colors">
-                        <div className="flex items-center justify-between mb-1.5">
-                          <p className="text-sm font-medium text-txt-primary">{inc.ragione_sociale}</p>
+                        className="rounded-lg px-4 py-3 cursor-pointer transition-colors border bg-accent-green/5 border-accent-green/30 hover:bg-accent-green/10">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <p className="text-sm font-medium text-txt-primary">{inc.ragione_sociale}</p>
+                            <p className="text-xs text-txt-muted mt-0.5">{inc.paid_count} fatture pagate — ultimo: {formatDate(inc.last_payment)}</p>
+                          </div>
                           <p className="text-sm font-bold text-accent-green">{formatCurrency(inc.total_paid)}</p>
                         </div>
-                        <div className="w-full bg-dark-surface rounded-full h-2.5">
-                          <div className="bg-accent-green h-2.5 rounded-full transition-all" style={{ width: `${pct}%` }} />
-                        </div>
-                        <div className="flex items-center justify-between mt-1">
-                          <p className="text-xs text-txt-muted">{inc.paid_count} fatture — ultimo {formatDate(inc.last_payment)}</p>
-                          <p className="text-xs text-txt-muted">{pct.toFixed(1)}%</p>
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-
-              {/* AZIONI SCADUTE */}
-              {overlayType === 'overdue' && (() => {
-                const overdueActions = []
-                const todayStr2 = now.toISOString().split('T')[0]
-                if (calData?.days) {
-                  Object.entries(calData.days).forEach(([date, actions]) => {
-                    if (date < todayStr2) {
-                      actions.filter(a => !a.completed_at).forEach(a => overdueActions.push({ ...a, date }))
-                    }
-                  })
-                }
-                overdueActions.sort((a, b) => a.date.localeCompare(b.date))
-                return (
-                  <div className="space-y-2">
-                    <p className="text-sm text-txt-muted">{overdueActions.length} azioni scadute da completare o ripianificare</p>
-                    {overdueActions.length === 0 && <p className="text-sm text-accent-green text-center py-4">Nessuna azione scaduta! Tutto in ordine.</p>}
-                    {overdueActions.map((a, idx) => (
-                      <div key={a.id || idx} onClick={() => { setOverlayType(null); navigate(`/customers/${a.customer_id}`) }}
-                        className="flex items-center justify-between rounded-lg px-4 py-3 cursor-pointer bg-accent-red/5 border border-accent-red/20 hover:bg-accent-red/10 transition-colors">
-                        <div className="flex items-center gap-3 min-w-0">
-                          <span className={`${STATUS_BADGE[a.action_type] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'} sc-badge shrink-0`}>
-                            {ACTION_LABELS[a.action_type] || a.action_type}
-                          </span>
-                          <div className="min-w-0">
-                            <p className="text-sm font-medium text-txt-primary truncate">{a.customer_name}</p>
-                            <p className="text-xs text-accent-red">Scaduta il {formatDate(a.date)}</p>
-                          </div>
-                        </div>
-                        {a.total_overdue > 0 && (
-                          <p className="text-sm font-bold text-accent-red shrink-0">{formatCurrency(a.total_overdue)}</p>
-                        )}
                       </div>
                     ))}
                   </div>
-                )
-              })()}
+                )}
 
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* ── CALENDAR ── */}
       <div className="sc-card p-6">
