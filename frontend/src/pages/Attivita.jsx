@@ -229,27 +229,32 @@ export default function Attivita() {
         </div>
       </div>
 
-      {/* ── SUMMARY CARDS (clickable) ── */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      {/* ── FUNNEL CARDS ── */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <button onClick={() => setOverlayType('idle')} className="sc-card p-4 text-left hover:border-txt-muted/50 transition-all group">
+          <p className="sc-kpi-label text-txt-muted">Da Contattare</p>
+          <p className="text-2xl font-bold text-txt-primary mt-1">{stages.idle?.count || 0}</p>
+          <p className="text-xs text-txt-muted mt-1">mai contattati</p>
+        </button>
         <button onClick={() => setOverlayType('contacted')} className="sc-card p-4 text-left hover:border-accent-blue/50 transition-all group">
-          <p className="sc-kpi-label">Account Contattati</p>
-          <p className="text-2xl font-bold text-accent-blue mt-1">{summary.total_contacted || 0}</p>
-          <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-blue">clienti in lavorazione</p>
+          <p className="sc-kpi-label text-accent-blue">I Contatto</p>
+          <p className="text-2xl font-bold text-accent-blue mt-1">{stages.first_contact?.count || 0}</p>
+          <p className="text-xs text-txt-muted mt-1">prima segnalazione</p>
+        </button>
+        <button onClick={() => setOverlayType('contacted')} className="sc-card p-4 text-left hover:border-accent-amber/50 transition-all group">
+          <p className="sc-kpi-label text-accent-amber">II Contatto</p>
+          <p className="text-2xl font-bold text-accent-amber mt-1">{stages.second_contact?.count || 0}</p>
+          <p className="text-xs text-txt-muted mt-1">seconda segnalazione</p>
         </button>
         <button onClick={() => setOverlayType('incassati')} className="sc-card p-4 text-left border-accent-green/20 hover:border-accent-green/50 transition-all group">
-          <p className="sc-kpi-label text-accent-green">Recuperati</p>
-          <p className="text-2xl font-bold text-accent-green mt-1">{stages.resolved?.count || 0}</p>
-          <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-green">clienti che hanno pagato dopo azione</p>
-        </button>
-        <button onClick={() => setOverlayType('recovered')} className="sc-card p-4 text-left border-accent-green/20 hover:border-accent-green/50 transition-all group">
-          <p className="sc-kpi-label text-accent-green">Totale Recuperato</p>
+          <p className="sc-kpi-label text-accent-green">Recuperato</p>
           <p className="text-2xl font-bold text-accent-green mt-1">{formatCurrency(stages.resolved?.amount || 0)}</p>
-          <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-green">importo da azioni di recupero</p>
+          <p className="text-xs text-txt-muted mt-1">totale incassato</p>
         </button>
-        <button onClick={() => setOverlayType('overdue')} className="sc-card p-4 text-left hover:border-accent-red/50 transition-all group">
-          <p className="sc-kpi-label">Azioni Scadute</p>
-          <p className="text-2xl font-bold text-accent-red mt-1">{calData?.overdue_count || 0}</p>
-          <p className="text-xs text-txt-muted mt-1 group-hover:text-accent-red">da completare</p>
+        <button onClick={() => setOverlayType('contacted')} className="sc-card p-4 text-left hover:border-accent-red/50 transition-all group">
+          <p className="sc-kpi-label text-accent-red">Avvocato</p>
+          <p className="text-2xl font-bold text-accent-red mt-1">{stages.lawyer?.count || 0}</p>
+          <p className="text-xs text-txt-muted mt-1">in gestione legale</p>
         </button>
       </div>
 
