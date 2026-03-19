@@ -861,16 +861,22 @@ async def get_recovery_report(
             Invoice.status == "paid",
         ).all()
 
-        # Recuperati: paid invoices where the customer had recovery actions
-        # These are the ones we actually recovered through our efforts
-        recovered_customer_ids = set(
-            a.customer_id for a in session.query(RecoveryAction.customer_id).filter(
-                RecoveryAction.action_type.in_(["first_contact", "second_contact", "lawyer"]),
-            ).distinct().all()
-        )
+        # Recuperati: paid invoices AFTER first recovery action on that customer
+        first_actions = {}
+        for row in session.query(
+            RecoveryAction.customer_id,
+            func.min(RecoveryAction.created_at).label("first_action"),
+        ).filter(
+            RecoveryAction.action_type.in_(["first_contact", "second_contact", "lawyer"]),
+        ).group_by(RecoveryAction.customer_id).all():
+            first_actions[row[0]] = row[1]
+
         recovered_invoices = [
             inv for inv in paid_invoices
-            if inv.customer_id and inv.customer_id in recovered_customer_ids
+            if inv.customer_id
+            and inv.customer_id in first_actions
+            and inv.updated_at
+            and inv.updated_at >= first_actions[inv.customer_id]
         ]
         recovered_total = sum(float(inv.amount or 0) for inv in recovered_invoices)
 

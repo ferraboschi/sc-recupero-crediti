@@ -535,23 +535,19 @@ async def get_attivita(session: Session = Depends(get_session)):
             })
 
         # ── INCASSATI ──
-        # ONLY customers who:
-        # 1. Had at least one recovery action (first_contact/second_contact/lawyer)
-        # 2. Have paid invoices that were overdue (due_date < payment date)
-        overdue_paid_filter = (
-            (Invoice.status == "paid")
-            & (Invoice.due_date.isnot(None))
-            & (Invoice.due_date < cast(Invoice.updated_at, Date))
-        )
-
-        # Subquery: customer IDs that had recovery actions
-        recovered_customer_ids = (
-            session.query(func.distinct(RecoveryAction.customer_id))
+        # ONLY invoices paid AFTER the first recovery action on that customer.
+        # Subquery: first recovery action date per customer
+        first_action_sub = (
+            session.query(
+                RecoveryAction.customer_id,
+                func.min(RecoveryAction.created_at).label("first_action"),
+            )
             .filter(
                 RecoveryAction.action_type.in_(
                     ["first_contact", "second_contact", "lawyer"]
                 ),
             )
+            .group_by(RecoveryAction.customer_id)
             .subquery()
         )
 
@@ -566,10 +562,14 @@ async def get_attivita(session: Session = Depends(get_session)):
                 func.max(Invoice.updated_at).label("last_payment"),
             )
             .join(Invoice, Invoice.customer_id == Customer.id)
+            .join(
+                first_action_sub,
+                Customer.id == first_action_sub.c.customer_id,
+            )
             .filter(
-                overdue_paid_filter,
+                Invoice.status == "paid",
+                Invoice.updated_at >= first_action_sub.c.first_action,
                 Customer.excluded.is_(False),
-                Customer.id.in_(recovered_customer_ids),
             )
             .group_by(
                 Customer.id, Customer.ragione_sociale,
