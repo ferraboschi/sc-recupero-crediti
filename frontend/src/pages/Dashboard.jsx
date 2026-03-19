@@ -51,6 +51,7 @@ export default function Dashboard() {
   const [todoCounts, setTodoCounts] = useState({})
   const [todoLoading, setTodoLoading] = useState(true)
   const [retryCount, setRetryCount] = useState(0)
+  const [connectorErrors, setConnectorErrors] = useState([])
 
   // Filter & Sort state
   const [filterPriority, setFilterPriority] = useState('all')
@@ -118,9 +119,26 @@ export default function Dashboard() {
     searchTimeout.current = setTimeout(() => handleSearch(val), 300)
   }
 
+  const fetchConnectorStatus = async () => {
+    try {
+      const response = await client.get('/system/status', { timeout: 10000 })
+      const connectors = response.data?.connectors || {}
+      const errors = []
+      Object.entries(connectors).forEach(([name, info]) => {
+        if (info.status === 'error' || info.error) {
+          errors.push({ name, error: info.error || info.status_detail || 'Connessione fallita' })
+        }
+      })
+      setConnectorErrors(errors)
+    } catch (err) {
+      // Don't block dashboard if status check fails
+    }
+  }
+
   useEffect(() => {
     fetchData()
     fetchTodos()
+    fetchConnectorStatus()
   }, [])
 
   const handleSync = async () => {
@@ -392,6 +410,22 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      {/* Connector warnings */}
+      {connectorErrors.length > 0 && (
+        <div className="bg-accent-red/10 border border-accent-red/30 rounded-lg px-4 py-3 flex items-center gap-3">
+          <span className="text-accent-red text-lg">⚠</span>
+          <div className="flex-1">
+            <p className="text-sm font-medium text-accent-red">Connessioni interrotte</p>
+            <p className="text-xs text-accent-red/70 mt-0.5">
+              {connectorErrors.map(e => e.name).join(', ')} — vai a Sistema per dettagli
+            </p>
+          </div>
+          <button onClick={() => navigate('/system')} className="text-xs text-accent-red font-bold hover:underline">
+            Verifica
+          </button>
+        </div>
+      )}
 
       {/* Top Stats */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
