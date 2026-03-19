@@ -65,16 +65,16 @@ export default function Dashboard() {
   const fetchData = async (retry = 0) => {
     try {
       setLoading(true)
-      const response = await client.get('/dashboard')
+      const response = await client.get('/dashboard', { timeout: 15000 })
       setData(response.data)
       setRetryCount(0)
       const savedLastSync = localStorage.getItem('lastSyncTime')
       if (savedLastSync) setLastSync(new Date(savedLastSync))
     } catch (err) {
       console.error(err)
-      if (retry < 5) {
+      if (retry < 2) {
         setRetryCount(retry + 1)
-        setTimeout(() => fetchData(retry + 1), 3000)
+        setTimeout(() => fetchData(retry + 1), 2000)
       } else {
         setError('Errore nel caricamento dei dati del dashboard')
       }
