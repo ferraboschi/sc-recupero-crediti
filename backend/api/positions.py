@@ -334,3 +334,58 @@ async def update_position_status(
         logger.error(f"Error updating position status: {e}", exc_info=True)
         session.rollback()
         raise
+
+
+@router.put("/{position_id}/reassign")
+async def reassign_position(
+    position_id: int,
+    new_customer_id: int = Query(..., description="ID of the customer to reassign this invoice to"),
+    session: Session = Depends(get_session),
+):
+    """Reassign an invoice to a different customer."""
+    try:
+        position = session.query(Invoice).filter(Invoice.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+
+        new_customer = session.query(Customer).filter(Customer.id == new_customer_id).first()
+        if not new_customer:
+            raise HTTPException(status_code=404, detail="Target customer not found")
+
+        old_customer_id = position.customer_id
+        old_customer_name = position.customer.ragione_sociale if position.customer else None
+        position.customer_id = new_customer_id
+        session.commit()
+
+        activity = ActivityLog(
+            action="reassign",
+            entity_type="invoice",
+            entity_id=position_id,
+            details={
+                "invoice_number": position.invoice_number,
+                "old_customer_id": old_customer_id,
+                "old_customer_name": old_customer_name,
+                "new_customer_id": new_customer_id,
+                "new_customer_name": new_customer.ragione_sociale,
+            }
+        )
+        session.add(activity)
+        session.commit()
+
+        logger.info(f"Position {position_id} reassigned from customer {old_customer_id} to {new_customer_id}")
+
+        return {
+            "id": position.id,
+            "invoice_number": position.invoice_number,
+            "old_customer_id": old_customer_id,
+            "old_customer_name": old_customer_name,
+            "new_customer_id": new_customer_id,
+            "new_customer_name": new_customer.ragione_sociale,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reassigning position: {e}", exc_info=True)
+        session.rollback()
+        raise

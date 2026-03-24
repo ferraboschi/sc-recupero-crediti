@@ -435,3 +435,68 @@ async def update_customer_phone(
         logger.error(f"Error updating customer phone: {e}", exc_info=True)
         session.rollback()
         raise
+
+
+@router.post("")
+async def create_customer(
+    ragione_sociale: str = Query(..., description="Company name"),
+    partita_iva: str = Query(None, description="P.IVA (VAT number)"),
+    codice_fiscale: str = Query(None, description="Codice Fiscale"),
+    phone: str = Query(None, description="Phone number"),
+    email: str = Query(None, description="Email address"),
+    session: Session = Depends(get_session),
+):
+    """Create a new customer manually (for data corrections)."""
+    try:
+        existing = session.query(Customer).filter(
+            Customer.ragione_sociale == ragione_sociale
+        ).first()
+        if existing:
+            return {
+                "id": existing.id,
+                "ragione_sociale": existing.ragione_sociale,
+                "partita_iva": existing.partita_iva,
+                "already_existed": True,
+            }
+
+        import re
+        normalized = re.sub(r'[^a-z0-9]', '', ragione_sociale.lower())
+
+        customer = Customer(
+            ragione_sociale=ragione_sociale,
+            ragione_sociale_normalized=normalized,
+            partita_iva=partita_iva,
+            codice_fiscale=codice_fiscale,
+            phone=phone,
+            email=email,
+            source="manual",
+        )
+        session.add(customer)
+        session.commit()
+
+        activity = ActivityLog(
+            action="customer_created",
+            entity_type="customer",
+            entity_id=customer.id,
+            details={
+                "ragione_sociale": ragione_sociale,
+                "source": "manual",
+                "reason": "data_correction",
+            }
+        )
+        session.add(activity)
+        session.commit()
+
+        logger.info(f"Customer created manually: {ragione_sociale} (ID: {customer.id})")
+
+        return {
+            "id": customer.id,
+            "ragione_sociale": customer.ragione_sociale,
+            "partita_iva": customer.partita_iva,
+            "already_existed": False,
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating customer: {e}", exc_info=True)
+        session.rollback()
+        raise
