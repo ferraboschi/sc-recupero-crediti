@@ -464,10 +464,13 @@ async def get_attivita(session: Session = Depends(get_session)):
                 Customer.recovery_status.notin_(["idle", "archived"]),
             )
             .group_by(Customer.id)
-            # Exclude customers who have fully paid (no unpaid invoices remaining)
+            # Exclude customers with no overdue invoices (nothing to recover)
             .having(
                 func.count(func.distinct(
-                    case((Invoice.status != "paid", Invoice.id), else_=None)
+                    case((
+                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
+                        Invoice.id
+                    ), else_=None)
                 )) > 0
             )
             .order_by(Customer.next_action_date.asc().nullslast())
