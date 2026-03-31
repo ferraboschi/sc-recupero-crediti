@@ -288,8 +288,19 @@ export default function ClientDetail() {
     const selected = (data.invoices?.items || []).filter(inv => selectedInvoices.has(inv.id))
     const totalSelected = selected.reduce((sum, inv) => sum + inv.amount_due, 0)
 
-    let msg = `Gentile ${data.ragione_sociale},\n\n`
-    msg += `le scriviamo per ricordarle che risultano in sospeso le seguenti fatture:\n\n`
+    const isSecondContact = data.recovery_status === 'second_contact'
+
+    let msg = ''
+
+    if (isSecondContact) {
+      // Secondo sollecito — tono perentorio
+      msg += `Spett.le ${data.ragione_sociale},\n\n`
+      msg += `nonostante il nostro precedente sollecito, risultano ancora non saldate le seguenti fatture:\n\n`
+    } else {
+      // Primo contatto — tono cordiale
+      msg += `Gentile ${data.ragione_sociale},\n\n`
+      msg += `le scriviamo per ricordarle che risultano in sospeso le seguenti fatture:\n\n`
+    }
 
     selected.forEach(inv => {
       const dueDate = inv.due_date ? new Date(inv.due_date + 'T00:00:00').toLocaleDateString('it-IT') : 'N/D'
@@ -298,8 +309,15 @@ export default function ClientDetail() {
     })
 
     msg += `\nTotale: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(totalSelected)}\n\n`
-    msg += `Coordinate bancarie:\nIBAN: IT44N0200801671000105175151\nIntestatario: Sake Company srl\nCausale: Saldo fatture ${data.ragione_sociale}\n\n`
-    msg += `La preghiamo di provvedere al saldo o contattarci per chiarimenti.\n\nGrazie,\nSake Company`
+
+    if (isSecondContact) {
+      msg += `Vi informiamo che in assenza di pagamento entro 7 giorni, la pratica verrà automaticamente trasmessa al nostro studio legale per il recupero del credito, con aggravio di spese legali e interessi di mora a Vostro carico.\n\n`
+      msg += `IBAN: IT44N0200801671000105175151\nIntestatario: Sake Company srl\n\n`
+      msg += `Sake Company — Ufficio Amministrativo`
+    } else {
+      msg += `Coordinate bancarie:\nIBAN: IT44N0200801671000105175151\nIntestatario: Sake Company srl\nCausale: Saldo fatture ${data.ragione_sociale}\n\n`
+      msg += `La preghiamo di provvedere al saldo o contattarci per chiarimenti.\n\nGrazie,\nSake Company`
+    }
 
     return msg
   }
