@@ -1,12 +1,10 @@
-Buongiorno {ragione_sociale},
+Spett.le {ragione_sociale},
 
-Con riferimento alla nostra precedente comunicazione, ti informiamo che la fattura n. {invoice_number} emessa da {company_name}, per un importo di €{amount_due}, rimane ancora in sospeso.
+nonostante il nostro precedente sollecito, la fattura n. {invoice_number} di €{amount_due} risulta ancora non saldata.
 
-Ti chiediamo cortesemente di regolarizzare il pagamento entro i prossimi giorni.
+Vi informiamo che in assenza di pagamento entro 7 giorni, la pratica verrà automaticamente trasmessa al nostro studio legale per il recupero del credito, con aggravio di spese legali e interessi di mora a Vostro carico.
 
-Qualora il saldo sia già stato effettuato, ti ringraziamo anticipatamente e considera questa comunicazione come non pervenuta.
+IBAN: IT44N0200801671000105175151
+Intestatario: Sake Company srl
 
-Per qualsiasi dubbio o necessità di chiarimenti, non esitare a contattarci.
-
-Cordiali saluti,
-{company_name}
+Sake Company — Ufficio Amministrativo

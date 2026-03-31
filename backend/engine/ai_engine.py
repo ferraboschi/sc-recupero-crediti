@@ -35,7 +35,7 @@ Firma sempre come "Sake Company - Ufficio Amministrativo".
 
 Livelli di escalation:
 - Livello 1: Promemoria gentile. "Ci risulta un pagamento in sospeso..."
-- Livello 2: Sollecito professionale. "Non avendo ricevuto riscontro..."
+- Livello 2: Sollecito perentorio. "Nonostante il nostro precedente sollecito... in assenza di pagamento entro 7 giorni la pratica verrà trasmessa al legale con aggravio di spese."
 - Livello 3: Avviso formale. "Siamo costretti a segnalare che..."
 - Livello 4: Ultimo avviso. "In assenza di pagamento entro 7 giorni..."
 
@@ -250,10 +250,11 @@ def _fallback_message(
             f"Sake Company - Ufficio Amministrativo"
         ),
         2: (
-            f"Gentile cliente, non avendo ricevuto riscontro, le ricordiamo che la fattura "
-            f"{invoice_number} di €{amount_due:,.2f} risulta ancora in sospeso da {days_overdue} giorni. "
-            f"La preghiamo di contattarci per risolvere. "
-            f"Sake Company - Ufficio Amministrativo"
+            f"Spett.le cliente, nonostante il nostro precedente sollecito, la fattura "
+            f"{invoice_number} di €{amount_due:,.2f} risulta ancora non saldata. "
+            f"In assenza di pagamento entro 7 giorni, la pratica verrà automaticamente trasmessa al nostro studio legale "
+            f"per il recupero del credito, con aggravio di spese legali e interessi di mora a Vostro carico. "
+            f"IBAN: IT44N0200801671000105175151 — Sake Company, Ufficio Amministrativo"
         ),
         3: (
             f"La informiamo che la fattura {invoice_number} di €{amount_due:,.2f} "
