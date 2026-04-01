@@ -517,10 +517,24 @@ def _auto_create_customers_from_invoices(session) -> int:
                 inv.customer_id = piva_to_customer_id[piva]
                 continue
 
-            # Try normalized name match
+            # Try normalized name match — but BLOCK if P.IVA conflicts
             if name_norm and name_norm in name_to_customer_id:
-                inv.customer_id = name_to_customer_id[name_norm]
-                continue
+                candidate_id = name_to_customer_id[name_norm]
+                # Check if the candidate customer has a different P.IVA
+                candidate_piva = None
+                for c in existing_customers:
+                    if c.id == candidate_id:
+                        candidate_piva = (c.partita_iva or "").strip().upper()
+                        break
+                # Only match if P.IVA is missing on either side, or they agree
+                if not piva or not candidate_piva or piva == candidate_piva:
+                    inv.customer_id = candidate_id
+                    continue
+                # P.IVA conflict — do NOT match, fall through to create new customer
+                logger.warning(
+                    f"Invoice {inv.invoice_number}: name '{name}' matches customer ID {candidate_id} "
+                    f"but P.IVA conflict ({piva} vs {candidate_piva}). Creating new customer."
+                )
 
             # No match — create new customer
             if not name and not piva:

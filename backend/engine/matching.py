@@ -12,6 +12,21 @@ from backend.config import config
 logger = logging.getLogger(__name__)
 
 
+def _piva_conflict(invoice: Invoice, customer: Customer) -> bool:
+    """
+    Check if an invoice and customer have DIFFERENT P.IVA values.
+
+    Returns True if both have a P.IVA and they don't match — meaning
+    the invoice belongs to a different business entity and must NOT
+    be assigned to this customer, regardless of name similarity.
+    """
+    inv_piva = (invoice.customer_piva_raw or "").strip().upper()
+    cust_piva = (customer.partita_iva or "").strip().upper()
+    if inv_piva and cust_piva and inv_piva != cust_piva:
+        return True
+    return False
+
+
 def match_invoice_to_customer(
     invoice: Invoice,
     customers: list[Customer],
@@ -22,8 +37,12 @@ def match_invoice_to_customer(
 
     Matching priority:
     1. P.IVA exact match (highest priority)
-    2. Normalized ragione sociale exact match
-    3. Fuzzy ragione sociale match (using rapidfuzz)
+    2. Normalized ragione sociale exact match (blocked if P.IVA conflicts)
+    3. Fuzzy ragione sociale match (blocked if P.IVA conflicts)
+
+    CRITICAL RULE: If an invoice has a P.IVA and a candidate customer has
+    a DIFFERENT P.IVA, that customer is NEVER a match — even if the names
+    are identical after normalization. Different P.IVA = different business.
 
     Args:
         invoice: The invoice to match
@@ -53,6 +72,10 @@ def match_invoice_to_customer(
         invoice_name_normalized = normalize_ragione_sociale(invoice.customer_name_raw)
 
         for customer in customers:
+            # BLOCK: never match if P.IVA values conflict
+            if _piva_conflict(invoice, customer):
+                continue
+
             customer_name_normalized = normalize_ragione_sociale(customer.ragione_sociale)
 
             if invoice_name_normalized and customer_name_normalized and \
@@ -69,6 +92,10 @@ def match_invoice_to_customer(
         best_score = 0
 
         for customer in customers:
+            # BLOCK: never match if P.IVA values conflict
+            if _piva_conflict(invoice, customer):
+                continue
+
             is_similar, score = are_similar(
                 invoice.customer_name_raw,
                 customer.ragione_sociale,
