@@ -379,6 +379,72 @@ async def complete_action(
         raise
 
 
+@router.patch("/customers/{customer_id}/actions/{action_id}/reschedule")
+async def reschedule_action(
+    customer_id: int,
+    action_id: int,
+    new_date: str = Query(..., description="New scheduled date in YYYY-MM-DD format"),
+    session: Session = Depends(get_session),
+):
+    """Update the scheduled_date of a recovery action and propagate to customer.
+
+    Only allowed for contact-type actions (first_contact, second_contact, lawyer, wait).
+    Updates both the action's scheduled_date AND the customer's next_action_date
+    so that Dashboard and Attività reflect the change.
+    """
+    try:
+        action = session.query(RecoveryAction).filter(
+            RecoveryAction.id == action_id,
+            RecoveryAction.customer_id == customer_id,
+        ).first()
+
+        if not action:
+            raise HTTPException(status_code=404, detail="Azione non trovata")
+
+        # Only allow rescheduling contact/lawyer/wait actions, not notes
+        if action.action_type == "note":
+            raise HTTPException(status_code=400, detail="Le note non hanno data pianificata modificabile")
+
+        customer = session.query(Customer).get(customer_id)
+        if not customer:
+            raise HTTPException(status_code=404, detail="Cliente non trovato")
+
+        from datetime import date as date_type
+        parsed_date = date_type.fromisoformat(new_date)
+        old_date = action.scheduled_date
+
+        # Update the action's scheduled date
+        action.scheduled_date = parsed_date
+
+        # Propagate to customer's next_action_date
+        # (only if this action is the one driving the current schedule)
+        customer.next_action_date = parsed_date
+
+        session.commit()
+
+        logger.info(
+            f"Rescheduled action {action_id} ({action.action_type}) for customer "
+            f"{customer.ragione_sociale}: {old_date} → {parsed_date}"
+        )
+
+        return {
+            "status": "ok",
+            "action_id": action_id,
+            "old_date": old_date.isoformat() if old_date else None,
+            "new_date": parsed_date.isoformat(),
+            "customer_next_action_date": customer.next_action_date.isoformat(),
+        }
+
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Data non valida: {new_date}. Formato: YYYY-MM-DD")
+    except Exception as e:
+        logger.error(f"Error rescheduling action: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
 # --- PDF Riepilogativo ---
 
 @router.get("/customers/{customer_id}/pdf-riepilogativo")

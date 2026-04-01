@@ -87,6 +87,8 @@ export default function ClientDetail() {
   const [completingAction, setCompletingAction] = useState(null)
   const [selectedOutcome, setSelectedOutcome] = useState('')
   const [copiedWhatsApp, setCopiedWhatsApp] = useState(false)
+  const [editingDateActionId, setEditingDateActionId] = useState(null)
+  const [editingDateValue, setEditingDateValue] = useState('')
   const [promemoria, setPromemoria] = useState(false)
   const [selectedWhatsAppPhone, setSelectedWhatsAppPhone] = useState(null)
   const [showDatePicker, setShowDatePicker] = useState(false)
@@ -178,6 +180,20 @@ export default function ClientDetail() {
     } catch (err) {
       console.error('Error completing action:', err)
       alert('Errore nel completamento dell\'azione')
+    }
+  }
+
+  const handleRescheduleAction = async (actionId, newDate) => {
+    try {
+      await client.patch(`/recovery/customers/${customerId}/actions/${actionId}/reschedule`, null, {
+        params: { new_date: newDate },
+      })
+      setEditingDateActionId(null)
+      setEditingDateValue('')
+      await fetchData()
+    } catch (err) {
+      console.error('Error rescheduling action:', err)
+      alert('Errore nell\'aggiornamento della data')
     }
   }
 
@@ -998,8 +1014,42 @@ export default function ClientDetail() {
                 {action.notes && (
                   <p className="text-sm text-txt-muted mt-0.5">{action.notes}</p>
                 )}
-                {action.scheduled_date && !action.completed_at && (
-                  <p className="text-xs text-accent-teal mt-0.5">Pianificata: {formatDate(action.scheduled_date)}</p>
+                {action.scheduled_date && action.action_type !== 'note' && (
+                  editingDateActionId === action.id ? (
+                    <div className="flex items-center gap-2 mt-1">
+                      <input
+                        type="date"
+                        value={editingDateValue}
+                        onChange={(e) => setEditingDateValue(e.target.value)}
+                        className="text-xs bg-dark-surface border border-dark-border rounded px-2 py-1 text-txt-primary"
+                        autoFocus
+                      />
+                      <button
+                        onClick={() => handleRescheduleAction(action.id, editingDateValue)}
+                        disabled={!editingDateValue}
+                        className="text-xs bg-accent-teal/20 text-accent-teal px-2 py-0.5 rounded hover:bg-accent-teal/30 disabled:opacity-40"
+                      >
+                        Salva
+                      </button>
+                      <button
+                        onClick={() => { setEditingDateActionId(null); setEditingDateValue('') }}
+                        className="text-xs text-txt-muted hover:text-txt-primary"
+                      >
+                        Annulla
+                      </button>
+                    </div>
+                  ) : (
+                    <p
+                      className="text-xs text-accent-teal mt-0.5 cursor-pointer hover:underline"
+                      onClick={() => {
+                        setEditingDateActionId(action.id)
+                        setEditingDateValue(action.scheduled_date?.split('T')[0] || '')
+                      }}
+                      title="Clicca per modificare la data"
+                    >
+                      Pianificata: {formatDate(action.scheduled_date)}
+                    </p>
+                  )
                 )}
               </div>
             ))}
