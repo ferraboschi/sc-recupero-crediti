@@ -567,16 +567,46 @@ class FatturaProConnector:
             if piva_input:
                 detail["piva"] = piva_input.get("value", "").strip()
 
-            # Pattern 2: Table cell with P.IVA label
-            piva_label = soup.find(text=re.compile(r"P\.?IVA", re.IGNORECASE))
-            if piva_label:
-                # Try to find the value in the next sibling
-                parent = piva_label.parent
-                for sibling in parent.find_next_siblings():
-                    text = sibling.get_text(strip=True)
-                    if text and not re.match(r"^P\.?IVA", text, re.IGNORECASE):
-                        detail["piva"] = text
-                        break
+            # Pattern 2: Table cell or label with P.IVA
+            if "piva" not in detail or not detail.get("piva"):
+                piva_label = soup.find(text=re.compile(r"P\.?\s*IVA", re.IGNORECASE))
+                if piva_label:
+                    parent = piva_label.parent
+                    # Try next sibling elements
+                    for sibling in parent.find_next_siblings():
+                        text = sibling.get_text(strip=True)
+                        if text and not re.match(r"^P\.?\s*IVA", text, re.IGNORECASE):
+                            detail["piva"] = text
+                            break
+                    # Also try parent's next sibling (common in <td>P.IVA</td><td>VALUE</td>)
+                    if "piva" not in detail or not detail.get("piva"):
+                        next_td = parent.find_next("td")
+                        if next_td:
+                            text = next_td.get_text(strip=True)
+                            if text:
+                                detail["piva"] = text
+
+            # Pattern 3: Look for Codice Fiscale / P.IVA in any text content
+            if "piva" not in detail or not detail.get("piva"):
+                # Search all text nodes for patterns like "P.IVA: 12345678901"
+                full_text = soup.get_text()
+                piva_match = re.search(
+                    r'P\.?\s*IVA\s*[:/]?\s*([A-Z]{0,3}\d{8,15})',
+                    full_text,
+                    re.IGNORECASE
+                )
+                if piva_match:
+                    detail["piva"] = piva_match.group(1).strip()
+
+            # Validate P.IVA format (Italian: 11 digits, or foreign: country prefix + digits)
+            if detail.get("piva"):
+                piva_clean = detail["piva"].strip().upper()
+                # Accept Italian (11 digits), EU (2 letter prefix + digits), Swiss (CHE + digits)
+                if re.match(r'^([A-Z]{2,3})?\d{8,15}$', piva_clean):
+                    detail["piva"] = piva_clean
+                else:
+                    logger.warning(f"Invalid P.IVA format for doc {doc_id}: '{piva_clean}', discarding")
+                    detail.pop("piva", None)
 
             logger.debug(f"Invoice detail: {detail}")
             return detail
@@ -584,6 +614,74 @@ class FatturaProConnector:
         except Exception as e:
             logger.error(f"Error fetching invoice detail for {doc_id}: {e}")
             return None
+
+    def enrich_invoices_with_piva(
+        self,
+        invoices: List[Dict[str, Any]],
+        delay: float = 0.5,
+    ) -> List[Dict[str, Any]]:
+        """Enrich a list of invoices with P.IVA from their detail pages.
+
+        Only fetches detail for invoices that have a doc_id and don't already
+        have a P.IVA. Adds a small delay between requests to avoid overloading
+        the FatturaPro server.
+
+        Args:
+            invoices: List of invoice dicts from fetch_overdue_invoices()
+            delay: Seconds to wait between detail requests (default 0.5s)
+
+        Returns:
+            The same list with "customer_piva" key added where found
+        """
+        import time
+
+        need_detail = [inv for inv in invoices if inv.get("doc_id") and not inv.get("customer_piva")]
+        if not need_detail:
+            logger.info("No invoices need P.IVA enrichment")
+            return invoices
+
+        logger.info(f"Enriching {len(need_detail)} invoices with P.IVA from detail pages...")
+        enriched_count = 0
+        failed_count = 0
+
+        for i, inv in enumerate(need_detail):
+            try:
+                detail = self.fetch_invoice_detail(inv["doc_id"])
+                if detail and detail.get("piva"):
+                    inv["customer_piva"] = detail["piva"]
+                    enriched_count += 1
+                    logger.debug(
+                        f"[{i+1}/{len(need_detail)}] Invoice {inv['invoice_number']}: "
+                        f"P.IVA = {detail['piva']}"
+                    )
+                else:
+                    logger.debug(
+                        f"[{i+1}/{len(need_detail)}] Invoice {inv['invoice_number']}: "
+                        f"no P.IVA found on detail page"
+                    )
+            except Exception as e:
+                failed_count += 1
+                logger.warning(
+                    f"[{i+1}/{len(need_detail)}] Failed to fetch detail for "
+                    f"{inv['invoice_number']}: {e}"
+                )
+
+            # Throttle requests
+            if i < len(need_detail) - 1:
+                time.sleep(delay)
+
+            # Progress log every 25 invoices
+            if (i + 1) % 25 == 0:
+                logger.info(
+                    f"P.IVA enrichment progress: {i+1}/{len(need_detail)} "
+                    f"({enriched_count} found, {failed_count} failed)"
+                )
+
+        logger.info(
+            f"P.IVA enrichment complete: {enriched_count}/{len(need_detail)} enriched, "
+            f"{failed_count} failed"
+        )
+        return invoices
 
     def request_xml_export(self, date_from: str, date_to: str) -> Optional[bytes]:
         """Request XML export of invoices for a date range.

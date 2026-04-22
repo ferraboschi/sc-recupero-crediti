@@ -340,9 +340,16 @@ async def update_position_status(
 async def reassign_position(
     position_id: int,
     new_customer_id: int = Query(..., description="ID of the customer to reassign this invoice to"),
+    force: bool = Query(False, description="Force reassignment even if P.IVA conflict detected"),
     session: Session = Depends(get_session),
 ):
-    """Reassign an invoice to a different customer."""
+    """Reassign an invoice to a different customer.
+
+    REGOLA P.IVA: Se la fattura ha una P.IVA (customer_piva_raw) e il cliente
+    di destinazione ha una P.IVA diversa, la riassegnazione viene bloccata.
+    Clienti diversi per P.IVA = entità diverse. Usare force=true solo se si è
+    certi che la P.IVA sulla fattura sia errata.
+    """
     try:
         position = session.query(Invoice).filter(Invoice.id == position_id).first()
         if not position:
@@ -351,6 +358,38 @@ async def reassign_position(
         new_customer = session.query(Customer).filter(Customer.id == new_customer_id).first()
         if not new_customer:
             raise HTTPException(status_code=404, detail="Target customer not found")
+
+        # ── REGOLA P.IVA IMPRESCINDIBILE ──
+        # Se la fattura ha P.IVA e il cliente destinazione ha una P.IVA DIVERSA,
+        # bloccare la riassegnazione: P.IVA diverse = entità diverse.
+        inv_piva = (position.customer_piva_raw or "").strip().upper()
+        cust_piva = (new_customer.partita_iva or "").strip().upper()
+
+        if inv_piva and cust_piva and inv_piva != cust_piva:
+            if not force:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"CONFLITTO P.IVA: La fattura {position.invoice_number} ha P.IVA "
+                        f"'{inv_piva}' ma il cliente '{new_customer.ragione_sociale}' ha P.IVA "
+                        f"'{cust_piva}'. P.IVA diverse = entità diverse. "
+                        f"Riassegnazione bloccata. Usa force=true solo se la P.IVA "
+                        f"sulla fattura è errata."
+                    )
+                )
+            logger.warning(
+                f"FORCED reassign with P.IVA conflict: invoice {position.invoice_number} "
+                f"P.IVA '{inv_piva}' → customer '{new_customer.ragione_sociale}' "
+                f"P.IVA '{cust_piva}'"
+            )
+
+        # Se il cliente destinazione ha P.IVA e la fattura no, logga un avviso
+        if cust_piva and not inv_piva:
+            logger.info(
+                f"Reassign: invoice {position.invoice_number} has no P.IVA, "
+                f"assigning to customer '{new_customer.ragione_sociale}' "
+                f"with P.IVA '{cust_piva}'"
+            )
 
         old_customer_id = position.customer_id
         old_customer_name = position.customer.ragione_sociale if position.customer else None

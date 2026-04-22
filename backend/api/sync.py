@@ -91,7 +91,7 @@ def _sync_invoices_task() -> dict:
     """
     session = get_session_direct()
     result = {
-        "fatturapro": {"success": False, "created": 0, "updated": 0, "paid_detected": 0, "error": None},
+        "fatturapro": {"success": False, "created": 0, "updated": 0, "paid_detected": 0, "piva_enriched": 0, "error": None},
         "fattura24": {"success": False, "created": 0, "updated": 0, "paid_detected": 0, "error": None},
     }
 
@@ -103,6 +103,33 @@ def _sync_invoices_task() -> dict:
             if fatturapro.login():
                 raw_invoices = fatturapro.fetch_overdue_invoices()
                 created, updated = 0, 0
+                piva_enriched = 0
+
+                # ── ENRICHMENT P.IVA ──
+                # Fetch P.IVA from detail pages for NEW invoices only.
+                # We identify which invoices are new by checking the DB first,
+                # then enrich only those that need it.
+                existing_invoice_numbers = set()
+                existing_with_piva = set()
+                for db_inv in session.query(Invoice.invoice_number, Invoice.customer_piva_raw).filter(
+                    Invoice.source_platform == "fatturapro"
+                ).all():
+                    existing_invoice_numbers.add(db_inv.invoice_number)
+                    if db_inv.customer_piva_raw:
+                        existing_with_piva.add(db_inv.invoice_number)
+
+                # Only fetch detail for invoices that are new OR exist but lack P.IVA
+                invoices_needing_piva = [
+                    inv for inv in raw_invoices
+                    if inv.get("doc_id") and inv["invoice_number"] not in existing_with_piva
+                ]
+
+                if invoices_needing_piva:
+                    logger.info(
+                        f"Fetching P.IVA for {len(invoices_needing_piva)} invoices "
+                        f"(out of {len(raw_invoices)} total)..."
+                    )
+                    fatturapro.enrich_invoices_with_piva(invoices_needing_piva, delay=0.3)
 
                 # Build set of invoice numbers currently overdue in FatturaPro
                 fetched_invoice_numbers = set()
@@ -122,6 +149,14 @@ def _sync_invoices_task() -> dict:
                         existing.customer_name_raw = inv.get("customer_name")
                         if inv.get("date"):
                             existing.issue_date = inv["date"]
+                        # Enrich P.IVA if we found one and existing doesn't have it
+                        if inv.get("customer_piva") and not existing.customer_piva_raw:
+                            existing.customer_piva_raw = inv["customer_piva"]
+                            piva_enriched += 1
+                            logger.info(
+                                f"Enriched existing invoice {inv_num} with P.IVA: "
+                                f"{inv['customer_piva']}"
+                            )
                         # Keep status as open if it was paid before but reappeared
                         if existing.status == "paid" and inv.get("balance", 0) > 0:
                             existing.status = "open"
@@ -134,6 +169,7 @@ def _sync_invoices_task() -> dict:
                             amount_due=inv.get("balance", 0),
                             issue_date=inv.get("date"),
                             customer_name_raw=inv.get("customer_name"),
+                            customer_piva_raw=inv.get("customer_piva"),
                             source_platform="fatturapro",
                             source_id=inv.get("doc_id"),
                         )
@@ -164,7 +200,11 @@ def _sync_invoices_task() -> dict:
                 result["fatturapro"]["created"] = created
                 result["fatturapro"]["updated"] = updated
                 result["fatturapro"]["paid_detected"] = paid_detected
-                logger.info(f"FatturaPro sync: created={created}, updated={updated}, paid_detected={paid_detected}")
+                result["fatturapro"]["piva_enriched"] = piva_enriched
+                logger.info(
+                    f"FatturaPro sync: created={created}, updated={updated}, "
+                    f"paid_detected={paid_detected}, piva_enriched={piva_enriched}"
+                )
             else:
                 result["fatturapro"]["error"] = (
                     "Login failed — check FATTURAPRO_USERNAME/PASSWORD env vars"
@@ -512,9 +552,18 @@ def _auto_create_customers_from_invoices(session) -> int:
             name = (inv.customer_name_raw or "").strip()
             name_norm = normalize_ragione_sociale(name) if name else ""
 
-            # Try P.IVA match first
+            # ── REGOLA P.IVA IMPRESCINDIBILE ──
+            # P.IVA è l'identificatore canonico. Se c'è match per P.IVA,
+            # questo ha sempre la priorità. Se c'è conflitto P.IVA,
+            # i clienti sono SICURAMENTE diversi.
+
+            # Try P.IVA match first (highest priority)
             if piva and piva in piva_to_customer_id:
                 inv.customer_id = piva_to_customer_id[piva]
+                logger.debug(
+                    f"Invoice {inv.invoice_number} matched by P.IVA '{piva}' "
+                    f"to customer ID {piva_to_customer_id[piva]}"
+                )
                 continue
 
             # Try normalized name match — but BLOCK if P.IVA conflicts
@@ -526,15 +575,40 @@ def _auto_create_customers_from_invoices(session) -> int:
                     if c.id == candidate_id:
                         candidate_piva = (c.partita_iva or "").strip().upper()
                         break
-                # Only match if P.IVA is missing on either side, or they agree
-                if not piva or not candidate_piva or piva == candidate_piva:
+
+                # ── REGOLA P.IVA: blocca se P.IVA diverse ──
+                if piva and candidate_piva and piva != candidate_piva:
+                    # P.IVA conflict — do NOT match, create new customer
+                    logger.warning(
+                        f"Invoice {inv.invoice_number}: name '{name}' matches customer ID {candidate_id} "
+                        f"but P.IVA CONFLICT ({piva} vs {candidate_piva}). "
+                        f"P.IVA diverse = entità diverse. Creating new customer."
+                    )
+                elif piva and candidate_piva and piva == candidate_piva:
+                    # Both have P.IVA and they agree — strong match
+                    inv.customer_id = candidate_id
+                    logger.info(
+                        f"Invoice {inv.invoice_number}: name + P.IVA match confirmed "
+                        f"to customer ID {candidate_id}"
+                    )
+                    continue
+                elif piva and not candidate_piva:
+                    # Invoice has P.IVA, customer doesn't — assign but update customer P.IVA
+                    inv.customer_id = candidate_id
+                    for c in existing_customers:
+                        if c.id == candidate_id:
+                            c.partita_iva = piva
+                            logger.info(
+                                f"Invoice {inv.invoice_number}: name match to customer ID {candidate_id}, "
+                                f"updated customer P.IVA to '{piva}'"
+                            )
+                            break
+                    piva_to_customer_id[piva] = candidate_id
+                    continue
+                else:
+                    # Neither has P.IVA or only customer has P.IVA — accept name match
                     inv.customer_id = candidate_id
                     continue
-                # P.IVA conflict — do NOT match, fall through to create new customer
-                logger.warning(
-                    f"Invoice {inv.invoice_number}: name '{name}' matches customer ID {candidate_id} "
-                    f"but P.IVA conflict ({piva} vs {candidate_piva}). Creating new customer."
-                )
 
             # No match — create new customer
             if not name and not piva:

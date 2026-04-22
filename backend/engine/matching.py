@@ -14,15 +14,24 @@ logger = logging.getLogger(__name__)
 
 def _piva_conflict(invoice: Invoice, customer: Customer) -> bool:
     """
-    Check if an invoice and customer have DIFFERENT P.IVA values.
+    REGOLA P.IVA IMPRESCINDIBILE: verifica conflitto P.IVA tra fattura e cliente.
+
+    P.IVA è l'identificatore canonico di un'entità commerciale.
+    Se sia la fattura che il cliente hanno una P.IVA e queste sono DIVERSE,
+    sono entità diverse — il match è VIETATO, indipendentemente dalla
+    somiglianza dei nomi.
 
     Returns True if both have a P.IVA and they don't match — meaning
     the invoice belongs to a different business entity and must NOT
-    be assigned to this customer, regardless of name similarity.
+    be assigned to this customer.
     """
     inv_piva = (invoice.customer_piva_raw or "").strip().upper()
     cust_piva = (customer.partita_iva or "").strip().upper()
     if inv_piva and cust_piva and inv_piva != cust_piva:
+        logger.debug(
+            f"P.IVA CONFLICT: invoice {invoice.invoice_number} has '{inv_piva}', "
+            f"customer '{customer.ragione_sociale}' has '{cust_piva}'. Match blocked."
+        )
         return True
     return False
 
