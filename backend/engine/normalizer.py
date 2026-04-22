@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 # Italian legal form abbreviations to remove
 LEGAL_FORMS = [
+    # Società a Responsabilità Limitata (e varianti)
+    "S.R.L.S.", "SRLS",  # Semplificata — molto comune per società nuove
     "S.R.L.", "SRL",
     "S.P.A.", "SPA",
     "S.A.S.", "SAS",
@@ -20,15 +22,23 @@ LEGAL_FORMS = [
     "S.C.",
     "S.C.A.R.L.", "SCARL",
     "S.C.P.A.", "SCPA",
+    "S.C.R.L.", "SCRL",  # Cooperativa a Resp. Limitata
     "S.P.A.M.", "SPAM",
     "S.R.C.", "SRC",
     "S.R.S.", "SRS",
+    "S.A.A.",  # Accomandita per Azioni
+    "S.A.P.A.", "SAPA",
+    "S.T.P.", "STP",  # Società tra Professionisti
     "P.A.",
     "A.S.",
-    "A.S.D.",
-    "A.P.S.",
-    "O.N.G.",
-    "E.T.S.",
+    "A.S.D.", "ASD",
+    "A.P.S.", "APS",
+    "O.N.G.", "ONG",
+    "E.T.S.", "ETS",
+    "ONLUS",
+    "UNIPERSONALE",
+    # Forme legali estere (per clienti stranieri fatturati in Italia)
+    "LLC", "LTD", "GMBH", "AG", "SA", "SARL",
 ]
 
 # Common prefixes to remove

@@ -24,7 +24,8 @@ from backend.engine.normalizer import normalize_ragione_sociale
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Sync mutex to prevent concurrent syncs
+# Sync mutex to prevent concurrent syncs — used by ALL sync operations
+# (full sync, individual invoice/customer/matching syncs)
 _sync_lock = threading.Lock()
 
 # Track last sync results
@@ -124,7 +125,15 @@ def _sync_invoices_task() -> dict:
                     if inv.get("doc_id") and inv["invoice_number"] not in existing_with_piva
                 ]
 
+                # Cap enrichment to avoid long-running syncs
+                PIVA_ENRICHMENT_LIMIT = 50
                 if invoices_needing_piva:
+                    if len(invoices_needing_piva) > PIVA_ENRICHMENT_LIMIT:
+                        logger.info(
+                            f"P.IVA enrichment: {len(invoices_needing_piva)} invoices need P.IVA, "
+                            f"capping to {PIVA_ENRICHMENT_LIMIT} per sync cycle"
+                        )
+                        invoices_needing_piva = invoices_needing_piva[:PIVA_ENRICHMENT_LIMIT]
                     logger.info(
                         f"Fetching P.IVA for {len(invoices_needing_piva)} invoices "
                         f"(out of {len(raw_invoices)} total)..."
@@ -213,6 +222,11 @@ def _sync_invoices_task() -> dict:
         except Exception as e:
             result["fatturapro"]["error"] = str(e)
             logger.error(f"Error syncing FatturaPro: {e}", exc_info=True)
+        finally:
+            try:
+                fatturapro.close()
+            except Exception:
+                pass
 
         # Fattura24
         # NOTE: Fattura24 API subscription is expired and no new invoices are expected.
@@ -353,6 +367,10 @@ def _sync_invoices_task() -> dict:
     except Exception as e:
         logger.error(f"Unexpected error in invoice sync: {e}", exc_info=True)
         result["error"] = str(e)
+        try:
+            session.rollback()
+        except Exception:
+            pass
     finally:
         session.close()
 
@@ -505,6 +523,10 @@ def _sync_customers_task() -> dict:
         result["error"] = str(e)
         logger.error(f"Error syncing customers: {e}", exc_info=True)
         _persist_sync_status("customers", result)
+        try:
+            session.rollback()
+        except Exception:
+            pass
     finally:
         session.close()
 
@@ -729,6 +751,10 @@ def _match_orders_task() -> dict:
         logger.error(
             f"Error in order matching: {e}", exc_info=True
         )
+        try:
+            session.rollback()
+        except Exception:
+            pass
     finally:
         session.close()
 
@@ -823,6 +849,10 @@ def _run_matching_task() -> dict:
         logger.error(f"Error running matching: {e}", exc_info=True)
         error_result = {"error": str(e)}
         _persist_sync_status("matching", error_result)
+        try:
+            session.rollback()
+        except Exception:
+            pass
         return error_result
     finally:
         session.close()
@@ -855,15 +885,37 @@ def _process_escalations_task() -> dict:
         logger.error(f"Error processing escalations: {e}", exc_info=True)
         error_result = {"error": str(e)}
         _persist_sync_status("escalations", error_result)
+        try:
+            session.rollback()
+        except Exception:
+            pass
         return error_result
     finally:
         session.close()
 
 
+def _locked_task(task_fn):
+    """Wrapper: run a sync task under the global _sync_lock.
+
+    If the lock is already held (another sync is running), the task
+    is skipped and an error result is returned instead of blocking.
+    """
+    def wrapper():
+        if not _sync_lock.acquire(blocking=False):
+            logger.warning(f"Skipping {task_fn.__name__}: another sync is already running")
+            return {"error": "Another sync operation is already running. Try again later."}
+        try:
+            return task_fn()
+        finally:
+            _sync_lock.release()
+    wrapper.__name__ = task_fn.__name__
+    return wrapper
+
+
 @router.post("/invoices")
 async def sync_invoices(background_tasks: BackgroundTasks):
     """Trigger manual sync of invoices from FatturaPro and Fattura24."""
-    background_tasks.add_task(_sync_invoices_task)
+    background_tasks.add_task(_locked_task(_sync_invoices_task))
     return {
         "status": "sync_started",
         "message": "Invoice sync started in background"
@@ -873,7 +925,7 @@ async def sync_invoices(background_tasks: BackgroundTasks):
 @router.post("/customers")
 async def sync_customers(background_tasks: BackgroundTasks):
     """Trigger manual sync of customers from Shopify."""
-    background_tasks.add_task(_sync_customers_task)
+    background_tasks.add_task(_locked_task(_sync_customers_task))
     return {
         "status": "sync_started",
         "message": "Customer sync started in background"
@@ -883,7 +935,7 @@ async def sync_customers(background_tasks: BackgroundTasks):
 @router.post("/matching")
 async def sync_matching(background_tasks: BackgroundTasks):
     """Trigger manual matching run."""
-    background_tasks.add_task(_run_matching_task)
+    background_tasks.add_task(_locked_task(_run_matching_task))
     return {
         "status": "sync_started",
         "message": "Matching sync started in background"
@@ -893,7 +945,7 @@ async def sync_matching(background_tasks: BackgroundTasks):
 @router.post("/order-matching")
 async def sync_order_matching(background_tasks: BackgroundTasks):
     """Match invoices to Shopify orders by amount + date."""
-    background_tasks.add_task(_match_orders_task)
+    background_tasks.add_task(_locked_task(_match_orders_task))
     return {
         "status": "sync_started",
         "message": "Order matching started in background",
@@ -903,7 +955,7 @@ async def sync_order_matching(background_tasks: BackgroundTasks):
 @router.post("/escalations")
 async def sync_escalations(background_tasks: BackgroundTasks):
     """Trigger manual escalation processing."""
-    background_tasks.add_task(_process_escalations_task)
+    background_tasks.add_task(_locked_task(_process_escalations_task))
     return {
         "status": "sync_started",
         "message": "Escalation processing started in background"

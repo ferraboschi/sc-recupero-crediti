@@ -90,7 +90,7 @@ async def twilio_webhook(
 
     except Exception as e:
         logger.error(f"Twilio webhook error: {e}", exc_info=True)
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "Internal processing error"}
 
 
 async def _handle_status_callback(

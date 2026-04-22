@@ -17,15 +17,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ── Config ──────────────────────────────────────────────────────────
-JWT_SECRET = os.getenv("JWT_SECRET", "sc-recupero-jwt-secret-2026-sake")
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError(
+        "JWT_SECRET env var is required. The app cannot start without it. "
+        "Set it in Render environment variables."
+    )
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = int(os.getenv("JWT_EXPIRATION_HOURS", "24"))
 
 # Credentials — hashed at startup for security
 _ADMIN_USER = os.getenv("AUTH_USERNAME", "admin")
-_ADMIN_PASS_HASH = hashlib.sha256(
-    os.getenv("AUTH_PASSWORD", "sakecompany2026").encode()
-).hexdigest()
+_raw_password = os.getenv("AUTH_PASSWORD")
+if not _raw_password:
+    raise RuntimeError(
+        "AUTH_PASSWORD env var is required. The app cannot start without it. "
+        "Set it in Render environment variables."
+    )
+_ADMIN_PASS_HASH = hashlib.sha256(_raw_password.encode()).hexdigest()
+del _raw_password  # Don't keep plaintext in memory
 
 security = HTTPBearer(auto_error=False)
 

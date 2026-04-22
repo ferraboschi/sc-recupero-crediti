@@ -477,7 +477,7 @@ def _send_escalation_email(
         "⚠️ ESCALATION — Recupero Crediti",
         "",
         f"Cliente: {customer.ragione_sociale}",
-        f"P.IVA: {customer.piva or 'N/A'}",
+        f"P.IVA: {customer.partita_iva or 'N/A'}",
         f"Telefono: {customer.phone or 'N/A'}",
         f"Email: {customer.email or 'N/A'}",
         "",

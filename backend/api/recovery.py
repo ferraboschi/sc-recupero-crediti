@@ -1,11 +1,12 @@
 """Recovery workflow API endpoints."""
 
+import os
 import logging
 from datetime import datetime, date, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from io import BytesIO
@@ -71,22 +72,36 @@ async def get_calendar(
             .all()
         )
 
+        # Pre-fetch invoice stats for all relevant customers in 1 query (avoids N+1)
+        all_customer_ids = set(a.customer_id for a in actions) | set(c.id for c in customers_with_actions)
+        invoice_stats = {}
+        if all_customer_ids:
+            stats_rows = (
+                session.query(
+                    Invoice.customer_id,
+                    func.count(Invoice.id).label("overdue_count"),
+                    func.coalesce(func.sum(Invoice.amount_due), 0).label("total_due"),
+                )
+                .filter(
+                    Invoice.customer_id.in_(all_customer_ids),
+                    Invoice.status != "paid",
+                    Invoice.days_overdue > 0,
+                )
+                .group_by(Invoice.customer_id)
+                .all()
+            )
+            for row in stats_rows:
+                invoice_stats[row.customer_id] = {
+                    "overdue_count": row.overdue_count,
+                    "total_due": float(row.total_due),
+                }
+
         items = []
         seen_customer_ids = set()
 
         for action in actions:
             seen_customer_ids.add(action.customer_id)
-            # Count overdue invoices for this customer
-            overdue_count = session.query(Invoice).filter(
-                Invoice.customer_id == action.customer_id,
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
-            ).count()
-            total_due = session.query(Invoice).filter(
-                Invoice.customer_id == action.customer_id,
-                Invoice.status != "paid",
-            ).with_entities(Invoice.amount_due).all()
-            total_amount = sum(r[0] for r in total_due) if total_due else 0
+            stats = invoice_stats.get(action.customer_id, {"overdue_count": 0, "total_due": 0.0})
 
             items.append({
                 "id": action.id,
@@ -95,24 +110,15 @@ async def get_calendar(
                 "action_type": action.action_type,
                 "scheduled_date": action.scheduled_date.isoformat(),
                 "notes": action.notes,
-                "overdue_invoices": overdue_count,
-                "total_due": float(total_amount),
+                "overdue_invoices": stats["overdue_count"],
+                "total_due": stats["total_due"],
                 "source": "action",
             })
 
         # Add customers that have next_action_date but no pending action record
         for cust in customers_with_actions:
             if cust.id not in seen_customer_ids:
-                overdue_count = session.query(Invoice).filter(
-                    Invoice.customer_id == cust.id,
-                    Invoice.status != "paid",
-                    Invoice.days_overdue > 0,
-                ).count()
-                total_due = session.query(Invoice).filter(
-                    Invoice.customer_id == cust.id,
-                    Invoice.status != "paid",
-                ).with_entities(Invoice.amount_due).all()
-                total_amount = sum(r[0] for r in total_due) if total_due else 0
+                stats = invoice_stats.get(cust.id, {"overdue_count": 0, "total_due": 0.0})
 
                 items.append({
                     "id": None,
@@ -121,8 +127,8 @@ async def get_calendar(
                     "action_type": cust.next_action_type or cust.recovery_status,
                     "scheduled_date": cust.next_action_date.isoformat(),
                     "notes": None,
-                    "overdue_invoices": overdue_count,
-                    "total_due": float(total_amount),
+                    "overdue_invoices": stats["overdue_count"],
+                    "total_due": stats["total_due"],
                     "source": "customer",
                 })
 
@@ -636,7 +642,7 @@ def _build_riepilogativo_pdf(customer, invoices):
     pdf.set_font("Helvetica", "", 11)
     pdf.cell(0, 7, "Pagamento: a vista", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, "Intestatario: Sake Company srl", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 7, "IBAN: IT44N0200801671000105175151", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"IBAN: {os.getenv('COMPANY_IBAN', 'IT44N0200801671000105175151')}", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, "Banca: UniCredit", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, f"Causale: Saldo fatture {customer.ragione_sociale}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(8)
@@ -775,7 +781,7 @@ def _build_invoice_pdf(customer, invoice):
     pdf.set_font("Helvetica", "", 10)
     pdf.cell(0, 6, "Intestatario: Sake Company srl",
              new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, "IBAN: IT44N0200801671000105175151",
+    pdf.cell(0, 6, f"IBAN: {os.getenv('COMPANY_IBAN', 'IT44N0200801671000105175151')}",
              new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 6, "Banca: UniCredit",
              new_x="LMARGIN", new_y="NEXT")
@@ -898,7 +904,7 @@ async def get_recovery_report(
     - prossime_scadenze: upcoming scheduled actions (next 30 days)
     - summary stats
     """
-    from sqlalchemy import func
+    # func already imported at module level
 
     try:
         today = date.today()

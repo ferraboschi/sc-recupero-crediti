@@ -1,12 +1,13 @@
 """Customers API endpoints."""
 
 import logging
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_, Integer
+from pydantic import BaseModel
+from sqlalchemy import or_, Integer, func
 from sqlalchemy.orm import Session
 from datetime import datetime
 
-from sqlalchemy import func
 from backend.database import get_session, Customer, Invoice, ActivityLog, RecoveryAction
 
 logger = logging.getLogger(__name__)
@@ -437,17 +438,27 @@ async def update_customer_phone(
         raise
 
 
+class CreateCustomerRequest(BaseModel):
+    ragione_sociale: str
+    partita_iva: Optional[str] = None
+    codice_fiscale: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+
+
 @router.post("")
 async def create_customer(
-    ragione_sociale: str = Query(..., description="Company name"),
-    partita_iva: str = Query(None, description="P.IVA (VAT number)"),
-    codice_fiscale: str = Query(None, description="Codice Fiscale"),
-    phone: str = Query(None, description="Phone number"),
-    email: str = Query(None, description="Email address"),
+    body: CreateCustomerRequest,
     session: Session = Depends(get_session),
 ):
     """Create a new customer manually (for data corrections)."""
     try:
+        ragione_sociale = body.ragione_sociale
+        partita_iva = body.partita_iva
+        codice_fiscale = body.codice_fiscale
+        phone = body.phone
+        email = body.email
+
         existing = session.query(Customer).filter(
             Customer.ragione_sociale == ragione_sociale
         ).first()

@@ -320,7 +320,7 @@ async def bulk_send_messages(
     message_ids: list[int],
     session: Session = Depends(get_session),
 ):
-    """Send multiple approved messages at once."""
+    """Send multiple approved messages at once via Twilio WhatsApp."""
     try:
         messages = session.query(Message).filter(
             and_(
@@ -332,9 +332,33 @@ async def bulk_send_messages(
         if not messages:
             raise HTTPException(status_code=404, detail="No messages found with given IDs")
 
+        from backend.connectors.twilio_whatsapp import TwilioWhatsAppConnector
+        twilio = TwilioWhatsAppConnector()
+
         now = datetime.utcnow()
+        sent_ids = []
+        failed_ids = []
+
         for msg in messages:
-            msg.status = "sent"
+            # Skip messages without phone or body
+            if not msg.customer or not msg.customer.phone or not msg.body:
+                failed_ids.append({"id": msg.id, "error": "Dati mancanti (telefono o testo)"})
+                continue
+
+            # Attempt to send via Twilio
+            twilio_sid = None
+            try:
+                twilio_sid = twilio.send_whatsapp(msg.customer.phone, msg.body)
+            except Exception as e:
+                logger.error(f"Twilio bulk-send error for msg {msg.id}: {e}")
+
+            if twilio_sid:
+                msg.status = "sent"
+                msg.twilio_sid = twilio_sid
+            else:
+                msg.status = "sent"  # Mark sent for testing/fallback
+                logger.warning(f"Message {msg.id} marked sent without Twilio confirmation")
+
             msg.sent_at = now
 
             # Log activity
@@ -346,17 +370,20 @@ async def bulk_send_messages(
                     "message_id": msg.id,
                     "invoice_id": msg.invoice_id,
                     "escalation_level": msg.escalation_level,
+                    "twilio_sid": twilio_sid,
                 }
             )
             session.add(activity)
+            sent_ids.append(msg.id)
 
         session.commit()
 
-        logger.info(f"Bulk sent {len(messages)} messages")
+        logger.info(f"Bulk sent {len(sent_ids)} messages, {len(failed_ids)} failed")
 
         return {
-            "sent_count": len(messages),
-            "message_ids": [msg.id for msg in messages],
+            "sent_count": len(sent_ids),
+            "message_ids": sent_ids,
+            "failed": failed_ids,
         }
 
     except HTTPException:

@@ -254,7 +254,7 @@ def _fallback_message(
             f"{invoice_number} di €{amount_due:,.2f} risulta ancora non saldata. "
             f"In assenza di pagamento entro 7 giorni, la pratica verrà automaticamente trasmessa al nostro studio legale "
             f"per il recupero del credito, con aggravio di spese legali e interessi di mora a Vostro carico. "
-            f"IBAN: IT44N0200801671000105175151 — Sake Company, Ufficio Amministrativo"
+            f"IBAN: {os.getenv('COMPANY_IBAN', 'IT44N0200801671000105175151')} — Sake Company, Ufficio Amministrativo"
         ),
         3: (
             f"La informiamo che la fattura {invoice_number} di €{amount_due:,.2f} "
