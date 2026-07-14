@@ -213,3 +213,27 @@ class TestEnrichmentAntiRepetition:
         conn.enrich_invoices_from_detail(invoices, delay=0)
 
         assert all(inv.get("customer_piva") == piva for inv in invoices)
+
+
+class TestCompanyPivaNormalization:
+    def test_blacklist_matches_env_with_it_prefix(self, monkeypatch):
+        """COMPANY_PIVA scritta come 'IT 10280600965' deve comunque
+        blacklistare la P.IVA scrappata '10280600965'."""
+        piva = _valid_piva()
+        monkeypatch.setattr(config, "COMPANY_PIVA", f"IT {piva}")
+        conn = FatturaProConnector()
+        html = DETAIL_HTML.format(piva=piva, company=piva)
+        monkeypatch.setattr(conn.client, "get", lambda *a, **kw: _fake_response(html))
+        detail = conn.fetch_invoice_detail("111")
+        assert "piva" not in detail
+
+    def test_invalid_company_piva_keeps_fulltext_disabled(self, monkeypatch):
+        """COMPANY_PIVA malformata = guardia inaffidabile → pattern
+        full-text spento (fail-closed), non acceso a vuoto."""
+        piva = _valid_piva()
+        monkeypatch.setattr(config, "COMPANY_PIVA", "GARBAGE123")
+        conn = FatturaProConnector()
+        html = DETAIL_HTML_FULLTEXT_ONLY.format(piva=piva)
+        monkeypatch.setattr(conn.client, "get", lambda *a, **kw: _fake_response(html))
+        detail = conn.fetch_invoice_detail("111")
+        assert "piva" not in detail

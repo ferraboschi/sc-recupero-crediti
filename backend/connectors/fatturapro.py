@@ -642,6 +642,12 @@ class FatturaProConnector:
         """
         from backend.engine.piva import validate_piva
 
+        # COMPANY_PIVA normalizzata come le P.IVA estratte: così la blacklist
+        # funziona anche se in env è scritta "IT 10280600965". Se il valore
+        # configurato non è una P.IVA valida, company_piva è None e il
+        # pattern full-text resta disabilitato (fail-closed).
+        company_piva = validate_piva(config.COMPANY_PIVA)
+
         try:
             logger.debug(f"Fetching invoice detail for doc_id: {doc_id}")
 
@@ -664,7 +670,7 @@ class FatturaProConnector:
                             f"Invalid P.IVA for doc {doc_id} from {source}: '{raw}' — discarded"
                         )
                     return False
-                if config.COMPANY_PIVA and validated == config.COMPANY_PIVA:
+                if company_piva and validated == company_piva:
                     logger.warning(
                         f"P.IVA for doc {doc_id} from {source} is COMPANY_PIVA "
                         f"(venditore, non destinatario) — discarded"
@@ -702,7 +708,7 @@ class FatturaProConnector:
             # Pattern 3 (full-text): il più soggetto a catturare la P.IVA
             # sbagliata (es. quella del venditore nel footer). Attivo SOLO
             # con COMPANY_PIVA configurata, che permette di scartarla.
-            if not detail.get("piva") and config.COMPANY_PIVA:
+            if not detail.get("piva") and company_piva:
                 full_text = soup.get_text()
                 for piva_match in re.finditer(
                     r'P\.?\s*IVA\s*[:/]?\s*([A-Z]{0,3}\d{8,15})',
