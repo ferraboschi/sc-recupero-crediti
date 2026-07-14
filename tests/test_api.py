@@ -2,7 +2,7 @@
 
 import pytest
 from datetime import date, datetime, timedelta
-from backend.database import Invoice, Customer, Message, ActivityLog
+from backend.database import Invoice, Customer, ActivityLog
 
 
 class TestHealthCheck:
@@ -145,15 +145,14 @@ class TestDashboardEndpoints:
         assert data["total_crediti"] == 0.0
         assert data["total_positions"] == 0
         assert data["total_customers"] == 0
-        assert data["total_messages"] == 0
         assert data["open_positions"] == 0
         assert data["contacted_positions"] == 0
         assert data["escalated_positions"] == 0
         assert data["paid_positions"] == 0
-        assert data["draft_messages"] == 0
-        assert data["sent_messages"] == 0
+        assert data["open_cases"] == 0
+        assert data["solleciti_inviati"] == 0
 
-    def test_get_stats_with_data(self, test_client, test_db_session, sample_customer, sample_invoice, sample_message):
+    def test_get_stats_with_data(self, test_client, test_db_session, sample_customer, sample_invoice):
         """Test stats endpoint with sample data."""
         response = test_client.get("/api/dashboard/stats")
         assert response.status_code == 200
@@ -162,7 +161,6 @@ class TestDashboardEndpoints:
         assert data["total_crediti"] == 1000.50
         assert data["total_positions"] == 1
         assert data["total_customers"] == 1
-        assert data["total_messages"] == 1
         assert data["open_positions"] == 1
 
     def test_get_stats_position_counts(self, test_client, test_db_session):
@@ -191,48 +189,6 @@ class TestDashboardEndpoints:
         assert data["escalated_positions"] == 1
         assert data["paid_positions"] == 1
 
-    def test_get_stats_message_counts(self, test_client, test_db_session, sample_customer):
-        """Test stats endpoint message counts."""
-        # Add messages with different statuses
-        invoice1 = Invoice(
-            invoice_number="INV001",
-            amount=1000.0,
-            amount_due=1000.0,
-            issue_date=date(2024, 1, 15),
-            customer_id=sample_customer.id,
-            source_platform="fatturapro"
-        )
-        invoice2 = Invoice(
-            invoice_number="INV002",
-            amount=2000.0,
-            amount_due=2000.0,
-            issue_date=date(2024, 1, 20),
-            customer_id=sample_customer.id,
-            source_platform="fatturapro"
-        )
-        test_db_session.add_all([invoice1, invoice2])
-        test_db_session.commit()
-
-        message1 = Message(
-            invoice_id=invoice1.id,
-            customer_id=sample_customer.id,
-            status="draft"
-        )
-        message2 = Message(
-            invoice_id=invoice2.id,
-            customer_id=sample_customer.id,
-            status="sent"
-        )
-        test_db_session.add_all([message1, message2])
-        test_db_session.commit()
-
-        response = test_client.get("/api/dashboard/stats")
-        assert response.status_code == 200
-        data = response.json()
-
-        assert data["draft_messages"] == 1
-        assert data["sent_messages"] == 1
-
     def test_get_stats_response_structure(self, test_client):
         """Test stats response has correct structure."""
         response = test_client.get("/api/dashboard/stats")
@@ -243,13 +199,12 @@ class TestDashboardEndpoints:
             "total_crediti",
             "total_positions",
             "total_customers",
-            "total_messages",
             "open_positions",
             "contacted_positions",
             "escalated_positions",
             "paid_positions",
-            "draft_messages",
-            "sent_messages",
+            "open_cases",
+            "solleciti_inviati",
         ]
 
         for key in expected_keys:

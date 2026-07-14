@@ -29,15 +29,9 @@ services:
         value: "2026-01"
       - key: SHOPIFY_PIVA_FIELD
         value: address2
-      - key: TWILIO_ACCOUNT_SID
-        sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-      - key: TWILIO_WHATSAPP_NUMBER_BUSINESS
-        sync: false
-      - key: TWILIO_WHATSAPP_NUMBER_RECOVERY
-        sync: false
-      - key: TWILIO_WEBHOOK_URL
+      # P.IVA di Sake Company: blacklist per l'enrichment P.IVA da FatturaPro
+      # (senza questa, il pattern full-text resta disabilitato per sicurezza)
+      - key: COMPANY_PIVA
         sync: false
       - key: TIMEZONE
         value: Europe/Rome

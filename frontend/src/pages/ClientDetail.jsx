@@ -94,6 +94,9 @@ export default function ClientDetail() {
   const [showDatePicker, setShowDatePicker] = useState(false)
   const [pendingActionType, setPendingActionType] = useState(null)
   const [scheduledDate, setScheduledDate] = useState('')
+  // Registrazione automatica del sollecito dopo Copia/WhatsApp
+  const [sollecitoToast, setSollecitoToast] = useState(null)
+  const [sollecitoError, setSollecitoError] = useState(null)
 
   const fetchData = useCallback(async () => {
     try {
@@ -163,7 +166,9 @@ export default function ClientDetail() {
       await fetchData()
     } catch (err) {
       console.error('Error creating action:', err)
-      alert('Errore nella creazione dell\'azione')
+      // Il backend spiega il perché (es. contatto già pianificato,
+      // sollecito già registrato oggi): mostrarlo, non un errore generico.
+      alert(err.response?.data?.detail || 'Errore nella creazione dell\'azione')
     } finally {
       setActionLoading(false)
     }
@@ -304,7 +309,9 @@ export default function ClientDetail() {
     const selected = (data.invoices?.items || []).filter(inv => selectedInvoices.has(inv.id))
     const totalSelected = selected.reduce((sum, inv) => sum + inv.amount_due, 0)
 
-    const isSecondContact = data.recovery_status === 'second_contact'
+    // Tono dal conteggio contatti della PRATICA (non dallo stato storico del
+    // cliente): dopo un saldo completo la pratica nuova riparte cordiale.
+    const isSecondContact = (data.case?.contact_count || 0) >= 1
 
     let msg = ''
 
@@ -319,9 +326,17 @@ export default function ClientDetail() {
     }
 
     selected.forEach(inv => {
-      const dueDate = inv.due_date ? new Date(inv.due_date + 'T00:00:00').toLocaleDateString('it-IT') : 'N/D'
       const orderRef = inv.shopify_order_number ? ` [Ordine ${inv.shopify_order_number}]` : ''
-      msg += `- Fatt. ${inv.invoice_number}${orderRef}: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(inv.amount_due)} (scad. ${dueDate})\n`
+      const importo = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(inv.amount_due)
+      // Scadenza citata SOLO se reale: una scadenza stimata (emissione+30)
+      // asserita al cliente come vera è già stata fonte di contestazioni.
+      let dateRef = ''
+      if (inv.due_date && inv.due_date_source === 'real') {
+        dateRef = ` (scad. ${new Date(inv.due_date + 'T00:00:00').toLocaleDateString('it-IT')})`
+      } else if (inv.issue_date) {
+        dateRef = ` (del ${new Date(inv.issue_date + 'T00:00:00').toLocaleDateString('it-IT')})`
+      }
+      msg += `- Fatt. ${inv.invoice_number}${orderRef}: ${importo}${dateRef}\n`
     })
 
     msg += `\nTotale: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(totalSelected)}\n\n`
@@ -343,17 +358,70 @@ export default function ClientDetail() {
     return raw.replace(/[^+\d]/g, '')
   }
 
+  // La sessione JWT dura 24h: se è scaduta, la registrazione del sollecito
+  // fallirebbe DOPO l'invio del messaggio. Meglio bloccarsi prima di copiare.
+  const isTokenExpired = () => {
+    const exp = localStorage.getItem('sc_token_expires')
+    if (!exp) return false
+    return new Date(exp) <= new Date()
+  }
+
+  const registerSollecito = async (channel) => {
+    // Cliente escluso: il copy resta possibile ma non è un sollecito
+    if (data?.excluded) return
+    const invoiceIds = [...selectedInvoices]
+    try {
+      const res = await client.post(`/recovery/customers/${customerId}/solleciti`, {
+        invoice_ids: invoiceIds,
+        channel,
+      })
+      setSollecitoError(null)
+      setSollecitoToast(res.data)
+      if (res.data.registered) {
+        await fetchData()
+      }
+      setTimeout(() => setSollecitoToast(current => (current === res.data ? null : current)), 15000)
+    } catch (err) {
+      console.error('Errore registrazione sollecito:', err)
+      // Il messaggio è GIÀ partito: l'errore di registrazione non può
+      // essere silenzioso, altrimenti numerazione e tono si corrompono.
+      setSollecitoError({ channel, invoiceIds, detail: err.response?.data?.detail })
+    }
+  }
+
+  const handleUndoSollecito = async (actionId) => {
+    try {
+      await client.delete(`/recovery/customers/${customerId}/solleciti/${actionId}`)
+      setSollecitoToast(null)
+      await fetchData()
+    } catch (err) {
+      console.error('Errore annullamento sollecito:', err)
+      alert(err.response?.data?.detail || 'Errore nell\'annullamento del sollecito')
+    }
+  }
+
   const handleWhatsAppSend = () => {
     const number = getWhatsAppNumber()
     if (!number) return
+    if (isTokenExpired()) {
+      alert('Sessione scaduta: effettua di nuovo il login prima di inviare (il sollecito non verrebbe registrato).')
+      window.location.reload()
+      return
+    }
     const message = buildWhatsAppMessage()
     const url = `https://wa.me/${number}?text=${encodeURIComponent(message)}`
     window.open(url, '_blank')
+    registerSollecito('whatsapp_link')
   }
 
   const handleCopyWhatsApp = async () => {
     const message = buildWhatsAppMessage()
     if (!message) return
+    if (isTokenExpired()) {
+      alert('Sessione scaduta: effettua di nuovo il login prima di copiare (il sollecito non verrebbe registrato).')
+      window.location.reload()
+      return
+    }
     try {
       await navigator.clipboard.writeText(message)
       setCopiedWhatsApp(true)
@@ -368,6 +436,7 @@ export default function ClientDetail() {
       setCopiedWhatsApp(true)
       setTimeout(() => setCopiedWhatsApp(false), 2000)
     }
+    registerSollecito('whatsapp_copy')
   }
 
   const ACTION_NUMBER_LABELS = ['PRIMA', 'SECONDA', 'TERZA', 'QUARTA', 'QUINTA', 'SESTA', 'SETTIMA', 'OTTAVA', 'NONA', 'DECIMA']
@@ -440,6 +509,77 @@ export default function ClientDetail() {
 
   return (
     <div className="space-y-6">
+      {/* Banner errore registrazione sollecito: il messaggio è GIÀ partito,
+          la registrazione va ritentata o fatta a mano — mai persa in silenzio */}
+      {sollecitoError && (
+        <div className="fixed bottom-6 right-6 z-50 max-w-md bg-dark-card border-2 border-accent-red rounded-lg p-4 shadow-xl">
+          <p className="text-sm font-bold text-accent-red">Sollecito NON registrato</p>
+          <p className="text-xs text-txt-secondary mt-1">
+            Il messaggio è stato copiato/inviato ma la registrazione è fallita
+            {sollecitoError.detail ? `: ${sollecitoError.detail}` : ''}.
+            Senza registrazione, numerazione e tono del prossimo sollecito saranno sbagliati.
+          </p>
+          <div className="flex gap-2 mt-3">
+            <button
+              onClick={() => registerSollecito(sollecitoError.channel)}
+              className="px-3 py-1.5 bg-accent-red text-dark-bg rounded text-xs font-bold hover:brightness-110"
+            >
+              Riprova registrazione
+            </button>
+            <button
+              onClick={() => setSollecitoError(null)}
+              className="px-3 py-1.5 text-xs text-txt-muted hover:text-txt-primary"
+            >
+              Registro a mano
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Toast conferma sollecito registrato (con Annulla) */}
+      {sollecitoToast && !sollecitoError && (
+        <div className="fixed bottom-6 right-6 z-50 max-w-md bg-dark-card border border-dark-border rounded-lg p-4 shadow-xl">
+          {sollecitoToast.registered ? (
+            <>
+              <p className="text-sm font-bold text-accent-green">
+                Sollecito n. {sollecitoToast.sollecito_n} registrato
+                {sollecitoToast.already_registered_today ? ' (già registrato oggi — fatture aggiornate)' : ''}
+              </p>
+              {sollecitoToast.next_action?.scheduled_date && (
+                <p className="text-xs text-txt-secondary mt-1">
+                  Prossima azione: {ACTION_LABELS[sollecitoToast.next_action.action_type] || sollecitoToast.next_action.action_type}{' '}
+                  il {formatDate(sollecitoToast.next_action.scheduled_date)}
+                  <span className="text-txt-muted"> (modificabile dalla timeline)</span>
+                </p>
+              )}
+              <div className="flex gap-2 mt-2">
+                {!sollecitoToast.already_registered_today && (
+                  <button
+                    onClick={() => handleUndoSollecito(sollecitoToast.action_id)}
+                    className="px-3 py-1 text-xs text-accent-amber hover:brightness-110 border border-accent-amber/40 rounded"
+                  >
+                    Annulla registrazione
+                  </button>
+                )}
+                <button
+                  onClick={() => setSollecitoToast(null)}
+                  className="px-3 py-1 text-xs text-txt-muted hover:text-txt-primary"
+                >
+                  Chiudi
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="text-sm font-medium text-txt-primary">Messaggio copiato</p>
+              <p className="text-xs text-txt-muted mt-1">
+                Nessuna fattura scaduta: promemoria di cortesia, sollecito non registrato.
+              </p>
+            </>
+          )}
+        </div>
+      )}
+
       {/* Navigation bar */}
       <div className="flex items-center justify-between">
         <button
@@ -534,6 +674,14 @@ export default function ClientDetail() {
             <span className={`${STATUS_COLORS[data.recovery_status] || STATUS_COLORS.idle} sc-badge text-sm`}>
               {STATUS_LABELS[data.recovery_status] || 'Da Gestire'}
             </span>
+            {data.case?.reopened_after_archive && (
+              <span
+                className="sc-badge text-xs bg-accent-red/15 text-accent-red"
+                title={`Pratica precedente archiviata/passata al legale: eredita ${data.case.inherited_contacts} contatti, il tono resta perentorio`}
+              >
+                Riaperta dopo archiviazione
+              </span>
+            )}
             {data.next_action_date && (
               <p className="text-sm text-txt-muted">
                 Prossima azione: <span className="font-medium text-txt-secondary">{formatDate(data.next_action_date)}</span>
@@ -672,7 +820,17 @@ export default function ClientDetail() {
                     </span>
                   </td>
                   <td className="px-3 py-3 text-sm text-right font-medium text-txt-primary">{formatCurrency(inv.amount_due)}</td>
-                  <td className="px-3 py-3 text-sm text-txt-secondary">{formatDate(inv.due_date)}</td>
+                  <td className="px-3 py-3 text-sm text-txt-secondary">
+                    {formatDate(inv.due_date)}
+                    {inv.due_date && inv.due_date_source !== 'real' && (
+                      <span
+                        className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-dark-surface text-txt-muted align-middle"
+                        title="Scadenza stimata (emissione + 30gg): non presente nel gestionale"
+                      >
+                        stimata
+                      </span>
+                    )}
+                  </td>
                   <td className="px-3 py-3 text-sm text-right">
                     {inv.status === 'paid' ? (
                       <span className="text-accent-green font-medium">Pagato</span>
@@ -961,15 +1119,30 @@ export default function ClientDetail() {
         {data.recovery_actions && data.recovery_actions.length > 0 && (
           <div className="mt-4 border-l-2 border-dark-border pl-4 space-y-3">
             {data.recovery_actions.map(action => (
-              <div key={action.id} className="relative">
+              <div key={action.id} className={`relative ${action.cancelled ? 'opacity-50' : ''}`}>
                 <div className={`absolute -left-[21px] top-1 w-3 h-3 rounded-full border-2 border-dark-card ${
-                  action.completed_at ? 'bg-accent-green' : 'bg-txt-muted'
+                  action.cancelled ? 'bg-dark-border' : action.completed_at ? 'bg-accent-green' : 'bg-txt-muted'
                 }`}></div>
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-sm font-medium text-txt-primary">
+                  <span className={`text-sm font-medium text-txt-primary ${action.cancelled ? 'line-through' : ''}`}>
                     {ACTION_LABELS[action.action_type] || action.action_type}
                   </span>
-                  <span className="text-xs text-txt-muted">{formatDate(action.created_at)}</span>
+                  {/* Data di ESECUZIONE per le azioni fatte, di pianificazione
+                      per i todo: la data di creazione mostrata in passato
+                      faceva sembrare i solleciti molto più vecchi del reale */}
+                  <span className="text-xs text-txt-muted">
+                    {action.completed_at
+                      ? `eseguita il ${formatDate(action.completed_at)}`
+                      : action.scheduled_date
+                        ? `pianificata per ${formatDate(action.scheduled_date)}`
+                        : formatDate(action.created_at)}
+                  </span>
+                  {(action.channel === 'whatsapp_copy' || action.channel === 'whatsapp_link') && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-accent-green/15 text-accent-green">WhatsApp</span>
+                  )}
+                  {action.cancelled && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-dark-surface text-txt-muted">annullata</span>
+                  )}
                   {action.completed_at && action.outcome && (
                     <span className={`text-xs px-1.5 py-0.5 rounded ${OUTCOME_COLORS[action.outcome] || 'bg-accent-green/15 text-accent-green'}`}>
                       {OUTCOME_LABELS[action.outcome] || action.outcome}

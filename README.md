@@ -1,6 +1,8 @@
 # SC Recupero Crediti
 
-Sistema automatizzato di recupero crediti per Sake Company con integrazione FatturaPro, Fattura24, Shopify e WhatsApp (Twilio).
+Sistema di recupero crediti per Sake Company con integrazione FatturaPro e Shopify.
+I solleciti sono MANUALI: l'operatore usa "Copia Messaggio" dal dettaglio cliente e invia su
+WhatsApp; il sistema registra automaticamente il sollecito sulla pratica del cliente.
 
 **Frontend live**: [https://recupero.sakecompany.com](https://recupero.sakecompany.com)
 
@@ -13,10 +15,21 @@ Il sistema è diviso in due componenti:
 
 ### Come funziona
 
-1. Lo scheduler giornaliero (08:30 CET) sincronizza fatture da FatturaPro/Fattura24 e clienti da Shopify
-2. Il matching automatico collega fatture e clienti usando normalizzazione ragioni sociali italiane + fuzzy matching
-3. Per ogni fattura scaduta, il sistema crea una posizione debitoria e invia messaggi WhatsApp in 4 livelli di escalation (7, 14, 21, 30 giorni)
-4. La dashboard web mostra lo stato di tutti i crediti in tempo reale
+1. Lo scheduler giornaliero (08:30 CET) sincronizza fatture da FatturaPro (con P.IVA e
+   scadenze reali dalle pagine di dettaglio) e clienti da Shopify
+2. Il matching abbina automaticamente solo i casi SICURI (P.IVA univoca validata con checksum,
+   nome normalizzato esatto e univoco); i casi dubbi (fuzzy, P.IVA ambigue) finiscono nella coda
+   "Da confermare" della pagina Fatture, dove l'operatore conferma o rifiuta
+3. Le fatture scadute di un cliente aprono una PRATICA (recovery case): i solleciti manuali via
+   "Copia Messaggio" vengono registrati sulla pratica (numerazione e tono per ciclo di debito);
+   a saldo completo la pratica si chiude e il ciclo successivo riparte da zero
+4. La dashboard web mostra todo, calendario e stato di tutti i crediti in tempo reale
+
+### Tabelle legacy
+
+Le tabelle `messages` e `conversations` (pipeline di invio automatico Twilio, mai attivata in
+produzione e rimossa a luglio 2026) restano nel database Supabase come archivio non mappato dal
+codice: possono essere eliminate manualmente quando non servono più.
 
 ## Quick Start — Sviluppo Locale
 
@@ -52,7 +65,7 @@ Per sviluppo locale il sistema usa SQLite automaticamente (nessun setup database
    - `DATABASE_URL` → connection string Supabase
    - `FATTURAPRO_API_KEY`, `FATTURAPRO_DOMAIN`
    - `SHOPIFY_STORE_URL`, `SHOPIFY_ACCESS_TOKEN`
-   - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_NUMBER_*`
+   - `JWT_SECRET`, `AUTH_PASSWORD`, `COMPANY_PIVA`
    - `CORS_ORIGINS` → `https://recupero.sakecompany.com`
 4. Il deploy è automatico ad ogni push su `main`
 
@@ -86,10 +99,9 @@ Per setup completo con Nginx + SSL: `sudo bash deploy/setup.sh`
 | `FATTURA24_API_KEY` | Chiave API Fattura24 (legacy) |
 | `SHOPIFY_STORE_URL` | URL negozio Shopify |
 | `SHOPIFY_ACCESS_TOKEN` | Token API Shopify |
-| `TWILIO_ACCOUNT_SID` | Account SID Twilio |
-| `TWILIO_AUTH_TOKEN` | Auth token Twilio |
-| `TWILIO_WHATSAPP_NUMBER_BUSINESS` | Numero WhatsApp business |
-| `TWILIO_WHATSAPP_NUMBER_RECOVERY` | Numero WhatsApp recupero crediti |
+| `COMPANY_PIVA` | P.IVA di Sake Company (blacklist scraping: senza, l'enrichment full-text resta disabilitato) |
+| `JWT_SECRET` | Segreto JWT (obbligatoria) |
+| `AUTH_PASSWORD` | Password di accesso (obbligatoria) |
 | `CORS_ORIGINS` | Origini CORS consentite |
 
 ## API Endpoints
@@ -98,29 +110,29 @@ Per setup completo con Nginx + SSL: `sudo bash deploy/setup.sh`
 - `GET /api/dashboard` — Statistiche dashboard
 - `GET /api/positions` — Lista posizioni debitorie
 - `GET /api/customers` — Lista clienti
-- `GET /api/messages` — Lista messaggi WhatsApp
-- `POST /api/sync/full` — Sincronizzazione completa (FatturaPro + Shopify + matching)
-- `POST /api/webhooks/twilio` — Webhook Twilio per risposte WhatsApp
+- `GET /api/positions/suggestions` — Abbinamenti in quarantena da confermare
+- `POST /api/recovery/customers/{id}/solleciti` — Registra un sollecito WhatsApp sulla pratica
+- `GET /api/system/match-audit` — Audit abbinamenti fatture→clienti (warn/bad)
+- `POST /api/sync/full` — Sincronizzazione completa (fatture → clienti → matching → auto-create → ordini → pratiche)
 
 ## Struttura Progetto
 
 ```
 ├── backend/
 │   ├── api/            # Route FastAPI
-│   ├── connectors/     # Client API (FatturaPro, Fattura24, Shopify, Twilio)
+│   ├── connectors/     # Client API (FatturaPro, Shopify)
 │   ├── engine/         # Logica business
 │   │   ├── normalizer.py      # Normalizzazione ragioni sociali
-│   │   ├── phone_validator.py # Validazione numeri per WhatsApp
-│   │   ├── matching.py        # Matching fatture-clienti
-│   │   ├── deduplicator.py    # Deduplicazione fatture
-│   │   └── escalation.py     # Escalation a 4 livelli
+│   │   ├── piva.py            # Validazione P.IVA (checksum)
+│   │   ├── matching.py        # Matching fatture-clienti + quarantena
+│   │   └── cases.py           # Pratiche di recupero (lifecycle + backfill)
 │   ├── config.py       # Configurazione da .env
 │   ├── database.py     # SQLAlchemy ORM (PostgreSQL/SQLite)
 │   ├── scheduler.py    # APScheduler (job giornaliero)
 │   └── main.py         # Entry point FastAPI
 ├── frontend/
 │   ├── src/
-│   │   ├── pages/      # Dashboard, Posizioni, Messaggi, Clienti
+│   │   ├── pages/      # Dashboard, Attività, Fatture, Clienti, Sistema
 │   │   ├── api/        # Client Axios
 │   │   └── config.js   # URL backend configurabile
 │   └── public/

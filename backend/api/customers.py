@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 
 from backend.database import get_session, Customer, Invoice, ActivityLog, RecoveryAction
+from backend.engine.cases import get_open_case, contact_count
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -173,6 +174,7 @@ async def get_customer_detail(
                 "amount_due": float(inv.amount_due),
                 "issue_date": inv.issue_date.isoformat() if inv.issue_date else None,
                 "due_date": inv.due_date.isoformat() if inv.due_date else None,
+                "due_date_source": inv.due_date_source or ("assumed" if inv.due_date else None),
                 "days_overdue": inv.days_overdue,
                 "status": inv.status,
                 "source_platform": inv.source_platform,
@@ -198,20 +200,43 @@ async def get_customer_detail(
                 "completed_at": a.completed_at.isoformat() if a.completed_at else None,
                 "outcome": a.outcome,
                 "notes": a.notes,
+                "channel": a.channel,
+                "invoice_ids": a.invoice_ids or [],
+                "cancelled": bool(a.cancelled),
+                "cancelled_reason": a.cancelled_reason,
+                "case_id": a.case_id,
                 "created_at": a.created_at.isoformat(),
             }
             for a in actions
         ]
 
-        # Count contact actions (first_contact, second_contact) for progressive numbering
-        contact_action_count = (
-            session.query(func.count(RecoveryAction.id))
-            .filter(
-                RecoveryAction.customer_id == customer_id,
-                RecoveryAction.action_type.in_(["first_contact", "second_contact"]),
-            )
-            .scalar() or 0
-        )
+        # Pratica aperta: numerazione e tono contano SOLO le azioni di
+        # questo ciclo di debito (più gli eventuali contatti ereditati da
+        # una pratica archiviata), mai tutta la storia del cliente.
+        open_case = get_open_case(session, customer_id)
+        case_block = None
+        contact_action_count = 0
+        if open_case:
+            contact_action_count = contact_count(session, open_case)
+            today_start = datetime.combine(datetime.utcnow().date(), datetime.min.time())
+            sollecito_today = (
+                session.query(func.count(RecoveryAction.id))
+                .filter(
+                    RecoveryAction.case_id == open_case.id,
+                    RecoveryAction.channel.in_(["whatsapp_copy", "whatsapp_link"]),
+                    RecoveryAction.completed_at >= today_start,
+                    RecoveryAction.cancelled.isnot(True),
+                )
+                .scalar() or 0
+            ) > 0
+            case_block = {
+                "id": open_case.id,
+                "opened_at": open_case.opened_at.isoformat() if open_case.opened_at else None,
+                "contact_count": contact_action_count,
+                "inherited_contacts": open_case.inherited_contacts or 0,
+                "reopened_after_archive": bool(open_case.reopened_after_archive),
+                "sollecito_registered_today": sollecito_today,
+            }
 
         return {
             "id": customer.id,
@@ -239,6 +264,7 @@ async def get_customer_detail(
             },
             "recovery_actions": action_list,
             "contact_action_count": contact_action_count,
+            "case": case_block,
         }
 
     except HTTPException:

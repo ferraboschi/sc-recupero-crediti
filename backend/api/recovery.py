@@ -1,20 +1,31 @@
-"""Recovery workflow API endpoints."""
+"""Recovery workflow API endpoints.
+
+Tutte le azioni sono agganciate alla PRATICA aperta del cliente
+(RecoveryCase): numerazione e tono dei solleciti contano le azioni della
+pratica, e alla chiusura (saldo) il ciclo riparte pulito.
+"""
 
 import os
 import logging
-from datetime import datetime, date, timedelta
-from typing import Optional
+from datetime import datetime, date, time as dt_time, timedelta
+from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, or_, func
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from io import BytesIO
 
 from backend.database import get_session, Customer, Invoice, RecoveryAction, ActivityLog
+from backend.engine.cases import (
+    CONTACT_TYPES, contact_count, ensure_open_case, get_open_case,
+    is_overdue_unpaid, schedule_next_action, close_case, _refresh_customer_status,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+WHATSAPP_CHANNELS = ("whatsapp_copy", "whatsapp_link")
 
 
 # --- Pydantic models ---
@@ -25,120 +36,241 @@ class ActionCreate(BaseModel):
     notes: Optional[str] = None
 
 
-class ActionUpdate(BaseModel):
-    notes: Optional[str] = None
-    scheduled_date: Optional[str] = None
+class SollecitoCreate(BaseModel):
+    invoice_ids: List[int] = []
+    channel: str = "whatsapp_copy"  # whatsapp_copy / whatsapp_link
 
 
-# --- Calendar endpoint ---
+def _serialize_action(a: RecoveryAction) -> dict:
+    return {
+        "id": a.id,
+        "action_type": a.action_type,
+        "scheduled_date": a.scheduled_date.isoformat() if a.scheduled_date else None,
+        "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+        "outcome": a.outcome,
+        "notes": a.notes,
+        "channel": a.channel,
+        "invoice_ids": a.invoice_ids or [],
+        "cancelled": bool(a.cancelled),
+        "cancelled_reason": a.cancelled_reason,
+        "case_id": a.case_id,
+        "created_at": a.created_at.isoformat(),
+    }
 
-@router.get("/calendar")
-async def get_calendar(
+
+# --- Registrazione solleciti (Copia Messaggio / WhatsApp) ---
+
+@router.post("/customers/{customer_id}/solleciti")
+async def register_sollecito(
+    customer_id: int,
+    body: SollecitoCreate,
     session: Session = Depends(get_session),
-    date_from: str = Query(None, description="Start date (YYYY-MM-DD), defaults to today"),
-    date_to: str = Query(None, description="End date (YYYY-MM-DD), defaults to +30 days"),
 ):
+    """Registra un sollecito inviato via WhatsApp (Copia Messaggio).
+
+    - Crea un'azione di contatto COMPLETATA ora, agganciata alla pratica
+      aperta (creata/riaperta se serve), con canale e fatture citate.
+    - Un eventuale todo di contatto pendente viene soppiantato (il todo
+      legale invece resta: un sollecito WhatsApp non sostituisce l'avvocato).
+    - Dedup per giornata solare: un secondo copy nello stesso giorno
+      aggiorna le fatture citate e ritorna lo stesso numero di sollecito.
+    - Cliente senza fatture scadute → 200 {registered: false}: il copy è
+      legittimo (promemoria di cortesia), semplicemente non è un sollecito.
     """
-    Get all scheduled recovery actions for the calendar view.
-    Returns actions grouped by date.
+    if body.channel not in WHATSAPP_CHANNELS:
+        raise HTTPException(status_code=400, detail=f"Canale non valido: {body.channel}")
+
+    try:
+        # Lock del cliente per rendere atomico dedup-check + insert
+        # (su PostgreSQL; SQLite serializza comunque le scritture).
+        customer = (
+            session.query(Customer)
+            .filter(Customer.id == customer_id)
+            .with_for_update()
+            .first()
+        )
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        if customer.excluded:
+            raise HTTPException(status_code=409, detail="Cliente escluso dal recupero crediti")
+
+        overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
+        if not overdue:
+            return {
+                "registered": False,
+                "reason": "no_overdue",
+                "message": "Nessuna fattura scaduta: messaggio copiato ma sollecito non registrato",
+            }
+
+        case = ensure_open_case(session, customer)
+        today = date.today()
+        now = datetime.utcnow()
+
+        # Dedup: già registrato un sollecito WhatsApp oggi per questa pratica?
+        start_of_day = datetime.combine(today, dt_time.min)
+        existing_today = session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == case.id,
+            RecoveryAction.channel.in_(WHATSAPP_CHANNELS),
+            RecoveryAction.completed_at >= start_of_day,
+            RecoveryAction.cancelled.isnot(True),
+        ).order_by(RecoveryAction.completed_at.desc()).first()
+
+        if existing_today:
+            merged = sorted(set((existing_today.invoice_ids or []) + body.invoice_ids))
+            existing_today.invoice_ids = merged
+            n = contact_count(session, case)
+            session.commit()
+            return {
+                "registered": True,
+                "already_registered_today": True,
+                "action_id": existing_today.id,
+                "sollecito_n": n,
+                "next_action": {
+                    "action_type": customer.next_action_type,
+                    "scheduled_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
+                },
+            }
+
+        # Soppianta i todo di contatto pendenti (NON quelli legali)
+        pending_contacts = session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == case.id,
+            RecoveryAction.action_type.in_(CONTACT_TYPES),
+            RecoveryAction.completed_at.is_(None),
+            RecoveryAction.cancelled.isnot(True),
+        ).all()
+
+        n_before = contact_count(session, case)
+        n = n_before + 1
+        action_type = "first_contact" if n == 1 else "second_contact"
+        channel_label = "Copia Messaggio" if body.channel == "whatsapp_copy" else "link WhatsApp"
+
+        action = RecoveryAction(
+            customer_id=customer.id,
+            case_id=case.id,
+            action_type=action_type,
+            scheduled_date=today,
+            completed_at=now,
+            outcome="contacted",
+            channel=body.channel,
+            invoice_ids=sorted(set(body.invoice_ids)),
+            notes=f"Sollecito n. {n} via {channel_label} ({len(body.invoice_ids)} fatture)",
+        )
+        session.add(action)
+        session.flush()
+
+        for p in pending_contacts:
+            p.cancelled = True
+            p.cancelled_reason = f"superseded_by_sollecito:{action.id}"
+
+        customer.recovery_status = "first_contact" if n == 1 else "second_contact"
+        next_action = schedule_next_action(session, customer, case, n)
+
+        session.add(ActivityLog(
+            action="sollecito",
+            entity_type="recovery_action",
+            entity_id=action.id,
+            details={
+                "customer": customer.ragione_sociale,
+                "case_id": case.id,
+                "sollecito_n": n,
+                "channel": body.channel,
+                "invoice_ids": body.invoice_ids,
+            },
+        ))
+        session.commit()
+
+        return {
+            "registered": True,
+            "action_id": action.id,
+            "sollecito_n": n,
+            "superseded_pending": len(pending_contacts),
+            "next_action": {
+                "action_type": next_action.action_type,
+                "scheduled_date": next_action.scheduled_date.isoformat(),
+            } if next_action else {
+                "action_type": customer.next_action_type,
+                "scheduled_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error registering sollecito: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.delete("/customers/{customer_id}/solleciti/{action_id}")
+async def undo_sollecito(
+    customer_id: int,
+    action_id: int,
+    session: Session = Depends(get_session),
+):
+    """Annulla un sollecito registrato per errore (solo lo stesso giorno).
+
+    Ripristina i todo soppiantati e rimuove la prossima azione
+    auto-pianificata; la numerazione torna com'era.
     """
     try:
-        today = date.today()
-        start = date.fromisoformat(date_from) if date_from else today - timedelta(days=7)
-        end = date.fromisoformat(date_to) if date_to else today + timedelta(days=60)
+        action = session.query(RecoveryAction).filter(
+            RecoveryAction.id == action_id,
+            RecoveryAction.customer_id == customer_id,
+        ).first()
+        if not action:
+            raise HTTPException(status_code=404, detail="Sollecito non trovato")
+        if action.channel not in WHATSAPP_CHANNELS or action.cancelled:
+            raise HTTPException(status_code=400, detail="Azione non annullabile")
+        if not action.completed_at or action.completed_at.date() != date.today():
+            raise HTTPException(status_code=400, detail="Annullabile solo lo stesso giorno")
 
-        actions = (
-            session.query(RecoveryAction)
-            .join(Customer)
-            .filter(
-                RecoveryAction.scheduled_date.isnot(None),
-                RecoveryAction.scheduled_date >= start,
-                RecoveryAction.scheduled_date <= end,
-                RecoveryAction.completed_at.is_(None),
-            )
-            .order_by(RecoveryAction.scheduled_date.asc())
-            .all()
-        )
+        action.cancelled = True
+        action.cancelled_reason = "undo"
 
-        # Also get customers with next_action_date that don't have a pending action
-        customers_with_actions = (
-            session.query(Customer)
-            .filter(
-                Customer.next_action_date.isnot(None),
-                Customer.next_action_date >= start,
-                Customer.next_action_date <= end,
-                Customer.recovery_status != "archived",
-            )
-            .all()
-        )
+        # Ripristina i todo soppiantati da QUESTO sollecito
+        superseded = session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == action.case_id,
+            RecoveryAction.cancelled_reason == f"superseded_by_sollecito:{action.id}",
+        ).all()
+        for p in superseded:
+            p.cancelled = False
+            p.cancelled_reason = None
 
-        # Pre-fetch invoice stats for all relevant customers in 1 query (avoids N+1)
-        all_customer_ids = set(a.customer_id for a in actions) | set(c.id for c in customers_with_actions)
-        invoice_stats = {}
-        if all_customer_ids:
-            stats_rows = (
-                session.query(
-                    Invoice.customer_id,
-                    func.count(Invoice.id).label("overdue_count"),
-                    func.coalesce(func.sum(Invoice.amount_due), 0).label("total_due"),
-                )
-                .filter(
-                    Invoice.customer_id.in_(all_customer_ids),
-                    Invoice.status != "paid",
-                    Invoice.days_overdue > 0,
-                )
-                .group_by(Invoice.customer_id)
-                .all()
-            )
-            for row in stats_rows:
-                invoice_stats[row.customer_id] = {
-                    "overdue_count": row.overdue_count,
-                    "total_due": float(row.total_due),
-                }
+        # Rimuove la prossima azione auto-pianificata da questo sollecito
+        auto_next = session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == action.case_id,
+            RecoveryAction.completed_at.is_(None),
+            RecoveryAction.cancelled.isnot(True),
+            RecoveryAction.created_at >= action.created_at,
+            RecoveryAction.notes.like("Auto-pianificata%"),
+        ).all()
+        for nxt in auto_next:
+            session.delete(nxt)
 
-        items = []
-        seen_customer_ids = set()
+        customer = session.query(Customer).filter(Customer.id == customer_id).first()
+        case = get_open_case(session, customer_id)
+        if customer and case:
+            _refresh_customer_status(session, customer, case)
 
-        for action in actions:
-            seen_customer_ids.add(action.customer_id)
-            stats = invoice_stats.get(action.customer_id, {"overdue_count": 0, "total_due": 0.0})
+        session.add(ActivityLog(
+            action="sollecito_undo",
+            entity_type="recovery_action",
+            entity_id=action.id,
+            details={"customer_id": customer_id, "restored_pending": len(superseded)},
+        ))
+        session.commit()
 
-            items.append({
-                "id": action.id,
-                "customer_id": action.customer_id,
-                "customer_name": action.customer.ragione_sociale,
-                "action_type": action.action_type,
-                "scheduled_date": action.scheduled_date.isoformat(),
-                "notes": action.notes,
-                "overdue_invoices": stats["overdue_count"],
-                "total_due": stats["total_due"],
-                "source": "action",
-            })
+        return {
+            "undone": True,
+            "restored_pending": len(superseded),
+            "removed_next_actions": len(auto_next),
+        }
 
-        # Add customers that have next_action_date but no pending action record
-        for cust in customers_with_actions:
-            if cust.id not in seen_customer_ids:
-                stats = invoice_stats.get(cust.id, {"overdue_count": 0, "total_due": 0.0})
-
-                items.append({
-                    "id": None,
-                    "customer_id": cust.id,
-                    "customer_name": cust.ragione_sociale,
-                    "action_type": cust.next_action_type or cust.recovery_status,
-                    "scheduled_date": cust.next_action_date.isoformat(),
-                    "notes": None,
-                    "overdue_invoices": stats["overdue_count"],
-                    "total_due": stats["total_due"],
-                    "source": "customer",
-                })
-
-        # Sort all items by date
-        items.sort(key=lambda x: x["scheduled_date"])
-
-        return {"items": items, "total": len(items)}
-
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error fetching calendar: {e}", exc_info=True)
+        logger.error(f"Error undoing sollecito: {e}", exc_info=True)
+        session.rollback()
         raise
 
 
@@ -167,18 +299,7 @@ async def get_customer_actions(
             "recovery_status": customer.recovery_status,
             "next_action_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
             "next_action_type": customer.next_action_type,
-            "actions": [
-                {
-                    "id": a.id,
-                    "action_type": a.action_type,
-                    "scheduled_date": a.scheduled_date.isoformat() if a.scheduled_date else None,
-                    "completed_at": a.completed_at.isoformat() if a.completed_at else None,
-                    "outcome": a.outcome,
-                    "notes": a.notes,
-                    "created_at": a.created_at.isoformat(),
-                }
-                for a in actions
-            ],
+            "actions": [_serialize_action(a) for a in actions],
         }
 
     except HTTPException:
@@ -220,9 +341,49 @@ async def create_action(
         today = date.today()
         scheduled = date.fromisoformat(action.scheduled_date) if action.scheduled_date else None
 
+        # Aggancio alla pratica aperta (creata se il cliente ha scadute).
+        # Le note non c'entrano col ciclo di recupero e restano senza pratica.
+        case = None
+        if action.action_type != "note":
+            overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
+            if overdue and not customer.excluded:
+                case = ensure_open_case(session, customer)
+
+        # Guardia anti-doppione: un contatto pianificato quando la pratica ha
+        # già un todo di contatto (o un sollecito WhatsApp registrato oggi)
+        # duplicherebbe la progressione.
+        if case and action.action_type in CONTACT_TYPES:
+            pending_contact = session.query(RecoveryAction).filter(
+                RecoveryAction.case_id == case.id,
+                RecoveryAction.action_type.in_(CONTACT_TYPES),
+                RecoveryAction.completed_at.is_(None),
+                RecoveryAction.cancelled.isnot(True),
+            ).first()
+            if pending_contact:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Esiste già un contatto pianificato per il "
+                        f"{pending_contact.scheduled_date.isoformat() if pending_contact.scheduled_date else 'N/D'}: "
+                        f"modificane la data invece di crearne un altro"
+                    ),
+                )
+            sollecito_today = session.query(RecoveryAction).filter(
+                RecoveryAction.case_id == case.id,
+                RecoveryAction.channel.in_(WHATSAPP_CHANNELS),
+                RecoveryAction.completed_at >= datetime.combine(today, dt_time.min),
+                RecoveryAction.cancelled.isnot(True),
+            ).first()
+            if sollecito_today:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Sollecito già registrato oggi via WhatsApp (Copia Messaggio)",
+                )
+
         # Create the action record
         new_action = RecoveryAction(
             customer_id=customer_id,
+            case_id=case.id if case else None,
             action_type=action.action_type,
             scheduled_date=scheduled or today,
             notes=action.notes,
@@ -247,6 +408,11 @@ async def create_action(
             customer.recovery_status = "archived"
             customer.next_action_date = None
             customer.next_action_type = None
+            # Archiviare è un atto immediato (non un todo) e chiude la pratica
+            new_action.completed_at = datetime.utcnow()
+            if case:
+                session.flush()
+                close_case(session, case, "archived")
         elif action.action_type == "wait":
             customer.recovery_status = "waiting"
             customer.next_action_date = scheduled or (today + timedelta(days=30))
@@ -319,32 +485,38 @@ async def complete_action(
 
         customer = session.query(Customer).filter(Customer.id == customer_id).first()
 
-        # --- Auto-progression: crea la prossima azione automaticamente ---
-        today = date.today()
+        # --- Auto-progression (unificata con l'endpoint solleciti) ---
         next_action = None
-        PROGRESSION = {
-            "first_contact": ("second_contact", 14),
-            "second_contact": ("lawyer", 30),
-            "lawyer": ("lawyer", 30),  # follow-up avvocato
-        }
+        if customer and action.action_type in CONTACT_TYPES + ("lawyer",):
+            case = None
+            if action.case_id and action.case and action.case.status == "open":
+                case = action.case
+            elif not customer.excluded:
+                overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
+                if overdue:
+                    case = ensure_open_case(session, customer)
+                    if not action.case_id:
+                        action.case_id = case.id
 
-        if action.action_type in PROGRESSION and customer:
-            next_type, next_days = PROGRESSION[action.action_type]
-            next_date = today + timedelta(days=next_days)
-
-            next_action = RecoveryAction(
-                customer_id=customer_id,
-                action_type=next_type,
-                scheduled_date=next_date,
-                notes=f"Auto-generato dopo completamento {action.action_type}",
-            )
-            session.add(next_action)
-
-            # Aggiorna stato cliente
-            customer.recovery_status = next_type
-            customer.next_action_date = next_date
-            customer.next_action_type = next_type
-            customer.updated_at = datetime.utcnow()
+            if case:
+                if action.action_type in CONTACT_TYPES:
+                    n = contact_count(session, case)
+                    customer.recovery_status = "first_contact" if n <= 1 else "second_contact"
+                    next_action = schedule_next_action(session, customer, case, n)
+                else:  # lawyer completato → follow-up legale +30gg
+                    customer.recovery_status = "lawyer"
+                    next_date = date.today() + timedelta(days=30)
+                    next_action = RecoveryAction(
+                        customer_id=customer_id,
+                        case_id=case.id,
+                        action_type="lawyer",
+                        scheduled_date=next_date,
+                        notes="Auto-pianificata: follow-up avvocato",
+                    )
+                    session.add(next_action)
+                    customer.next_action_date = next_date
+                    customer.next_action_type = "lawyer"
+                customer.updated_at = datetime.utcnow()
 
         session.commit()
 
@@ -884,175 +1056,4 @@ async def download_invoices_zip(
             f"Error generating invoices ZIP: {e}",
             exc_info=True,
         )
-        raise
-
-
-# --- Recovery Report / Attività ---
-
-@router.get("/report")
-async def get_recovery_report(
-    session: Session = Depends(get_session),
-):
-    """
-    Get recovery report with stats by status, upcoming deadlines, and paid summary.
-
-    Returns data for the Attività report page:
-    - recuperi_attivi: customers in active recovery (first_contact, second_contact)
-    - saldato: customers/invoices that have been paid
-    - in_attesa: customers in waiting status
-    - avvocato: customers passed to lawyer
-    - prossime_scadenze: upcoming scheduled actions (next 30 days)
-    - summary stats
-    """
-    # func already imported at module level
-
-    try:
-        today = date.today()
-
-        # --- Summary stats ---
-        # Active recovery customers
-        active_customers = session.query(Customer).filter(
-            Customer.recovery_status.in_(["first_contact", "second_contact"]),
-            Customer.excluded.is_(False),
-        ).all()
-
-        # Waiting customers
-        waiting_customers = session.query(Customer).filter(
-            Customer.recovery_status == "waiting",
-            Customer.excluded.is_(False),
-        ).all()
-
-        # Lawyer customers
-        lawyer_customers = session.query(Customer).filter(
-            Customer.recovery_status == "lawyer",
-            Customer.excluded.is_(False),
-        ).all()
-
-        # Paid invoices (all)
-        paid_invoices = session.query(Invoice).filter(
-            Invoice.status == "paid",
-        ).all()
-
-        # Recuperati: paid invoices AFTER first recovery action on that customer
-        first_actions = {}
-        for row in session.query(
-            RecoveryAction.customer_id,
-            func.min(RecoveryAction.created_at).label("first_action"),
-        ).filter(
-            RecoveryAction.action_type.in_(["first_contact", "second_contact", "lawyer"]),
-        ).group_by(RecoveryAction.customer_id).all():
-            first_actions[row[0]] = row[1]
-
-        recovered_invoices = [
-            inv for inv in paid_invoices
-            if inv.customer_id
-            and inv.customer_id in first_actions
-            and inv.updated_at
-            and inv.updated_at >= first_actions[inv.customer_id]
-        ]
-        recovered_total = sum(float(inv.amount or 0) for inv in recovered_invoices)
-
-        # Upcoming actions (next 30 days)
-        upcoming_actions = (
-            session.query(RecoveryAction)
-            .join(Customer)
-            .filter(
-                RecoveryAction.scheduled_date.isnot(None),
-                RecoveryAction.scheduled_date >= today,
-                RecoveryAction.scheduled_date <= today + timedelta(days=30),
-                RecoveryAction.completed_at.is_(None),
-            )
-            .order_by(RecoveryAction.scheduled_date.asc())
-            .all()
-        )
-
-        # Also include customers with next_action_date
-        customers_upcoming = session.query(Customer).filter(
-            Customer.next_action_date.isnot(None),
-            Customer.next_action_date >= today,
-            Customer.next_action_date <= today + timedelta(days=30),
-            Customer.recovery_status != "archived",
-            Customer.excluded.is_(False),
-        ).all()
-
-        # Helper to get customer invoice stats
-        def get_customer_stats(cust):
-            inv_query = session.query(Invoice).filter(
-                Invoice.customer_id == cust.id,
-                Invoice.status != "paid",
-            )
-            total_due = sum(i.amount_due for i in inv_query.all())
-            count = inv_query.count()
-            return {
-                "id": cust.id,
-                "ragione_sociale": cust.ragione_sociale,
-                "partita_iva": cust.partita_iva,
-                "recovery_status": cust.recovery_status,
-                "next_action_date": cust.next_action_date.isoformat() if cust.next_action_date else None,
-                "next_action_type": cust.next_action_type,
-                "total_due": float(total_due),
-                "invoice_count": count,
-            }
-
-        # Build response
-        return {
-            "summary": {
-                "active_count": len(active_customers),
-                "active_total_due": float(sum(
-                    sum(i.amount_due for i in session.query(Invoice).filter(
-                        Invoice.customer_id == c.id, Invoice.status != "paid"
-                    ).all())
-                    for c in active_customers
-                )),
-                "waiting_count": len(waiting_customers),
-                "lawyer_count": len(lawyer_customers),
-                "paid_count": len(paid_invoices),
-                "paid_total": float(sum(i.amount for i in paid_invoices)),
-                "recovered_count": len(recovered_invoices),
-                "recovered_total": recovered_total,
-                "upcoming_actions_count": len(upcoming_actions) + len([
-                    c for c in customers_upcoming
-                    if c.id not in {a.customer_id for a in upcoming_actions}
-                ]),
-            },
-            "recuperi_attivi": [get_customer_stats(c) for c in active_customers],
-            "in_attesa": [get_customer_stats(c) for c in waiting_customers],
-            "avvocato": [get_customer_stats(c) for c in lawyer_customers],
-            "saldato": [
-                {
-                    "id": inv.id,
-                    "invoice_number": inv.invoice_number,
-                    "amount": float(inv.amount),
-                    "customer_name": inv.customer.ragione_sociale if inv.customer else inv.customer_name_raw,
-                    "customer_id": inv.customer_id,
-                    "source_platform": inv.source_platform,
-                }
-                for inv in paid_invoices[:50]  # Limit to recent 50
-            ],
-            "prossime_scadenze": [
-                {
-                    "id": a.id,
-                    "customer_id": a.customer_id,
-                    "customer_name": a.customer.ragione_sociale,
-                    "action_type": a.action_type,
-                    "scheduled_date": a.scheduled_date.isoformat(),
-                    "notes": a.notes,
-                }
-                for a in upcoming_actions
-            ],
-            "recuperati": [
-                {
-                    "id": inv.id,
-                    "invoice_number": inv.invoice_number,
-                    "amount": float(inv.amount),
-                    "customer_name": inv.customer.ragione_sociale if inv.customer else inv.customer_name_raw,
-                    "customer_id": inv.customer_id,
-                    "source_platform": inv.source_platform,
-                }
-                for inv in recovered_invoices[:50]
-            ],
-        }
-
-    except Exception as e:
-        logger.error(f"Error fetching recovery report: {e}", exc_info=True)
         raise

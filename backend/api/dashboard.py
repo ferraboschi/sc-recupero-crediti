@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, extract
 from sqlalchemy.orm import Session, joinedload
 
-from backend.database import get_session, Invoice, Customer, Message, RecoveryAction
+from backend.database import get_session, Invoice, Customer, RecoveryAction, RecoveryCase
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -154,6 +154,7 @@ async def get_todos(session: Session = Depends(get_session)):
             .options(joinedload(RecoveryAction.customer))
             .filter(
                 RecoveryAction.completed_at.is_(None),
+                RecoveryAction.cancelled.isnot(True),
                 RecoveryAction.scheduled_date.isnot(None),
                 RecoveryAction.scheduled_date <= cutoff_date,
                 Customer.excluded.is_(False),
@@ -302,6 +303,7 @@ async def get_calendar(
             .filter(
                 RecoveryAction.scheduled_date >= start,
                 RecoveryAction.scheduled_date <= end,
+                RecoveryAction.cancelled.isnot(True),
                 Customer.excluded.is_(False),
             )
             .order_by(RecoveryAction.scheduled_date.asc())
@@ -353,6 +355,7 @@ async def get_calendar(
             .filter(
                 RecoveryAction.scheduled_date < today,
                 RecoveryAction.completed_at.is_(None),
+                RecoveryAction.cancelled.isnot(True),
                 Customer.excluded.is_(False),
             )
             .scalar() or 0
@@ -383,7 +386,6 @@ async def get_stats(session: Session = Depends(get_session)):
         total_crediti = session.query(func.sum(Invoice.amount_due)).scalar() or 0.0
         total_positions = session.query(func.count(Invoice.id)).scalar() or 0
         total_customers = session.query(func.count(Customer.id)).scalar() or 0
-        total_messages = session.query(func.count(Message.id)).scalar() or 0
 
         # Count by status
         open_positions = session.query(func.count(Invoice.id)).filter(
@@ -402,26 +404,27 @@ async def get_stats(session: Session = Depends(get_session)):
             Invoice.status == "paid"
         ).scalar() or 0
 
-        # Messages by status
-        draft_messages = session.query(func.count(Message.id)).filter(
-            Message.status == "draft"
+        # Pratiche di recupero
+        open_cases = session.query(func.count(RecoveryCase.id)).filter(
+            RecoveryCase.status == "open"
         ).scalar() or 0
 
-        sent_messages = session.query(func.count(Message.id)).filter(
-            Message.status.in_(["sent", "delivered", "read", "replied"])
+        solleciti_inviati = session.query(func.count(RecoveryAction.id)).filter(
+            RecoveryAction.completed_at.isnot(None),
+            RecoveryAction.cancelled.isnot(True),
+            RecoveryAction.action_type.in_(["first_contact", "second_contact"]),
         ).scalar() or 0
 
         return {
             "total_crediti": float(total_crediti),
             "total_positions": total_positions,
             "total_customers": total_customers,
-            "total_messages": total_messages,
             "open_positions": open_positions,
             "contacted_positions": contacted_positions,
             "escalated_positions": escalated_positions,
             "paid_positions": paid_positions,
-            "draft_messages": draft_messages,
-            "sent_messages": sent_messages,
+            "open_cases": open_cases,
+            "solleciti_inviati": solleciti_inviati,
         }
 
     except Exception as e:

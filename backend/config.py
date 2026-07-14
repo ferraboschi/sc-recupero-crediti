@@ -31,13 +31,6 @@ class Config:
     SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10")
     SHOPIFY_PIVA_FIELD = os.getenv("SHOPIFY_PIVA_FIELD", "address2")
 
-    # Twilio / WhatsApp
-    TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
-    TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-    TWILIO_WHATSAPP_NUMBER_BUSINESS = os.getenv("TWILIO_WHATSAPP_NUMBER_BUSINESS", "")
-    TWILIO_WHATSAPP_NUMBER_RECOVERY = os.getenv("TWILIO_WHATSAPP_NUMBER_RECOVERY", "")
-    TWILIO_WEBHOOK_URL = os.getenv("TWILIO_WEBHOOK_URL", "")
-
     # Database
     # Use DATABASE_URL for PostgreSQL (Supabase) or fall back to SQLite
     DATABASE_URL = os.getenv(
@@ -53,19 +46,16 @@ class Config:
     # CORS - frontend origin (GitHub Pages)
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "https://recupero.sakecompany.com,http://localhost:5173").split(",")
 
-    # Anthropic AI
-    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-
-    # Autopilot
-    AUTOPILOT_ENABLED = os.getenv("AUTOPILOT_ENABLED", "false").lower() == "true"
-    ESCALATION_EMAIL = os.getenv("ESCALATION_EMAIL", "lorenzo@ef-ti.com")
-    ESCALATION_PHONE = os.getenv("ESCALATION_PHONE", "")
+    # P.IVA della propria azienda (Sake Company): blacklist per lo scraping
+    # FatturaPro — una P.IVA estratta uguale a questa è sempre quella del
+    # venditore, mai del destinatario. Se assente, il pattern full-text
+    # dell'enrichment viene disabilitato (fail-closed).
+    COMPANY_PIVA = os.getenv("COMPANY_PIVA", "").strip().upper()
 
     # Business rules
-    FUZZY_MATCH_THRESHOLD = 75  # Minimum score for fuzzy matching (lowered from 85 for short names like F-T SRL)
-    BUSINESS_HOURS_START = 9
-    BUSINESS_HOURS_END = 18
-    ESCALATION_DAYS = [7, 14, 21, 30]  # Days between escalation levels
+    # Soglia minima perché un fuzzy match generi un SUGGERIMENTO (mai un
+    # abbinamento automatico). 75 copre i nomi corti reali tipo "F-T SRL".
+    FUZZY_MATCH_THRESHOLD = 75
 
     @classmethod
     def shopify_api_base(cls) -> str:
@@ -82,7 +72,6 @@ class Config:
                 cls.SHOPIFY_ACCESS_TOKEN
                 or (cls.SHOPIFY_CLIENT_ID and cls.SHOPIFY_CLIENT_SECRET)
             ),
-            "twilio": bool(cls.TWILIO_ACCOUNT_SID and cls.TWILIO_AUTH_TOKEN),
         }
 
 

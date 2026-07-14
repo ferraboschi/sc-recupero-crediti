@@ -74,12 +74,27 @@ class TestNormalizeRagioneSociale:
         """Test removal of P.A. (Pubblica Amministrazione)."""
         assert normalize_ragione_sociale("Municipio P.A.") == "municipio"
 
+    def test_short_legal_forms_trailing_only(self):
+        """Short/ambiguous legal forms are removed ONLY at the end of the name."""
+        assert normalize_ragione_sociale("ACME S.S.") == "acme"
+        assert normalize_ragione_sociale("ACME S.C.") == "acme"
+        assert normalize_ragione_sociale("ACME AG") == "acme"
+        assert normalize_ragione_sociale("ACME SA") == "acme"
+        # Same tokens NOT at the end are real words: they must survive
+        assert normalize_ragione_sociale("Sa Duchessa SRL") == "sa duchessa"
+        assert normalize_ragione_sociale("AG Costruzioni") == "ag costruzioni"
+
     def test_remove_di_pattern(self):
-        """Test removal of 'di' + personal name pattern."""
+        """Test removal of 'di' + personal name (2+ words after 'di')."""
         assert normalize_ragione_sociale("SHU&SHU DI SHU KEI S.A.S.") == "shu&shu"
         assert normalize_ragione_sociale("SHU&SHU DI SHU KEI") == "shu&shu"
-        assert normalize_ragione_sociale("Mario Rossi di Marco") == "mario rossi"
-        assert normalize_ragione_sociale("Ditta di Carlo") == "ditta"
+
+    def test_di_pattern_single_word_kept(self):
+        """A single word after 'di' is part of the real name: NOT stripped."""
+        assert normalize_ragione_sociale("Osteria di Mare") == "osteria di mare"
+        assert normalize_ragione_sociale("Mario Rossi di Marco") == "mario rossi di marco"
+        # "ditta" prefix is still removed, but "di Carlo" stays
+        assert normalize_ragione_sociale("Ditta di Carlo") == "di carlo"
 
     def test_di_pattern_with_multiple_names(self):
         """Test 'di' pattern removal with multiple names after 'di'."""

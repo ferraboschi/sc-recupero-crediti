@@ -1,4 +1,10 @@
-"""Database setup and models using SQLAlchemy (PostgreSQL/SQLite)."""
+"""Database setup and models using SQLAlchemy (PostgreSQL/SQLite).
+
+Nota storica: le tabelle `messages` e `conversations` (pipeline di invio
+automatico Twilio, mai attivata in produzione) non sono più mappate dal
+codice ma restano nel database di produzione come archivio. Possono essere
+eliminate manualmente quando si è certi di non doverle più consultare.
+"""
 
 import datetime
 from sqlalchemy import (
@@ -26,9 +32,10 @@ class Customer(Base):
     phones_json = Column(JSON, nullable=True)  # [{"number": "+39...", "source": "shopify_billing", "label": "Fatturazione"}]
     email = Column(String, nullable=True)
     excluded = Column(Boolean, default=False)
-    source = Column(String, default="shopify")  # shopify / fatturapro / fatture24
+    source = Column(String, default="shopify")  # shopify / fatturapro / fatture24 / manual
     tags = Column(String, nullable=True)
-    # Recovery workflow
+    # Recovery workflow — cache dello stato della pratica aperta, per liste/filtri.
+    # La fonte di verità del ciclo di recupero è RecoveryCase.
     recovery_status = Column(String, default="idle")  # idle / first_contact / second_contact / lawyer / archived / waiting
     next_action_date = Column(Date, nullable=True)
     next_action_type = Column(String, nullable=True)  # first_contact / second_contact / lawyer / archive / wait
@@ -36,9 +43,9 @@ class Customer(Base):
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
     # Relationships
-    invoices = relationship("Invoice", back_populates="customer")
-    messages = relationship("Message", back_populates="customer")
+    invoices = relationship("Invoice", back_populates="customer", foreign_keys="Invoice.customer_id")
     recovery_actions = relationship("RecoveryAction", back_populates="customer", order_by="RecoveryAction.created_at.desc()")
+    recovery_cases = relationship("RecoveryCase", back_populates="customer", order_by="RecoveryCase.opened_at.desc()")
 
 
 class Invoice(Base):
@@ -50,8 +57,12 @@ class Invoice(Base):
     amount_due = Column(Float, nullable=False)
     issue_date = Column(Date, nullable=True)
     due_date = Column(Date, nullable=True)
+    # Provenienza della scadenza: 'real' (dal gestionale/CSV), 'assumed'
+    # (sintetizzata emissione+30gg), 'manual'. NULL è trattato come 'assumed'.
+    due_date_source = Column(String, nullable=True)
     days_overdue = Column(Integer, default=0)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    case_id = Column(Integer, ForeignKey("recovery_cases.id"), nullable=True)
     source_platform = Column(String, nullable=False)  # fatturapro / fatture24
     source_id = Column(String, nullable=True)
     shopify_order_id = Column(String, nullable=True)
@@ -59,49 +70,54 @@ class Invoice(Base):
     status = Column(String, default="open")  # open / contacted / promised / paid / disputed / escalated
     customer_name_raw = Column(String, nullable=True)  # Original name from invoice
     customer_piva_raw = Column(String, nullable=True)  # Original P.IVA from invoice
+    # Provenienza dell'abbinamento cliente:
+    # piva / name_exact / fuzzy_confirmed / manual / auto_created / order /
+    # legacy (abbinata prima dell'introduzione della provenance) /
+    # unlinked (scollegata a mano: mai più auto-abbinata, solo suggerimenti)
+    match_method = Column(String, nullable=True)
+    match_score = Column(Integer, nullable=True)
+    # Suggerimento in quarantena (fuzzy/P.IVA ambigua): richiede conferma manuale.
+    suggested_customer_id = Column(Integer, nullable=True)
+    suggested_score = Column(Integer, nullable=True)
+    suggested_method = Column(String, nullable=True)  # fuzzy / piva_ambiguous / piva_name_mismatch / name_ambiguous
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
     # Relationships
-    customer = relationship("Customer", back_populates="invoices")
-    messages = relationship("Message", back_populates="invoice")
+    customer = relationship("Customer", back_populates="invoices", foreign_keys=[customer_id])
+    case = relationship("RecoveryCase", back_populates="invoices")
 
 
-class Message(Base):
-    __tablename__ = "messages"
+class RecoveryCase(Base):
+    """Pratica di recupero: un ciclo di debito di un cliente.
+
+    Si apre quando il cliente ha fatture scadute non pagate, si chiude a
+    saldo (o per archiviazione/esclusione). Numerazione e tono dei solleciti
+    contano le azioni della pratica, non tutta la storia del cliente.
+    """
+    __tablename__ = "recovery_cases"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=False)
-    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
-    escalation_level = Column(Integer, default=1)  # 1-4
-    template = Column(String, nullable=True)
-    body = Column(Text, nullable=True)
-    status = Column(String, default="draft")  # draft / approved / sent / delivered / read / replied
-    approved_by = Column(String, nullable=True)
-    approved_at = Column(DateTime, nullable=True)
-    sent_at = Column(DateTime, nullable=True)
-    twilio_sid = Column(String, nullable=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    status = Column(String, default="open", nullable=False)  # open / closed
+    opened_at = Column(DateTime, default=datetime.datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
+    # paid: tutte le fatture del ciclo saldate.
+    # no_overdue: svuotata senza saldo (es. scadenze corrette nel futuro) — riapribile.
+    # resolved: rimaste solo fatture contestate.
+    # archived: archiviata dall'operatore. excluded: cliente escluso.
+    closed_reason = Column(String, nullable=True)
+    # Contatti ereditati dalla pratica precedente chiusa per archiviazione /
+    # passata all'avvocato: il tono non riparte mai dal sollecito cordiale.
+    inherited_contacts = Column(Integer, default=0)
+    reopened_after_archive = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
     # Relationships
-    invoice = relationship("Invoice", back_populates="messages")
-    customer = relationship("Customer", back_populates="messages")
-    conversations = relationship("Conversation", back_populates="message")
-
-
-class Conversation(Base):
-    __tablename__ = "conversations"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False)
-    direction = Column(String, nullable=False)  # outbound / inbound
-    body = Column(Text, nullable=True)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
-    intent = Column(String, nullable=True)  # payment_confirm / extension / dispute / info_request / wrong_number / opt_out / unknown
-
-    # Relationships
-    message = relationship("Message", back_populates="conversations")
+    customer = relationship("Customer", back_populates="recovery_cases")
+    invoices = relationship("Invoice", back_populates="case")
+    actions = relationship("RecoveryAction", back_populates="case")
 
 
 class RecoveryAction(Base):
@@ -110,15 +126,25 @@ class RecoveryAction(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    case_id = Column(Integer, ForeignKey("recovery_cases.id"), nullable=True)
     action_type = Column(String, nullable=False)  # first_contact / second_contact / lawyer / archive / wait / note
     scheduled_date = Column(Date, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     outcome = Column(String, nullable=True)  # contacted / promised / partial_payment / paid / unreachable / disputed / no_answer
     notes = Column(Text, nullable=True)
+    # Canale del sollecito registrato automaticamente: whatsapp_copy / whatsapp_link / phone / email
+    channel = Column(String, nullable=True)
+    # Fatture citate nel sollecito (lista di invoice id)
+    invoice_ids = Column(JSON, nullable=True)
+    # Azione annullata (non conta, nascosta da todos/calendario).
+    # cancelled_reason: case_closed / superseded_by_sollecito / customer_excluded / undo
+    cancelled = Column(Boolean, default=False)
+    cancelled_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     # Relationships
     customer = relationship("Customer", back_populates="recovery_actions")
+    case = relationship("RecoveryCase", back_populates="actions")
 
 
 class ActivityLog(Base):
@@ -126,9 +152,9 @@ class ActivityLog(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
-    action = Column(String, nullable=False)  # sync / match / message_sent / reply_received / phone_updated / status_change
+    action = Column(String, nullable=False)  # sync / match / status_change / case_opened / case_closed / sollecito ...
     details = Column(JSON, nullable=True)
-    entity_type = Column(String, nullable=True)  # invoice / customer / message
+    entity_type = Column(String, nullable=True)  # invoice / customer / case / recovery_action
     entity_id = Column(Integer, nullable=True)
 
 
@@ -136,7 +162,7 @@ class SyncState(Base):
     """Persists sync status across server restarts."""
     __tablename__ = "sync_state"
 
-    key = Column(String, primary_key=True)  # invoices / customers / matching / escalations
+    key = Column(String, primary_key=True)  # invoices / customers / matching / cases / case_backfill
     last_sync = Column(DateTime, nullable=True)
     result = Column(JSON, nullable=True)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
@@ -185,10 +211,10 @@ def init_db():
 
 
 def _run_migrations(engine):
-    """Add missing columns to existing tables (lightweight migration).
+    """Add missing columns/indexes to existing tables (lightweight migration).
 
     Uses a single raw DBAPI connection to minimise round-trips to Supabase.
-    Each ALTER TABLE is wrapped in a try/except so that 'already exists'
+    Each statement is wrapped in a try/except so that 'already exists'
     errors are silently ignored (idempotent).
     """
     import logging
@@ -198,6 +224,36 @@ def _run_migrations(engine):
         "ALTER TABLE customers ADD COLUMN phones_json JSONB",
         "ALTER TABLE invoices ADD COLUMN shopify_order_id VARCHAR",
         "ALTER TABLE invoices ADD COLUMN shopify_order_number VARCHAR",
+        # Pratiche di recupero + provenance abbinamenti + provenance scadenze
+        "ALTER TABLE invoices ADD COLUMN case_id INTEGER",
+        "ALTER TABLE invoices ADD COLUMN due_date_source VARCHAR",
+        "ALTER TABLE invoices ADD COLUMN match_method VARCHAR",
+        "ALTER TABLE invoices ADD COLUMN match_score INTEGER",
+        "ALTER TABLE invoices ADD COLUMN suggested_customer_id INTEGER",
+        "ALTER TABLE invoices ADD COLUMN suggested_score INTEGER",
+        "ALTER TABLE invoices ADD COLUMN suggested_method VARCHAR",
+        "ALTER TABLE recovery_actions ADD COLUMN case_id INTEGER",
+        "ALTER TABLE recovery_actions ADD COLUMN channel VARCHAR",
+        "ALTER TABLE recovery_actions ADD COLUMN invoice_ids JSONB",
+        "ALTER TABLE recovery_actions ADD COLUMN cancelled BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE recovery_actions ADD COLUMN cancelled_reason VARCHAR",
+        # Una sola pratica aperta per cliente (vale anche su SQLite)
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_open_case_per_customer "
+        "ON recovery_cases (customer_id) WHERE status = 'open'",
+        # Normalizza i NULL del BOOLEAN aggiunto via ALTER
+        "UPDATE recovery_actions SET cancelled = FALSE WHERE cancelled IS NULL",
+        # Backfill provenance (idempotenti: toccano solo righe non classificate).
+        # 'legacy' = abbinata prima dell'introduzione della provenance.
+        "UPDATE invoices SET match_method = 'legacy' "
+        "WHERE customer_id IS NOT NULL AND match_method IS NULL",
+        # Scadenze: emissione+30 esatti = quasi certamente sintetizzata dal
+        # ricalcolo storico (qualsiasi piattaforma) → 'assumed'; le altre con
+        # una scadenza sono vere ('real').
+        "UPDATE invoices SET due_date_source = 'assumed' "
+        "WHERE due_date_source IS NULL AND due_date IS NOT NULL "
+        "AND issue_date IS NOT NULL AND due_date = issue_date + 30",
+        "UPDATE invoices SET due_date_source = 'real' "
+        "WHERE due_date_source IS NULL AND due_date IS NOT NULL",
     ]
     try:
         raw = engine.raw_connection()
@@ -205,10 +261,17 @@ def _run_migrations(engine):
             cur = raw.cursor()
             for stmt in _alters:
                 try:
-                    cur.execute(stmt)
+                    stmt_exec = stmt
+                    if config.DATABASE_URL.startswith("sqlite"):
+                        # SQLite non ha JSONB né l'aritmetica date di Postgres
+                        stmt_exec = stmt.replace("JSONB", "JSON").replace(
+                            "due_date = issue_date + 30",
+                            "due_date = date(issue_date, '+30 days')",
+                        )
+                    cur.execute(stmt_exec)
                     raw.commit()
                 except Exception:
-                    raw.rollback()  # column already exists
+                    raw.rollback()  # column/index already exists
             cur.close()
         finally:
             raw.close()
@@ -237,8 +300,10 @@ def _enable_rls(engine):
         return
 
     tables = [
-        "customers", "invoices", "messages", "conversations",
+        "customers", "invoices", "recovery_cases",
         "recovery_actions", "activity_log", "sync_state",
+        # legacy, non più mappate dal codice ma presenti nel DB
+        "messages", "conversations",
     ]
 
     try:
