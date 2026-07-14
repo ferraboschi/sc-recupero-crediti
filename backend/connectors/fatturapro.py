@@ -823,7 +823,7 @@ class FatturaProConnector:
             except Exception as e:
                 failed_count += 1
                 logger.warning(
-                    f"[{i+1}/{len(need_detail)}] Failed to fetch detail for "
+                    f"[{i + 1}/{len(need_detail)}] Failed to fetch detail for "
                     f"{inv['invoice_number']}: {e}"
                 )
 
@@ -834,7 +834,7 @@ class FatturaProConnector:
             # Progress log every 25 invoices
             if (i + 1) % 25 == 0:
                 logger.info(
-                    f"Detail enrichment progress: {i+1}/{len(need_detail)} "
+                    f"Detail enrichment progress: {i + 1}/{len(need_detail)} "
                     f"({piva_count} P.IVA, {due_count} scadenze, {failed_count} failed)"
                 )
 

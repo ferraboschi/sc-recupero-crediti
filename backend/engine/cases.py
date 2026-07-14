@@ -49,6 +49,7 @@ def business_day_start(now_utc: Optional[datetime] = None) -> datetime:
     local_midnight = now.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0)
     return local_midnight.astimezone(timezone.utc).replace(tzinfo=None)
 
+
 # Tipi di azione che rappresentano un CONTATTO verso il cliente
 # (contano per numerazione e tono). lawyer/wait/archive/note non lo sono.
 CONTACT_TYPES = ("first_contact", "second_contact")
