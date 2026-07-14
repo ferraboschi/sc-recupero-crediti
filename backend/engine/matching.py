@@ -85,7 +85,7 @@ def match_invoice_to_customer(
                     )
                     result.suggested_customer = candidate
                     result.suggested_method = "piva_name_mismatch"
-                    result.suggested_score = name_score
+                    result.suggested_score = int(name_score)
                     return result
             result.customer = candidate
             result.method = "piva"
@@ -230,6 +230,11 @@ def run_matching(session: Session) -> Dict[str, Any]:
             invoice.suggested_score = result.suggested_score
             stats['suggested'] += 1
         else:
+            # Pulisce eventuali suggerimenti stali di run precedenti
+            # (es. cliente suggerito poi rimosso/mergiato).
+            invoice.suggested_customer_id = None
+            invoice.suggested_method = None
+            invoice.suggested_score = None
             stats['unmatched'] += 1
 
     session.commit()

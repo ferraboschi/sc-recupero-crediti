@@ -79,7 +79,10 @@ class Invoice(Base):
     # Suggerimento in quarantena (fuzzy/P.IVA ambigua): richiede conferma manuale.
     suggested_customer_id = Column(Integer, nullable=True)
     suggested_score = Column(Integer, nullable=True)
-    suggested_method = Column(String, nullable=True)  # fuzzy / piva_ambiguous / piva_name_mismatch / name_ambiguous
+    # fuzzy / piva_ambiguous / piva_name_mismatch / name_ambiguous;
+    # per fatture 'unlinked' anche piva / name_exact (il match sarebbe stato
+    # automatico, ma lo scollegamento manuale lo declassa a suggerimento)
+    suggested_method = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
