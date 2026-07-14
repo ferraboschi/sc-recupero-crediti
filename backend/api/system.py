@@ -459,6 +459,7 @@ async def match_audit(
                 _, name_score = are_similar(
                     inv.customer_name_raw, cust.ragione_sociale, threshold=100
                 )
+                name_score = int(name_score)
 
             inv_piva = validate_piva(inv.customer_piva_raw)
             cust_piva = validate_piva(cust.partita_iva)

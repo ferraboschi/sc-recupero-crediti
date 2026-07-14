@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 
-const API = import.meta.env.VITE_API_URL || 'https://sc-recupero-api.onrender.com/api'
+import { API_BASE as API } from '../utils/api'
 
 function StatusBadge({ status }) {
   const colors = {

@@ -1,6 +1,6 @@
 import React, { useState } from 'react'
 
-const API = import.meta.env.VITE_API_URL || 'https://sc-recupero-api.onrender.com/api'
+import { API_BASE as API } from '../utils/api'
 
 export default function Login({ onLogin }) {
   const [username, setUsername] = useState('')
