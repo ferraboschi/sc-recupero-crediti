@@ -1,208 +1,247 @@
-"""Matching module - matches invoices to customers."""
+"""Matching module — abbina le fatture ai clienti, con provenance.
+
+Principi (nati dagli errori di abbinamento visti in produzione):
+1. La P.IVA valida è l'unico identificatore affidabile — ma solo se UN SOLO
+   cliente la possiede e il nome non è palesemente di un'altra azienda.
+2. Il nome normalizzato abbina automaticamente solo se distintivo e UNIVOCO.
+3. Il fuzzy NON abbina mai automaticamente: produce un SUGGERIMENTO in
+   quarantena (suggested_*) che l'operatore conferma o rifiuta dalla UI.
+4. Ogni abbinamento registra come è avvenuto (match_method, match_score).
+5. Una fattura scollegata a mano (match_method='unlinked') non viene mai
+   più abbinata automaticamente: solo suggerimenti.
+"""
 
 import logging
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
 
 from sqlalchemy.orm import Session
 
 from backend.database import Invoice, Customer
 from backend.engine.normalizer import normalize_ragione_sociale, are_similar
+from backend.engine.piva import validate_piva
 from backend.config import config
 
 logger = logging.getLogger(__name__)
 
+# Sotto questa somiglianza nome-fattura vs nome-cliente, un match per P.IVA
+# è sospetto (P.IVA probabilmente scrappata male) → quarantena.
+PIVA_NAME_MISMATCH_THRESHOLD = 40
 
-def _piva_conflict(invoice: Invoice, customer: Customer) -> bool:
-    """
-    REGOLA P.IVA IMPRESCINDIBILE: verifica conflitto P.IVA tra fattura e cliente.
+# Un nome normalizzato più corto di così non è abbastanza distintivo per un
+# abbinamento automatico.
+MIN_DISTINCTIVE_NAME_LEN = 4
 
-    P.IVA è l'identificatore canonico di un'entità commerciale.
-    Se sia la fattura che il cliente hanno una P.IVA e queste sono DIVERSE,
-    sono entità diverse — il match è VIETATO, indipendentemente dalla
-    somiglianza dei nomi.
 
-    Returns True if both have a P.IVA and they don't match — meaning
-    the invoice belongs to a different business entity and must NOT
-    be assigned to this customer.
-    """
-    inv_piva = (invoice.customer_piva_raw or "").strip().upper()
-    cust_piva = (customer.partita_iva or "").strip().upper()
-    if inv_piva and cust_piva and inv_piva != cust_piva:
-        logger.debug(
-            f"P.IVA CONFLICT: invoice {invoice.invoice_number} has '{inv_piva}', "
-            f"customer '{customer.ragione_sociale}' has '{cust_piva}'. Match blocked."
-        )
-        return True
-    return False
+@dataclass
+class MatchResult:
+    """Esito del matching di una fattura."""
+    customer: Optional[Customer] = None  # abbinamento automatico sicuro
+    method: Optional[str] = None         # piva / name_exact
+    score: Optional[int] = None
+    # Suggerimento in quarantena (mai auto-assegnato)
+    suggested_customer: Optional[Customer] = None
+    suggested_method: Optional[str] = None  # fuzzy / piva_ambiguous / piva_name_mismatch / name_ambiguous
+    suggested_score: Optional[int] = None
 
 
 def match_invoice_to_customer(
     invoice: Invoice,
-    customers: list[Customer],
-    session: Session
-) -> Optional[Customer]:
+    customers: List[Customer],
+    session: Session,
+) -> MatchResult:
+    """Match di una fattura contro la lista clienti.
+
+    Ritorna sempre un MatchResult: o un abbinamento automatico sicuro
+    (customer valorizzato), o un suggerimento in quarantena, o niente.
     """
-    Match an invoice to a customer using multiple strategies.
+    result = MatchResult()
 
-    Matching priority:
-    1. P.IVA exact match (highest priority)
-    2. Normalized ragione sociale exact match (blocked if P.IVA conflicts)
-    3. Fuzzy ragione sociale match (blocked if P.IVA conflicts)
+    inv_piva = validate_piva(invoice.customer_piva_raw)
+    inv_name = (invoice.customer_name_raw or "").strip()
+    inv_name_norm = normalize_ragione_sociale(inv_name) if inv_name else ""
 
-    CRITICAL RULE: If an invoice has a P.IVA and a candidate customer has
-    a DIFFERENT P.IVA, that customer is NEVER a match — even if the names
-    are identical after normalization. Different P.IVA = different business.
-
-    Args:
-        invoice: The invoice to match
-        customers: List of available customers to match against
-        session: Database session
-
-    Returns:
-        Matched Customer object, or None if no match found
-    """
-    if not invoice.customer_piva_raw and not invoice.customer_name_raw:
+    if not inv_piva and not inv_name:
         logger.warning(f"Invoice {invoice.invoice_number} has no customer data")
-        return None
+        return result
 
-    # Strategy 1: P.IVA exact match (highest priority)
-    if invoice.customer_piva_raw:
-        piva_clean = invoice.customer_piva_raw.strip().upper()
-        for customer in customers:
-            if customer.partita_iva and customer.partita_iva.strip().upper() == piva_clean:
-                logger.info(
-                    f"Invoice {invoice.invoice_number} matched to customer {customer.ragione_sociale} "
-                    f"by P.IVA: {piva_clean}"
-                )
-                return customer
-
-    # Strategy 2: Normalized ragione sociale exact match
-    if invoice.customer_name_raw:
-        invoice_name_normalized = normalize_ragione_sociale(invoice.customer_name_raw)
-
-        for customer in customers:
-            # BLOCK: never match if P.IVA values conflict
-            if _piva_conflict(invoice, customer):
-                continue
-
-            customer_name_normalized = normalize_ragione_sociale(customer.ragione_sociale)
-
-            if invoice_name_normalized and customer_name_normalized and \
-               invoice_name_normalized == customer_name_normalized:
-                logger.info(
-                    f"Invoice {invoice.invoice_number} matched to customer {customer.ragione_sociale} "
-                    f"by normalized name"
-                )
-                return customer
-
-    # Strategy 3: Fuzzy match on original names
-    if invoice.customer_name_raw:
-        best_match = None
-        best_score = 0
-
-        for customer in customers:
-            # BLOCK: never match if P.IVA values conflict
-            if _piva_conflict(invoice, customer):
-                continue
-
-            is_similar, score = are_similar(
-                invoice.customer_name_raw,
-                customer.ragione_sociale,
-                threshold=config.FUZZY_MATCH_THRESHOLD
-            )
-
-            if is_similar and score > best_score:
-                best_match = customer
-                best_score = score
-
-        if best_match:
+    # ── Strategia 1: P.IVA esatta ───────────────────────────────────
+    if inv_piva:
+        piva_matches = [
+            c for c in customers
+            if validate_piva(c.partita_iva) == inv_piva
+        ]
+        if len(piva_matches) == 1:
+            candidate = piva_matches[0]
+            # Guardia anti-poisoning: P.IVA uguale ma nome completamente
+            # diverso = P.IVA probabilmente corrotta → quarantena.
+            if inv_name and candidate.ragione_sociale:
+                _, name_score = are_similar(inv_name, candidate.ragione_sociale, threshold=100)
+                if name_score < PIVA_NAME_MISMATCH_THRESHOLD:
+                    logger.warning(
+                        f"Invoice {invoice.invoice_number}: P.IVA {inv_piva} matches "
+                        f"'{candidate.ragione_sociale}' but names are dissimilar "
+                        f"(score={name_score}) — quarantined"
+                    )
+                    result.suggested_customer = candidate
+                    result.suggested_method = "piva_name_mismatch"
+                    result.suggested_score = int(name_score)
+                    return result
+            result.customer = candidate
+            result.method = "piva"
+            result.score = 100
             logger.info(
-                f"Invoice {invoice.invoice_number} matched to customer {best_match.ragione_sociale} "
-                f"by fuzzy match (score={best_score})"
+                f"Invoice {invoice.invoice_number} matched to "
+                f"{candidate.ragione_sociale} by P.IVA {inv_piva}"
             )
-            return best_match
+            return result
+        if len(piva_matches) > 1:
+            # Più clienti con la stessa P.IVA (duplicati): decide l'operatore.
+            best = piva_matches[0]
+            if inv_name:
+                best = max(
+                    piva_matches,
+                    key=lambda c: are_similar(inv_name, c.ragione_sociale or "", threshold=100)[1],
+                )
+            result.suggested_customer = best
+            result.suggested_method = "piva_ambiguous"
+            result.suggested_score = 100
+            logger.warning(
+                f"Invoice {invoice.invoice_number}: P.IVA {inv_piva} shared by "
+                f"{len(piva_matches)} customers — quarantined"
+            )
+            return result
+
+    # ── Strategia 2: nome normalizzato esatto ───────────────────────
+    if inv_name_norm and len(inv_name_norm) >= MIN_DISTINCTIVE_NAME_LEN:
+        name_matches = []
+        for c in customers:
+            cust_piva = validate_piva(c.partita_iva)
+            # P.IVA in conflitto = entità diverse, mai un match
+            if inv_piva and cust_piva and inv_piva != cust_piva:
+                continue
+            if normalize_ragione_sociale(c.ragione_sociale or "") == inv_name_norm:
+                name_matches.append(c)
+        if len(name_matches) == 1:
+            result.customer = name_matches[0]
+            result.method = "name_exact"
+            result.score = 100
+            logger.info(
+                f"Invoice {invoice.invoice_number} matched to "
+                f"{name_matches[0].ragione_sociale} by normalized name"
+            )
+            return result
+        if len(name_matches) > 1:
+            result.suggested_customer = name_matches[0]
+            result.suggested_method = "name_ambiguous"
+            result.suggested_score = 100
+            logger.warning(
+                f"Invoice {invoice.invoice_number}: normalized name "
+                f"'{inv_name_norm}' shared by {len(name_matches)} customers — quarantined"
+            )
+            return result
+
+    # ── Strategia 3: fuzzy → SOLO suggerimento ──────────────────────
+    if inv_name:
+        best_customer = None
+        best_score = 0
+        for c in customers:
+            cust_piva = validate_piva(c.partita_iva)
+            if inv_piva and cust_piva and inv_piva != cust_piva:
+                continue
+            is_sim, score = are_similar(
+                inv_name, c.ragione_sociale or "",
+                threshold=config.FUZZY_MATCH_THRESHOLD,
+            )
+            if is_sim and score > best_score:
+                best_customer = c
+                best_score = score
+        if best_customer:
+            result.suggested_customer = best_customer
+            result.suggested_method = "fuzzy"
+            result.suggested_score = int(best_score)
+            logger.info(
+                f"Invoice {invoice.invoice_number}: fuzzy suggestion "
+                f"{best_customer.ragione_sociale} (score={best_score}) — needs confirmation"
+            )
+            return result
 
     logger.debug(
         f"Invoice {invoice.invoice_number} ({invoice.customer_name_raw}) could not be matched"
     )
-    return None
+    return result
 
 
 def run_matching(session: Session) -> Dict[str, Any]:
-    """
-    Batch match all unmatched invoices to customers.
+    """Batch match delle fatture senza cliente.
 
-    Processes all invoices with customer_id = NULL and attempts to match them
-    to customers using match_invoice_to_customer.
-
-    Unmatched invoices without a customer with P.IVA are likely Shopify sales
-    (not real invoices) and are left unmatched intentionally.
-
-    Args:
-        session: Database session
-
-    Returns:
-        Dictionary with match statistics
+    Abbina automaticamente solo i match sicuri (P.IVA univoca, nome esatto
+    univoco); tutto il resto finisce in quarantena come suggerimento.
     """
     stats = {
         'matched_piva': 0,
         'matched_exact': 0,
-        'matched_fuzzy': 0,
+        'suggested': 0,
         'unmatched': 0,
         'total': 0,
     }
 
-    # Get all unmatched invoices
     unmatched_invoices = session.query(Invoice).filter(
         Invoice.customer_id.is_(None)
     ).all()
-
     stats['total'] = len(unmatched_invoices)
 
-    # Get all customers
     customers = session.query(Customer).all()
-
     if not customers:
         logger.warning("No customers found in database for matching")
         stats['unmatched'] = len(unmatched_invoices)
         return stats
 
-    logger.info(f"Starting matching process for {stats['total']} invoices against {len(customers)} customers")
+    logger.info(
+        f"Starting matching for {stats['total']} invoices against {len(customers)} customers"
+    )
 
-    # Match each invoice
     for invoice in unmatched_invoices:
-        matched_customer = match_invoice_to_customer(invoice, customers, session)
+        result = match_invoice_to_customer(invoice, customers, session)
 
-        if matched_customer:
-            invoice.customer_id = matched_customer.id
+        # Una fattura scollegata a mano non viene mai più abbinata in
+        # automatico: qualsiasi esito diventa al massimo un suggerimento.
+        if invoice.match_method == "unlinked" and result.customer is not None:
+            result.suggested_customer = result.customer
+            result.suggested_method = result.method
+            result.suggested_score = result.score
+            result.customer = None
+            result.method = None
 
-            # Track which strategy was used
-            if invoice.customer_piva_raw:
-                piva_clean = invoice.customer_piva_raw.strip().upper()
-                if matched_customer.partita_iva and \
-                   matched_customer.partita_iva.strip().upper() == piva_clean:
-                    stats['matched_piva'] += 1
-                    continue
-
-            # Check if it's exact name match
-            if invoice.customer_name_raw:
-                invoice_norm = normalize_ragione_sociale(invoice.customer_name_raw)
-                customer_norm = normalize_ragione_sociale(matched_customer.ragione_sociale)
-                if invoice_norm == customer_norm:
-                    stats['matched_exact'] += 1
-                    continue
-
-            # Otherwise it's fuzzy match
-            stats['matched_fuzzy'] += 1
+        if result.customer is not None:
+            invoice.customer_id = result.customer.id
+            invoice.match_method = result.method
+            invoice.match_score = result.score
+            invoice.suggested_customer_id = None
+            invoice.suggested_method = None
+            invoice.suggested_score = None
+            if result.method == "piva":
+                stats['matched_piva'] += 1
+            else:
+                stats['matched_exact'] += 1
+        elif result.suggested_customer is not None:
+            invoice.suggested_customer_id = result.suggested_customer.id
+            invoice.suggested_method = result.suggested_method
+            invoice.suggested_score = result.suggested_score
+            stats['suggested'] += 1
         else:
+            # Pulisce eventuali suggerimenti stali di run precedenti
+            # (es. cliente suggerito poi rimosso/mergiato).
+            invoice.suggested_customer_id = None
+            invoice.suggested_method = None
+            invoice.suggested_score = None
             stats['unmatched'] += 1
 
     session.commit()
 
     logger.info(
-        f"Matching complete. Results: {stats['matched_piva']} P.IVA, "
-        f"{stats['matched_exact']} exact, {stats['matched_fuzzy']} fuzzy, "
+        f"Matching complete: {stats['matched_piva']} P.IVA, "
+        f"{stats['matched_exact']} exact, {stats['suggested']} suggested (quarantine), "
         f"{stats['unmatched']} unmatched"
     )
-
     return stats

@@ -1,22 +1,34 @@
-"""Sync API endpoints for manual trigger of data synchronization."""
+"""Sync API endpoints for manual trigger of data synchronization.
+
+Pipeline (ordine vincolante — vedi design luglio 2026):
+1. invoices    — fetch FatturaPro (+ enrichment P.IVA/scadenze), payment
+                 detection SOLO se il fetch è completo (mai su fetch parziale)
+2. customers   — sync clienti da Shopify
+3. matching    — abbinamenti sicuri + suggerimenti in quarantena
+4. auto-create — crea clienti SOLO per fatture senza alcun candidato
+                 (dopo il matching, mai prima: altrimenti la quarantena
+                 non vede mai le fatture e nascono clienti duplicati)
+5. order matching — aggancio ordini Shopify
+6. cases       — lifecycle pratiche (apertura/aggancio/chiusura; chiusure
+                 saltate se il fetch fatture era parziale)
+"""
 
 import logging
 import csv
 import threading
 from io import StringIO
-from fastapi import APIRouter, BackgroundTasks, Depends, UploadFile, File
-from sqlalchemy.orm import Session
-from datetime import datetime, date
+from fastapi import APIRouter, BackgroundTasks, UploadFile, File
+from datetime import datetime, date, timedelta
 
 from backend.database import (
-    get_session, get_session_direct, ActivityLog,
+    get_session_direct, ActivityLog,
     Invoice, Customer, SyncState,
 )
 from backend.connectors.fatturapro import FatturaProConnector
-from backend.connectors.fatture24 import Fattura24Connector
 from backend.connectors.shopify import ShopifyConnector
 from backend.engine.matching import run_matching
-from backend.engine.escalation import process_escalations
+from backend.engine.cases import update_case_lifecycle
+from backend.engine.piva import validate_piva
 from backend.scheduler import get_scheduler_status
 from backend.config import config
 from backend.engine.normalizer import normalize_ragione_sociale
@@ -33,7 +45,9 @@ _sync_status = {
     "invoices": {"last_sync": None, "result": None},
     "customers": {"last_sync": None, "result": None},
     "matching": {"last_sync": None, "result": None},
-    "escalations": {"last_sync": None, "result": None},
+    "auto_create": {"last_sync": None, "result": None},
+    "order_matching": {"last_sync": None, "result": None},
+    "cases": {"last_sync": None, "result": None},
 }
 
 _sync_loaded = False
@@ -62,8 +76,9 @@ def _load_sync_state():
 def _persist_sync_status(key: str, result: dict):
     """Update in-memory sync status AND persist to DB."""
     now = datetime.utcnow()
-    _sync_status[key]["last_sync"] = now.isoformat()
-    _sync_status[key]["result"] = result
+    if key in _sync_status:
+        _sync_status[key]["last_sync"] = now.isoformat()
+        _sync_status[key]["result"] = result
     try:
         session = get_session_direct()
         existing = session.query(SyncState).filter_by(key=key).first()
@@ -80,65 +95,65 @@ def _persist_sync_status(key: str, result: dict):
 
 
 def _sync_invoices_task() -> dict:
-    """Background task to sync invoices from FatturaPro and Fattura24.
+    """Background task to sync invoices from FatturaPro.
 
     Key behaviors:
-    - Fetches currently-overdue invoices from both platforms
+    - Fetches currently-overdue invoices (with partial-fetch flag)
+    - Enriches new/incomplete invoices with P.IVA + REAL due date from
+      the detail pages (single fetch per invoice, capped per run)
     - Updates existing invoices with fresh amount_due values
-    - Creates new invoices for newly-found overdue items
-    - Detects payments: invoices previously known but no longer in the overdue
-      list are marked as 'paid' (amount_due becomes 0)
+    - Payment detection (invoice known but no longer in the overdue list →
+      paid) runs ONLY on a COMPLETE fetch: a missing invoice in a partial
+      list is not evidence of payment.
     - Recalculates days_overdue dynamically for ALL unpaid invoices
     """
     session = get_session_direct()
     result = {
-        "fatturapro": {"success": False, "created": 0, "updated": 0, "paid_detected": 0, "piva_enriched": 0, "error": None},
-        "fattura24": {"success": False, "created": 0, "updated": 0, "paid_detected": 0, "error": None},
+        "fatturapro": {
+            "success": False, "created": 0, "updated": 0, "paid_detected": 0,
+            "piva_enriched": 0, "due_date_enriched": 0, "partial": False, "error": None,
+        },
     }
 
     try:
-        # FatturaPro
+        fatturapro = None
         try:
             logger.info("Syncing invoices from FatturaPro...")
             fatturapro = FatturaProConnector()
             if fatturapro.login():
-                raw_invoices = fatturapro.fetch_overdue_invoices()
+                raw_invoices, partial = fatturapro.fetch_overdue_invoices()
+                result["fatturapro"]["partial"] = partial
                 created, updated = 0, 0
                 piva_enriched = 0
+                due_enriched = 0
 
-                # ── ENRICHMENT P.IVA ──
-                # Fetch P.IVA from detail pages for NEW invoices only.
-                # We identify which invoices are new by checking the DB first,
-                # then enrich only those that need it.
-                existing_invoice_numbers = set()
-                existing_with_piva = set()
-                for db_inv in session.query(Invoice.invoice_number, Invoice.customer_piva_raw).filter(
-                    Invoice.source_platform == "fatturapro"
-                ).all():
-                    existing_invoice_numbers.add(db_inv.invoice_number)
-                    if db_inv.customer_piva_raw:
-                        existing_with_piva.add(db_inv.invoice_number)
+                # ── ENRICHMENT dettaglio (P.IVA + scadenza reale) ──
+                # Serve il dettaglio per le fatture nuove e per quelle già
+                # note senza P.IVA o senza scadenza reale.
+                existing_rows = session.query(
+                    Invoice.invoice_number, Invoice.customer_piva_raw, Invoice.due_date_source,
+                ).filter(Invoice.source_platform == "fatturapro").all()
+                complete_invoice_numbers = {
+                    row.invoice_number for row in existing_rows
+                    if row.customer_piva_raw and row.due_date_source == "real"
+                }
 
-                # Only fetch detail for invoices that are new OR exist but lack P.IVA
-                invoices_needing_piva = [
+                invoices_needing_detail = [
                     inv for inv in raw_invoices
-                    if inv.get("doc_id") and inv["invoice_number"] not in existing_with_piva
+                    if inv.get("doc_id")
+                    and inv["invoice_number"] not in complete_invoice_numbers
                 ]
 
                 # Cap enrichment to avoid long-running syncs
-                PIVA_ENRICHMENT_LIMIT = 50
-                if invoices_needing_piva:
-                    if len(invoices_needing_piva) > PIVA_ENRICHMENT_LIMIT:
+                DETAIL_ENRICHMENT_LIMIT = 50
+                if invoices_needing_detail:
+                    if len(invoices_needing_detail) > DETAIL_ENRICHMENT_LIMIT:
                         logger.info(
-                            f"P.IVA enrichment: {len(invoices_needing_piva)} invoices need P.IVA, "
-                            f"capping to {PIVA_ENRICHMENT_LIMIT} per sync cycle"
+                            f"Detail enrichment: {len(invoices_needing_detail)} invoices need it, "
+                            f"capping to {DETAIL_ENRICHMENT_LIMIT} per sync cycle"
                         )
-                        invoices_needing_piva = invoices_needing_piva[:PIVA_ENRICHMENT_LIMIT]
-                    logger.info(
-                        f"Fetching P.IVA for {len(invoices_needing_piva)} invoices "
-                        f"(out of {len(raw_invoices)} total)..."
-                    )
-                    fatturapro.enrich_invoices_with_piva(invoices_needing_piva, delay=0.3)
+                        invoices_needing_detail = invoices_needing_detail[:DETAIL_ENRICHMENT_LIMIT]
+                    fatturapro.enrich_invoices_from_detail(invoices_needing_detail, delay=0.3)
 
                 # Build set of invoice numbers currently overdue in FatturaPro
                 fetched_invoice_numbers = set()
@@ -166,6 +181,12 @@ def _sync_invoices_task() -> dict:
                                 f"Enriched existing invoice {inv_num} with P.IVA: "
                                 f"{inv['customer_piva']}"
                             )
+                        # Scadenza REALE trovata: sovrascrive anche una
+                        # scadenza 'assumed' sintetizzata in passato.
+                        if inv.get("due_date") and existing.due_date_source != "real":
+                            existing.due_date = inv["due_date"]
+                            existing.due_date_source = "real"
+                            due_enriched += 1
                         # Keep status as open if it was paid before but reappeared
                         if existing.status == "paid" and inv.get("balance", 0) > 0:
                             existing.status = "open"
@@ -177,6 +198,8 @@ def _sync_invoices_task() -> dict:
                             amount=inv.get("total", 0),
                             amount_due=inv.get("balance", 0),
                             issue_date=inv.get("date"),
+                            due_date=inv.get("due_date"),
+                            due_date_source="real" if inv.get("due_date") else None,
                             customer_name_raw=inv.get("customer_name"),
                             customer_piva_raw=inv.get("customer_piva"),
                             source_platform="fatturapro",
@@ -184,25 +207,39 @@ def _sync_invoices_task() -> dict:
                         )
                         session.add(new_invoice)
                         created += 1
+                        if inv.get("due_date"):
+                            due_enriched += 1
 
-                # PAYMENT DETECTION: find FatturaPro invoices in our DB that are
-                # no longer in the overdue list → they have been paid
+                # PAYMENT DETECTION — solo su fetch COMPLETO.
                 paid_detected = 0
-                known_fp_invoices = session.query(Invoice).filter(
-                    Invoice.source_platform == "fatturapro",
-                    Invoice.status != "paid",
-                ).all()
+                if not partial:
+                    known_fp_invoices = session.query(Invoice).filter(
+                        Invoice.source_platform == "fatturapro",
+                        Invoice.status != "paid",
+                    ).all()
 
-                for known_inv in known_fp_invoices:
-                    if known_inv.invoice_number not in fetched_invoice_numbers:
-                        known_inv.status = "paid"
-                        known_inv.amount_due = 0
-                        known_inv.updated_at = datetime.utcnow()
-                        paid_detected += 1
-                        logger.info(
-                            f"Payment detected: FatturaPro invoice {known_inv.invoice_number} "
-                            f"no longer overdue — marked as paid"
+                    # Ulteriore guardia: se il fetch copre meno della metà
+                    # delle fatture aperte note, qualcosa non torna.
+                    if known_fp_invoices and len(fetched_invoice_numbers) < len(known_fp_invoices) * 0.5:
+                        logger.warning(
+                            f"Fetch covers only {len(fetched_invoice_numbers)} of "
+                            f"{len(known_fp_invoices)} known open invoices — "
+                            f"treating as PARTIAL, skipping payment detection"
                         )
+                        result["fatturapro"]["partial"] = True
+                    else:
+                        for known_inv in known_fp_invoices:
+                            if known_inv.invoice_number not in fetched_invoice_numbers:
+                                known_inv.status = "paid"
+                                known_inv.amount_due = 0
+                                known_inv.updated_at = datetime.utcnow()
+                                paid_detected += 1
+                                logger.info(
+                                    f"Payment detected: FatturaPro invoice {known_inv.invoice_number} "
+                                    f"no longer overdue — marked as paid"
+                                )
+                else:
+                    logger.warning("PARTIAL fetch — payment detection skipped")
 
                 session.commit()
                 result["fatturapro"]["success"] = True
@@ -210,9 +247,11 @@ def _sync_invoices_task() -> dict:
                 result["fatturapro"]["updated"] = updated
                 result["fatturapro"]["paid_detected"] = paid_detected
                 result["fatturapro"]["piva_enriched"] = piva_enriched
+                result["fatturapro"]["due_date_enriched"] = due_enriched
                 logger.info(
                     f"FatturaPro sync: created={created}, updated={updated}, "
-                    f"paid_detected={paid_detected}, piva_enriched={piva_enriched}"
+                    f"paid_detected={paid_detected}, piva_enriched={piva_enriched}, "
+                    f"due_dates={due_enriched}, partial={result['fatturapro']['partial']}"
                 )
             else:
                 result["fatturapro"]["error"] = (
@@ -221,134 +260,14 @@ def _sync_invoices_task() -> dict:
                 logger.error("FatturaPro login failed — cannot sync invoices")
         except Exception as e:
             result["fatturapro"]["error"] = str(e)
+            result["fatturapro"]["partial"] = True
             logger.error(f"Error syncing FatturaPro: {e}", exc_info=True)
         finally:
             try:
-                fatturapro.close()
+                if fatturapro:
+                    fatturapro.close()
             except Exception:
                 pass
-
-        # Fattura24
-        # NOTE: Fattura24 API subscription is expired and no new invoices are expected.
-        # Invoices were manually imported from the Fattura24 web UI (34 unpaid invoices).
-        # Disabling API sync to prevent the stale-detection logic from marking them as paid.
-        try:
-            if False and config.FATTURA24_API_KEY:  # Disabled — subscription expired
-                logger.info("Syncing invoices from Fattura24...")
-                fattura24 = Fattura24Connector()
-
-                # Fetch ALL invoices (not just overdue) to detect payments
-                # Use wide date range (4 years) to catch old invoices that may have been paid
-                from datetime import timedelta
-                date_to = datetime.now().strftime("%Y-%m-%d")
-                date_from = (datetime.now() - timedelta(days=1460)).strftime("%Y-%m-%d")
-                raw_invoices = fattura24.fetch_invoices(date_from, date_to)
-
-                created, updated, paid_detected = 0, 0, 0
-                fetched_invoice_numbers = set()
-
-                for inv in raw_invoices:
-                    inv_num = inv["invoice_number"]
-                    fetched_invoice_numbers.add(inv_num)
-
-                    existing = session.query(Invoice).filter_by(
-                        invoice_number=inv_num,
-                        source_platform="fatture24"
-                    ).first()
-
-                    amount_due = inv.get("amount_due", 0)
-
-                    if existing:
-                        existing.amount = inv.get("amount", 0)
-                        existing.amount_due = amount_due
-                        existing.customer_name_raw = inv.get("customer_name")
-                        existing.customer_piva_raw = inv.get("customer_piva")
-                        existing.updated_at = datetime.utcnow()
-
-                        # Detect payment: amount_due dropped to 0
-                        if amount_due <= 0 and existing.status != "paid":
-                            existing.status = "paid"
-                            paid_detected += 1
-                            logger.info(f"Payment detected: Fattura24 invoice {inv_num} amount_due=0 → paid")
-                        elif amount_due > 0 and existing.status == "paid":
-                            existing.status = "open"  # Re-opened
-
-                        # Parse dates for existing if missing
-                        if not existing.issue_date and inv.get("issue_date"):
-                            try:
-                                existing.issue_date = datetime.strptime(inv["issue_date"], "%Y-%m-%d").date()
-                            except (ValueError, TypeError):
-                                pass
-                        if not existing.due_date and inv.get("due_date"):
-                            try:
-                                existing.due_date = datetime.strptime(inv["due_date"], "%Y-%m-%d").date()
-                            except (ValueError, TypeError):
-                                pass
-
-                        updated += 1
-                    else:
-                        # Only create if there's something due
-                        if amount_due <= 0:
-                            continue
-
-                        issue_date = None
-                        due_date = None
-                        try:
-                            if inv.get("issue_date"):
-                                issue_date = datetime.strptime(inv["issue_date"], "%Y-%m-%d").date()
-                            if inv.get("due_date"):
-                                due_date = datetime.strptime(inv["due_date"], "%Y-%m-%d").date()
-                        except (ValueError, TypeError):
-                            pass
-
-                        new_invoice = Invoice(
-                            invoice_number=inv_num,
-                            amount=inv.get("amount", 0),
-                            amount_due=amount_due,
-                            issue_date=issue_date,
-                            due_date=due_date,
-                            customer_name_raw=inv.get("customer_name"),
-                            customer_piva_raw=inv.get("customer_piva"),
-                            source_platform="fatture24",
-                            source_id=inv.get("source_id"),
-                        )
-                        session.add(new_invoice)
-                        created += 1
-
-                # Mark as paid any F24 invoices in our DB that are NOT in the API response
-                # If Fatture24 doesn't return them anymore, they've been paid/settled
-                stale_paid = 0
-                stale_invoices = (
-                    session.query(Invoice)
-                    .filter(
-                        Invoice.source_platform == "fatture24",
-                        Invoice.status != "paid",
-                        Invoice.invoice_number.notin_(fetched_invoice_numbers) if fetched_invoice_numbers else True,
-                    )
-                    .all()
-                )
-                for inv in stale_invoices:
-                    if inv.invoice_number not in fetched_invoice_numbers:
-                        inv.status = "paid"
-                        inv.amount_due = 0
-                        stale_paid += 1
-                        logger.info(f"Stale F24 invoice marked paid: {inv.invoice_number} (not in API response)")
-
-                session.commit()
-                result["fattura24"]["success"] = True
-                result["fattura24"]["created"] = created
-                result["fattura24"]["updated"] = updated
-                result["fattura24"]["paid_detected"] = paid_detected
-                result["fattura24"]["stale_paid"] = stale_paid
-                logger.info(
-                    f"Fattura24 sync: created={created}, updated={updated}, "
-                    f"paid_detected={paid_detected}, stale_paid={stale_paid}"
-                )
-            else:
-                logger.debug("Fattura24 not configured")
-        except Exception as e:
-            result["fattura24"]["error"] = str(e)
-            logger.error(f"Error syncing Fattura24: {e}", exc_info=True)
 
         # RECALCULATE days_overdue for ALL unpaid invoices (dynamic, not stale)
         _recalculate_days_overdue(session)
@@ -382,6 +301,11 @@ def _recalculate_days_overdue(session):
 
     Positive values = days overdue (past due date).
     Negative values = days remaining until due date.
+
+    Se manca la scadenza, ne sintetizza una a 30 giorni dall'emissione e la
+    marca ESPLICITAMENTE come 'assumed': la UI la mostra come stimata e il
+    messaggio WhatsApp non la spaccia per vera. Una scadenza 'real' non
+    viene MAI toccata da questo ricalcolo.
     """
     today = date.today()
     unpaid_invoices = session.query(Invoice).filter(
@@ -393,11 +317,18 @@ def _recalculate_days_overdue(session):
         if inv.due_date:
             # Actual due_date exists — calculate difference (can be negative)
             new_days = (today - inv.due_date).days
+            if inv.due_date_source is None:
+                # Riga storica non classificata: emissione+30 esatti è il
+                # marchio del vecchio ricalcolo → stimata.
+                if inv.issue_date and inv.due_date == inv.issue_date + timedelta(days=30):
+                    inv.due_date_source = "assumed"
+                else:
+                    inv.due_date_source = "real"
         elif inv.issue_date:
             # No due_date: assume 30-day payment terms, and SAVE the assumed due_date
-            from datetime import timedelta
             assumed_due = inv.issue_date + timedelta(days=30)
             inv.due_date = assumed_due
+            inv.due_date_source = "assumed"
             new_days = (today - assumed_due).days
         else:
             new_days = 0
@@ -414,28 +345,23 @@ def _recalculate_days_overdue(session):
     for inv in paid_invoices:
         inv.days_overdue = 0
 
+    session.commit()
     if updated > 0:
-        session.commit()
         logger.info(f"Recalculated days_overdue for {updated} invoices")
 
 
 def _sync_customers_task() -> dict:
-    """Background task to sync customers from Shopify AND auto-create from invoices.
+    """Background task to sync customers from Shopify.
 
-    Two-phase approach:
-    1. Sync from Shopify (primary customer source)
-    2. Auto-create customers from unmatched invoices that have P.IVA or name
-       but no corresponding Customer record. This ensures customers like
-       "F-T SRL" that only exist in FatturaPro/Fattura24 get created.
+    L'auto-creazione di clienti dalle fatture NON avviene più qui: gira
+    come step dedicato DOPO il matching (vedi _auto_create_task), così le
+    fatture con un candidato fuzzy finiscono in quarantena invece di
+    generare clienti duplicati.
     """
     session = get_session_direct()
-    result = {
-        "success": False, "created": 0, "updated": 0,
-        "auto_created_from_invoices": 0, "error": None,
-    }
+    result = {"success": False, "created": 0, "updated": 0, "error": None}
 
     try:
-        # Phase 1: Shopify sync (isolated — failure here must NOT block Phase 2)
         try:
             if config.SHOPIFY_ACCESS_TOKEN or (
                 config.SHOPIFY_CLIENT_ID and config.SHOPIFY_CLIENT_SECRET
@@ -492,21 +418,12 @@ def _sync_customers_task() -> dict:
                 result["success"] = True  # Not an error, just unconfigured
                 logger.debug("Shopify not configured")
         except Exception as e:
-            logger.error(f"Shopify sync failed (non-blocking): {e}", exc_info=True)
+            logger.error(f"Shopify sync failed: {e}", exc_info=True)
             result["shopify_error"] = str(e)
-            # Rollback any partial Shopify changes to keep session clean
             try:
                 session.rollback()
             except Exception:
                 pass
-            # Continue to Phase 2 — auto-create must still run
-
-        # Phase 2: Auto-create customers from unmatched invoices
-        auto_created = _auto_create_customers_from_invoices(session)
-        result["auto_created_from_invoices"] = auto_created
-        # Mark success if auto-create ran even if Shopify failed
-        if auto_created > 0 or result.get("success"):
-            result["success"] = True
 
         _persist_sync_status("customers", result)
 
@@ -533,140 +450,114 @@ def _sync_customers_task() -> dict:
     return result
 
 
-def _auto_create_customers_from_invoices(session) -> int:
-    """Auto-create Customer records from unmatched invoices.
+def _auto_create_task() -> dict:
+    """Auto-create Customer records from invoices with NO candidate at all.
 
-    For invoices that have customer_name_raw but no customer_id and no
-    matching Customer, create a new Customer record. Uses normalized name
-    deduplication (not fuzzy matching, which is too slow for batch operations).
+    Gira DOPO run_matching: a questo punto ogni fattura senza cliente
+    o ha un suggerimento in quarantena (→ si salta, decide l'operatore)
+    o non ha davvero nessun candidato (→ si crea il cliente).
 
-    Returns:
-        Number of customers auto-created
+    Regole:
+    - mai toccare la P.IVA di un cliente esistente (il "poisoning" della
+      P.IVA è stata la causa principale dei profili con fatture altrui);
+    - P.IVA usata solo se valida (checksum);
+    - fatture 'unlinked' (scollegate a mano) escluse per sempre.
     """
-    unmatched = session.query(Invoice).filter(
-        Invoice.customer_id.is_(None),
-        Invoice.status != "paid",
-    ).all()
+    session = get_session_direct()
+    result = {"auto_created": 0, "matched_within_run": 0, "skipped_suggested": 0}
 
-    if not unmatched:
-        return 0
+    try:
+        candidates = session.query(Invoice).filter(
+            Invoice.customer_id.is_(None),
+            Invoice.status != "paid",
+        ).all()
 
-    auto_created = 0
-    # Track normalized names → customer_id for dedup within this run
-    name_to_customer_id = {}
-    piva_to_customer_id = {}
+        # Lookup delle entità CREATE IN QUESTA RUN (per non duplicare un
+        # cliente che compare su più fatture nello stesso sync).
+        run_piva_map = {}
+        run_name_map = {}
 
-    # Pre-build lookup maps from existing customers
-    existing_customers = session.query(Customer).all()
-    for c in existing_customers:
-        if c.ragione_sociale_normalized:
-            name_to_customer_id[c.ragione_sociale_normalized] = c.id
-        if c.partita_iva:
-            piva_to_customer_id[c.partita_iva.strip().upper()] = c.id
+        for inv in candidates:
+            try:
+                if inv.suggested_customer_id is not None:
+                    result["skipped_suggested"] += 1
+                    continue
+                if inv.match_method == "unlinked":
+                    continue
 
-    for inv in unmatched:
-        try:
-            # Skip if no identifying info
-            if not inv.customer_name_raw and not inv.customer_piva_raw:
-                continue
+                piva = validate_piva(inv.customer_piva_raw)
+                name = (inv.customer_name_raw or "").strip()
+                name_norm = normalize_ragione_sociale(name) if name else ""
 
-            piva = (inv.customer_piva_raw or "").strip().upper()
-            name = (inv.customer_name_raw or "").strip()
-            name_norm = normalize_ragione_sociale(name) if name else ""
+                if not name and not piva:
+                    continue
 
-            # ── REGOLA P.IVA IMPRESCINDIBILE ──
-            # P.IVA è l'identificatore canonico. Se c'è match per P.IVA,
-            # questo ha sempre la priorità. Se c'è conflitto P.IVA,
-            # i clienti sono SICURAMENTE diversi.
+                # Già creato in questa run?
+                existing_id = None
+                if piva and piva in run_piva_map:
+                    existing_id = run_piva_map[piva]
+                elif name_norm and name_norm in run_name_map:
+                    candidate_id, candidate_piva = run_name_map[name_norm]
+                    # P.IVA in conflitto = entità diverse
+                    if not (piva and candidate_piva and piva != candidate_piva):
+                        existing_id = candidate_id
 
-            # Try P.IVA match first (highest priority)
-            if piva and piva in piva_to_customer_id:
-                inv.customer_id = piva_to_customer_id[piva]
-                logger.debug(
-                    f"Invoice {inv.invoice_number} matched by P.IVA '{piva}' "
-                    f"to customer ID {piva_to_customer_id[piva]}"
+                if existing_id:
+                    inv.customer_id = existing_id
+                    inv.match_method = "auto_created"
+                    inv.match_score = 100
+                    result["matched_within_run"] += 1
+                    continue
+
+                new_customer = Customer(
+                    ragione_sociale=name if name else f"Cliente P.IVA {piva}",
+                    ragione_sociale_normalized=name_norm,
+                    partita_iva=piva,
+                    source=inv.source_platform,
                 )
+                session.add(new_customer)
+                session.flush()  # Get the ID
+
+                inv.customer_id = new_customer.id
+                inv.match_method = "auto_created"
+                inv.match_score = 100
+                result["auto_created"] += 1
+
+                if piva:
+                    run_piva_map[piva] = new_customer.id
+                if name_norm:
+                    run_name_map[name_norm] = (new_customer.id, piva)
+
+                logger.info(
+                    f"Auto-created customer '{new_customer.ragione_sociale}' "
+                    f"(P.IVA: {piva or 'N/A'}) from {inv.source_platform} invoice {inv.invoice_number}"
+                )
+            except Exception as e:
+                logger.warning(f"Error processing invoice {inv.invoice_number} for auto-create: {e}")
                 continue
 
-            # Try normalized name match — but BLOCK if P.IVA conflicts
-            if name_norm and name_norm in name_to_customer_id:
-                candidate_id = name_to_customer_id[name_norm]
-                # Check if the candidate customer has a different P.IVA
-                candidate_piva = None
-                for c in existing_customers:
-                    if c.id == candidate_id:
-                        candidate_piva = (c.partita_iva or "").strip().upper()
-                        break
-
-                # ── REGOLA P.IVA: blocca se P.IVA diverse ──
-                if piva and candidate_piva and piva != candidate_piva:
-                    # P.IVA conflict — do NOT match, create new customer
-                    logger.warning(
-                        f"Invoice {inv.invoice_number}: name '{name}' matches customer ID {candidate_id} "
-                        f"but P.IVA CONFLICT ({piva} vs {candidate_piva}). "
-                        f"P.IVA diverse = entità diverse. Creating new customer."
-                    )
-                elif piva and candidate_piva and piva == candidate_piva:
-                    # Both have P.IVA and they agree — strong match
-                    inv.customer_id = candidate_id
-                    logger.info(
-                        f"Invoice {inv.invoice_number}: name + P.IVA match confirmed "
-                        f"to customer ID {candidate_id}"
-                    )
-                    continue
-                elif piva and not candidate_piva:
-                    # Invoice has P.IVA, customer doesn't — assign but update customer P.IVA
-                    inv.customer_id = candidate_id
-                    for c in existing_customers:
-                        if c.id == candidate_id:
-                            c.partita_iva = piva
-                            logger.info(
-                                f"Invoice {inv.invoice_number}: name match to customer ID {candidate_id}, "
-                                f"updated customer P.IVA to '{piva}'"
-                            )
-                            break
-                    piva_to_customer_id[piva] = candidate_id
-                    continue
-                else:
-                    # Neither has P.IVA or only customer has P.IVA — accept name match
-                    inv.customer_id = candidate_id
-                    continue
-
-            # No match — create new customer
-            if not name and not piva:
-                continue
-
-            new_customer = Customer(
-                ragione_sociale=name if name else f"Cliente P.IVA {piva}",
-                ragione_sociale_normalized=name_norm,
-                partita_iva=piva if piva else None,
-                source=inv.source_platform,
-            )
-            session.add(new_customer)
-            session.flush()  # Get the ID
-
-            inv.customer_id = new_customer.id
-            auto_created += 1
-
-            # Update lookup maps
-            if piva:
-                piva_to_customer_id[piva] = new_customer.id
-            if name_norm:
-                name_to_customer_id[name_norm] = new_customer.id
-
-            logger.info(
-                f"Auto-created customer '{new_customer.ragione_sociale}' "
-                f"(P.IVA: {piva or 'N/A'}) from {inv.source_platform} invoice {inv.invoice_number}"
-            )
-        except Exception as e:
-            logger.warning(f"Error processing invoice {inv.invoice_number} for auto-create: {e}")
-            continue
-
-    if auto_created > 0:
         session.commit()
-        logger.info(f"Auto-created {auto_created} customers from unmatched invoices")
+        _persist_sync_status("auto_create", result)
 
-    return auto_created
+        session.add(ActivityLog(
+            action="auto_create",
+            entity_type="customer",
+            details=result,
+        ))
+        session.commit()
+
+        logger.info(f"Auto-create complete: {result}")
+    except Exception as e:
+        result["error"] = str(e)
+        logger.error(f"Error in auto-create: {e}", exc_info=True)
+        try:
+            session.rollback()
+        except Exception:
+            pass
+    finally:
+        session.close()
+
+    return result
 
 
 def _match_orders_task() -> dict:
@@ -773,8 +664,6 @@ def _find_best_order_match(
 
     Returns the best matching order or None.
     """
-    from datetime import timedelta  # noqa: F811
-
     if not invoice.issue_date:
         # Without a date, match by amount only
         for order in orders:
@@ -858,33 +747,26 @@ def _run_matching_task() -> dict:
         session.close()
 
 
-def _process_escalations_task() -> dict:
-    """Background task to process escalations."""
+def _case_lifecycle_task(allow_close: bool = True) -> dict:
+    """Background task: apre/aggancia/chiude le pratiche di recupero."""
     session = get_session_direct()
     try:
-        logger.info("Processing escalations...")
-        messages = process_escalations(session)
-        result = {
-            "escalations_created": len(messages),
-            "message_ids": [msg.id for msg in messages]
-        }
-        logger.info(f"Escalations processed: {result}")
+        logger.info(f"Updating case lifecycle (allow_close={allow_close})...")
+        result = update_case_lifecycle(session, allow_close=allow_close)
+        result["allow_close"] = allow_close
+        _persist_sync_status("cases", result)
 
-        _persist_sync_status("escalations", result)
-
-        # Log activity
-        activity = ActivityLog(
-            action="escalation",
-            details=result
-        )
-        session.add(activity)
+        session.add(ActivityLog(
+            action="case_lifecycle",
+            entity_type="case",
+            details=result,
+        ))
         session.commit()
-
         return result
     except Exception as e:
-        logger.error(f"Error processing escalations: {e}", exc_info=True)
+        logger.error(f"Error in case lifecycle: {e}", exc_info=True)
         error_result = {"error": str(e)}
-        _persist_sync_status("escalations", error_result)
+        _persist_sync_status("cases", error_result)
         try:
             session.rollback()
         except Exception:
@@ -914,7 +796,7 @@ def _locked_task(task_fn):
 
 @router.post("/invoices")
 async def sync_invoices(background_tasks: BackgroundTasks):
-    """Trigger manual sync of invoices from FatturaPro and Fattura24."""
+    """Trigger manual sync of invoices from FatturaPro."""
     background_tasks.add_task(_locked_task(_sync_invoices_task))
     return {
         "status": "sync_started",
@@ -952,18 +834,19 @@ async def sync_order_matching(background_tasks: BackgroundTasks):
     }
 
 
-@router.post("/escalations")
-async def sync_escalations(background_tasks: BackgroundTasks):
-    """Trigger manual escalation processing."""
-    background_tasks.add_task(_locked_task(_process_escalations_task))
+@router.post("/cases")
+async def sync_cases(background_tasks: BackgroundTasks):
+    """Trigger manual case lifecycle update."""
+    background_tasks.add_task(_locked_task(_case_lifecycle_task))
     return {
         "status": "sync_started",
-        "message": "Escalation processing started in background"
+        "message": "Case lifecycle update started in background",
     }
 
 
 def _full_sync_task() -> dict:
-    """Run full sync sequentially: invoices → customers → matching → escalations.
+    """Run full sync sequentially:
+    invoices → customers → matching → auto-create → order matching → cases.
 
     Uses a mutex to prevent concurrent full syncs from corrupting data.
     """
@@ -982,21 +865,29 @@ def _full_sync_task() -> dict:
             logger.error(f"Invoice sync failed: {e}", exc_info=True)
             results["invoices"] = {"error": str(e)}
 
-        # Step 2: Sync customers (including auto-create from invoices)
+        # Step 2: Sync customers from Shopify
         try:
             results["customers"] = _sync_customers_task()
         except Exception as e:
             logger.error(f"Customer sync failed: {e}", exc_info=True)
             results["customers"] = {"error": str(e)}
 
-        # Step 3: Run matching (now that we have fresh invoices + customers)
+        # Step 3: Matching (abbinamenti sicuri + quarantena suggerimenti)
         try:
             results["matching"] = _run_matching_task()
         except Exception as e:
             logger.error(f"Matching failed: {e}", exc_info=True)
             results["matching"] = {"error": str(e)}
 
-        # Step 3b: Match invoices to Shopify orders
+        # Step 4: Auto-create clienti SOLO per fatture senza alcun candidato
+        # (deve girare DOPO il matching, mai prima)
+        try:
+            results["auto_create"] = _auto_create_task()
+        except Exception as e:
+            logger.error(f"Auto-create failed: {e}", exc_info=True)
+            results["auto_create"] = {"error": str(e)}
+
+        # Step 5: Match invoices to Shopify orders
         try:
             results["order_matching"] = _match_orders_task()
         except Exception as e:
@@ -1005,12 +896,16 @@ def _full_sync_task() -> dict:
             )
             results["order_matching"] = {"error": str(e)}
 
-        # Step 4: Process escalations (depends on matched invoices)
+        # Step 6: Case lifecycle. Con fetch fatture PARZIALE la payment
+        # detection non è affidabile → niente chiusure (solo aperture).
         try:
-            results["escalations"] = _process_escalations_task()
+            invoices_result = results.get("invoices", {})
+            fp = invoices_result.get("fatturapro", {}) if isinstance(invoices_result, dict) else {}
+            fetch_ok = bool(fp.get("success")) and not fp.get("partial")
+            results["cases"] = _case_lifecycle_task(allow_close=fetch_ok)
         except Exception as e:
-            logger.error(f"Escalations failed: {e}", exc_info=True)
-            results["escalations"] = {"error": str(e)}
+            logger.error(f"Case lifecycle failed: {e}", exc_info=True)
+            results["cases"] = {"error": str(e)}
 
         logger.info(f"Full sync completed: {results}")
         return results
@@ -1020,18 +915,20 @@ def _full_sync_task() -> dict:
 
 @router.post("/full")
 async def sync_full(background_tasks: BackgroundTasks):
-    """Trigger full sync: invoices → customers → matching → escalations (sequential)."""
+    """Trigger full sync (sequential):
+    invoices → customers → matching → auto-create → order matching → cases."""
     background_tasks.add_task(_full_sync_task)
 
     return {
         "status": "sync_started",
-        "message": "Full sync started in background (sequential: invoices → customers → matching → escalations)"
+        "message": "Full sync started in background"
     }
 
 
 @router.get("/status")
 async def get_sync_status():
     """Get the last sync timestamps and results."""
+    _load_sync_state()
     return {
         "last_sync": _sync_status,
         "scheduler": get_scheduler_status(),
@@ -1241,7 +1138,9 @@ async def import_csv(file: UploadFile = File(...)):
                 existing.amount = amount
                 existing.amount_due = amount_due
                 existing.issue_date = issue_date or existing.issue_date
-                existing.due_date = due_date or existing.due_date
+                if due_date:
+                    existing.due_date = due_date
+                    existing.due_date_source = "real"
                 existing.customer_name_raw = mapped.get("customer_name") or existing.customer_name_raw
                 existing.customer_piva_raw = mapped.get("piva") or existing.customer_piva_raw
                 existing.days_overdue = days_overdue
@@ -1253,6 +1152,7 @@ async def import_csv(file: UploadFile = File(...)):
                     amount_due=amount_due,
                     issue_date=issue_date,
                     due_date=due_date,
+                    due_date_source="real" if due_date else None,
                     customer_name_raw=mapped.get("customer_name"),
                     customer_piva_raw=mapped.get("piva"),
                     source_platform="fatture24",

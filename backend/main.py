@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from backend.database import init_db
 from backend.config import config
 from backend.scheduler import start_scheduler, stop_scheduler
-from backend.api import auth, dashboard, positions, messages, customers, sync, webhooks, recovery, system
+from backend.api import auth, dashboard, positions, customers, sync, recovery, system
 from backend.api.auth import verify_token
 
 # Configure logging
@@ -76,6 +76,22 @@ async def startup_event():
                     time.sleep(2)
 
         try:
+            # Backfill una-tantum delle pratiche (idempotente: marker in
+            # sync_state scritto nello stesso commit, retry al prossimo
+            # avvio in caso di fallimento).
+            from backend.engine.cases import run_backfill_if_needed
+            run_backfill_if_needed()
+        except Exception as e:
+            logger.error(f"Case backfill error: {e}")
+
+        if not config.COMPANY_PIVA:
+            logger.error(
+                "COMPANY_PIVA non impostata: il pattern full-text "
+                "dell'enrichment P.IVA da FatturaPro resta DISABILITATO "
+                "(fail-closed). Impostarla su Render per riattivarlo."
+            )
+
+        try:
             logger.info("Starting scheduler...")
             start_scheduler()
             logger.info("Scheduler started successfully")
@@ -105,10 +121,8 @@ app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 # Protected routes — all require JWT token
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"], dependencies=[Depends(verify_token)])
 app.include_router(positions.router, prefix="/api/positions", tags=["positions"], dependencies=[Depends(verify_token)])
-app.include_router(messages.router, prefix="/api/messages", tags=["messages"], dependencies=[Depends(verify_token)])
 app.include_router(customers.router, prefix="/api/customers", tags=["customers"], dependencies=[Depends(verify_token)])
 app.include_router(sync.router, prefix="/api/sync", tags=["sync"], dependencies=[Depends(verify_token)])
-app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])  # Webhooks stay public (Twilio/Shopify)
 app.include_router(recovery.router, prefix="/api/recovery", tags=["recovery"], dependencies=[Depends(verify_token)])
 app.include_router(system.router, prefix="/api/system", tags=["system"], dependencies=[Depends(verify_token)])
 

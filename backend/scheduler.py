@@ -20,16 +20,17 @@ _last_sync = {
     "invoices": None,
     "customers": None,
     "matching": None,
-    "escalations": None,
+    "cases": None,
 }
 
 
 def run_daily_job(manual: bool = False):
     """
-    Daily job that runs the full sequential sync + autopilot.
+    Daily job that runs the full sequential sync.
 
-    Pipeline: invoices → customers → matching → escalations → AUTOPILOT
-    The autopilot generates AI messages and sends them via Twilio.
+    Pipeline: invoices → customers → matching → auto-create →
+    order matching → case lifecycle. I solleciti sono manuali
+    (Copia Messaggio): nessun invio automatico.
 
     Args:
         manual: Whether this is a manual trigger (vs scheduled)
@@ -48,27 +49,10 @@ def run_daily_job(manual: bool = False):
         logger.error(f"Error in daily job: {e}", exc_info=True)
         results = {"error": str(e), "timestamp": datetime.utcnow().isoformat()}
 
-    # Run autopilot after sync (generate and send messages)
-    try:
-        import os
-        if os.getenv("AUTOPILOT_ENABLED", "false").lower() == "true":
-            from backend.engine.autopilot import run_autopilot
-            autopilot_result = run_autopilot()
-            results["autopilot"] = autopilot_result
-            logger.info(f"Autopilot result: {autopilot_result}")
-        else:
-            results["autopilot"] = {"status": "disabled"}
-            logger.info("Autopilot disabled (set AUTOPILOT_ENABLED=true to enable)")
-    except Exception as e:
-        logger.error(f"Autopilot error: {e}", exc_info=True)
-        results["autopilot"] = {"error": str(e)}
-
     # Update last sync times
     now = datetime.utcnow().isoformat()
-    _last_sync["invoices"] = now
-    _last_sync["customers"] = now
-    _last_sync["matching"] = now
-    _last_sync["escalations"] = now
+    for key in _last_sync:
+        _last_sync[key] = now
 
     logger.info(f"Daily job completed: {results}")
     return results
@@ -97,7 +81,7 @@ def start_scheduler():
             run_daily_job,
             trigger=trigger,
             id="daily_sync_job",
-            name="Daily invoice sync and escalation",
+            name="Daily invoice sync",
             replace_existing=True,
             max_instances=1,  # Prevent concurrent execution
         )

@@ -5,10 +5,10 @@ import csv
 from io import StringIO
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, or_
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from backend.database import get_session, Invoice, Customer, Message, ActivityLog
+from backend.database import get_session, Invoice, Customer, ActivityLog
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -18,7 +18,6 @@ router = APIRouter()
 async def list_positions(
     session: Session = Depends(get_session),
     status: str = Query(None),
-    escalation_level: int = Query(None),
     min_amount: float = Query(None),
     search: str = Query(None),
     source: str = Query(None, description="Filter by source: fatturapro or fatture24"),
@@ -52,11 +51,6 @@ async def list_positions(
 
         if exclude_status:
             query = query.filter(Invoice.status != exclude_status)
-
-        if escalation_level is not None:
-            query = query.join(
-                Message, Invoice.id == Message.invoice_id, isouter=True
-            ).filter(Message.escalation_level == escalation_level)
 
         if min_amount is not None:
             query = query.filter(Invoice.amount_due >= min_amount)
@@ -149,10 +143,13 @@ async def list_positions(
                     "amount_due": float(pos.amount_due),
                     "issue_date": pos.issue_date.isoformat() if pos.issue_date else None,
                     "due_date": pos.due_date.isoformat() if pos.due_date else None,
+                    "due_date_source": pos.due_date_source or ("assumed" if pos.due_date else None),
                     "days_overdue": pos.days_overdue,
                     "status": pos.status,
                     "source_platform": pos.source_platform,
                     "customer_name_raw": pos.customer_name_raw,
+                    "match_method": pos.match_method,
+                    "has_suggestion": pos.suggested_customer_id is not None,
                     "customer": {
                         "id": pos.customer.id if pos.customer else None,
                         "ragione_sociale": pos.customer.ragione_sociale if pos.customer else pos.customer_name_raw,
@@ -223,33 +220,217 @@ async def export_positions(session: Session = Depends(get_session)):
         raise
 
 
-@router.get("/{position_id}")
-async def get_position_detail(position_id: int, session: Session = Depends(get_session)):
-    """Get detailed information for a single position including message history."""
+@router.get("/suggestions")
+async def list_suggestions(session: Session = Depends(get_session)):
+    """Fatture in quarantena: abbinamento suggerito da confermare o rifiutare.
+
+    Il matching automatico assegna solo i casi sicuri (P.IVA univoca, nome
+    esatto univoco); fuzzy e ambiguità finiscono qui e decide l'operatore.
+    """
+    try:
+        invoices = (
+            session.query(Invoice)
+            .filter(
+                Invoice.customer_id.is_(None),
+                Invoice.suggested_customer_id.isnot(None),
+                Invoice.status != "paid",
+            )
+            .order_by(Invoice.suggested_score.desc().nullslast())
+            .all()
+        )
+
+        # Batch-load suggested customers (avoid N+1)
+        cust_ids = {inv.suggested_customer_id for inv in invoices}
+        customers = {}
+        if cust_ids:
+            for c in session.query(Customer).filter(Customer.id.in_(cust_ids)).all():
+                customers[c.id] = c
+
+        items = []
+        for inv in invoices:
+            cust = customers.get(inv.suggested_customer_id)
+            items.append({
+                "id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "amount_due": float(inv.amount_due),
+                "issue_date": inv.issue_date.isoformat() if inv.issue_date else None,
+                "customer_name_raw": inv.customer_name_raw,
+                "customer_piva_raw": inv.customer_piva_raw,
+                "source_platform": inv.source_platform,
+                "suggested_method": inv.suggested_method,
+                "suggested_score": inv.suggested_score,
+                "low_confidence": (inv.suggested_score or 0) < 85 and inv.suggested_method == "fuzzy",
+                "suggested_customer": {
+                    "id": cust.id,
+                    "ragione_sociale": cust.ragione_sociale,
+                    "partita_iva": cust.partita_iva,
+                } if cust else None,
+            })
+
+        return {"items": items, "total": len(items)}
+
+    except Exception as e:
+        logger.error(f"Error listing suggestions: {e}", exc_info=True)
+        raise
+
+
+@router.post("/{position_id}/confirm-suggestion")
+async def confirm_suggestion(position_id: int, session: Session = Depends(get_session)):
+    """Conferma il suggerimento: la fattura viene abbinata al cliente proposto."""
     try:
         position = session.query(Invoice).filter(Invoice.id == position_id).first()
         if not position:
             raise HTTPException(status_code=404, detail="Position not found")
+        if not position.suggested_customer_id:
+            raise HTTPException(status_code=400, detail="Nessun suggerimento da confermare")
 
-        # Get all messages for this position
-        messages = session.query(Message).filter(
-            Message.invoice_id == position_id
-        ).order_by(Message.created_at.desc()).all()
+        customer = session.query(Customer).filter(
+            Customer.id == position.suggested_customer_id
+        ).first()
+        if not customer:
+            # Cliente sparito nel frattempo: pulisce il suggerimento
+            position.suggested_customer_id = None
+            position.suggested_method = None
+            position.suggested_score = None
+            session.commit()
+            raise HTTPException(status_code=404, detail="Il cliente suggerito non esiste più")
 
-        message_list = [
-            {
-                "id": msg.id,
-                "escalation_level": msg.escalation_level,
-                "status": msg.status,
-                "body": msg.body,
-                "template": msg.template,
-                "created_at": msg.created_at.isoformat(),
-                "approved_at": msg.approved_at.isoformat() if msg.approved_at else None,
-                "sent_at": msg.sent_at.isoformat() if msg.sent_at else None,
-                "approved_by": msg.approved_by,
-            }
-            for msg in messages
-        ]
+        position.customer_id = customer.id
+        position.case_id = None  # la pratica giusta viene agganciata dal lifecycle
+        position.match_method = "fuzzy_confirmed"
+        position.match_score = position.suggested_score
+        method_was = position.suggested_method
+        position.suggested_customer_id = None
+        position.suggested_method = None
+        position.suggested_score = None
+        session.commit()
+
+        session.add(ActivityLog(
+            action="suggestion_confirmed",
+            entity_type="invoice",
+            entity_id=position_id,
+            details={
+                "invoice_number": position.invoice_number,
+                "customer_id": customer.id,
+                "customer_name": customer.ragione_sociale,
+                "method": method_was,
+                "score": position.match_score,
+            },
+        ))
+        session.commit()
+
+        return {
+            "id": position.id,
+            "customer_id": customer.id,
+            "customer_name": customer.ragione_sociale,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error confirming suggestion: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.post("/{position_id}/reject-suggestion")
+async def reject_suggestion(position_id: int, session: Session = Depends(get_session)):
+    """Rifiuta il suggerimento: la fattura resta senza cliente e non verrà
+    più riproposta in automatico (match_method='unlinked')."""
+    try:
+        position = session.query(Invoice).filter(Invoice.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+        if not position.suggested_customer_id:
+            raise HTTPException(status_code=400, detail="Nessun suggerimento da rifiutare")
+
+        rejected_id = position.suggested_customer_id
+        position.suggested_customer_id = None
+        position.suggested_method = None
+        position.suggested_score = None
+        position.match_method = "unlinked"
+        session.commit()
+
+        session.add(ActivityLog(
+            action="suggestion_rejected",
+            entity_type="invoice",
+            entity_id=position_id,
+            details={
+                "invoice_number": position.invoice_number,
+                "rejected_customer_id": rejected_id,
+            },
+        ))
+        session.commit()
+
+        return {"id": position.id, "rejected": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error rejecting suggestion: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.post("/{position_id}/unlink")
+async def unlink_position(position_id: int, session: Session = Depends(get_session)):
+    """Scollega una fattura dal cliente (abbinamento errato).
+
+    La fattura viene marcata 'unlinked': non verrà mai più abbinata in
+    automatico — solo suggerimenti con conferma esplicita o riassegnazione
+    manuale (altrimenti il sync notturno rifarebbe lo stesso errore).
+    """
+    try:
+        position = session.query(Invoice).filter(Invoice.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+        if not position.customer_id:
+            raise HTTPException(status_code=400, detail="La fattura non è abbinata a nessun cliente")
+
+        old_customer_id = position.customer_id
+        old_customer_name = position.customer.ragione_sociale if position.customer else None
+        position.customer_id = None
+        position.case_id = None
+        position.match_method = "unlinked"
+        position.match_score = None
+        position.suggested_customer_id = None
+        position.suggested_method = None
+        position.suggested_score = None
+        session.commit()
+
+        session.add(ActivityLog(
+            action="unlink",
+            entity_type="invoice",
+            entity_id=position_id,
+            details={
+                "invoice_number": position.invoice_number,
+                "old_customer_id": old_customer_id,
+                "old_customer_name": old_customer_name,
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"Position {position_id} unlinked from customer {old_customer_id} "
+            f"('{old_customer_name}')"
+        )
+        return {"id": position.id, "unlinked": True, "old_customer_name": old_customer_name}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error unlinking position: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.get("/{position_id}")
+async def get_position_detail(position_id: int, session: Session = Depends(get_session)):
+    """Get detailed information for a single position."""
+    try:
+        position = session.query(Invoice).filter(Invoice.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
 
         return {
             "id": position.id,
@@ -258,9 +439,12 @@ async def get_position_detail(position_id: int, session: Session = Depends(get_s
             "amount_due": float(position.amount_due),
             "issue_date": position.issue_date.isoformat() if position.issue_date else None,
             "due_date": position.due_date.isoformat() if position.due_date else None,
+            "due_date_source": position.due_date_source or ("assumed" if position.due_date else None),
             "days_overdue": position.days_overdue,
             "status": position.status,
             "source_platform": position.source_platform,
+            "match_method": position.match_method,
+            "match_score": position.match_score,
             "customer": {
                 "id": position.customer.id if position.customer else None,
                 "ragione_sociale": position.customer.ragione_sociale if position.customer else position.customer_name_raw,
@@ -269,7 +453,6 @@ async def get_position_detail(position_id: int, session: Session = Depends(get_s
                 "email": position.customer.email if position.customer else None,
                 "excluded": position.customer.excluded if position.customer else None,
             } if position.customer else None,
-            "messages": message_list,
             "created_at": position.created_at.isoformat(),
             "updated_at": position.updated_at.isoformat(),
         }
@@ -394,6 +577,14 @@ async def reassign_position(
         old_customer_id = position.customer_id
         old_customer_name = position.customer.ragione_sociale if position.customer else None
         position.customer_id = new_customer_id
+        # La pratica del vecchio cliente non può tenersi la fattura: il
+        # lifecycle la aggancerà alla pratica del cliente nuovo.
+        position.case_id = None
+        position.match_method = "manual"
+        position.match_score = None
+        position.suggested_customer_id = None
+        position.suggested_method = None
+        position.suggested_score = None
         session.commit()
 
         activity = ActivityLog(

@@ -4,7 +4,13 @@
  * If token is expired/invalid (401), clears auth and reloads the page.
  */
 
-export const API_BASE = import.meta.env.VITE_API_URL || 'https://sc-recupero-api.onrender.com/api'
+import config from '../config'
+
+// Stessa sorgente di api/client.js: in dev il proxy Vite inoltra /api al
+// backend locale; in prod VITE_API_BASE_URL punta al server Render.
+// (Il vecchio fallback hardcoded all'URL di produzione faceva sì che i test
+// locali colpissero silenziosamente il backend LIVE.)
+export const API_BASE = config.API_BASE_URL ? `${config.API_BASE_URL}/api` : '/api'
 
 export function getAuthHeaders() {
   const token = localStorage.getItem('sc_token')

@@ -10,7 +10,8 @@ from rapidfuzz import fuzz
 logger = logging.getLogger(__name__)
 
 
-# Italian legal form abbreviations to remove
+# Italian legal form abbreviations to remove (safe anywhere in the name:
+# multi-letter, non ambigue con parole vere)
 LEGAL_FORMS = [
     # Società a Responsabilità Limitata (e varianti)
     "S.R.L.S.", "SRLS",  # Semplificata — molto comune per società nuove
@@ -18,19 +19,13 @@ LEGAL_FORMS = [
     "S.P.A.", "SPA",
     "S.A.S.", "SAS",
     "S.N.C.", "SNC",
-    "S.S.",
-    "S.C.",
     "S.C.A.R.L.", "SCARL",
     "S.C.P.A.", "SCPA",
     "S.C.R.L.", "SCRL",  # Cooperativa a Resp. Limitata
-    "S.P.A.M.", "SPAM",
     "S.R.C.", "SRC",
     "S.R.S.", "SRS",
-    "S.A.A.",  # Accomandita per Azioni
     "S.A.P.A.", "SAPA",
     "S.T.P.", "STP",  # Società tra Professionisti
-    "P.A.",
-    "A.S.",
     "A.S.D.", "ASD",
     "A.P.S.", "APS",
     "O.N.G.", "ONG",
@@ -38,7 +33,15 @@ LEGAL_FORMS = [
     "ONLUS",
     "UNIPERSONALE",
     # Forme legali estere (per clienti stranieri fatturati in Italia)
-    "LLC", "LTD", "GMBH", "AG", "SA", "SARL",
+    "LLC", "LTD", "GMBH", "SARL",
+]
+
+# Sigle CORTE e ambigue (2 lettere, o parole reali come "sa"): rimosse SOLO
+# a fine nome, altrimenti mangiano pezzi veri della ragione sociale
+# (es. "Sa Duchessa", "Pa' Sushi").
+TRAILING_LEGAL_FORMS = [
+    "S.S.", "S.C.", "S.A.A.", "P.A.", "A.S.",
+    "AG", "SA",
 ]
 
 # Common prefixes to remove
@@ -105,13 +108,23 @@ def normalize_ragione_sociale(name: str) -> str:
         if nodots != form.lower():
             normalized = re.sub(rf"(?<!\w){re.escape(nodots)}(?!\w)", "", normalized)
 
+    # Remove short/ambiguous legal forms ONLY at the end of the name
+    for form in TRAILING_LEGAL_FORMS:
+        escaped = re.escape(form.lower())
+        normalized = re.sub(rf"(?<!\w){escaped}\.?\s*$", "", normalized)
+        nodots = form.replace(".", "").lower()
+        if nodots != form.lower():
+            normalized = re.sub(rf"(?<!\w){re.escape(nodots)}\s*$", "", normalized)
+
     # Clean up before di pattern matching
     normalized = normalized.strip()
 
     # Handle "di" + personal name pattern
     # E.g., "SHU&SHU DI SHU KEI" -> "SHU&SHU"
-    # Pattern: word(s) + "di" + word(s) where the "di" part is a personal name
-    di_pattern = re.compile(r"\s+di\s+\w+(?:\s+\w+)*\s*$")
+    # Only when 2+ words follow "di" (nome+cognome): a single word after
+    # "di" is usually part of the real name ("Osteria di Mare"), and
+    # stripping it would collapse different businesses onto the same key.
+    di_pattern = re.compile(r"\s+di\s+\w+(?:\s+\w+)+\s*$")
     normalized = di_pattern.sub("", normalized)
 
     # Remove common prefixes

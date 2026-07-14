@@ -50,7 +50,6 @@ export default function Positions() {
 
   // Filters
   const [statusFilter, setStatusFilter] = useState('exclude_paid')
-  const [escalationFilter, setEscalationFilter] = useState('')
   const [minAmountFilter, setMinAmountFilter] = useState('')
   const [searchFilter, setSearchFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
@@ -71,6 +70,15 @@ export default function Positions() {
   // Status update feedback
   const [updatingId, setUpdatingId] = useState(null)
   const [summaryTotalAmountDue, setSummaryTotalAmountDue] = useState(0)
+  const [positionsRefreshKey, setPositionsRefreshKey] = useState(0)
+
+  // Suggestions ("Da confermare")
+  const [showSuggestions, setShowSuggestions] = useState(false)
+  const [suggestions, setSuggestions] = useState([])
+  const [suggestionsTotal, setSuggestionsTotal] = useState(0)
+  const [suggestionsLoading, setSuggestionsLoading] = useState(false)
+  const [suggestionsError, setSuggestionsError] = useState(null)
+  const [suggestionActingId, setSuggestionActingId] = useState(null)
 
   useEffect(() => {
     const fetchPositions = async () => {
@@ -82,7 +90,6 @@ export default function Positions() {
         } else if (statusFilter) {
           params.status = statusFilter
         }
-        if (escalationFilter) params.escalation_level = parseInt(escalationFilter)
         if (minAmountFilter) params.min_amount = parseFloat(minAmountFilter)
         if (searchFilter) params.search = searchFilter
         if (sourceFilter) params.source = sourceFilter
@@ -109,9 +116,62 @@ export default function Positions() {
       }
     }
     fetchPositions()
-  }, [skip, limit, statusFilter, escalationFilter, minAmountFilter, searchFilter,
+  }, [skip, limit, statusFilter, minAmountFilter, searchFilter,
       sourceFilter, overdueFilter, hasCustomerFilter, issueDateFrom, issueDateTo,
-      dueDateFrom, dueDateTo, sortBy, sortOrder])
+      dueDateFrom, dueDateTo, sortBy, sortOrder, positionsRefreshKey])
+
+  const fetchSuggestions = async () => {
+    try {
+      setSuggestionsLoading(true)
+      setSuggestionsError(null)
+      const response = await client.get('/positions/suggestions')
+      setSuggestions(response.data.items)
+      setSuggestionsTotal(response.data.total)
+    } catch (err) {
+      setSuggestionsError('Errore nel caricamento dei suggerimenti')
+      console.error(err)
+    } finally {
+      setSuggestionsLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    fetchSuggestions()
+  }, [])
+
+  const handleConfirmSuggestion = async (id) => {
+    try {
+      setSuggestionActingId(id)
+      await client.post(`/positions/${id}/confirm-suggestion`)
+      await fetchSuggestions()
+      setPositionsRefreshKey(k => k + 1)
+    } catch (err) {
+      setSuggestionsError('Errore durante la conferma del suggerimento')
+      console.error(err)
+    } finally {
+      setSuggestionActingId(null)
+    }
+  }
+
+  const handleRejectSuggestion = async (id) => {
+    if (!window.confirm('La fattura resterà senza cliente e non verrà più proposta automaticamente. Continuare?')) return
+    try {
+      setSuggestionActingId(id)
+      await client.post(`/positions/${id}/reject-suggestion`)
+      await fetchSuggestions()
+      setPositionsRefreshKey(k => k + 1)
+    } catch (err) {
+      setSuggestionsError('Errore durante il rifiuto del suggerimento')
+      console.error(err)
+    } finally {
+      setSuggestionActingId(null)
+    }
+  }
+
+  const formatScore = (score) => {
+    if (score === null || score === undefined) return ''
+    return Math.round(score <= 1 ? score * 100 : score)
+  }
 
   const formatCurrency = (value) => {
     return new Intl.NumberFormat('it-IT', {
@@ -197,6 +257,108 @@ export default function Positions() {
 
   return (
     <div className="space-y-6">
+      {/* View tabs */}
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => setShowSuggestions(false)}
+          className={!showSuggestions
+            ? 'px-4 py-2 rounded-lg text-sm font-medium bg-accent-teal/15 text-accent-teal border border-accent-teal/30 transition-colors'
+            : 'sc-btn-secondary'}
+        >
+          Fatture
+        </button>
+        <button
+          onClick={() => setShowSuggestions(true)}
+          className={showSuggestions
+            ? 'px-4 py-2 rounded-lg text-sm font-medium bg-accent-teal/15 text-accent-teal border border-accent-teal/30 transition-colors'
+            : 'sc-btn-secondary'}
+        >
+          Da confermare ({suggestionsTotal})
+        </button>
+      </div>
+
+      {showSuggestions ? (
+        /* Suggestions ("Da confermare") */
+        <div className="sc-card overflow-hidden">
+          <div className="sc-card-header">
+            <h2 className="sc-section-title">Abbinamenti da Confermare</h2>
+            <span className="text-sm text-txt-muted">{suggestionsTotal} in attesa</span>
+          </div>
+
+          {suggestionsError && (
+            <div className="mx-5 mt-4 p-3 rounded-lg text-sm bg-accent-red/10 text-accent-red border border-accent-red/20">
+              {suggestionsError}
+            </div>
+          )}
+
+          {suggestionsLoading ? (
+            <div className="flex items-center justify-center h-48">
+              <svg className="animate-spin-slow w-8 h-8 text-accent-teal" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+            </div>
+          ) : suggestions.length === 0 ? (
+            <div className="p-6 text-center text-txt-muted">Nessun abbinamento da confermare ✓</div>
+          ) : (
+            <div className="divide-y divide-dark-border">
+              {suggestions.map(sug => (
+                <div key={sug.id} className="p-4 flex flex-wrap items-center gap-4">
+                  <div className="w-44 shrink-0">
+                    <p className="text-sm font-medium text-txt-primary">{sug.invoice_number}</p>
+                    <p className="text-sm text-txt-secondary">{formatCurrency(sug.amount_due)}</p>
+                    <div className="flex items-center gap-1.5 mt-0.5">
+                      <span className="text-xs text-txt-muted">{formatDate(sug.issue_date)}</span>
+                      <span className={`sc-badge ${getSourceBadge(sug.source_platform)}`}>
+                        {getSourceLabel(sug.source_platform)}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex-1 min-w-[180px]">
+                    <p className="text-xs font-semibold text-txt-label uppercase tracking-wider mb-1">Destinatario fattura</p>
+                    <p className="text-sm text-txt-primary">{sug.customer_name_raw || '-'}</p>
+                    <p className="text-xs font-mono text-txt-muted">{sug.customer_piva_raw || '-'}</p>
+                  </div>
+
+                  <div className="text-txt-muted text-lg shrink-0">→</div>
+
+                  <div className="flex-1 min-w-[180px]">
+                    <p className="text-xs font-semibold text-txt-label uppercase tracking-wider mb-1">Cliente suggerito</p>
+                    <p className="text-sm text-accent-teal">{sug.suggested_customer?.ragione_sociale || '-'}</p>
+                    <p className="text-xs font-mono text-txt-muted">{sug.suggested_customer?.partita_iva || '-'}</p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="sc-badge bg-[rgba(148,163,184,0.15)] text-txt-secondary">
+                        {sug.suggested_method} {formatScore(sug.suggested_score)}
+                      </span>
+                      {sug.low_confidence && (
+                        <span className="sc-badge bg-[rgba(251,191,36,0.15)] text-accent-amber">bassa confidenza</span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex gap-2 shrink-0">
+                    <button
+                      onClick={() => handleConfirmSuggestion(sug.id)}
+                      disabled={suggestionActingId === sug.id}
+                      className="px-4 py-2 rounded-lg text-sm font-medium bg-accent-green/15 hover:bg-accent-green/25 text-accent-green border border-accent-green/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Conferma
+                    </button>
+                    <button
+                      onClick={() => handleRejectSuggestion(sug.id)}
+                      disabled={suggestionActingId === sug.id}
+                      className="px-4 py-2 rounded-lg text-sm font-medium bg-transparent hover:bg-accent-red/10 text-accent-red border border-accent-red/40 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Rifiuta
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
+      <>
       {/* Filters */}
       <div className="sc-card p-5">
         <div className="flex items-center justify-between mb-4">
@@ -452,7 +614,17 @@ export default function Positions() {
                         {formatDate(pos.issue_date)}
                       </td>
                       <td className="px-3 py-3 text-sm text-txt-secondary">
-                        {formatDate(pos.due_date)}
+                        <span className="inline-flex items-center gap-1.5">
+                          {formatDate(pos.due_date)}
+                          {pos.due_date && pos.due_date_source !== 'real' && (
+                            <span
+                              className="text-xs px-1.5 py-0.5 rounded bg-dark-surface text-txt-muted"
+                              title="Scadenza stimata (emissione + 30gg): non presente nel gestionale"
+                            >
+                              stimata
+                            </span>
+                          )}
+                        </span>
                       </td>
                       <td className="px-3 py-3 text-sm text-right">
                         <span className={`font-medium ${
@@ -501,6 +673,8 @@ export default function Positions() {
           </>
         )}
       </div>
+      </>
+      )}
     </div>
   )
 }

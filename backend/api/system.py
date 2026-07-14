@@ -1,47 +1,17 @@
 """System health and diagnostics API endpoint."""
 
 import logging
-from datetime import datetime, date, timedelta
-from fastapi import APIRouter
+from datetime import datetime, date
+from fastapi import APIRouter, Query
 from sqlalchemy import func, text
 
-from backend.database import get_session_direct, Customer, Invoice, Message, ActivityLog
+from backend.database import get_session_direct, Customer, Invoice, RecoveryCase, ActivityLog
 from backend.config import config
 from backend.scheduler import get_scheduler_status
 from backend.api.sync import _sync_status, _load_sync_state
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-
-@router.post("/migrate")
-@router.get("/migrate")
-async def run_migrations():
-    """Run schema migrations to add missing columns."""
-    results = []
-    try:
-        from sqlalchemy import create_engine as _ce
-        from sqlalchemy.pool import NullPool
-        # Use the same pooler URL but with short timeouts
-        migration_engine = _ce(
-            config.DATABASE_URL,
-            poolclass=NullPool,
-            connect_args={"connect_timeout": 10, "options": "-c statement_timeout=15000"},
-        )
-        with migration_engine.begin() as conn:
-            try:
-                conn.execute(text('ALTER TABLE recovery_actions ADD COLUMN outcome VARCHAR'))
-                results.append("outcome: added successfully")
-            except Exception as e:
-                err = str(e).lower()
-                if 'already exists' in err or 'duplicate' in err:
-                    results.append("outcome: already exists")
-                else:
-                    results.append(f"outcome error: {str(e)[:200]}")
-        migration_engine.dispose()
-    except Exception as e:
-        results.append(f"error: {str(e)[:200]}")
-    return {"migrations": results}
 
 
 @router.get("")
@@ -82,7 +52,9 @@ async def get_system_status():
         # Table counts
         total_customers = session.query(func.count(Customer.id)).scalar() or 0
         total_invoices = session.query(func.count(Invoice.id)).scalar() or 0
-        total_messages = session.query(func.count(Message.id)).scalar() or 0
+        open_cases = session.query(func.count(RecoveryCase.id)).filter(
+            RecoveryCase.status == "open"
+        ).scalar() or 0
 
         customers_shopify = session.query(func.count(Customer.id)).filter(
             Customer.source == "shopify"
@@ -123,7 +95,7 @@ async def get_system_status():
                 "last_result": None,
             },
             "fattura24": {
-                "configured": creds.get("fattura24", False),
+                "configured": False,  # API dismessa (abbonamento scaduto): dati importati via CSV
                 "status": "unknown",
                 "last_result": None,
             },
@@ -133,19 +105,26 @@ async def get_system_status():
                 "status": "unknown",
                 "last_result": None,
             },
-            "twilio": {
-                "configured": creds.get("twilio", False),
-                "status": "configured" if creds.get("twilio") else "not_configured",
+            "company_piva": {
+                "configured": bool(config.COMPANY_PIVA),
+                "status": "ok" if config.COMPANY_PIVA else "not_configured",
+                "note": (
+                    None if config.COMPANY_PIVA else
+                    "COMPANY_PIVA assente: pattern full-text dell'enrichment "
+                    "P.IVA disabilitato (fail-closed)"
+                ),
             },
         }
 
-        # Fattura24: if no API key but invoices exist, mark as imported
-        if not config.FATTURA24_API_KEY and invoices_f24 > 0:
+        # Fattura24: API dismessa — se ci sono fatture in DB sono importate via CSV
+        if invoices_f24 > 0:
             connectors["fattura24"]["status"] = "imported"
             connectors["fattura24"]["last_result"] = {
                 "success": True,
                 "imported_count": invoices_f24,
             }
+        else:
+            connectors["fattura24"]["status"] = "dismissed"
 
         # Enrich from last sync
         inv_result = _sync_status.get("invoices", {}).get("result")
@@ -160,28 +139,6 @@ async def get_system_status():
                 "error": fp.get("error"),
             }
 
-            f24 = inv_result.get("fattura24", {})
-            # Fattura24 API sync is disabled (subscription expired).
-            # If we have invoices in DB, show "imported" status regardless of API key.
-            if invoices_f24 > 0 and not f24.get("success"):
-                connectors["fattura24"]["status"] = "imported"
-                connectors["fattura24"]["last_result"] = {
-                    "success": True,
-                    "imported_count": invoices_f24,
-                }
-            elif f24.get("success"):
-                connectors["fattura24"]["status"] = "ok"
-                connectors["fattura24"]["last_result"] = {
-                    "success": True,
-                    "error": None,
-                }
-            else:
-                connectors["fattura24"]["status"] = "not_configured"
-                connectors["fattura24"]["last_result"] = {
-                    "success": False,
-                    "error": f24.get("error"),
-                }
-
         cust_result = _sync_status.get("customers", {}).get("result")
         if cust_result:
             shopify_err = cust_result.get("shopify_error")
@@ -193,7 +150,7 @@ async def get_system_status():
 
         # --- 3. Sync Status ---
         sync_info = {}
-        for key in ["invoices", "customers", "matching", "escalations"]:
+        for key in ["invoices", "customers", "matching", "cases"]:
             s = _sync_status.get(key, {})
             last = s.get("last_sync")
             stale = False
@@ -250,7 +207,6 @@ async def get_system_status():
 
         # Check: customers in active recovery with NO remaining overdue
         # (all overdue invoices paid → status should be updated)
-        from sqlalchemy import and_
         active_cust_ids = session.query(Customer.id).filter(
             Customer.excluded.is_(False),
             Customer.recovery_status.in_(
@@ -295,11 +251,14 @@ async def get_system_status():
                 "message": f"FatturaPro errore: {connectors['fatturapro']['last_result'].get('error', 'sconosciuto')}"
             })
 
-        if not connectors["fattura24"]["configured"]:
+        if not config.COMPANY_PIVA:
             alerts.append({
                 "level": "warning",
-                "component": "fattura24",
-                "message": "Fattura24 non configurato — impostare FATTURA24_API_KEY su Render"
+                "component": "company_piva",
+                "message": (
+                    "COMPANY_PIVA non impostata su Render: l'enrichment P.IVA "
+                    "full-text è disabilitato per sicurezza (fail-closed)"
+                )
             })
 
         shopify_err = connectors["shopify"].get("error")
@@ -370,7 +329,7 @@ async def get_system_status():
                         "fatturapro": invoices_fp,
                         "fattura24": invoices_f24,
                     },
-                    "messages": {"total": total_messages},
+                    "cases": {"open": open_cases},
                 },
                 "totals": {
                     "crediti_aperti": round(total_crediti, 2),
@@ -406,23 +365,19 @@ def _summarize_sync_result(key: str, result: dict) -> str:
 
     if key == "invoices":
         fp = result.get("fatturapro", {})
-        f24 = result.get("fattura24", {})
-        parts = []
         if fp.get("success"):
-            parts.append(
+            summary = (
                 f"FP: {fp.get('updated', 0)} agg, {fp.get('created', 0)} nuove, "
                 f"{fp.get('paid_detected', 0)} pagate"
             )
-        else:
-            parts.append("FP: errore")
-        if f24.get("success"):
-            parts.append(f"F24: {f24.get('updated', 0)} agg, {f24.get('created', 0)} nuove")
-        else:
-            parts.append("F24: non attivo")
-        return " | ".join(parts)
+            if fp.get("due_date_enriched"):
+                summary += f", {fp['due_date_enriched']} scadenze reali"
+            if fp.get("partial"):
+                summary += " (PARZIALE)"
+            return summary
+        return "FP: errore"
 
     if key == "customers":
-        auto = result.get("auto_created_from_invoices", 0)
         created = result.get("created", 0)
         shopify_err = result.get("shopify_error")
         parts = []
@@ -430,232 +385,130 @@ def _summarize_sync_result(key: str, result: dict) -> str:
             parts.append(f"Shopify: {created} nuovi")
         if shopify_err:
             parts.append("Shopify: errore token")
-        if auto > 0:
-            parts.append(f"Auto-creati: {auto}")
         return " | ".join(parts) if parts else "Nessuna modifica"
 
     if key == "matching":
         total = result.get("total", 0)
         if total == 0:
             return "Tutte le fatture già associate"
-        exact = result.get("matched_exact", 0)
-        fuzzy = result.get("matched_fuzzy", 0)
+        exact = result.get("matched_exact", 0) + result.get("matched_piva", 0)
+        suggested = result.get("suggested", 0)
         unm = result.get("unmatched", 0)
-        return f"{exact} esatte, {fuzzy} fuzzy, {unm} non associate"
+        return f"{exact} sicure, {suggested} da confermare, {unm} non associate"
 
-    if key == "escalations":
-        n = result.get("escalations_created", 0)
-        return f"{n} escalation create" if n > 0 else "Nessuna nuova escalation"
+    if key == "cases":
+        opened = result.get("opened", 0) + result.get("reopened", 0)
+        closed = result.get("closed", 0)
+        if opened == 0 and closed == 0:
+            return "Nessuna variazione pratiche"
+        return f"{opened} pratiche aperte, {closed} chiuse"
 
     return str(result)
 
 
-@router.get("/autopilot")
-async def get_autopilot_status():
-    """Get autopilot status and recent activity."""
-    import os
+# ── Audit abbinamenti fatture→clienti ────────────────────────────────
 
-    session = get_session_direct()
-    try:
-        # Recent autopilot activity
-        recent = session.query(ActivityLog).filter(
-            ActivityLog.action.in_([
-                "autopilot_sent", "autopilot_reply_processed",
-                "escalation_triggered", "reply_processed_fallback",
-            ])
-        ).order_by(ActivityLog.timestamp.desc()).limit(20).all()
+@router.get("/match-audit")
+async def match_audit(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    only_problems: bool = Query(True, description="Solo esiti warn/bad"),
+):
+    """Audit degli abbinamenti fattura→cliente sulle fatture NON pagate.
 
-        # Message stats
-        total_sent = session.query(func.count(Message.id)).filter(
-            Message.approved_by == "autopilot",
-        ).scalar() or 0
+    Per ogni fattura abbinata confronta il destinatario della fattura con la
+    ragione sociale del cliente e l'accordo P.IVA:
+    - bad:  P.IVA in conflitto, o nomi del tutto dissimili (score < 40)
+    - warn: nomi poco simili (score < 75) o P.IVA fattura assente sul cliente
+    - ok:   il resto
 
-        total_replied = session.query(func.count(Message.id)).filter(
-            Message.status == "replied",
-            Message.approved_by == "autopilot",
-        ).scalar() or 0
-
-        escalations = session.query(func.count(ActivityLog.id)).filter(
-            ActivityLog.action == "escalation_triggered",
-        ).scalar() or 0
-
-        return {
-            "enabled": os.getenv("AUTOPILOT_ENABLED", "false").lower() == "true",
-            "anthropic_configured": bool(os.getenv("ANTHROPIC_API_KEY")),
-            "twilio_configured": bool(config.TWILIO_ACCOUNT_SID and config.TWILIO_AUTH_TOKEN),
-            "escalation_email": os.getenv("ESCALATION_EMAIL", "lorenzo@ef-ti.com"),
-            "stats": {
-                "messages_sent": total_sent,
-                "replies_received": total_replied,
-                "escalations": escalations,
-            },
-            "recent_activity": [
-                {
-                    "action": a.action,
-                    "timestamp": a.timestamp.isoformat() if a.timestamp else None,
-                    "details": a.details,
-                }
-                for a in recent
-            ],
-        }
-    finally:
-        session.close()
-
-
-@router.post("/autopilot/run")
-async def run_autopilot_manual():
-    """Manually trigger one autopilot cycle."""
-    import os
-    if os.getenv("AUTOPILOT_ENABLED", "false").lower() != "true":
-        return {"status": "disabled", "message": "Autopilot non abilitato. Imposta AUTOPILOT_ENABLED=true."}
-
-    try:
-        from backend.engine.autopilot import run_autopilot_async
-        result = await run_autopilot_async()
-        return {"status": "ok", "result": result}
-    except Exception as e:
-        logger.error(f"Manual autopilot run failed: {e}", exc_info=True)
-        return {"status": "error", "message": str(e)}
-
-
-@router.get("/autopilot/preview")
-async def preview_autopilot():
-    """Dry-run: show what messages WOULD be sent without sending anything.
-
-    Returns a list of customers and the messages that would be generated.
+    Serve a trovare le fatture finite nel profilo sbagliato (i casi
+    QOQA/Rooftop). Da lì: "Scollega" o riassegnazione manuale.
     """
-    from backend.engine.autopilot import _get_customers_for_today
-    from backend.engine.ai_engine import generate_message
-    from backend.engine.escalation import get_escalation_level
+    from backend.engine.normalizer import are_similar
+    from backend.engine.piva import validate_piva
 
     session = get_session_direct()
     try:
-        customers_to_contact = _get_customers_for_today(session)
-
-        previews = []
-        for customer, invoices in customers_to_contact:
-            if not customer.phone:
-                previews.append({
-                    "customer": customer.ragione_sociale,
-                    "phone": None,
-                    "skip_reason": "Nessun telefono",
-                    "message": None,
-                })
-                continue
-
-            total_due = sum(inv.amount_due or 0 for inv in invoices)
-            max_overdue = max(inv.days_overdue for inv in invoices)
-            main_invoice = max(invoices, key=lambda i: i.amount_due or 0)
-            level = get_escalation_level(main_invoice)
-
-            if level == 0:
-                previews.append({
-                    "customer": customer.ragione_sociale,
-                    "phone": customer.phone,
-                    "skip_reason": "Non ancora in escalation",
-                    "message": None,
-                })
-                continue
-
-            # Check if already sent recently
-            recent_msg = session.query(Message).filter(
-                Message.customer_id == customer.id,
-                Message.escalation_level == level,
-                Message.sent_at.isnot(None),
-                Message.sent_at >= datetime.utcnow() - timedelta(days=5),
-            ).first()
-
-            if recent_msg:
-                previews.append({
-                    "customer": customer.ragione_sociale,
-                    "phone": customer.phone,
-                    "skip_reason": f"Già inviato livello {level} di recente",
-                    "message": None,
-                    "level": level,
-                })
-                continue
-
-            # Generate message preview
-            invoice_refs = ", ".join(inv.invoice_number for inv in invoices[:3])
-            if len(invoices) > 3:
-                invoice_refs += f" (+{len(invoices) - 3} altre)"
-
-            body = await generate_message(
-                customer_name=customer.ragione_sociale or "Cliente",
-                invoice_number=invoice_refs,
-                amount_due=total_due,
-                days_overdue=max_overdue,
-                escalation_level=level,
+        invoices = (
+            session.query(Invoice)
+            .filter(
+                Invoice.customer_id.isnot(None),
+                Invoice.status != "paid",
             )
-
-            previews.append({
-                "customer": customer.ragione_sociale,
-                "phone": customer.phone,
-                "level": level,
-                "total_due": total_due,
-                "days_overdue": max_overdue,
-                "invoices": [inv.invoice_number for inv in invoices],
-                "message": body,
-                "skip_reason": None,
-            })
-
-        return {
-            "status": "ok",
-            "total_customers": len(previews),
-            "would_send": len([p for p in previews if p["message"]]),
-            "would_skip": len([p for p in previews if p["skip_reason"]]),
-            "previews": previews,
-        }
-    except Exception as e:
-        logger.error(f"Preview failed: {e}", exc_info=True)
-        return {"status": "error", "message": str(e)}
-    finally:
-        session.close()
-
-
-@router.post("/autopilot/test")
-async def test_autopilot_message():
-    """Send a test message to the admin phone number.
-
-    Generates a sample message and sends it to the configured test number.
-    """
-    from backend.engine.ai_engine import generate_message
-    from backend.connectors.twilio_whatsapp import TwilioWhatsAppConnector
-
-    test_phone = config.ESCALATION_PHONE or "+393515978498"
-
-    try:
-        # Generate a sample message
-        body = await generate_message(
-            customer_name="Test Cliente S.R.L.",
-            invoice_number="TEST-001",
-            amount_due=1250.00,
-            days_overdue=15,
-            escalation_level=1,
+            .order_by(Invoice.id)
+            .all()
         )
 
-        if not body:
-            return {"status": "error", "message": "Impossibile generare il messaggio (AI non configurata?)"}
+        cust_ids = {inv.customer_id for inv in invoices}
+        customers = {}
+        if cust_ids:
+            for c in session.query(Customer).filter(Customer.id.in_(cust_ids)).all():
+                customers[c.id] = c
 
-        # Send via Twilio
-        twilio = TwilioWhatsAppConnector()
-        sid = twilio.send_whatsapp(test_phone, body)
+        results = []
+        counts = {"ok": 0, "warn": 0, "bad": 0}
+        for inv in invoices:
+            cust = customers.get(inv.customer_id)
+            if not cust:
+                continue
 
-        if sid:
-            return {
-                "status": "ok",
-                "message": body,
-                "phone": test_phone,
-                "twilio_sid": sid,
-                "note": f"Messaggio di test inviato a {test_phone}",
-            }
-        else:
-            return {
-                "status": "error",
-                "message": body,
-                "phone": test_phone,
-                "note": "Twilio non è riuscito a inviare il messaggio",
-            }
-    except Exception as e:
-        logger.error(f"Test message failed: {e}", exc_info=True)
-        return {"status": "error", "message": str(e)}
+            name_score = None
+            if inv.customer_name_raw and cust.ragione_sociale:
+                _, name_score = are_similar(
+                    inv.customer_name_raw, cust.ragione_sociale, threshold=100
+                )
+                name_score = int(name_score)
+
+            inv_piva = validate_piva(inv.customer_piva_raw)
+            cust_piva = validate_piva(cust.partita_iva)
+            piva_conflict = bool(inv_piva and cust_piva and inv_piva != cust_piva)
+            piva_match = bool(inv_piva and cust_piva and inv_piva == cust_piva)
+
+            reasons = []
+            if piva_conflict:
+                verdict = "bad"
+                reasons.append("P.IVA fattura diversa da P.IVA cliente")
+            elif name_score is not None and name_score < 40 and not piva_match:
+                verdict = "bad"
+                reasons.append(f"nomi dissimili (score {name_score})")
+            elif name_score is not None and name_score < 75 and not piva_match:
+                verdict = "warn"
+                reasons.append(f"nomi poco simili (score {name_score})")
+            elif inv_piva and not cust_piva:
+                verdict = "warn"
+                reasons.append("P.IVA presente in fattura ma assente sul cliente")
+            else:
+                verdict = "ok"
+
+            counts[verdict] += 1
+            if only_problems and verdict == "ok":
+                continue
+
+            results.append({
+                "invoice_id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "amount_due": float(inv.amount_due),
+                "customer_id": cust.id,
+                "customer_name": cust.ragione_sociale,
+                "customer_name_raw": inv.customer_name_raw,
+                "customer_piva": cust.partita_iva,
+                "customer_piva_raw": inv.customer_piva_raw,
+                "match_method": inv.match_method,
+                "match_score": inv.match_score,
+                "name_score": name_score,
+                "verdict": verdict,
+                "reasons": reasons,
+            })
+
+        page = results[skip:skip + limit]
+        return {
+            "counts": counts,
+            "total_audited": len(invoices),
+            "total_problems": counts["warn"] + counts["bad"],
+            "skip": skip,
+            "limit": limit,
+            "items": page,
+        }
+    finally:
+        session.close()

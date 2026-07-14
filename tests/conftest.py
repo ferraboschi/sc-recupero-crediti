@@ -7,7 +7,7 @@ from sqlalchemy.pool import StaticPool
 import tempfile
 from pathlib import Path
 
-from backend.database import Base, Invoice, Customer, Message, Conversation, ActivityLog
+from backend.database import Base, Invoice, Customer, RecoveryCase, RecoveryAction, ActivityLog
 from backend.main import app
 from backend.api.auth import verify_token
 from fastapi.testclient import TestClient
@@ -99,22 +99,6 @@ def sample_invoice(test_db_session, sample_customer):
     test_db_session.add(invoice)
     test_db_session.commit()
     return invoice
-
-
-@pytest.fixture
-def sample_message(test_db_session, sample_invoice, sample_customer):
-    """Create a sample message for testing."""
-    message = Message(
-        invoice_id=sample_invoice.id,
-        customer_id=sample_customer.id,
-        escalation_level=1,
-        template="reminder_1",
-        body="Please pay your invoice",
-        status="draft",
-    )
-    test_db_session.add(message)
-    test_db_session.commit()
-    return message
 
 
 @pytest.fixture

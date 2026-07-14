@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
+import { Link } from 'react-router-dom'
 
-const API = import.meta.env.VITE_API_URL || 'https://sc-recupero-api.onrender.com/api'
+import { API_BASE as API } from '../utils/api'
 
 function StatusBadge({ status }) {
   const colors = {
@@ -57,12 +58,10 @@ export default function System() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [syncing, setSyncing] = useState(false)
-  const [autopilot, setAutopilot] = useState(null)
-  const [runningAutopilot, setRunningAutopilot] = useState(false)
-  const [preview, setPreview] = useState(null)
-  const [loadingPreview, setLoadingPreview] = useState(false)
-  const [testResult, setTestResult] = useState(null)
-  const [sendingTest, setSendingTest] = useState(false)
+  const [audit, setAudit] = useState(null)
+  const [auditLoading, setAuditLoading] = useState(false)
+  const [auditError, setAuditError] = useState(null)
+  const [unlinkingId, setUnlinkingId] = useState(null)
 
   const authHeaders = () => {
     const token = localStorage.getItem('sc_token')
@@ -82,46 +81,38 @@ export default function System() {
     }
   }, [])
 
-  useEffect(() => { fetchData(); fetchAutopilot() }, [fetchData])
+  useEffect(() => { fetchData() }, [fetchData])
 
-  const fetchAutopilot = async () => {
+  const runAudit = async () => {
+    setAuditLoading(true)
+    setAuditError(null)
     try {
-      const res = await fetch(`${API}/system/autopilot`, { headers: authHeaders() })
-      if (res.ok) setAutopilot(await res.json())
-    } catch { /* ignore */ }
-  }
-
-  const triggerAutopilot = async () => {
-    setRunningAutopilot(true)
-    try {
-      const res = await fetch(`${API}/system/autopilot/run`, { method: 'POST', headers: authHeaders() })
-      const result = await res.json()
-      setRunningAutopilot(false)
-      fetchAutopilot()
-      fetchData()
-    } catch {
-      setRunningAutopilot(false)
+      const res = await fetch(`${API}/system/match-audit?only_problems=true&limit=100`, { headers: authHeaders() })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setAudit(await res.json())
+    } catch (e) {
+      setAuditError(e.message)
+    } finally {
+      setAuditLoading(false)
     }
   }
 
-  const loadPreview = async () => {
-    setLoadingPreview(true)
-    setPreview(null)
+  const unlinkInvoice = async (item) => {
+    const ok = window.confirm(
+      `Scollegare la fattura ${item.invoice_number} dal cliente "${item.customer_name}"?`
+    )
+    if (!ok) return
+    setUnlinkingId(item.invoice_id)
     try {
-      const res = await fetch(`${API}/system/autopilot/preview`, { headers: authHeaders() })
-      if (res.ok) setPreview(await res.json())
-    } catch { /* ignore */ }
-    setLoadingPreview(false)
-  }
-
-  const sendTest = async () => {
-    setSendingTest(true)
-    setTestResult(null)
-    try {
-      const res = await fetch(`${API}/system/autopilot/test`, { method: 'POST', headers: authHeaders() })
-      if (res.ok) setTestResult(await res.json())
-    } catch { /* ignore */ }
-    setSendingTest(false)
+      const res = await fetch(`${API}/positions/${item.invoice_id}/unlink`, { method: 'POST', headers: authHeaders() })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      await runAudit()
+      fetchData()
+    } catch (e) {
+      setAuditError(e.message)
+    } finally {
+      setUnlinkingId(null)
+    }
   }
 
   const triggerSync = async () => {
@@ -259,21 +250,26 @@ export default function System() {
             <div key={name} className="px-6 py-4 flex items-center justify-between">
               <div className="flex items-center gap-4">
                 <div className="w-10 h-10 rounded-lg bg-dark-surface flex items-center justify-center text-lg font-bold text-txt-secondary">
-                  {name === 'fatturapro' ? 'FP' : name === 'fattura24' ? 'F24' : name === 'shopify' ? 'SH' : 'TW'}
+                  {name === 'fatturapro' ? 'FP' : name === 'fattura24' ? 'F24' : name === 'shopify' ? 'SH' : name === 'company_piva' ? 'PI' : name.slice(0, 2).toUpperCase()}
                 </div>
                 <div>
-                  <p className="font-semibold text-txt-primary capitalize">{name}</p>
+                  <p className="font-semibold text-txt-primary capitalize">
+                    {name === 'company_piva' ? 'P.IVA azienda' : name}
+                  </p>
                   {conn.api_version && (
                     <p className="text-xs text-txt-muted">API v{conn.api_version}</p>
                   )}
                   {conn.status === 'imported' && conn.last_result?.imported_count && (
                     <p className="text-xs text-accent-green mt-0.5">{conn.last_result.imported_count} fatture importate via CSV</p>
                   )}
-                  {conn.last_result && conn.last_result.error && conn.status !== 'imported' && (
+                  {conn.last_result?.error && conn.status !== 'imported' && (
                     <p className="text-xs text-accent-red mt-0.5 max-w-md truncate">{conn.last_result.error}</p>
                   )}
                   {conn.error && conn.status !== 'imported' && (
                     <p className="text-xs text-accent-red mt-0.5 max-w-lg truncate">{conn.error}</p>
+                  )}
+                  {conn.note && (
+                    <p className="text-xs text-txt-muted mt-0.5 max-w-lg truncate">{conn.note}</p>
                   )}
                 </div>
               </div>
@@ -282,147 +278,6 @@ export default function System() {
           ))}
         </div>
       </div>
-
-      {/* Autopilot AI */}
-      {autopilot && (
-        <div className="sc-card overflow-hidden">
-          <div className="sc-card-header bg-dark-surface flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <h3 className="sc-section-title">Autopilot AI</h3>
-              <StatusBadge status={autopilot.enabled ? 'ok' : 'not_configured'} />
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={loadPreview}
-                disabled={loadingPreview}
-                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-blue/20 text-accent-blue hover:bg-accent-blue/30 transition-colors"
-              >
-                {loadingPreview ? 'Caricamento...' : 'Anteprima'}
-              </button>
-              <button
-                onClick={sendTest}
-                disabled={sendingTest}
-                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-green/20 text-accent-green hover:bg-accent-green/30 transition-colors"
-              >
-                {sendingTest ? 'Invio...' : 'Test WhatsApp'}
-              </button>
-              <button
-                onClick={triggerAutopilot}
-                disabled={runningAutopilot || !autopilot.enabled}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
-                  autopilot.enabled
-                    ? 'bg-accent-purple/20 text-accent-purple hover:bg-accent-purple/30'
-                    : 'bg-dark-surface text-txt-muted cursor-not-allowed'
-                }`}
-              >
-                {runningAutopilot ? 'Invio in corso...' : 'Lancia Ciclo'}
-              </button>
-            </div>
-          </div>
-          <div className="p-6 space-y-4">
-            <div className="grid grid-cols-3 gap-4">
-              <div className="text-center">
-                <p className="text-2xl font-bold text-accent-purple">{autopilot.stats?.messages_sent || 0}</p>
-                <p className="text-xs text-txt-muted mt-1">Messaggi inviati</p>
-              </div>
-              <div className="text-center">
-                <p className="text-2xl font-bold text-accent-green">{autopilot.stats?.replies_received || 0}</p>
-                <p className="text-xs text-txt-muted mt-1">Risposte ricevute</p>
-              </div>
-              <div className="text-center">
-                <p className="text-2xl font-bold text-accent-amber">{autopilot.stats?.escalations || 0}</p>
-                <p className="text-xs text-txt-muted mt-1">Escalation umane</p>
-              </div>
-            </div>
-            <div className="border-t border-dark-border pt-4 space-y-2">
-              <div className="flex items-center justify-between text-sm">
-                <span className="text-txt-label">Claude AI</span>
-                <StatusBadge status={autopilot.anthropic_configured ? 'ok' : 'not_configured'} />
-              </div>
-              <div className="flex items-center justify-between text-sm">
-                <span className="text-txt-label">Twilio WhatsApp</span>
-                <StatusBadge status={autopilot.twilio_configured ? 'ok' : 'not_configured'} />
-              </div>
-              <div className="flex items-center justify-between text-sm">
-                <span className="text-txt-label">Email escalation</span>
-                <span className="text-xs text-txt-secondary">{autopilot.escalation_email}</span>
-              </div>
-            </div>
-            {/* Test Result */}
-            {testResult && (
-              <div className={`p-3 rounded-lg border ${testResult.status === 'ok' ? 'border-accent-green/30 bg-accent-green/5' : 'border-accent-red/30 bg-accent-red/5'}`}>
-                <p className={`text-xs font-semibold mb-1 ${testResult.status === 'ok' ? 'text-accent-green' : 'text-accent-red'}`}>
-                  {testResult.status === 'ok' ? '✓ Messaggio di test inviato!' : '✗ Errore invio test'}
-                </p>
-                {testResult.phone && <p className="text-xs text-txt-muted">Destinatario: {testResult.phone}</p>}
-                {testResult.message && (
-                  <p className="text-xs text-txt-secondary mt-1 whitespace-pre-wrap bg-dark-bg/50 p-2 rounded mt-2">{testResult.message}</p>
-                )}
-                {testResult.note && <p className="text-xs text-txt-muted mt-1">{testResult.note}</p>}
-              </div>
-            )}
-
-            {/* Preview Results */}
-            {preview && (
-              <div className="border border-dark-border rounded-lg overflow-hidden">
-                <div className="bg-accent-blue/10 px-3 py-2 flex items-center justify-between">
-                  <p className="text-xs font-semibold text-accent-blue">
-                    Anteprima: {preview.would_send} messaggi da inviare, {preview.would_skip} da saltare
-                  </p>
-                  <button onClick={() => setPreview(null)} className="text-xs text-txt-muted hover:text-txt-primary">✕</button>
-                </div>
-                <div className="max-h-80 overflow-y-auto divide-y divide-dark-border">
-                  {preview.previews?.map((p, i) => (
-                    <div key={i} className="px-3 py-2">
-                      <div className="flex items-center justify-between mb-1">
-                        <span className="text-xs font-semibold text-txt-primary">{p.customer}</span>
-                        {p.skip_reason ? (
-                          <span className="text-xs text-txt-muted">{p.skip_reason}</span>
-                        ) : (
-                          <span className="text-xs text-accent-purple">Livello {p.level} — €{p.total_due?.toLocaleString('it-IT', { minimumFractionDigits: 2 })}</span>
-                        )}
-                      </div>
-                      {p.message && (
-                        <p className="text-xs text-txt-secondary whitespace-pre-wrap bg-dark-bg/50 p-2 rounded">{p.message}</p>
-                      )}
-                      {p.phone && !p.skip_reason && (
-                        <p className="text-xs text-txt-muted mt-1">📱 {p.phone} — Fatture: {p.invoices?.join(', ')}</p>
-                      )}
-                    </div>
-                  ))}
-                  {(!preview.previews || preview.previews.length === 0) && (
-                    <div className="px-3 py-4 text-center text-xs text-txt-muted">Nessun cliente da contattare oggi</div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {autopilot.recent_activity?.length > 0 && (
-              <div className="border-t border-dark-border pt-4">
-                <p className="text-xs text-txt-label uppercase tracking-wider mb-2">Attività recente</p>
-                <div className="space-y-1.5 max-h-40 overflow-y-auto">
-                  {autopilot.recent_activity.slice(0, 8).map((a, i) => (
-                    <div key={i} className="flex items-center justify-between text-xs">
-                      <span className={`${
-                        a.action === 'escalation_triggered' ? 'text-accent-amber' :
-                        a.action === 'autopilot_sent' ? 'text-accent-purple' :
-                        'text-accent-green'
-                      }`}>
-                        {a.action === 'autopilot_sent' ? '📤 Inviato' :
-                         a.action === 'autopilot_reply_processed' ? '📥 Risposta' :
-                         a.action === 'escalation_triggered' ? '⚠️ Escalation' :
-                         a.action}
-                        {a.details?.customer && ` — ${a.details.customer}`}
-                      </span>
-                      <span className="text-txt-muted">{a.timestamp ? timeAgo(a.timestamp) : ''}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
 
       {/* Database & Data */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -486,8 +341,8 @@ export default function System() {
               </div>
             </div>
             <div className="flex justify-between">
-              <span className="text-sm text-txt-secondary">Messaggi</span>
-              <span className="text-sm font-semibold text-txt-primary">{database.tables.messages.total}</span>
+              <span className="text-sm text-txt-secondary">Pratiche aperte</span>
+              <span className="text-sm font-semibold text-txt-primary">{database.tables.cases?.open ?? 0}</span>
             </div>
             <hr className="border-dark-border" />
             <div className="flex justify-between items-center">
@@ -505,13 +360,14 @@ export default function System() {
             <h3 className="sc-section-title">Pipeline Sync</h3>
           </div>
           <div className="p-6 space-y-4">
-            {['invoices', 'customers', 'matching', 'escalations'].map(key => {
+            {['invoices', 'customers', 'matching', 'cases'].map(key => {
               const s = sync[key]
+              if (!s) return null
               const labels = {
                 invoices: 'Fatture',
                 customers: 'Clienti',
                 matching: 'Associazione',
-                escalations: 'Escalation',
+                cases: 'Pratiche',
               }
               return (
                 <div key={key} className="border border-dark-border rounded-lg p-3">
@@ -563,6 +419,121 @@ export default function System() {
             </div>
           ))}
         </div>
+      </div>
+
+      {/* Match Audit */}
+      <div className="sc-card overflow-hidden">
+        <div className="sc-card-header bg-dark-surface flex items-center justify-between">
+          <h3 className="sc-section-title">Audit abbinamenti</h3>
+          <button
+            onClick={runAudit}
+            disabled={auditLoading}
+            className={`sc-btn-secondary ${auditLoading ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            {auditLoading ? 'Audit in corso...' : 'Esegui audit'}
+          </button>
+        </div>
+
+        {auditError && (
+          <div className="px-6 py-3 text-sm text-accent-red border-b border-dark-border">
+            Errore audit: {auditError}
+          </div>
+        )}
+
+        {!audit && !auditLoading && !auditError && (
+          <div className="p-6 text-sm text-txt-muted">
+            Verifica la qualità degli abbinamenti fattura → cliente. Premi &quot;Esegui audit&quot; per avviare il controllo.
+          </div>
+        )}
+
+        {audit && (
+          <div className="p-6 space-y-4">
+            <div className="grid grid-cols-3 gap-4">
+              <div className="text-center">
+                <p className="text-2xl font-bold text-accent-green">{audit.counts?.ok ?? 0}</p>
+                <p className="text-xs text-txt-muted mt-1">OK</p>
+              </div>
+              <div className="text-center">
+                <p className="text-2xl font-bold text-accent-amber">{audit.counts?.warn ?? 0}</p>
+                <p className="text-xs text-txt-muted mt-1">Dubbi</p>
+              </div>
+              <div className="text-center">
+                <p className="text-2xl font-bold text-accent-red">{audit.counts?.bad ?? 0}</p>
+                <p className="text-xs text-txt-muted mt-1">Critici</p>
+              </div>
+            </div>
+
+            {audit.total_problems === 0 ? (
+              <div className="bg-accent-green/10 border border-accent-green/20 rounded-xl p-4 text-center">
+                <p className="text-accent-green font-medium">Nessun problema rilevato &#10003;</p>
+              </div>
+            ) : (
+              <div className="border border-dark-border rounded-lg overflow-x-auto">
+                <table className="w-full">
+                  <thead className="bg-dark-surface border-b border-dark-border">
+                    <tr>
+                      <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">N. fattura</th>
+                      <th className="px-3 py-3 text-right text-xs font-semibold text-txt-label uppercase tracking-wider">Importo</th>
+                      <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Destinatario fattura</th>
+                      <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Cliente assegnato</th>
+                      <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider">Verdetto</th>
+                      <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Motivi</th>
+                      <th className="px-3 py-3 text-right text-xs font-semibold text-txt-label uppercase tracking-wider">Azioni</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-dark-border">
+                    {audit.items?.map(item => (
+                      <tr key={item.invoice_id}>
+                        <td className="px-3 py-3 text-sm font-mono text-txt-primary whitespace-nowrap">{item.invoice_number}</td>
+                        <td className="px-3 py-3 text-sm text-right font-mono text-txt-primary whitespace-nowrap">
+                          EUR {(item.amount_due ?? 0).toLocaleString('it-IT', { minimumFractionDigits: 2 })}
+                        </td>
+                        <td className="px-3 py-3 text-sm text-txt-secondary">{item.customer_name_raw || '-'}</td>
+                        <td className="px-3 py-3 text-sm">
+                          {item.customer_id ? (
+                            <Link
+                              to={`/customers/${item.customer_id}`}
+                              className="text-accent-teal hover:text-accent-cyan"
+                            >
+                              {item.customer_name}
+                            </Link>
+                          ) : (
+                            <span className="text-txt-secondary">{item.customer_name || '-'}</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-3 text-center">
+                          <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
+                            item.verdict === 'bad'
+                              ? 'bg-accent-red/15 text-accent-red'
+                              : 'bg-accent-amber/15 text-accent-amber'
+                          }`}>
+                            {item.verdict === 'bad' ? 'Critico' : 'Dubbio'}
+                          </span>
+                        </td>
+                        <td className="px-3 py-3 text-xs text-txt-muted max-w-xs">{item.reasons?.join(', ')}</td>
+                        <td className="px-3 py-3 text-right">
+                          <button
+                            onClick={() => unlinkInvoice(item)}
+                            disabled={unlinkingId === item.invoice_id}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-red/15 text-accent-red hover:bg-accent-red/25 transition-colors ${
+                              unlinkingId === item.invoice_id ? 'opacity-50 cursor-not-allowed' : ''
+                            }`}
+                          >
+                            {unlinkingId === item.invoice_id ? 'Scollego...' : 'Scollega'}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <p className="text-xs text-txt-muted">
+              Analizzate {audit.total_audited} fatture — {audit.total_problems} con problemi (mostrate max {audit.limit}).
+            </p>
+          </div>
+        )}
       </div>
     </div>
   )

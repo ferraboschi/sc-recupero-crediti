@@ -294,32 +294,36 @@ class FatturaProConnector:
             logger.error(f"Error retrieving xcrud key: {e}")
             return None
 
-    def fetch_overdue_invoices(self) -> List[Dict[str, Any]]:
+    def fetch_overdue_invoices(self) -> tuple[List[Dict[str, Any]], bool]:
         """Fetch all overdue invoices from FatturaPro.
 
         Scrapes the documenti.php?s=1 page ("Da incassare" / invoices to collect).
         First parses the initial page HTML, then paginates via xcrud AJAX.
 
-        xcrud pagination uses jQuery-style nested POST params:
-            xcrud[key]=..., xcrud[start]=10, xcrud[task]=list, etc.
+        Il mapping delle colonne viene derivato UNA volta dall'header della
+        pagina iniziale e riusato per i frammenti AJAX (che spesso non hanno
+        l'header): così un'eventuale colonna in più — es. Scadenza — non
+        disallinea gli importi delle pagine successive.
 
         Returns:
-            List of invoice dictionaries with keys:
-            - invoice_number
-            - date
-            - customer_name
-            - total
-            - balance (saldo)
-            - doc_id
-            - source_platform: "fatturapro"
+            (invoices, partial) — partial=True quando il fetch NON è
+            certamente completo (chiave xcrud mancante, errore xcrud,
+            eccezione a metà paginazione, batch anomalo scartato).
+            Con partial=True il chiamante NON deve fare payment detection:
+            una fattura assente da una lista incompleta non è pagata.
+
+            Invoice dict keys: invoice_number, date, customer_name, total,
+            balance, due_date (se la lista ha la colonna Scadenza), doc_id,
+            source_platform.
         """
         if not self._authenticated:
             if not self.login():
                 logger.error("Cannot fetch invoices: not authenticated")
-                return []
+                return [], True
 
         logger.info("Fetching overdue invoices from FatturaPro...")
         all_invoices = []
+        partial = False
         PAGE_SIZE = 10  # xcrud default
 
         try:
@@ -330,8 +334,12 @@ class FatturaProConnector:
             )
             response.raise_for_status()
 
+            # Derive the column map from the initial page header, reuse it
+            # for all AJAX fragments of this run.
+            colmap = self._derive_column_map(response.text)
+
             # Parse the initial page
-            initial_invoices = self._parse_invoice_table(response.text)
+            initial_invoices = self._parse_invoice_table(response.text, colmap)
             all_invoices.extend(initial_invoices)
             logger.info(f"Page 1: {len(initial_invoices)} invoices")
 
@@ -339,15 +347,19 @@ class FatturaProConnector:
             soup = BeautifulSoup(response.text, "html.parser")
             key_input = soup.find("input", {"name": "key", "type": "hidden"})
             if not key_input:
-                logger.warning("No xcrud key found, returning page 1 only")
-                return all_invoices
+                if len(initial_invoices) >= PAGE_SIZE:
+                    # Ci sono quasi certamente altre pagine che non possiamo leggere
+                    logger.warning("No xcrud key found with a full first page — PARTIAL fetch")
+                    return all_invoices, True
+                logger.info(f"All invoices fit on one page ({len(initial_invoices)})")
+                return all_invoices, False
 
             xcrud_key = key_input.get("value")
 
             # Check if there are more pages
             if len(initial_invoices) < PAGE_SIZE:
                 logger.info(f"All invoices fit on one page ({len(initial_invoices)})")
-                return all_invoices
+                return all_invoices, False
 
             # Paginate via xcrud AJAX with jQuery-style nested params
             start = PAGE_SIZE
@@ -376,12 +388,27 @@ class FatturaProConnector:
 
                 # Check for xcrud error
                 if "xcrud-error" in ajax_resp.text:
-                    logger.warning(f"xcrud error at page {page}, stopping pagination")
+                    logger.warning(f"xcrud error at page {page}, stopping pagination — PARTIAL fetch")
+                    partial = True
                     break
 
-                batch = self._parse_invoice_table(ajax_resp.text)
+                batch = self._parse_invoice_table(ajax_resp.text, colmap)
                 if not batch:
                     logger.debug(f"Page {page}: empty — pagination complete")
+                    break
+
+                # Sanity guard: un batch con tutti i saldi a zero o tutte le
+                # date non parsabili indica colonne disallineate o HTML
+                # inatteso → scartarlo è più sicuro che importarlo.
+                if len(batch) >= 3 and (
+                    all((inv.get("balance") or 0) == 0 for inv in batch)
+                    or all(inv.get("date") is None for inv in batch)
+                ):
+                    logger.warning(
+                        f"Page {page}: anomalous batch (all-zero balances or "
+                        f"unparseable dates) — discarded, PARTIAL fetch"
+                    )
+                    partial = True
                     break
 
                 all_invoices.extend(batch)
@@ -402,26 +429,78 @@ class FatturaProConnector:
                 start += PAGE_SIZE
                 page += 1
 
-            logger.info(f"Successfully fetched {len(all_invoices)} overdue invoices total")
-            return all_invoices
+            logger.info(
+                f"Fetched {len(all_invoices)} overdue invoices total"
+                f"{' (PARTIAL)' if partial else ''}"
+            )
+            return all_invoices, partial
 
         except Exception as e:
             logger.error(f"Error fetching overdue invoices: {e}", exc_info=True)
-            return all_invoices  # Return what we have so far
+            return all_invoices, True  # Return what we have, flagged as partial
 
-    def _parse_invoice_table(self, html: str) -> List[Dict[str, Any]]:
+    def _derive_column_map(self, html: str) -> Dict[str, int]:
+        """Mappa nome-colonna → indice, derivata dall'header della tabella.
+
+        Fallback al layout storico (Documento, Data, Destinatario, Totale,
+        Saldo) se l'header non è riconoscibile.
+        """
+        default = {"documento": 0, "data": 1, "destinatario": 2, "totale": 3, "saldo": 4}
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            header_cells = []
+            for row in soup.find_all("tr"):
+                ths = row.find_all("th")
+                if ths:
+                    header_cells = [th.get_text(strip=True).lower() for th in ths]
+                    break
+            if not header_cells:
+                return default
+
+            colmap = {}
+            for idx, text in enumerate(header_cells):
+                if "document" in text and "documento" not in colmap:
+                    colmap["documento"] = idx
+                elif "scadenz" in text:
+                    colmap["scadenza"] = idx
+                elif text.startswith("data") and "data" not in colmap:
+                    colmap["data"] = idx
+                elif "destinatar" in text or "cliente" in text:
+                    colmap["destinatario"] = idx
+                elif "total" in text:
+                    colmap["totale"] = idx
+                elif "saldo" in text or "residuo" in text:
+                    colmap["saldo"] = idx
+
+            required = {"documento", "data", "destinatario", "totale", "saldo"}
+            if not required.issubset(colmap):
+                logger.debug(f"Header incompleto {header_cells}, uso layout di default")
+                return default
+            if "scadenza" in colmap:
+                logger.info(f"Colonna Scadenza trovata nella lista (indice {colmap['scadenza']})")
+            return colmap
+        except Exception as e:
+            logger.warning(f"Errore derivando il mapping colonne: {e}")
+            return default
+
+    def _parse_invoice_table(
+        self, html: str, colmap: Optional[Dict[str, int]] = None
+    ) -> List[Dict[str, Any]]:
         """Parse invoice data from xcrud HTML table response.
-
-        Expected table columns: Documento, Data, Destinatario, Totale, Saldo
-        Each row has a data-doc_id attribute for the invoice ID.
 
         Args:
             html: HTML response from xcrud_ajax.php
+            colmap: mapping colonna→indice derivato dalla pagina iniziale
+                    (i frammenti AJAX spesso non hanno l'header). Default:
+                    layout storico Documento, Data, Destinatario, Totale, Saldo.
 
         Returns:
             List of parsed invoice dictionaries
         """
         invoices = []
+        if colmap is None:
+            colmap = {"documento": 0, "data": 1, "destinatario": 2, "totale": 3, "saldo": 4}
+        min_cells = max(colmap.values()) + 1
 
         try:
             soup = BeautifulSoup(html, "html.parser")
@@ -441,16 +520,15 @@ class FatturaProConnector:
 
                     # Extract cells
                     cells = row.find_all("td")
-                    if len(cells) < 5:
-                        logger.debug(f"Row has {len(cells)} cells, expected >= 5, skipping")
+                    if len(cells) < min_cells:
+                        logger.debug(f"Row has {len(cells)} cells, expected >= {min_cells}, skipping")
                         continue
 
-                    # Parse cells: Documento, Data, Destinatario, Totale, Saldo
-                    invoice_number = cells[0].get_text(strip=True)
-                    date_str = cells[1].get_text(strip=True)
-                    customer_name = cells[2].get_text(strip=True)
-                    total_str = cells[3].get_text(strip=True)
-                    balance_str = cells[4].get_text(strip=True)
+                    invoice_number = cells[colmap["documento"]].get_text(strip=True)
+                    date_str = cells[colmap["data"]].get_text(strip=True)
+                    customer_name = cells[colmap["destinatario"]].get_text(strip=True)
+                    total_str = cells[colmap["totale"]].get_text(strip=True)
+                    balance_str = cells[colmap["saldo"]].get_text(strip=True)
 
                     # Skip summary/total rows (no invoice number or no date)
                     if not invoice_number or not date_str:
@@ -477,6 +555,15 @@ class FatturaProConnector:
                         "doc_id": doc_id,
                         "source_platform": "fatturapro"
                     }
+
+                    # Scadenza reale, se la lista ha la colonna
+                    if "scadenza" in colmap and len(cells) > colmap["scadenza"]:
+                        due_str = cells[colmap["scadenza"]].get_text(strip=True)
+                        if due_str:
+                            try:
+                                invoice["due_date"] = datetime.strptime(due_str, "%d/%m/%Y").date()
+                            except ValueError:
+                                pass
 
                     invoices.append(invoice)
                     logger.debug(f"Parsed invoice: {invoice_number} - {customer_name} - {balance}")
@@ -538,14 +625,29 @@ class FatturaProConnector:
     def fetch_invoice_detail(self, doc_id: str) -> Optional[Dict[str, Any]]:
         """Fetch detailed information for a single invoice.
 
-        Retrieves the detail page for an invoice to extract P.IVA and other info.
+        Estrae dalla pagina di dettaglio (form di edit) la P.IVA del
+        destinatario e — quando presente — la SCADENZA reale della fattura.
 
-        Args:
-            doc_id: The document ID from the invoice list
+        Guardie sulla P.IVA (la corruzione di questo campo in passato ha
+        convogliato fatture di clienti diversi sullo stesso profilo):
+        - checksum ufficiale (piva.validate_piva): invalida = scartata;
+        - blacklist COMPANY_PIVA: la P.IVA di Sake Company compare su ogni
+          fattura come venditore, non è mai quella del destinatario;
+        - il pattern full-text (il più fragile) è DISABILITATO se
+          COMPANY_PIVA non è configurata (fail-closed).
 
         Returns:
-            Dictionary with invoice details including P.IVA, or None if failed
+            Dict with doc_id, piva (validated), piva_source
+            (field/label/fulltext), due_date (date) — or None if failed
         """
+        from backend.engine.piva import validate_piva
+
+        # COMPANY_PIVA normalizzata come le P.IVA estratte: così la blacklist
+        # funziona anche se in env è scritta "IT 10280600965". Se il valore
+        # configurato non è una P.IVA valida, company_piva è None e il
+        # pattern full-text resta disabilitato (fail-closed).
+        company_piva = validate_piva(config.COMPANY_PIVA)
+
         try:
             logger.debug(f"Fetching invoice detail for doc_id: {doc_id}")
 
@@ -559,16 +661,35 @@ class FatturaProConnector:
 
             detail = {"doc_id": doc_id}
 
-            # Try to extract P.IVA from various common field locations
-            # Pattern 1: Form field with name containing "piva" or "partita_iva"
+            def _accept_piva(raw: str, source: str) -> bool:
+                """Valida e registra la P.IVA se supera le guardie."""
+                validated = validate_piva(raw)
+                if not validated:
+                    if raw and raw.strip():
+                        logger.warning(
+                            f"Invalid P.IVA for doc {doc_id} from {source}: '{raw}' — discarded"
+                        )
+                    return False
+                if company_piva and validated == company_piva:
+                    logger.warning(
+                        f"P.IVA for doc {doc_id} from {source} is COMPANY_PIVA "
+                        f"(venditore, non destinatario) — discarded"
+                    )
+                    return False
+                detail["piva"] = validated
+                detail["piva_source"] = source
+                return True
+
+            # Pattern 1: Form field with name containing "piva"/"partitaiva"
+            # (con o senza underscore: xcrud usa nomi tipo "documenti.PartitaIva")
             piva_input = soup.find(["input", "textarea"], {
-                "name": re.compile(r"(piva|partita_iva|p\.iva|pivanumber)", re.IGNORECASE)
+                "name": re.compile(r"(piva|partita_?iva|p\.iva|pivanumber)", re.IGNORECASE)
             })
             if piva_input:
-                detail["piva"] = piva_input.get("value", "").strip()
+                _accept_piva(piva_input.get("value", ""), "field")
 
             # Pattern 2: Table cell or label with P.IVA
-            if "piva" not in detail or not detail.get("piva"):
+            if not detail.get("piva"):
                 piva_label = soup.find(text=re.compile(r"P\.?\s*IVA", re.IGNORECASE))
                 if piva_label:
                     parent = piva_label.parent
@@ -576,37 +697,61 @@ class FatturaProConnector:
                     for sibling in parent.find_next_siblings():
                         text = sibling.get_text(strip=True)
                         if text and not re.match(r"^P\.?\s*IVA", text, re.IGNORECASE):
-                            detail["piva"] = text
-                            break
+                            if _accept_piva(text, "label"):
+                                break
                     # Also try parent's next sibling (common in <td>P.IVA</td><td>VALUE</td>)
-                    if "piva" not in detail or not detail.get("piva"):
+                    if not detail.get("piva"):
                         next_td = parent.find_next("td")
                         if next_td:
-                            text = next_td.get_text(strip=True)
-                            if text:
-                                detail["piva"] = text
+                            _accept_piva(next_td.get_text(strip=True), "label")
 
-            # Pattern 3: Look for Codice Fiscale / P.IVA in any text content
-            if "piva" not in detail or not detail.get("piva"):
-                # Search all text nodes for patterns like "P.IVA: 12345678901"
+            # Pattern 3 (full-text): il più soggetto a catturare la P.IVA
+            # sbagliata (es. quella del venditore nel footer). Attivo SOLO
+            # con COMPANY_PIVA configurata, che permette di scartarla.
+            if not detail.get("piva") and company_piva:
                 full_text = soup.get_text()
-                piva_match = re.search(
+                for piva_match in re.finditer(
                     r'P\.?\s*IVA\s*[:/]?\s*([A-Z]{0,3}\d{8,15})',
                     full_text,
-                    re.IGNORECASE
-                )
-                if piva_match:
-                    detail["piva"] = piva_match.group(1).strip()
+                    re.IGNORECASE,
+                ):
+                    if _accept_piva(piva_match.group(1), "fulltext"):
+                        break
 
-            # Validate P.IVA format (Italian: 11 digits, or foreign: country prefix + digits)
-            if detail.get("piva"):
-                piva_clean = detail["piva"].strip().upper()
-                # Accept Italian (11 digits), EU (2 letter prefix + digits), Swiss (CHE + digits)
-                if re.match(r'^([A-Z]{2,3})?\d{8,15}$', piva_clean):
-                    detail["piva"] = piva_clean
-                else:
-                    logger.warning(f"Invalid P.IVA format for doc {doc_id}: '{piva_clean}', discarding")
-                    detail.pop("piva", None)
+            # ── Scadenza reale ──────────────────────────────────────────
+            # Pattern A: campo form con nome contenente "scaden"
+            due_input = soup.find(["input", "select"], {
+                "name": re.compile(r"scaden", re.IGNORECASE)
+            })
+            if due_input and due_input.get("value"):
+                detail["due_date"] = self._parse_detail_date(due_input.get("value"))
+
+            # Pattern B: label/td "Scadenza" seguita dal valore
+            if not detail.get("due_date"):
+                due_label = soup.find(text=re.compile(r"Scadenza", re.IGNORECASE))
+                if due_label:
+                    parent = due_label.parent
+                    for sibling in parent.find_next_siblings():
+                        parsed = self._parse_detail_date(sibling.get_text(strip=True))
+                        if parsed:
+                            detail["due_date"] = parsed
+                            break
+                    if not detail.get("due_date"):
+                        next_td = parent.find_next("td")
+                        if next_td:
+                            detail["due_date"] = self._parse_detail_date(
+                                next_td.get_text(strip=True)
+                            )
+
+            # Pattern C: regex sul testo "Scadenza: gg/mm/aaaa"
+            if not detail.get("due_date"):
+                text_match = re.search(
+                    r"Scadenza\s*[:\-]?\s*(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})",
+                    soup.get_text(),
+                    re.IGNORECASE,
+                )
+                if text_match:
+                    detail["due_date"] = self._parse_detail_date(text_match.group(1))
 
             logger.debug(f"Invoice detail: {detail}")
             return detail
@@ -615,54 +760,70 @@ class FatturaProConnector:
             logger.error(f"Error fetching invoice detail for {doc_id}: {e}")
             return None
 
-    def enrich_invoices_with_piva(
+    @staticmethod
+    def _parse_detail_date(raw: str):
+        """Parse a date string from the detail page (dd/mm/yyyy or ISO)."""
+        if not raw:
+            return None
+        raw = raw.strip()
+        for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y"):
+            try:
+                return datetime.strptime(raw, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    def enrich_invoices_from_detail(
         self,
         invoices: List[Dict[str, Any]],
         delay: float = 0.5,
     ) -> List[Dict[str, Any]]:
-        """Enrich a list of invoices with P.IVA from their detail pages.
+        """Enrich invoices with P.IVA and real due date from detail pages.
 
-        Only fetches detail for invoices that have a doc_id and don't already
-        have a P.IVA. Adds a small delay between requests to avoid overloading
-        the FatturaPro server.
+        Un solo fetch di dettaglio per fattura riempie sia "customer_piva"
+        che "due_date" (se non già presenti). Piccolo delay tra le richieste
+        per non sovraccaricare FatturaPro.
 
-        Args:
-            invoices: List of invoice dicts from fetch_overdue_invoices()
-            delay: Seconds to wait between detail requests (default 0.5s)
-
-        Returns:
-            The same list with "customer_piva" key added where found
+        Guardia anti-ripetizione: se la STESSA P.IVA emerge dal pattern
+        full-text per destinatari con nomi diversi nella stessa run, è
+        quasi certamente un valore fisso della pagina (es. il venditore) e
+        viene revocata da tutte le fatture coinvolte.
         """
         import time
 
-        need_detail = [inv for inv in invoices if inv.get("doc_id") and not inv.get("customer_piva")]
+        need_detail = [
+            inv for inv in invoices
+            if inv.get("doc_id") and (not inv.get("customer_piva") or not inv.get("due_date"))
+        ]
         if not need_detail:
-            logger.info("No invoices need P.IVA enrichment")
+            logger.info("No invoices need detail enrichment")
             return invoices
 
-        logger.info(f"Enriching {len(need_detail)} invoices with P.IVA from detail pages...")
-        enriched_count = 0
+        logger.info(f"Enriching {len(need_detail)} invoices from detail pages...")
+        piva_count = 0
+        due_count = 0
         failed_count = 0
+        # P.IVA da pattern full-text → set dei nomi destinatario incontrati
+        fulltext_piva_names: Dict[str, set] = {}
 
         for i, inv in enumerate(need_detail):
             try:
                 detail = self.fetch_invoice_detail(inv["doc_id"])
-                if detail and detail.get("piva"):
-                    inv["customer_piva"] = detail["piva"]
-                    enriched_count += 1
-                    logger.debug(
-                        f"[{i+1}/{len(need_detail)}] Invoice {inv['invoice_number']}: "
-                        f"P.IVA = {detail['piva']}"
-                    )
-                else:
-                    logger.debug(
-                        f"[{i+1}/{len(need_detail)}] Invoice {inv['invoice_number']}: "
-                        f"no P.IVA found on detail page"
-                    )
+                if detail:
+                    if detail.get("piva") and not inv.get("customer_piva"):
+                        inv["customer_piva"] = detail["piva"]
+                        inv["piva_source"] = detail.get("piva_source")
+                        piva_count += 1
+                        if detail.get("piva_source") == "fulltext":
+                            names = fulltext_piva_names.setdefault(detail["piva"], set())
+                            names.add((inv.get("customer_name") or "").strip().lower())
+                    if detail.get("due_date") and not inv.get("due_date"):
+                        inv["due_date"] = detail["due_date"]
+                        due_count += 1
             except Exception as e:
                 failed_count += 1
                 logger.warning(
-                    f"[{i+1}/{len(need_detail)}] Failed to fetch detail for "
+                    f"[{i + 1}/{len(need_detail)}] Failed to fetch detail for "
                     f"{inv['invoice_number']}: {e}"
                 )
 
@@ -673,12 +834,29 @@ class FatturaProConnector:
             # Progress log every 25 invoices
             if (i + 1) % 25 == 0:
                 logger.info(
-                    f"P.IVA enrichment progress: {i+1}/{len(need_detail)} "
-                    f"({enriched_count} found, {failed_count} failed)"
+                    f"Detail enrichment progress: {i + 1}/{len(need_detail)} "
+                    f"({piva_count} P.IVA, {due_count} scadenze, {failed_count} failed)"
                 )
 
+        # Guardia anti-ripetizione sul pattern full-text
+        repeated = {
+            piva for piva, names in fulltext_piva_names.items() if len(names) > 2
+        }
+        if repeated:
+            revoked = 0
+            for inv in need_detail:
+                if inv.get("customer_piva") in repeated and inv.get("piva_source") == "fulltext":
+                    inv.pop("customer_piva", None)
+                    inv.pop("piva_source", None)
+                    revoked += 1
+            logger.warning(
+                f"P.IVA full-text ripetute su destinatari diversi {sorted(repeated)}: "
+                f"revocate da {revoked} fatture (probabile valore fisso della pagina)"
+            )
+            piva_count -= revoked
+
         logger.info(
-            f"P.IVA enrichment complete: {enriched_count}/{len(need_detail)} enriched, "
+            f"Detail enrichment complete: {piva_count} P.IVA, {due_count} scadenze reali, "
             f"{failed_count} failed"
         )
         return invoices
