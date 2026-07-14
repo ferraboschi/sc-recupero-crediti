@@ -441,8 +441,7 @@ async def get_attivita(session: Session = Depends(get_session)):
 
     Performance: all data fetched in batch queries (no N+1).
     """
-    from sqlalchemy import case, cast, Date  # noqa: F811
-    from sqlalchemy.orm import aliased
+    from sqlalchemy import case  # noqa: F811
     try:
         # ── CONTACTED ACCOUNTS ──
         contacted_raw = (
@@ -655,7 +654,7 @@ async def get_pipeline(session: Session = Depends(get_session)):
     Resolved = ONLY customers who had recovery actions AND then paid.
     """
     try:
-        from sqlalchemy import case, cast, Date  # noqa: F811
+        from sqlalchemy import case  # noqa: F811
 
         # Only count customers who actually have overdue invoices (INNER join)
         pipeline_raw = (

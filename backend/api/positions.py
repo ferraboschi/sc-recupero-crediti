@@ -5,7 +5,7 @@ import csv
 from io import StringIO
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, or_
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from backend.database import get_session, Invoice, Customer, ActivityLog

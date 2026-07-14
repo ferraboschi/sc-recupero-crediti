@@ -4,12 +4,12 @@ import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import or_, Integer, func
+from sqlalchemy import or_, func
 from sqlalchemy.orm import Session
 from datetime import datetime
 
 from backend.database import get_session, Customer, Invoice, ActivityLog, RecoveryAction
-from backend.engine.cases import get_open_case, contact_count
+from backend.engine.cases import get_open_case, contact_count, business_day_start
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -218,7 +218,7 @@ async def get_customer_detail(
         contact_action_count = 0
         if open_case:
             contact_action_count = contact_count(session, open_case)
-            today_start = datetime.combine(datetime.utcnow().date(), datetime.min.time())
+            today_start = business_day_start()
             sollecito_today = (
                 session.query(func.count(RecoveryAction.id))
                 .filter(

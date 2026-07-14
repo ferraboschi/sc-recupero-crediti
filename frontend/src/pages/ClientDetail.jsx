@@ -1151,7 +1151,7 @@ export default function ClientDetail() {
                   {action.completed_at && !action.outcome && (
                     <span className="text-xs bg-accent-green/15 text-accent-green px-1.5 py-0.5 rounded">completata</span>
                   )}
-                  {!action.completed_at && (
+                  {!action.completed_at && !action.cancelled && (
                     <>
                       {completingAction === action.id ? (
                         <div className="flex items-center gap-1 flex-wrap">

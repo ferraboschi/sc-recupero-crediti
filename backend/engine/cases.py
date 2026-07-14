@@ -23,17 +23,31 @@ il conteggio contatti: il tono non riparte mai dal sollecito cordiale.
 """
 
 import logging
-from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any
+from datetime import datetime, date, timedelta, timezone
+from typing import Optional, Dict, Any
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_
 from sqlalchemy.orm import Session, joinedload
 
+from backend.config import config
 from backend.database import (
     Customer, Invoice, RecoveryCase, RecoveryAction, ActivityLog, SyncState,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def business_day_start(now_utc: Optional[datetime] = None) -> datetime:
+    """Inizio della giornata lavorativa ITALIANA corrente, in UTC naive.
+
+    Il server (Render) gira in UTC: usare date.today() per il dedup dei
+    solleciti sposterebbe il confine di giornata all'1-2 di notte italiane.
+    Tutti i confronti "oggi" sui solleciti passano da qui.
+    """
+    tz = ZoneInfo(config.TIMEZONE)
+    now = (now_utc or datetime.utcnow()).replace(tzinfo=timezone.utc)
+    local_midnight = now.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    return local_midnight.astimezone(timezone.utc).replace(tzinfo=None)
 
 # Tipi di azione che rappresentano un CONTATTO verso il cliente
 # (contano per numerazione e tono). lawyer/wait/archive/note non lo sono.
@@ -109,16 +123,20 @@ def open_new_case(session: Session, customer: Customer) -> RecoveryCase:
         inherited_contacts=inherited,
         reopened_after_archive=reopened_after_archive,
     )
-    session.add(case)
     try:
         # L'indice UNIQUE parziale (customer_id WHERE status='open') protegge
-        # dalle corse tra scheduler ed endpoint: in caso di conflitto si
-        # rilegge la pratica creata dall'altro processo.
-        session.flush()
+        # dalle corse tra scheduler ed endpoint. Il SAVEPOINT confina il
+        # conflitto a QUESTO insert: un rollback di sessione butterebbe via
+        # anche il lavoro non ancora committato del pass di lifecycle in
+        # corso (aperture/chiusure degli altri clienti).
+        with session.begin_nested():
+            session.add(case)
     except Exception:
-        session.rollback()
         existing = get_open_case(session, customer.id)
         if existing:
+            logger.info(
+                f"Open case for customer {customer.id} created concurrently — reusing {existing.id}"
+            )
             return existing
         raise
 
@@ -233,10 +251,12 @@ def close_case(session: Session, case: RecoveryCase, reason: str) -> None:
 
     # Annulla le azioni pendenti della pratica E quelle orfane del cliente
     # (azioni registrate prima dell'introduzione delle pratiche).
+    # Le NOTE sono annotazioni, non todo: restano fuori.
     pending = session.query(RecoveryAction).filter(
         RecoveryAction.customer_id == case.customer_id,
         RecoveryAction.completed_at.is_(None),
         RecoveryAction.cancelled.isnot(True),
+        RecoveryAction.action_type != "note",
         (RecoveryAction.case_id == case.id) | (RecoveryAction.case_id.is_(None)),
     ).all()
     note_by_reason = {
@@ -455,14 +475,26 @@ def backfill_cases(session: Session) -> Dict[str, Any]:
         overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
 
         if overdue and not customer.excluded:
-            case = RecoveryCase(
-                customer_id=customer.id,
-                status="open",
-                opened_at=now,
-            )
-            session.add(case)
-            session.flush()
-            stats["cases_created"] += 1
+            # Convergenza sul retry: se una pratica aperta esiste già (un
+            # backfill precedente fallito a metà, il lifecycle dello
+            # startup-sync, un sollecito registrato nel frattempo) la si
+            # RIUSA — crearne un'altra alla cieca violerebbe l'indice
+            # UNIQUE e renderebbe il backfill non riavviabile per sempre.
+            case = get_open_case(session, customer.id)
+            if case is None:
+                case = RecoveryCase(
+                    customer_id=customer.id,
+                    status="open",
+                    opened_at=now,
+                )
+                try:
+                    with session.begin_nested():
+                        session.add(case)
+                except Exception:
+                    case = get_open_case(session, customer.id)
+                    if case is None:
+                        raise
+                stats["cases_created"] += 1
 
             for inv in overdue:
                 inv.case_id = case.id

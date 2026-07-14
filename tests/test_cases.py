@@ -392,3 +392,71 @@ class TestBackfill:
         assert marker.result["done"] is True
         # nessuna pratica duplicata
         assert test_db_session.query(RecoveryCase).count() == 1
+
+
+class TestAuditFixes:
+    """Regressioni dei difetti confermati dall'audit avversario finale."""
+
+    def test_backfill_reuses_existing_open_case(self, test_db_session):
+        """Backfill riavviabile: se una pratica aperta esiste già (lifecycle
+        partito prima, o retry dopo fallimento a metà) la riusa senza
+        violare l'indice UNIQUE."""
+        cust = make_customer(test_db_session)
+        make_invoice(test_db_session, cust, days_overdue=15)
+        # il lifecycle è passato PRIMA del backfill (startup-sync)
+        update_case_lifecycle(test_db_session)
+        existing = get_open_case(test_db_session, cust.id)
+        assert existing is not None
+
+        stats = backfill_cases(test_db_session)
+
+        assert stats.get("skipped") is not True
+        assert stats["cases_created"] == 0  # riusata, non duplicata
+        assert test_db_session.query(RecoveryCase).filter_by(
+            customer_id=cust.id, status="open"
+        ).count() == 1
+        marker = test_db_session.query(SyncState).filter_by(key="case_backfill").first()
+        assert marker.result["done"] is True
+
+    def test_open_new_case_conflict_does_not_discard_session(self, test_db_session):
+        """Il conflitto sull'indice UNIQUE non deve scartare il lavoro non
+        committato del pass (SAVEPOINT, non rollback di sessione)."""
+        cust_a = make_customer(test_db_session, name="Cliente A SRL")
+        cust_b = make_customer(test_db_session, name="Cliente B SRL")
+        make_invoice(test_db_session, cust_b, number="B-1")
+        # pratica già aperta per A
+        open_new_case(test_db_session, cust_a)
+        test_db_session.commit()
+
+        # lavoro non committato nel pass corrente: pratica per B
+        case_b = open_new_case(test_db_session, cust_b)
+        # conflitto: seconda apertura per A → deve riusare, senza buttare B
+        reused = open_new_case(test_db_session, cust_a)
+        test_db_session.commit()
+
+        assert reused.id is not None
+        assert test_db_session.query(RecoveryCase).filter_by(
+            customer_id=cust_b.id, status="open"
+        ).count() == 1
+        assert test_db_session.query(RecoveryCase).filter_by(
+            customer_id=cust_a.id, status="open"
+        ).count() == 1
+
+
+class TestBusinessDay:
+    def test_business_day_start_is_rome_midnight_in_utc(self):
+        from zoneinfo import ZoneInfo
+        from datetime import timezone as tz
+        from backend.engine.cases import business_day_start
+        from backend.config import config
+
+        fixed = datetime(2026, 7, 14, 23, 30)  # 23:30 UTC = 01:30 del 15/07 a Roma (estate)
+        start = business_day_start(fixed)
+        rome = ZoneInfo(config.TIMEZONE)
+        expected_local = datetime(2026, 7, 15, 0, 0, tzinfo=rome)
+        assert start == expected_local.astimezone(tz.utc).replace(tzinfo=None)
+        # e per un istante di giorno pieno, la mezzanotte italiana dello stesso giorno
+        fixed2 = datetime(2026, 7, 14, 10, 0)
+        start2 = business_day_start(fixed2)
+        expected2 = datetime(2026, 7, 14, 0, 0, tzinfo=rome)
+        assert start2 == expected2.astimezone(tz.utc).replace(tzinfo=None)

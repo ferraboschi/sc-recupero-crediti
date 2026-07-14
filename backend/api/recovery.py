@@ -7,19 +7,19 @@ pratica, e alla chiusura (saldo) il ciclo riparte pulito.
 
 import os
 import logging
-from datetime import datetime, date, time as dt_time, timedelta
+from datetime import datetime, date, timedelta
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from io import BytesIO
 
 from backend.database import get_session, Customer, Invoice, RecoveryAction, ActivityLog
 from backend.engine.cases import (
-    CONTACT_TYPES, contact_count, ensure_open_case, get_open_case,
-    is_overdue_unpaid, schedule_next_action, close_case, _refresh_customer_status,
+    CONTACT_TYPES, business_day_start, contact_count, ensure_open_case,
+    get_open_case, is_overdue_unpaid, schedule_next_action, close_case,
+    _refresh_customer_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -107,7 +107,8 @@ async def register_sollecito(
         now = datetime.utcnow()
 
         # Dedup: già registrato un sollecito WhatsApp oggi per questa pratica?
-        start_of_day = datetime.combine(today, dt_time.min)
+        # "Oggi" = giornata lavorativa italiana (il server gira in UTC).
+        start_of_day = business_day_start()
         existing_today = session.query(RecoveryAction).filter(
             RecoveryAction.case_id == case.id,
             RecoveryAction.channel.in_(WHATSAPP_CHANNELS),
@@ -221,7 +222,7 @@ async def undo_sollecito(
             raise HTTPException(status_code=404, detail="Sollecito non trovato")
         if action.channel not in WHATSAPP_CHANNELS or action.cancelled:
             raise HTTPException(status_code=400, detail="Azione non annullabile")
-        if not action.completed_at or action.completed_at.date() != date.today():
+        if not action.completed_at or action.completed_at < business_day_start():
             raise HTTPException(status_code=400, detail="Annullabile solo lo stesso giorno")
 
         action.cancelled = True
@@ -242,7 +243,7 @@ async def undo_sollecito(
             RecoveryAction.completed_at.is_(None),
             RecoveryAction.cancelled.isnot(True),
             RecoveryAction.created_at >= action.created_at,
-            RecoveryAction.notes.like("Auto-pianificata%"),
+            RecoveryAction.notes.like("Auto-pianificata dopo il%"),
         ).all()
         for nxt in auto_next:
             session.delete(nxt)
@@ -371,7 +372,7 @@ async def create_action(
             sollecito_today = session.query(RecoveryAction).filter(
                 RecoveryAction.case_id == case.id,
                 RecoveryAction.channel.in_(WHATSAPP_CHANNELS),
-                RecoveryAction.completed_at >= datetime.combine(today, dt_time.min),
+                RecoveryAction.completed_at >= business_day_start(),
                 RecoveryAction.cancelled.isnot(True),
             ).first()
             if sollecito_today:
@@ -476,6 +477,14 @@ async def complete_action(
         ).first()
         if not action:
             raise HTTPException(status_code=404, detail="Action not found")
+        if action.cancelled:
+            raise HTTPException(
+                status_code=400,
+                detail="Azione annullata: non può essere completata "
+                       "(completarla riattiverebbe una progressione chiusa)",
+            )
+        if action.completed_at:
+            raise HTTPException(status_code=400, detail="Azione già completata")
 
         action.completed_at = datetime.utcnow()
         if outcome:

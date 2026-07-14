@@ -207,7 +207,6 @@ async def get_system_status():
 
         # Check: customers in active recovery with NO remaining overdue
         # (all overdue invoices paid → status should be updated)
-        from sqlalchemy import and_
         active_cust_ids = session.query(Customer.id).filter(
             Customer.excluded.is_(False),
             Customer.recovery_status.in_(

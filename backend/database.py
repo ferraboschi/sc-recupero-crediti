@@ -9,7 +9,7 @@ eliminate manualmente quando si è certi di non doverle più consultare.
 import datetime
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Boolean,
-    DateTime, Date, Text, ForeignKey, JSON, event
+    DateTime, Date, Text, ForeignKey, JSON, Index, event, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from backend.config import config
@@ -99,6 +99,18 @@ class RecoveryCase(Base):
     contano le azioni della pratica, non tutta la storia del cliente.
     """
     __tablename__ = "recovery_cases"
+    __table_args__ = (
+        # Una sola pratica aperta per cliente — l'invariante su cui poggiano
+        # numerazione, dedup e chiusure. Definito sul modello così vale
+        # anche nei DB creati da create_all (test inclusi), oltre che nella
+        # migrazione raw per il DB live.
+        Index(
+            "uq_open_case_per_customer", "customer_id",
+            unique=True,
+            sqlite_where=text("status = 'open'"),
+            postgresql_where=text("status = 'open'"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)

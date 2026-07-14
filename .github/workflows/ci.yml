@@ -30,6 +30,9 @@ jobs:
 
       - name: Run pytest
         run: pytest tests/ -v
+        env:
+          JWT_SECRET: ci-test-secret-not-used-in-production
+          AUTH_PASSWORD: ci-test-password
 
       - name: Run flake8 linting
         run: flake8 backend/ --ignore=E501,W503,W504,F401 --max-line-length=120

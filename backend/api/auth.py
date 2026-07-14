@@ -4,11 +4,10 @@ import os
 import logging
 import hashlib
 import hmac
-import time
 from datetime import datetime, timedelta
 
 import jwt
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
