@@ -83,6 +83,14 @@ class Invoice(Base):
     # per fatture 'unlinked' anche piva / name_exact (il match sarebbe stato
     # automatico, ma lo scollegamento manuale lo declassa a suggerimento)
     suggested_method = Column(String, nullable=True)
+    # Payment detection per assenza: numero di fetch COMPLETI consecutivi
+    # in cui la fattura è mancata dalla lista "Da incassare". Si marca paid
+    # solo oltre soglia (vedi sync.PAID_ABSENCE_STREAK); azzerato quando la
+    # fattura ricompare.
+    missing_streak = Column(Integer, default=0)
+    # Ultimo tentativo di enrichment dal dettaglio FatturaPro: permette la
+    # rotazione del cap (prima le mai tentate, poi le più vecchie).
+    detail_attempted_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -269,6 +277,10 @@ def _run_migrations(engine):
         "AND issue_date IS NOT NULL AND due_date = issue_date + 30",
         "UPDATE invoices SET due_date_source = 'real' "
         "WHERE due_date_source IS NULL AND due_date IS NOT NULL",
+        # Payment detection a doppia assenza + rotazione enrichment dettaglio
+        "ALTER TABLE invoices ADD COLUMN missing_streak INTEGER DEFAULT 0",
+        "ALTER TABLE invoices ADD COLUMN detail_attempted_at TIMESTAMP",
+        "UPDATE invoices SET missing_streak = 0 WHERE missing_streak IS NULL",
     ]
     try:
         raw = engine.raw_connection()

@@ -1,6 +1,7 @@
 """Shopify Admin REST API connector for B2B customer data retrieval."""
 
 import logging
+import re
 from typing import Optional, List, Dict, Any
 from backend.connectors.base import BaseConnector
 from backend.config import config
@@ -64,15 +65,16 @@ class ShopifyConnector(BaseConnector):
             page_count += 1
             logger.info(f"Fetching B2B customers page {page_count}")
 
-            # Build query for B2B tagged customers
+            # Con page_info Shopify rifiuta i parametri di filtro (query):
+            # nelle pagine successive restano solo limit/fields/page_info.
             params = {
-                "query": 'tag:"B2B"',
                 "limit": 250,  # Max allowed by Shopify
                 "fields": "id,email,phone,tags,addresses,createdAt",
             }
-
             if cursor:
-                params["cursor"] = cursor
+                params["page_info"] = cursor
+            else:
+                params["query"] = 'tag:"B2B"'
 
             try:
                 response = self.get("customers/search.json", headers=self._get_headers(), params=params)
@@ -94,7 +96,7 @@ class ShopifyConnector(BaseConnector):
                     customers.append(parsed)
 
             # Check for next page using Link header
-            cursor = self._extract_next_cursor(response)
+            cursor = self._extract_next_cursor()
             if not cursor:
                 logger.info(f"Completed pagination - fetched {len(customers)} B2B customers total")
                 break
@@ -153,13 +155,13 @@ class ShopifyConnector(BaseConnector):
             logger.info(f"Searching customers with query: {query} (page {page_count})")
 
             params = {
-                "query": query,
                 "limit": 250,
                 "fields": "id,email,phone,tags,addresses,createdAt",
             }
-
             if cursor:
-                params["cursor"] = cursor
+                params["page_info"] = cursor
+            else:
+                params["query"] = query
 
             try:
                 response = self.get(
@@ -179,7 +181,7 @@ class ShopifyConnector(BaseConnector):
                 if parsed:
                     customers.append(parsed)
 
-            cursor = self._extract_next_cursor(response)
+            cursor = self._extract_next_cursor()
             if not cursor:
                 logger.info(f"Completed search - found {len(customers)} customers total")
                 break
@@ -418,11 +420,14 @@ class ShopifyConnector(BaseConnector):
                     params=params,
                 )
             except Exception as e:
+                # Rilancia invece di restituire una lista parziale come se
+                # fosse completa: il chiamante (_match_orders_task) ha già
+                # il catch per-cliente e registra l'errore nel result.
                 logger.error(
                     f"Error fetching orders for customer "
                     f"{numeric_id}: {e}"
                 )
-                break
+                raise
 
             batch = resp.get("orders", [])
             if not batch:
@@ -477,27 +482,27 @@ class ShopifyConnector(BaseConnector):
 
         return shopify_id
 
-    @staticmethod
-    def _extract_next_cursor(response: Dict[str, Any]) -> Optional[str]:
+    def _extract_next_cursor(self) -> Optional[str]:
         """
-        Extract cursor for next page from response.
+        Extract the next-page cursor from the Link header of the last response.
 
-        Shopify API returns pagination info in the Link header,
-        but the response dict may contain pagination metadata.
-
-        Args:
-            response: API response dict
+        La REST Admin API mette la paginazione ESCLUSIVAMENTE nell'header
+        `Link: <...page_info=...>; rel="next"` — non nel body JSON. Il
+        vecchio parsing su `pageInfo` (vocabolario GraphQL) non trovava mai
+        nulla e la sincronizzazione si fermava alla prima pagina (250 clienti).
 
         Returns:
-            Next cursor string or None if no next page
+            Next page_info cursor string or None if no next page
         """
-        # Check for pageInfo in response (if returned by Shopify)
-        if "pageInfo" in response:
-            page_info = response["pageInfo"]
-            if page_info.get("hasNextPage"):
-                return page_info.get("endCursor")
-
-        return None
+        headers = self.last_response_headers
+        if not headers:
+            return None
+        link_header = headers.get("Link") or headers.get("link") or ""
+        match = re.search(
+            r'<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"',
+            link_header,
+        )
+        return match.group(1) if match else None
 
     def close(self):
         """Close the HTTP client."""

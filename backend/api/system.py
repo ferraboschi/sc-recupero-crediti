@@ -413,32 +413,35 @@ async def match_audit(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
     only_problems: bool = Query(True, description="Solo esiti warn/bad"),
+    include_paid: bool = Query(False, description="Audita anche le fatture pagate"),
 ):
-    """Audit degli abbinamenti fattura→cliente sulle fatture NON pagate.
+    """Audit degli abbinamenti fattura→cliente.
 
     Per ogni fattura abbinata confronta il destinatario della fattura con la
     ragione sociale del cliente e l'accordo P.IVA:
-    - bad:  P.IVA in conflitto, o nomi del tutto dissimili (score < 40)
-    - warn: nomi poco simili (score < 75) o P.IVA fattura assente sul cliente
+    - bad:  P.IVA in conflitto, nomi del tutto dissimili (score < 40), o
+            P.IVA coincidente ma nomi dissimili (possibile P.IVA avvelenata
+            sul cliente dal vecchio motore)
+    - warn: nomi poco simili (score < 75), P.IVA fattura assente sul cliente,
+            o nome fattura assente (verifica impossibile)
     - ok:   il resto
 
     Serve a trovare le fatture finite nel profilo sbagliato (i casi
-    QOQA/Rooftop). Da lì: "Scollega" o riassegnazione manuale.
+    QOQA/Rooftop). Da lì: "Scollega" o riassegnazione manuale. Con
+    include_paid=true copre anche le pagate (che inquinano i totali del
+    profilo pur non contando nelle scadute).
     """
     from backend.engine.normalizer import are_similar
     from backend.engine.piva import validate_piva
 
     session = get_session_direct()
     try:
-        invoices = (
-            session.query(Invoice)
-            .filter(
-                Invoice.customer_id.isnot(None),
-                Invoice.status != "paid",
-            )
-            .order_by(Invoice.id)
-            .all()
+        query = session.query(Invoice).filter(
+            Invoice.customer_id.isnot(None),
         )
+        if not include_paid:
+            query = query.filter(Invoice.status != "paid")
+        invoices = query.order_by(Invoice.id).all()
 
         cust_ids = {inv.customer_id for inv in invoices}
         customers = {}
@@ -469,6 +472,16 @@ async def match_audit(
             if piva_conflict:
                 verdict = "bad"
                 reasons.append("P.IVA fattura diversa da P.IVA cliente")
+            elif piva_match and name_score is not None and name_score < 40:
+                # Replica della guardia anti-poisoning del matcher: se il
+                # vecchio motore ha scritto la P.IVA della fattura sul
+                # cliente SBAGLIATO, l'accordo P.IVA è proprio il sintomo,
+                # non una conferma.
+                verdict = "bad"
+                reasons.append(
+                    f"P.IVA coincidente ma nomi dissimili (score {name_score}): "
+                    f"possibile P.IVA avvelenata sul cliente"
+                )
             elif name_score is not None and name_score < 40 and not piva_match:
                 verdict = "bad"
                 reasons.append(f"nomi dissimili (score {name_score})")
@@ -478,6 +491,9 @@ async def match_audit(
             elif inv_piva and not cust_piva:
                 verdict = "warn"
                 reasons.append("P.IVA presente in fattura ma assente sul cliente")
+            elif name_score is None and not piva_match:
+                verdict = "warn"
+                reasons.append("nome fattura assente: verifica impossibile")
             else:
                 verdict = "ok"
 

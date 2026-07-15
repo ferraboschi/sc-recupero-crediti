@@ -57,6 +57,12 @@ class Config:
     # abbinamento automatico). 75 copre i nomi corti reali tipo "F-T SRL".
     FUZZY_MATCH_THRESHOLD = 75
 
+    # Fatture arricchite dalla pagina di dettaglio FatturaPro per ciclo di
+    # sync (P.IVA + scadenza reale). ~0.45s a fattura: 150 ≈ 70s in più per
+    # un job in background, e la coda ruota (detail_attempted_at) quindi
+    # l'intero parco converge in pochi giorni.
+    DETAIL_ENRICHMENT_LIMIT = int(os.getenv("DETAIL_ENRICHMENT_LIMIT", "150"))
+
     @classmethod
     def shopify_api_base(cls) -> str:
         """Return the Shopify Admin API base URL."""

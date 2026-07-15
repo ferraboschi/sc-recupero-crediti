@@ -388,7 +388,8 @@ async def unlink_position(position_id: int, session: Session = Depends(get_sessi
             raise HTTPException(status_code=400, detail="La fattura non è abbinata a nessun cliente")
 
         old_customer_id = position.customer_id
-        old_customer_name = position.customer.ragione_sociale if position.customer else None
+        old_customer = position.customer
+        old_customer_name = old_customer.ragione_sociale if old_customer else None
         position.customer_id = None
         position.case_id = None
         position.match_method = "unlinked"
@@ -396,6 +397,17 @@ async def unlink_position(position_id: int, session: Session = Depends(get_sessi
         position.suggested_customer_id = None
         position.suggested_method = None
         position.suggested_score = None
+
+        # Riallinea subito pratica e stato-cache del vecchio cliente
+        # (prima restavano stantii fino al sync notturno).
+        if old_customer is not None:
+            from backend.engine.repair import reconcile_customer_after_detach
+            try:
+                reconcile_customer_after_detach(session, old_customer)
+            except Exception as e:
+                logger.warning(
+                    f"Post-unlink reconcile failed for customer {old_customer_id}: {e}"
+                )
         session.commit()
 
         session.add(ActivityLog(
@@ -545,8 +557,11 @@ async def reassign_position(
         # ── REGOLA P.IVA IMPRESCINDIBILE ──
         # Se la fattura ha P.IVA e il cliente destinazione ha una P.IVA DIVERSA,
         # bloccare la riassegnazione: P.IVA diverse = entità diverse.
-        inv_piva = (position.customer_piva_raw or "").strip().upper()
-        cust_piva = (new_customer.partita_iva or "").strip().upper()
+        # Confronto su P.IVA NORMALIZZATE: 'IT12345678901' e '12345678901'
+        # sono la stessa entità, non un conflitto (prima era un falso 409).
+        from backend.engine.piva import validate_piva
+        inv_piva = validate_piva(position.customer_piva_raw) or ""
+        cust_piva = validate_piva(new_customer.partita_iva) or ""
 
         if inv_piva and cust_piva and inv_piva != cust_piva:
             if not force:

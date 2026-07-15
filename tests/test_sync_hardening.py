@@ -1,0 +1,476 @@
+"""Test dei fix di sincronizzazione (batch 2026-07-15).
+
+Copertura:
+- parse_retry_after tollerante ("2.0" di Shopify non deve più uccidere il sync)
+- paginazione Shopify via header Link (prima si fermava a 250 clienti)
+- fetch_customer_orders rilancia invece di restituire liste parziali
+- payment detection a DOPPIA assenza consecutiva (missing_streak)
+- rotazione dell'enrichment dettaglio (mai tentate prima, poi le più vecchie)
+- adozione per P.IVA dei clienti nati da FatturaPro nel sync clienti Shopify
+- order matching: mai match per solo importo senza issue_date
+- audit abbinamenti v2: P.IVA avvelenata, nome assente, include_paid
+- matching: name_exact degradato a suggerimento se la P.IVA non è verificabile
+- auto-create: merge name-only degradato a suggerimento
+"""
+
+import pytest
+import httpx
+from datetime import date, datetime, timedelta
+
+from backend.connectors.base import parse_retry_after
+from backend.connectors.shopify import ShopifyConnector
+from backend.database import Invoice, Customer, SyncState
+from backend.engine.matching import match_invoice_to_customer, piva_contradiction
+from backend.config import config
+
+# P.IVA italiane checksum-valide (vedi backend/engine/piva.py)
+PIVA_A = "12345678903"
+PIVA_B = "98765432103"
+PIVA_C = "11111111115"
+
+
+# ── parse_retry_after ────────────────────────────────────────────────
+
+class TestParseRetryAfter:
+    def test_float_string_from_shopify(self):
+        assert parse_retry_after("2.0") == 2
+
+    def test_plain_int_string(self):
+        assert parse_retry_after("5") == 5
+
+    def test_missing_header_defaults(self):
+        assert parse_retry_after(None) == 2
+
+    def test_garbage_defaults(self):
+        assert parse_retry_after("Wed, 21 Oct 2026") == 2
+
+    def test_capped(self):
+        assert parse_retry_after("999999") == 60
+
+    def test_floor_at_one_second(self):
+        assert parse_retry_after("0") == 1
+        assert parse_retry_after("-3") == 1
+
+
+# ── Paginazione Shopify (header Link) ────────────────────────────────
+
+LINK_NEXT = (
+    '<https://x.myshopify.com/admin/api/2026-01/customers/search.json'
+    '?page_info=CURSOR123&limit=250>; rel="next"'
+)
+LINK_PREV_ONLY = (
+    '<https://x.myshopify.com/admin/api/2026-01/customers/search.json'
+    '?page_info=BACK&limit=250>; rel="previous"'
+)
+
+
+class TestShopifyPagination:
+    def _connector(self, monkeypatch):
+        monkeypatch.setattr(config, "SHOPIFY_STORE_URL", "https://x.myshopify.com")
+        monkeypatch.setattr(config, "SHOPIFY_ACCESS_TOKEN", "test-token")
+        return ShopifyConnector()
+
+    def test_cursor_from_link_header(self, monkeypatch):
+        conn = self._connector(monkeypatch)
+        conn.last_response_headers = httpx.Headers({"Link": LINK_NEXT})
+        assert conn._extract_next_cursor() == "CURSOR123"
+
+    def test_no_next_rel_means_done(self, monkeypatch):
+        conn = self._connector(monkeypatch)
+        conn.last_response_headers = httpx.Headers({"Link": LINK_PREV_ONLY})
+        assert conn._extract_next_cursor() is None
+
+    def test_no_headers_means_done(self, monkeypatch):
+        conn = self._connector(monkeypatch)
+        conn.last_response_headers = None
+        assert conn._extract_next_cursor() is None
+
+    def test_fetch_paginates_and_drops_query_param(self, monkeypatch):
+        conn = self._connector(monkeypatch)
+        calls = []
+
+        def fake_get(endpoint, headers=None, params=None):
+            calls.append(params)
+            if len(calls) == 1:
+                conn.last_response_headers = httpx.Headers({"Link": LINK_NEXT})
+                return {"customers": [{"id": 1, "email": "a@x.it", "addresses": []}]}
+            conn.last_response_headers = httpx.Headers({})
+            return {"customers": [{"id": 2, "email": "b@x.it", "addresses": []}]}
+
+        monkeypatch.setattr(conn, "get", fake_get)
+        monkeypatch.setattr(conn, "_get_headers", lambda: {})
+        customers = conn.fetch_b2b_customers()
+
+        assert len(calls) == 2
+        # Prima pagina: filtro query, nessun cursore
+        assert "query" in calls[0] and "page_info" not in calls[0]
+        # Seconda pagina: cursore, NIENTE query (Shopify la rifiuta)
+        assert calls[1].get("page_info") == "CURSOR123"
+        assert "query" not in calls[1]
+        assert len(customers) == 2
+
+    def test_customer_orders_error_propagates(self, monkeypatch):
+        conn = self._connector(monkeypatch)
+
+        def boom(*a, **kw):
+            raise ValueError("invalid literal for int() with base 10: '2.0'")
+
+        monkeypatch.setattr(conn, "get", boom)
+        monkeypatch.setattr(conn, "_get_headers", lambda: {})
+        with pytest.raises(ValueError):
+            conn.fetch_customer_orders("123")
+
+
+# ── Harness per i task di sync ───────────────────────────────────────
+
+class FakeFatturaPro:
+    """Connettore finto: lista fissa, enrichment che registra le chiamate."""
+
+    instances = []
+
+    def __init__(self, *a, **kw):
+        FakeFatturaPro.instances.append(self)
+        self.enriched = None
+
+    def login(self):
+        return True
+
+    def fetch_overdue_invoices(self):
+        return list(self.raw_invoices), False
+
+    def enrich_invoices_from_detail(self, invoices, delay=0.5):
+        self.enriched = list(invoices)
+        return invoices
+
+    def close(self):
+        pass
+
+
+def _run_invoice_sync(monkeypatch, session, raw_invoices):
+    """Esegue _sync_invoices_task con connettore e sessione finti."""
+    from backend.api import sync as sync_mod
+    FakeFatturaPro.raw_invoices = raw_invoices
+    FakeFatturaPro.instances = []
+    monkeypatch.setattr(sync_mod, "FatturaProConnector", FakeFatturaPro)
+    monkeypatch.setattr(sync_mod, "get_session_direct", lambda: session)
+    return sync_mod._sync_invoices_task()
+
+
+def _raw(number, doc_id="d1", balance=100.0, name="ACME SRL"):
+    return {
+        "invoice_number": number,
+        "date": date(2026, 5, 1),
+        "customer_name": name,
+        "total": balance,
+        "balance": balance,
+        "doc_id": doc_id,
+        "source_platform": "fatturapro",
+    }
+
+
+def _mk_invoice(session, number, **kw):
+    inv = Invoice(
+        invoice_number=number,
+        amount=kw.pop("amount", 100.0),
+        amount_due=kw.pop("amount_due", 100.0),
+        issue_date=kw.pop("issue_date", date(2026, 4, 1)),
+        source_platform=kw.pop("source_platform", "fatturapro"),
+        status=kw.pop("status", "open"),
+        **kw,
+    )
+    session.add(inv)
+    session.commit()
+    return inv
+
+
+# ── Payment detection a doppia assenza ───────────────────────────────
+
+class TestPaymentDetectionStreak:
+    def test_first_absence_only_increments_streak(self, monkeypatch, test_db_session):
+        _mk_invoice(test_db_session, "A/2026")
+        _mk_invoice(test_db_session, "B/2026")
+
+        # Fetch completo che contiene solo A: B è assente per la prima volta
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session, [_raw("A/2026")]
+        )
+        assert result["fatturapro"]["paid_detected"] == 0
+        b = test_db_session.query(Invoice).filter_by(invoice_number="B/2026").one()
+        assert b.status == "open"
+        assert b.missing_streak == 1
+
+    def test_second_consecutive_absence_marks_paid(self, monkeypatch, test_db_session):
+        _mk_invoice(test_db_session, "A/2026")
+        _mk_invoice(test_db_session, "B/2026", missing_streak=1)
+
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session, [_raw("A/2026")]
+        )
+        assert result["fatturapro"]["paid_detected"] == 1
+        b = test_db_session.query(Invoice).filter_by(invoice_number="B/2026").one()
+        assert b.status == "paid"
+        assert b.amount_due == 0
+
+    def test_reappearance_resets_streak(self, monkeypatch, test_db_session):
+        _mk_invoice(test_db_session, "B/2026", missing_streak=1)
+
+        _run_invoice_sync(monkeypatch, test_db_session, [_raw("B/2026")])
+        b = test_db_session.query(Invoice).filter_by(invoice_number="B/2026").one()
+        assert b.status == "open"
+        assert b.missing_streak == 0
+
+
+# ── Rotazione enrichment dettaglio ───────────────────────────────────
+
+class TestEnrichmentRotation:
+    def test_never_attempted_first_then_oldest(self, monkeypatch, test_db_session):
+        now = datetime.utcnow()
+        # A: tentata ieri; B: mai tentata; C: tentata 3 giorni fa
+        _mk_invoice(test_db_session, "A/2026", detail_attempted_at=now - timedelta(days=1))
+        _mk_invoice(test_db_session, "B/2026")
+        _mk_invoice(test_db_session, "C/2026", detail_attempted_at=now - timedelta(days=3))
+
+        monkeypatch.setattr(config, "DETAIL_ENRICHMENT_LIMIT", 2)
+        _run_invoice_sync(
+            monkeypatch, test_db_session,
+            [_raw("A/2026", doc_id="da"), _raw("B/2026", doc_id="db"), _raw("C/2026", doc_id="dc")],
+        )
+
+        enriched = FakeFatturaPro.instances[0].enriched
+        assert [inv["invoice_number"] for inv in enriched] == ["B/2026", "C/2026"]
+
+    def test_attempt_timestamp_recorded(self, monkeypatch, test_db_session):
+        _mk_invoice(test_db_session, "B/2026")
+        _run_invoice_sync(monkeypatch, test_db_session, [_raw("B/2026", doc_id="db")])
+        b = test_db_session.query(Invoice).filter_by(invoice_number="B/2026").one()
+        assert b.detail_attempted_at is not None
+
+
+# ── Adozione clienti per P.IVA nel sync Shopify ──────────────────────
+
+class FakeShopify:
+    def __init__(self, *a, **kw):
+        pass
+
+    def fetch_b2b_customers(self):
+        return [{
+            "shopify_id": "gid://shopify/Customer/777",
+            "ragione_sociale": "QOQA SRL",
+            "partita_iva": PIVA_A,
+            "codice_fiscale": None,
+            "codice_sdi": None,
+            "phone": "+39 333 000 1111",
+            "phones": [{"number": "+39 333 000 1111", "source": "shopify"}],
+            "email": "qoqa@example.com",
+            "tags": "B2B",
+        }]
+
+
+class TestCustomerAdoption:
+    def _run(self, monkeypatch, session):
+        from backend.api import sync as sync_mod
+        monkeypatch.setattr(sync_mod, "ShopifyConnector", FakeShopify)
+        monkeypatch.setattr(sync_mod, "get_session_direct", lambda: session)
+        monkeypatch.setattr(config, "SHOPIFY_ACCESS_TOKEN", "test-token")
+        return sync_mod._sync_customers_task()
+
+    def test_orphan_adopted_instead_of_duplicated(self, monkeypatch, test_db_session):
+        orphan = Customer(
+            ragione_sociale="QOQA",
+            partita_iva=f"IT{PIVA_A}",  # con prefisso: il confronto normalizza
+            source="fatturapro",
+        )
+        test_db_session.add(orphan)
+        test_db_session.commit()
+
+        result = self._run(monkeypatch, test_db_session)
+
+        assert result["adopted"] == 1
+        assert result["created"] == 0
+        rows = test_db_session.query(Customer).all()
+        assert len(rows) == 1
+        assert rows[0].shopify_id == "gid://shopify/Customer/777"
+        assert rows[0].email == "qoqa@example.com"
+        assert rows[0].phone == "+39 333 000 1111"
+
+    def test_new_customer_still_created_when_no_orphan(self, monkeypatch, test_db_session):
+        result = self._run(monkeypatch, test_db_session)
+        assert result["created"] == 1
+        assert result.get("adopted", 0) == 0
+
+
+# ── Order matching ───────────────────────────────────────────────────
+
+class TestOrderMatching:
+    def test_no_issue_date_no_match(self, test_db_session):
+        from backend.api.sync import _find_best_order_match
+        inv = _mk_invoice(test_db_session, "X/2026", issue_date=None)
+        orders = [{
+            "id": "1", "name": "#SAK1", "order_number": 1,
+            "total_price": 100.0, "created_at": "2026-05-01T00:00:00",
+            "financial_status": "paid",
+        }]
+        assert _find_best_order_match(inv, orders) is None
+
+    def test_best_match_prefers_closest(self, test_db_session):
+        from backend.api.sync import _find_best_order_match
+        inv = _mk_invoice(test_db_session, "Y/2026", issue_date=date(2026, 5, 10))
+        orders = [
+            {"id": "1", "name": "#SAK1", "order_number": 1,
+             "total_price": 100.0, "created_at": "2026-04-15T00:00:00",
+             "financial_status": "paid"},
+            {"id": "2", "name": "#SAK2", "order_number": 2,
+             "total_price": 100.0, "created_at": "2026-05-09T00:00:00",
+             "financial_status": "paid"},
+        ]
+        best = _find_best_order_match(inv, orders)
+        assert best["id"] == "2"
+
+
+# ── Audit abbinamenti v2 ─────────────────────────────────────────────
+
+class TestMatchAuditV2:
+    @pytest.fixture(autouse=True)
+    def _use_test_session(self, monkeypatch, test_db_session):
+        # L'endpoint audit apre la sessione via get_session_direct, non via
+        # dependency injection: va reindirizzato alla sessione di test.
+        from backend.api import system as system_mod
+        monkeypatch.setattr(system_mod, "get_session_direct", lambda: test_db_session)
+
+    def _customer(self, session, name, piva=None):
+        c = Customer(ragione_sociale=name, partita_iva=piva, source="shopify")
+        session.add(c)
+        session.commit()
+        return c
+
+    def test_poisoned_piva_flagged_bad(self, test_client, test_db_session):
+        # P.IVA coincidente ma nomi completamente diversi: il vecchio motore
+        # aveva scritto la P.IVA della fattura sul cliente sbagliato.
+        cust = self._customer(test_db_session, "Rooftop SRL", PIVA_A)
+        _mk_invoice(
+            test_db_session, "993/2026", customer_id=cust.id,
+            customer_name_raw="QOQA di Amanda Piccolo", customer_piva_raw=PIVA_A,
+            match_method="legacy", days_overdue=10,
+        )
+        resp = test_client.get("/api/system/match-audit")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        assert len(items) == 1
+        assert items[0]["verdict"] == "bad"
+        assert "avvelenata" in items[0]["reasons"][0]
+
+    def test_missing_raw_name_is_warn_not_ok(self, test_client, test_db_session):
+        cust = self._customer(test_db_session, "Rooftop SRL")
+        _mk_invoice(
+            test_db_session, "994/2026", customer_id=cust.id,
+            customer_name_raw=None, match_method="legacy", days_overdue=10,
+        )
+        resp = test_client.get("/api/system/match-audit")
+        items = resp.json()["items"]
+        assert len(items) == 1
+        assert items[0]["verdict"] == "warn"
+
+    def test_include_paid_covers_paid_invoices(self, test_client, test_db_session):
+        cust = self._customer(test_db_session, "Belfiore M & M srl", PIVA_A)
+        _mk_invoice(
+            test_db_session, "655/2026", customer_id=cust.id, status="paid",
+            customer_name_raw="Altra Azienda SRL", customer_piva_raw=PIVA_B,
+            match_method="legacy",
+        )
+        # Senza include_paid la pagata è invisibile
+        resp = test_client.get("/api/system/match-audit")
+        assert resp.json()["total_audited"] == 0
+        # Con include_paid emerge il conflitto P.IVA
+        resp = test_client.get("/api/system/match-audit?include_paid=true")
+        items = resp.json()["items"]
+        assert len(items) == 1
+        assert items[0]["verdict"] == "bad"
+
+
+# ── Matching: name_exact con P.IVA non verificabile ──────────────────
+
+class TestNameExactUnverified:
+    def test_degraded_to_suggestion(self, test_db_session):
+        cust = Customer(ragione_sociale="QOQA SRL", partita_iva=None, source="manual")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        inv = _mk_invoice(
+            test_db_session, "Z/2026",
+            customer_name_raw="QOQA SRL", customer_piva_raw=PIVA_A,
+        )
+        result = match_invoice_to_customer(inv, [cust], test_db_session)
+        assert result.customer is None
+        assert result.suggested_customer is cust
+        assert result.suggested_method == "name_exact_piva_unverified"
+
+    def test_still_automatic_when_invoice_has_no_piva(self, test_db_session):
+        cust = Customer(ragione_sociale="QOQA SRL", partita_iva=None, source="manual")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        inv = _mk_invoice(
+            test_db_session, "Z2/2026", customer_name_raw="QOQA SRL",
+        )
+        result = match_invoice_to_customer(inv, [cust], test_db_session)
+        assert result.customer is cust
+        assert result.method == "name_exact"
+
+
+# ── piva_contradiction ───────────────────────────────────────────────
+
+class TestPivaContradiction:
+    def test_true_only_when_both_valid_and_different(self, test_db_session):
+        cust_a = Customer(ragione_sociale="A", partita_iva=PIVA_A, source="manual")
+        cust_none = Customer(ragione_sociale="N", partita_iva=None, source="manual")
+        test_db_session.add_all([cust_a, cust_none])
+        test_db_session.commit()
+        inv_b = _mk_invoice(test_db_session, "K/2026", customer_piva_raw=PIVA_B)
+        inv_a = _mk_invoice(test_db_session, "K2/2026", customer_piva_raw=f"IT {PIVA_A}")
+        inv_invalid = _mk_invoice(test_db_session, "K3/2026", customer_piva_raw="12345678901")
+
+        assert piva_contradiction(inv_b, cust_a) is True
+        assert piva_contradiction(inv_a, cust_a) is False      # stessa, normalizzata
+        assert piva_contradiction(inv_invalid, cust_a) is False  # invalida = assente
+        assert piva_contradiction(inv_b, cust_none) is False
+        assert piva_contradiction(inv_b, None) is False
+
+
+# ── Auto-create: merge name-only degradato ───────────────────────────
+
+class TestAutoCreateNameOnlyMerge:
+    def _run(self, monkeypatch, session):
+        from backend.api import sync as sync_mod
+        monkeypatch.setattr(sync_mod, "get_session_direct", lambda: session)
+        return sync_mod._auto_create_task()
+
+    def test_same_normalized_name_no_piva_degrades_to_suggestion(
+        self, monkeypatch, test_db_session
+    ):
+        _mk_invoice(
+            test_db_session, "T1/2026",
+            customer_name_raw="Trattoria X di Mario Rossi SNC",
+        )
+        _mk_invoice(
+            test_db_session, "T2/2026",
+            customer_name_raw="Trattoria X di Luigi Bianchi SRL",
+        )
+        result = self._run(monkeypatch, test_db_session)
+
+        assert result["auto_created"] == 1
+        assert result["matched_within_run"] == 0
+        t2 = test_db_session.query(Invoice).filter_by(invoice_number="T2/2026").one()
+        assert t2.customer_id is None
+        assert t2.suggested_customer_id is not None
+        assert t2.suggested_method == "name_ambiguous"
+
+    def test_same_piva_still_attaches(self, monkeypatch, test_db_session):
+        _mk_invoice(
+            test_db_session, "P1/2026",
+            customer_name_raw="QOQA SRL", customer_piva_raw=PIVA_A,
+        )
+        _mk_invoice(
+            test_db_session, "P2/2026",
+            customer_name_raw="QOQA S.R.L.", customer_piva_raw=PIVA_A,
+        )
+        result = self._run(monkeypatch, test_db_session)
+        assert result["auto_created"] == 1
+        assert result["matched_within_run"] == 1

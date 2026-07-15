@@ -34,6 +34,12 @@ from backend.config import config
 from backend.engine.normalizer import normalize_ragione_sociale
 
 logger = logging.getLogger(__name__)
+
+# Payment detection per assenza: quante volte consecutive una fattura deve
+# mancare da un fetch COMPLETO prima di essere marcata pagata. Con 1 sola
+# assenza, una riga persa silenziosamente dal fetch diventava una falsa
+# "pagata" e spariva da tutti i conteggi scadute.
+PAID_ABSENCE_STREAK = 2
 router = APIRouter()
 
 # Sync mutex to prevent concurrent syncs — used by ALL sync operations
@@ -131,11 +137,16 @@ def _sync_invoices_task() -> dict:
                 # Serve il dettaglio per le fatture nuove e per quelle già
                 # note senza P.IVA o senza scadenza reale.
                 existing_rows = session.query(
-                    Invoice.invoice_number, Invoice.customer_piva_raw, Invoice.due_date_source,
+                    Invoice.invoice_number, Invoice.customer_piva_raw,
+                    Invoice.due_date_source, Invoice.detail_attempted_at,
                 ).filter(Invoice.source_platform == "fatturapro").all()
                 complete_invoice_numbers = {
                     row.invoice_number for row in existing_rows
                     if row.customer_piva_raw and row.due_date_source == "real"
+                }
+                attempted_at_by_number = {
+                    row.invoice_number: row.detail_attempted_at
+                    for row in existing_rows
                 }
 
                 invoices_needing_detail = [
@@ -144,16 +155,40 @@ def _sync_invoices_task() -> dict:
                     and inv["invoice_number"] not in complete_invoice_numbers
                 ]
 
+                # Rotazione: prima le fatture mai tentate, poi quelle col
+                # tentativo più vecchio. Senza questo ordinamento il cap
+                # riprovava per sempre le stesse N fatture in testa alla
+                # lista (le più recenti), lasciando le altre a digiuno.
+                invoices_needing_detail.sort(
+                    key=lambda inv: (
+                        attempted_at_by_number.get(inv["invoice_number"]) is not None,
+                        attempted_at_by_number.get(inv["invoice_number"]) or datetime.min,
+                    )
+                )
+
                 # Cap enrichment to avoid long-running syncs
-                DETAIL_ENRICHMENT_LIMIT = 50
+                detail_limit = config.DETAIL_ENRICHMENT_LIMIT
                 if invoices_needing_detail:
-                    if len(invoices_needing_detail) > DETAIL_ENRICHMENT_LIMIT:
+                    if len(invoices_needing_detail) > detail_limit:
                         logger.info(
                             f"Detail enrichment: {len(invoices_needing_detail)} invoices need it, "
-                            f"capping to {DETAIL_ENRICHMENT_LIMIT} per sync cycle"
+                            f"capping to {detail_limit} per sync cycle"
                         )
-                        invoices_needing_detail = invoices_needing_detail[:DETAIL_ENRICHMENT_LIMIT]
+                        invoices_needing_detail = invoices_needing_detail[:detail_limit]
                     fatturapro.enrich_invoices_from_detail(invoices_needing_detail, delay=0.3)
+
+                    # Marca il tentativo (riuscito o no) così il prossimo
+                    # ciclo ruota su fatture diverse.
+                    attempted_numbers = [
+                        inv["invoice_number"] for inv in invoices_needing_detail
+                    ]
+                    session.query(Invoice).filter(
+                        Invoice.source_platform == "fatturapro",
+                        Invoice.invoice_number.in_(attempted_numbers),
+                    ).update(
+                        {Invoice.detail_attempted_at: datetime.utcnow()},
+                        synchronize_session=False,
+                    )
 
                 # Build set of invoice numbers currently overdue in FatturaPro
                 fetched_invoice_numbers = set()
@@ -170,7 +205,13 @@ def _sync_invoices_task() -> dict:
                     if existing:
                         existing.amount = inv.get("total", 0)
                         existing.amount_due = inv.get("balance", 0)
-                        existing.customer_name_raw = inv.get("customer_name")
+                        # Presente nella lista: azzera il conteggio assenze
+                        # della payment detection.
+                        existing.missing_streak = 0
+                        # Mai sovrascrivere il nome raw con un valore vuoto:
+                        # è l'evidenza usata dall'audit abbinamenti.
+                        if inv.get("customer_name"):
+                            existing.customer_name_raw = inv.get("customer_name")
                         if inv.get("date"):
                             existing.issue_date = inv["date"]
                         # Enrich P.IVA if we found one and existing doesn't have it
@@ -230,14 +271,29 @@ def _sync_invoices_task() -> dict:
                     else:
                         for known_inv in known_fp_invoices:
                             if known_inv.invoice_number not in fetched_invoice_numbers:
-                                known_inv.status = "paid"
-                                known_inv.amount_due = 0
-                                known_inv.updated_at = datetime.utcnow()
-                                paid_detected += 1
-                                logger.info(
-                                    f"Payment detected: FatturaPro invoice {known_inv.invoice_number} "
-                                    f"no longer overdue — marked as paid"
-                                )
+                                # La "pagata" è un'inferenza per assenza: una
+                                # riga persa silenziosamente dal fetch non
+                                # deve sparire dai conteggi scadute. Si marca
+                                # paid solo alla SECONDA assenza consecutiva
+                                # su fetch completi.
+                                streak = (known_inv.missing_streak or 0) + 1
+                                if streak >= PAID_ABSENCE_STREAK:
+                                    known_inv.status = "paid"
+                                    known_inv.amount_due = 0
+                                    known_inv.missing_streak = 0
+                                    known_inv.updated_at = datetime.utcnow()
+                                    paid_detected += 1
+                                    logger.info(
+                                        f"Payment detected: FatturaPro invoice {known_inv.invoice_number} "
+                                        f"absent from {streak} consecutive complete fetches — marked as paid"
+                                    )
+                                else:
+                                    known_inv.missing_streak = streak
+                                    logger.info(
+                                        f"Invoice {known_inv.invoice_number} absent from complete "
+                                        f"fetch ({streak}/{PAID_ABSENCE_STREAK}) — awaiting confirmation "
+                                        f"before marking paid"
+                                    )
                 else:
                     logger.warning("PARTIAL fetch — payment detection skipped")
 
@@ -369,12 +425,39 @@ def _sync_customers_task() -> dict:
                 logger.info("Syncing customers from Shopify...")
                 shopify = ShopifyConnector()
                 raw_customers = shopify.fetch_b2b_customers()
-                created, updated = 0, 0
+                created, updated, adopted = 0, 0, 0
+
+                # Clienti nati dalle fatture (auto-create, shopify_id NULL):
+                # se su Shopify esiste lo stesso esercizio (stessa P.IVA
+                # validata), va ADOTTATO — shopify_id + contatti sulla riga
+                # esistente — invece di creare un duplicato. Il duplicato
+                # renderebbe pure ambiguo il matching per P.IVA (quarantena).
+                orphans_by_piva = {}
+                for orphan in session.query(Customer).filter(
+                    Customer.shopify_id.is_(None),
+                    Customer.partita_iva.isnot(None),
+                ).all():
+                    orphan_piva = validate_piva(orphan.partita_iva)
+                    if orphan_piva and orphan_piva not in orphans_by_piva:
+                        orphans_by_piva[orphan_piva] = orphan
 
                 for cust in raw_customers:
                     existing = session.query(Customer).filter_by(
                         shopify_id=cust["shopify_id"]
                     ).first()
+
+                    if not existing:
+                        cust_piva = validate_piva(cust.get("partita_iva"))
+                        orphan = orphans_by_piva.pop(cust_piva, None) if cust_piva else None
+                        if orphan is not None:
+                            orphan.shopify_id = cust["shopify_id"]
+                            existing = orphan
+                            adopted += 1
+                            logger.info(
+                                f"Adopted fatturapro-born customer "
+                                f"'{orphan.ragione_sociale}' (P.IVA {cust_piva}) "
+                                f"→ Shopify {cust['shopify_id']}"
+                            )
 
                     if existing:
                         existing.ragione_sociale = cust.get("ragione_sociale", existing.ragione_sociale)
@@ -413,7 +496,10 @@ def _sync_customers_task() -> dict:
                 result["success"] = True
                 result["created"] = created
                 result["updated"] = updated
-                logger.info(f"Shopify sync: created={created}, updated={updated}")
+                result["adopted"] = adopted
+                logger.info(
+                    f"Shopify sync: created={created}, updated={updated}, adopted={adopted}"
+                )
             else:
                 result["success"] = True  # Not an error, just unconfigured
                 logger.debug("Shopify not configured")
@@ -498,9 +584,30 @@ def _auto_create_task() -> dict:
                     existing_id = run_piva_map[piva]
                 elif name_norm and name_norm in run_name_map:
                     candidate_id, candidate_piva = run_name_map[name_norm]
-                    # P.IVA in conflitto = entità diverse
-                    if not (piva and candidate_piva and piva != candidate_piva):
+                    if piva and candidate_piva and piva == candidate_piva:
+                        # Stessa P.IVA validata: stessa entità, aggancio sicuro.
                         existing_id = candidate_id
+                    elif piva and candidate_piva:
+                        # P.IVA in conflitto = entità diverse: si prosegue e
+                        # si crea un cliente separato.
+                        pass
+                    else:
+                        # Merge sul SOLO nome normalizzato (una o entrambe le
+                        # P.IVA mancanti): il normalizzatore è aggressivo
+                        # ('Trattoria X di Mario Rossi' e 'Trattoria X di
+                        # Luigi Bianchi' collassano sullo stesso nome), quindi
+                        # niente aggancio automatico → suggerimento in
+                        # quarantena, decide l'operatore.
+                        inv.suggested_customer_id = candidate_id
+                        inv.suggested_method = "name_ambiguous"
+                        inv.suggested_score = 100
+                        result["skipped_suggested"] += 1
+                        logger.info(
+                            f"Invoice {inv.invoice_number}: name-only merge with "
+                            f"run-created customer {candidate_id} degraded to "
+                            f"suggestion (P.IVA not verifiable on both sides)"
+                        )
+                        continue
 
                 if existing_id:
                     inv.customer_id = existing_id
@@ -665,16 +772,9 @@ def _find_best_order_match(
     Returns the best matching order or None.
     """
     if not invoice.issue_date:
-        # Without a date, match by amount only
-        for order in orders:
-            amt_diff = abs(
-                order["total_price"] - invoice.amount
-            )
-            tolerance = max(
-                invoice.amount * 0.01, 0.50
-            )
-            if amt_diff <= tolerance:
-                return order
+        # Senza data il match per solo importo è troppo fragile (il primo
+        # ordine entro tolleranza vince e il link è sticky: mai più
+        # ricontrollato). Meglio nessun match: la data arriva col sync.
         return None
 
     best = None

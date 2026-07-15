@@ -43,6 +43,12 @@ class FatturaProConnector:
         )
         self._xcrud_key: Optional[str] = None
         self._authenticated = False
+        # Contatore righe-fattura scartate dall'ultimo _parse_invoice_table
+        self._last_parse_drops = 0
+        # Telemetria dettaglio: diagnostica loggata al massimo una volta
+        # per run di enrichment, e variante xcrud che ha funzionato.
+        self._detail_diag_logged = False
+        self._detail_working_variant: Optional[str] = None
 
     def set_xcrud_key(self, key: str):
         """Manually set the xcrud key (e.g., from browser session).
@@ -323,11 +329,31 @@ class FatturaProConnector:
 
         logger.info("Fetching overdue invoices from FatturaPro...")
         all_invoices = []
+        seen_numbers = set()
         partial = False
+        dropped_rows = 0
         PAGE_SIZE = 10  # xcrud default
 
+        def _add_batch(batch):
+            """Accumula deduplicando per invoice_number (l'offset-pagination
+            senza tiebreaker può ripresentare righe al confine di pagina)."""
+            added = 0
+            for inv in batch:
+                num = inv.get("invoice_number")
+                if num in seen_numbers:
+                    continue
+                seen_numbers.add(num)
+                all_invoices.append(inv)
+                added += 1
+            return added
+
         try:
-            # Load the initial page which already contains data
+            # Load the initial page: serve per il column map e la chiave
+            # xcrud. Le RIGHE renderizzate non vengono usate quando la
+            # paginazione AJAX è disponibile: la pagina renderizzata usa
+            # l'ordinamento di default del sito, le pagine AJAX quello
+            # imposto dal codice — un mismatch faceva saltare
+            # deterministicamente una finestra di fatture a ogni sync.
             response = self.client.get(
                 f"{self.base_url}/documenti.php?s=1",
                 timeout=self.timeout,
@@ -338,35 +364,39 @@ class FatturaProConnector:
             # for all AJAX fragments of this run.
             colmap = self._derive_column_map(response.text)
 
-            # Parse the initial page
-            initial_invoices = self._parse_invoice_table(response.text, colmap)
-            all_invoices.extend(initial_invoices)
-            logger.info(f"Page 1: {len(initial_invoices)} invoices")
-
             # Get xcrud key for pagination (from hidden input)
             soup = BeautifulSoup(response.text, "html.parser")
             key_input = soup.find("input", {"name": "key", "type": "hidden"})
             if not key_input:
+                # Fallback: senza chiave si può leggere solo la pagina
+                # renderizzata.
+                initial_invoices = self._parse_invoice_table(response.text, colmap)
+                dropped_rows += self._last_parse_drops
+                _add_batch(initial_invoices)
                 if len(initial_invoices) >= PAGE_SIZE:
                     # Ci sono quasi certamente altre pagine che non possiamo leggere
                     logger.warning("No xcrud key found with a full first page — PARTIAL fetch")
                     return all_invoices, True
                 logger.info(f"All invoices fit on one page ({len(initial_invoices)})")
-                return all_invoices, False
+                return all_invoices, dropped_rows > 0
 
             xcrud_key = key_input.get("value")
 
-            # Check if there are more pages
-            if len(initial_invoices) < PAGE_SIZE:
-                logger.info(f"All invoices fit on one page ({len(initial_invoices)})")
-                return all_invoices, False
+            # Paginate via xcrud AJAX with jQuery-style nested params.
+            # Si parte da start=0 così TUTTE le pagine (prima inclusa)
+            # condividono lo stesso ordinamento imposto.
+            start = 0
+            page = 1
+            max_pages = 200  # Safety limit
 
-            # Paginate via xcrud AJAX with jQuery-style nested params
-            start = PAGE_SIZE
-            page = 2
-            max_pages = 100  # Safety limit
-
-            while page <= max_pages:
+            while True:
+                if page > max_pages:
+                    logger.warning(
+                        f"Reached max_pages={max_pages} without a natural "
+                        f"end — PARTIAL fetch"
+                    )
+                    partial = True
+                    break
                 ajax_resp = self.client.post(
                     f"{self.base_url}/xcrud/xcrud_ajax.php",
                     data={
@@ -393,6 +423,7 @@ class FatturaProConnector:
                     break
 
                 batch = self._parse_invoice_table(ajax_resp.text, colmap)
+                dropped_rows += self._last_parse_drops
                 if not batch:
                     logger.debug(f"Page {page}: empty — pagination complete")
                     break
@@ -411,7 +442,7 @@ class FatturaProConnector:
                     partial = True
                     break
 
-                all_invoices.extend(batch)
+                _add_batch(batch)
 
                 if page % 10 == 0:
                     logger.info(f"Page {page}: {len(batch)} invoices (running total: {len(all_invoices)})")
@@ -428,6 +459,16 @@ class FatturaProConnector:
 
                 start += PAGE_SIZE
                 page += 1
+
+            if dropped_rows:
+                # Righe che sembravano fatture ma non sono state parsate:
+                # una lista con buchi non deve mai passare per completa
+                # (la payment detection marcherebbe pagate le fatture perse).
+                logger.warning(
+                    f"{dropped_rows} invoice-like rows dropped during "
+                    f"parsing — PARTIAL fetch"
+                )
+                partial = True
 
             logger.info(
                 f"Fetched {len(all_invoices)} overdue invoices total"
@@ -498,6 +539,9 @@ class FatturaProConnector:
             List of parsed invoice dictionaries
         """
         invoices = []
+        # Righe che sembravano dati-fattura ma non sono state parsate:
+        # il chiamante le legge per decidere se il fetch è parziale.
+        self._last_parse_drops = 0
         if colmap is None:
             colmap = {"documento": 0, "data": 1, "destinatario": 2, "totale": 3, "saldo": 4}
         min_cells = max(colmap.values()) + 1
@@ -521,6 +565,11 @@ class FatturaProConnector:
                     # Extract cells
                     cells = row.find_all("td")
                     if len(cells) < min_cells:
+                        if doc_id:
+                            # Una riga con doc_id è una fattura vera: se non
+                            # ha le celle attese è un problema di layout, non
+                            # una riga di riepilogo.
+                            self._last_parse_drops += 1
                         logger.debug(f"Row has {len(cells)} cells, expected >= {min_cells}, skipping")
                         continue
 
@@ -569,12 +618,14 @@ class FatturaProConnector:
                     logger.debug(f"Parsed invoice: {invoice_number} - {customer_name} - {balance}")
 
                 except Exception as e:
+                    self._last_parse_drops += 1
                     logger.warning(f"Error parsing invoice row: {e}")
                     continue
 
             return invoices
 
         except Exception as e:
+            self._last_parse_drops += 1
             logger.error(f"Error parsing invoice table: {e}")
             return []
 
@@ -651,107 +702,24 @@ class FatturaProConnector:
         try:
             logger.debug(f"Fetching invoice detail for doc_id: {doc_id}")
 
-            # Construct detail page URL
-            detail_url = f"{self.base_url}/documenti.php?id={doc_id}&action=edit"
-
-            response = self.client.get(detail_url, timeout=self.timeout)
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
-
+            last_response = None
             detail = {"doc_id": doc_id}
 
-            def _accept_piva(raw: str, source: str) -> bool:
-                """Valida e registra la P.IVA se supera le guardie."""
-                validated = validate_piva(raw)
-                if not validated:
-                    if raw and raw.strip():
-                        logger.warning(
-                            f"Invalid P.IVA for doc {doc_id} from {source}: '{raw}' — discarded"
-                        )
-                    return False
-                if company_piva and validated == company_piva:
-                    logger.warning(
-                        f"P.IVA for doc {doc_id} from {source} is COMPANY_PIVA "
-                        f"(venditore, non destinatario) — discarded"
-                    )
-                    return False
-                detail["piva"] = validated
-                detail["piva_source"] = source
-                return True
+            for variant, response in self._iter_detail_responses(doc_id):
+                if response is None:
+                    continue
+                last_response = response
+                soup = BeautifulSoup(response.text, "html.parser")
+                extracted = self._extract_detail_fields(soup, doc_id, company_piva)
+                if extracted.get("piva") or extracted.get("due_date"):
+                    detail.update(extracted)
+                    if self._detail_working_variant != variant:
+                        self._detail_working_variant = variant
+                        logger.info(f"Detail fetch variant '{variant}' is working for doc {doc_id}")
+                    break
 
-            # Pattern 1: Form field with name containing "piva"/"partitaiva"
-            # (con o senza underscore: xcrud usa nomi tipo "documenti.PartitaIva")
-            piva_input = soup.find(["input", "textarea"], {
-                "name": re.compile(r"(piva|partita_?iva|p\.iva|pivanumber)", re.IGNORECASE)
-            })
-            if piva_input:
-                _accept_piva(piva_input.get("value", ""), "field")
-
-            # Pattern 2: Table cell or label with P.IVA
-            if not detail.get("piva"):
-                piva_label = soup.find(text=re.compile(r"P\.?\s*IVA", re.IGNORECASE))
-                if piva_label:
-                    parent = piva_label.parent
-                    # Try next sibling elements
-                    for sibling in parent.find_next_siblings():
-                        text = sibling.get_text(strip=True)
-                        if text and not re.match(r"^P\.?\s*IVA", text, re.IGNORECASE):
-                            if _accept_piva(text, "label"):
-                                break
-                    # Also try parent's next sibling (common in <td>P.IVA</td><td>VALUE</td>)
-                    if not detail.get("piva"):
-                        next_td = parent.find_next("td")
-                        if next_td:
-                            _accept_piva(next_td.get_text(strip=True), "label")
-
-            # Pattern 3 (full-text): il più soggetto a catturare la P.IVA
-            # sbagliata (es. quella del venditore nel footer). Attivo SOLO
-            # con COMPANY_PIVA configurata, che permette di scartarla.
-            if not detail.get("piva") and company_piva:
-                full_text = soup.get_text()
-                for piva_match in re.finditer(
-                    r'P\.?\s*IVA\s*[:/]?\s*([A-Z]{0,3}\d{8,15})',
-                    full_text,
-                    re.IGNORECASE,
-                ):
-                    if _accept_piva(piva_match.group(1), "fulltext"):
-                        break
-
-            # ── Scadenza reale ──────────────────────────────────────────
-            # Pattern A: campo form con nome contenente "scaden"
-            due_input = soup.find(["input", "select"], {
-                "name": re.compile(r"scaden", re.IGNORECASE)
-            })
-            if due_input and due_input.get("value"):
-                detail["due_date"] = self._parse_detail_date(due_input.get("value"))
-
-            # Pattern B: label/td "Scadenza" seguita dal valore
-            if not detail.get("due_date"):
-                due_label = soup.find(text=re.compile(r"Scadenza", re.IGNORECASE))
-                if due_label:
-                    parent = due_label.parent
-                    for sibling in parent.find_next_siblings():
-                        parsed = self._parse_detail_date(sibling.get_text(strip=True))
-                        if parsed:
-                            detail["due_date"] = parsed
-                            break
-                    if not detail.get("due_date"):
-                        next_td = parent.find_next("td")
-                        if next_td:
-                            detail["due_date"] = self._parse_detail_date(
-                                next_td.get_text(strip=True)
-                            )
-
-            # Pattern C: regex sul testo "Scadenza: gg/mm/aaaa"
-            if not detail.get("due_date"):
-                text_match = re.search(
-                    r"Scadenza\s*[:\-]?\s*(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})",
-                    soup.get_text(),
-                    re.IGNORECASE,
-                )
-                if text_match:
-                    detail["due_date"] = self._parse_detail_date(text_match.group(1))
+            if not detail.get("piva") and not detail.get("due_date"):
+                self._log_detail_diagnostics(doc_id, last_response)
 
             logger.debug(f"Invoice detail: {detail}")
             return detail
@@ -759,6 +727,208 @@ class FatturaProConnector:
         except Exception as e:
             logger.error(f"Error fetching invoice detail for {doc_id}: {e}")
             return None
+
+    def _iter_detail_responses(self, doc_id: str):
+        """Genera (variante, response) per le possibili viste di dettaglio.
+
+        FatturaPro è costruito su xcrud: il form di edit viene normalmente
+        servito via AJAX POST a xcrud_ajax.php (come la paginazione della
+        lista), NON via GET con query string. Il vecchio GET
+        `documenti.php?id=X&action=edit` in produzione restituiva la shell
+        della pagina senza alcun campo (0 P.IVA e 0 scadenze su 588 fatture):
+        qui si tenta prima il GET storico (economico e innocuo), poi le
+        varianti AJAX xcrud.
+        """
+        # Variante 0: GET storico
+        try:
+            resp = self.client.get(
+                f"{self.base_url}/documenti.php?id={doc_id}&action=edit",
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            yield "get", resp
+        except Exception as e:
+            logger.debug(f"Detail GET failed for {doc_id}: {e}")
+            yield "get", None
+
+        # Varianti xcrud AJAX: servono la chiave di sessione della lista
+        xcrud_key = self._xcrud_key or self._get_xcrud_key()
+        if not xcrud_key:
+            return
+
+        # Se una variante ha già funzionato in questa run, provala per prima
+        ajax_tasks = ["edit", "view"]
+        if self._detail_working_variant in ("ajax-view",):
+            ajax_tasks = ["view", "edit"]
+
+        for task in ajax_tasks:
+            for primary_param in ("xcrud[primary]", "xcrud[pk]"):
+                try:
+                    resp = self.client.post(
+                        f"{self.base_url}/xcrud/xcrud_ajax.php",
+                        data={
+                            "xcrud[key]": xcrud_key,
+                            "xcrud[instance]": "documenti",
+                            "xcrud[task]": task,
+                            primary_param: str(doc_id),
+                        },
+                        headers={
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Referer": f"{self.base_url}/documenti.php?s=1",
+                        },
+                        timeout=self.timeout,
+                    )
+                    resp.raise_for_status()
+                    if "xcrud-error" in resp.text:
+                        continue
+                    yield f"ajax-{task}", resp
+                except Exception as e:
+                    logger.debug(f"Detail AJAX {task} failed for {doc_id}: {e}")
+                    continue
+
+    def _extract_detail_fields(self, soup, doc_id: str, company_piva) -> Dict[str, Any]:
+        """Estrae P.IVA e scadenza da un documento di dettaglio già parsato."""
+        from backend.engine.piva import validate_piva
+
+        detail: Dict[str, Any] = {}
+
+        def _accept_piva(raw: str, source: str) -> bool:
+            """Valida e registra la P.IVA se supera le guardie."""
+            validated = validate_piva(raw)
+            if not validated:
+                if raw and raw.strip():
+                    logger.warning(
+                        f"Invalid P.IVA for doc {doc_id} from {source}: '{raw}' — discarded"
+                    )
+                return False
+            if company_piva and validated == company_piva:
+                logger.warning(
+                    f"P.IVA for doc {doc_id} from {source} is COMPANY_PIVA "
+                    f"(venditore, non destinatario) — discarded"
+                )
+                return False
+            detail["piva"] = validated
+            detail["piva_source"] = source
+            return True
+
+        # Pattern 1: Form field with name containing "piva"/"partitaiva"
+        # (con o senza underscore: xcrud usa nomi tipo "documenti.PartitaIva").
+        # find_all: un campo-filtro vuoto non deve oscurare il campo vero.
+        for piva_input in soup.find_all(["input", "textarea"], {
+            "name": re.compile(r"(piva|partita_?iva|p\.iva|pivanumber)", re.IGNORECASE)
+        }):
+            value = piva_input.get("value") or piva_input.get_text(strip=True)
+            if value and _accept_piva(value, "field"):
+                break
+
+        # Pattern 2: Table cell or label with P.IVA
+        if not detail.get("piva"):
+            piva_label = soup.find(text=re.compile(r"P\.?\s*IVA", re.IGNORECASE))
+            if piva_label:
+                parent = piva_label.parent
+                # Try next sibling elements
+                for sibling in parent.find_next_siblings():
+                    text = sibling.get_text(strip=True)
+                    if text and not re.match(r"^P\.?\s*IVA", text, re.IGNORECASE):
+                        if _accept_piva(text, "label"):
+                            break
+                # Also try parent's next sibling (common in <td>P.IVA</td><td>VALUE</td>)
+                if not detail.get("piva"):
+                    next_td = parent.find_next("td")
+                    if next_td:
+                        _accept_piva(next_td.get_text(strip=True), "label")
+
+        # Pattern 3 (full-text): il più soggetto a catturare la P.IVA
+        # sbagliata (es. quella del venditore nel footer). Attivo SOLO
+        # con COMPANY_PIVA configurata, che permette di scartarla.
+        if not detail.get("piva") and company_piva:
+            full_text = soup.get_text()
+            for piva_match in re.finditer(
+                r'P\.?\s*IVA\s*[:/]?\s*([A-Z]{0,3}\d{8,15})',
+                full_text,
+                re.IGNORECASE,
+            ):
+                if _accept_piva(piva_match.group(1), "fulltext"):
+                    break
+
+        # ── Scadenza reale ──────────────────────────────────────────
+        # Pattern A: campo form con nome contenente "scaden". find_all per
+        # non fermarsi a un campo vuoto; i <select> non hanno value → si
+        # legge l'<option selected>.
+        for due_input in soup.find_all(["input", "select"], {
+            "name": re.compile(r"scaden", re.IGNORECASE)
+        }):
+            if due_input.name == "select":
+                selected = due_input.find("option", selected=True)
+                raw_value = None
+                if selected:
+                    raw_value = selected.get("value") or selected.get_text(strip=True)
+            else:
+                raw_value = due_input.get("value")
+            if raw_value:
+                parsed = self._parse_detail_date(raw_value)
+                if parsed:
+                    detail["due_date"] = parsed
+                    break
+
+        # Pattern B: label/td "Scadenza" seguita dal valore
+        if not detail.get("due_date"):
+            due_label = soup.find(text=re.compile(r"Scadenza", re.IGNORECASE))
+            if due_label:
+                parent = due_label.parent
+                for sibling in parent.find_next_siblings():
+                    parsed = self._parse_detail_date(sibling.get_text(strip=True))
+                    if parsed:
+                        detail["due_date"] = parsed
+                        break
+                if not detail.get("due_date"):
+                    next_td = parent.find_next("td")
+                    if next_td:
+                        detail["due_date"] = self._parse_detail_date(
+                            next_td.get_text(strip=True)
+                        )
+
+        # Pattern C: regex sul testo "Scadenza: gg/mm/aaaa"
+        if not detail.get("due_date"):
+            text_match = re.search(
+                r"Scadenza\s*[:\-]?\s*(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})",
+                soup.get_text(),
+                re.IGNORECASE,
+            )
+            if text_match:
+                detail["due_date"] = self._parse_detail_date(text_match.group(1))
+
+        return detail
+
+    def _log_detail_diagnostics(self, doc_id: str, response) -> None:
+        """Diagnostica actionable (una volta per run) quando l'estrazione
+        non trova NIENTE: dice cosa c'è davvero nella pagina scaricata,
+        così il prossimo fix si calibra sul markup reale invece che su
+        markup immaginato."""
+        if self._detail_diag_logged:
+            return
+        self._detail_diag_logged = True
+        if response is None:
+            logger.warning(f"Detail diagnostics for doc {doc_id}: no response at all")
+            return
+        try:
+            soup = BeautifulSoup(response.text, "html.parser")
+            title = soup.title.get_text(strip=True) if soup.title else None
+            field_names = [
+                el.get("name") for el in soup.find_all(["input", "select", "textarea"])
+                if el.get("name")
+            ]
+            low = response.text.lower()
+            logger.warning(
+                "Detail extraction found NOTHING for doc %s — diagnostics: "
+                "final_url=%s len=%d title=%r has_scaden=%s has_piva_text=%s "
+                "form_fields(%d)=%s",
+                doc_id, str(response.url), len(response.text), title,
+                "scaden" in low, bool(re.search(r"p\.?\s*iva", low)),
+                len(field_names), field_names[:25],
+            )
+        except Exception as e:
+            logger.warning(f"Detail diagnostics failed for doc {doc_id}: {e}")
 
     @staticmethod
     def _parse_detail_date(raw: str):
@@ -800,6 +970,8 @@ class FatturaProConnector:
             return invoices
 
         logger.info(f"Enriching {len(need_detail)} invoices from detail pages...")
+        # Una diagnostica fresca per ogni run di enrichment
+        self._detail_diag_logged = False
         piva_count = 0
         due_count = 0
         failed_count = 0
@@ -859,6 +1031,16 @@ class FatturaProConnector:
             f"Detail enrichment complete: {piva_count} P.IVA, {due_count} scadenze reali, "
             f"{failed_count} failed"
         )
+        attempted = len(need_detail) - failed_count
+        if attempted >= 10 and piva_count == 0 and due_count == 0:
+            # Fetch riusciti ma zero campi estratti su TUTTE le pagine: non
+            # sono "dati mancanti", è la pagina/markup sbagliata. Il WARNING
+            # di diagnostica sopra dice cosa contiene davvero la risposta.
+            logger.error(
+                f"Detail markup mismatch: 0 fields extracted from {attempted} "
+                f"successfully-fetched detail pages — the scraper is parsing "
+                f"the wrong page or the form markup changed"
+            )
         return invoices
 
     def request_xml_export(self, date_from: str, date_to: str) -> Optional[bytes]:
