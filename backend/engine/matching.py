@@ -33,6 +33,21 @@ PIVA_NAME_MISMATCH_THRESHOLD = 40
 MIN_DISTINCTIVE_NAME_LEN = 4
 
 
+def piva_contradiction(invoice: Invoice, customer: Optional[Customer]) -> bool:
+    """True se la P.IVA della fattura e quella del cliente abbinato sono
+    ENTRAMBE checksum-valide e DIVERSE: contraddizione deterministica,
+    l'abbinamento è certamente sbagliato.
+
+    Predicato unico condiviso da audit abbinamenti e repair pass: nessuna
+    soglia di somiglianza coinvolta.
+    """
+    if customer is None:
+        return False
+    inv_piva = validate_piva(invoice.customer_piva_raw)
+    cust_piva = validate_piva(customer.partita_iva)
+    return bool(inv_piva and cust_piva and inv_piva != cust_piva)
+
+
 @dataclass
 class MatchResult:
     """Esito del matching di una fattura."""
@@ -123,12 +138,28 @@ def match_invoice_to_customer(
             if normalize_ragione_sociale(c.ragione_sociale or "") == inv_name_norm:
                 name_matches.append(c)
         if len(name_matches) == 1:
-            result.customer = name_matches[0]
+            candidate = name_matches[0]
+            if inv_piva and not validate_piva(candidate.partita_iva):
+                # La fattura HA una P.IVA valida ma il cliente candidato no:
+                # il nome coincide ma l'identità non è verificabile (e la
+                # Strategia 1 non ha trovato quella P.IVA su nessun cliente).
+                # Un omonimo qui creerebbe un nuovo abbinamento sbagliato →
+                # quarantena, decide l'operatore.
+                result.suggested_customer = candidate
+                result.suggested_method = "name_exact_piva_unverified"
+                result.suggested_score = 100
+                logger.warning(
+                    f"Invoice {invoice.invoice_number}: exact name match to "
+                    f"'{candidate.ragione_sociale}' but invoice P.IVA {inv_piva} "
+                    f"is not on the customer — quarantined"
+                )
+                return result
+            result.customer = candidate
             result.method = "name_exact"
             result.score = 100
             logger.info(
                 f"Invoice {invoice.invoice_number} matched to "
-                f"{name_matches[0].ragione_sociale} by normalized name"
+                f"{candidate.ragione_sociale} by normalized name"
             )
             return result
         if len(name_matches) > 1:

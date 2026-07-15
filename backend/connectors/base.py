@@ -8,6 +8,20 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+def parse_retry_after(raw: Any, default: int = 2, cap: int = 60) -> int:
+    """Parse a Retry-After header value tolerantly.
+
+    Shopify manda "2.0" (stringa float): int("2.0") solleva ValueError e
+    l'eccezione buca gli except httpx del retry loop, abbattendo l'intero
+    sync del chiamante. Qui qualsiasi valore non numerico degrada al default.
+    """
+    try:
+        seconds = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(seconds, cap))
+
+
 class BaseConnector:
     """Base class for all API connectors."""
 
@@ -16,6 +30,9 @@ class BaseConnector:
         self.timeout = timeout
         self.max_retries = max_retries
         self.client = httpx.Client(timeout=timeout)
+        # Header dell'ultima risposta riuscita di _request: serve ai
+        # connettori REST che paginano via header Link (Shopify).
+        self.last_response_headers: Optional[httpx.Headers] = None
 
     def _request(
         self,
@@ -43,12 +60,13 @@ class BaseConnector:
 
                 # Rate limit handling
                 if response.status_code == 429:
-                    retry_after = int(response.headers.get("Retry-After", 2))
+                    retry_after = parse_retry_after(response.headers.get("Retry-After"))
                     logger.warning(f"Rate limited on {url}. Waiting {retry_after}s (attempt {attempt})")
                     time.sleep(retry_after)
                     continue
 
                 response.raise_for_status()
+                self.last_response_headers = response.headers
 
                 # Return JSON if possible, otherwise raw text
                 try:
