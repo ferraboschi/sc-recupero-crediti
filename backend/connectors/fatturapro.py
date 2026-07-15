@@ -425,7 +425,19 @@ class FatturaProConnector:
                 batch = self._parse_invoice_table(ajax_resp.text, colmap)
                 dropped_rows += self._last_parse_drops
                 if not batch:
-                    logger.debug(f"Page {page}: empty — pagination complete")
+                    # Un batch vuoto è la fine naturale SOLO se la risposta
+                    # è un frammento xcrud: una sessione scaduta a metà
+                    # paginazione restituisce la pagina di login con status
+                    # 200 (follow_redirects) e chiuderebbe il fetch come
+                    # completo → lista troncata + false "pagate".
+                    if self._looks_like_auth_page(ajax_resp):
+                        logger.warning(
+                            f"Page {page}: session expired mid-pagination "
+                            f"(login page returned) — PARTIAL fetch"
+                        )
+                        partial = True
+                    else:
+                        logger.debug(f"Page {page}: empty — pagination complete")
                     break
 
                 # Sanity guard: un batch con tutti i saldi a zero o tutte le
@@ -479,6 +491,17 @@ class FatturaProConnector:
         except Exception as e:
             logger.error(f"Error fetching overdue invoices: {e}", exc_info=True)
             return all_invoices, True  # Return what we have, flagged as partial
+
+    @staticmethod
+    def _looks_like_auth_page(response) -> bool:
+        """True se la risposta è la pagina di login (sessione scaduta)."""
+        try:
+            if "signin" in str(response.url):
+                return True
+            low = response.text.lower()
+            return 'type="password"' in low or "accesso alla piattaforma" in low
+        except Exception:
+            return False
 
     def _derive_column_map(self, html: str) -> Dict[str, int]:
         """Mappa nome-colonna → indice, derivata dall'header della tabella.
@@ -581,6 +604,11 @@ class FatturaProConnector:
 
                     # Skip summary/total rows (no invoice number or no date)
                     if not invoice_number or not date_str:
+                        if doc_id:
+                            # Riga con doc_id = fattura vera: se numero o
+                            # data sono vuoti è un problema di parsing, non
+                            # una riga di riepilogo — conta come drop.
+                            self._last_parse_drops += 1
                         logger.debug("Skipping row without invoice number or date (likely summary row)")
                         continue
 

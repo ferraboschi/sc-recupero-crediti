@@ -557,11 +557,14 @@ async def reassign_position(
         # ── REGOLA P.IVA IMPRESCINDIBILE ──
         # Se la fattura ha P.IVA e il cliente destinazione ha una P.IVA DIVERSA,
         # bloccare la riassegnazione: P.IVA diverse = entità diverse.
-        # Confronto su P.IVA NORMALIZZATE: 'IT12345678901' e '12345678901'
-        # sono la stessa entità, non un conflitto (prima era un falso 409).
-        from backend.engine.piva import validate_piva
-        inv_piva = validate_piva(position.customer_piva_raw) or ""
-        cust_piva = validate_piva(new_customer.partita_iva) or ""
+        # Confronto su P.IVA NORMALIZZATE ('IT12345678901' e '12345678901'
+        # sono la stessa entità, non un conflitto — prima era un falso 409)
+        # ma NON validate: una P.IVA malformata deve continuare a bloccare,
+        # non a bypassare il 409 (questo è un blocco di sicurezza manuale,
+        # non un match automatico).
+        from backend.engine.piva import normalize_piva
+        inv_piva = normalize_piva(position.customer_piva_raw)
+        cust_piva = normalize_piva(new_customer.partita_iva)
 
         if inv_piva and cust_piva and inv_piva != cust_piva:
             if not force:

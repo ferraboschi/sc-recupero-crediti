@@ -69,7 +69,7 @@ class ShopifyConnector(BaseConnector):
             # nelle pagine successive restano solo limit/fields/page_info.
             params = {
                 "limit": 250,  # Max allowed by Shopify
-                "fields": "id,email,phone,tags,addresses,createdAt",
+                "fields": "id,email,phone,tags,addresses,first_name,last_name",
             }
             if cursor:
                 params["page_info"] = cursor
@@ -156,7 +156,7 @@ class ShopifyConnector(BaseConnector):
 
             params = {
                 "limit": 250,
-                "fields": "id,email,phone,tags,addresses,createdAt",
+                "fields": "id,email,phone,tags,addresses,first_name,last_name",
             }
             if cursor:
                 params["page_info"] = cursor

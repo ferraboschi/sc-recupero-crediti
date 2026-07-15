@@ -81,6 +81,7 @@ class TestDetachOnPivaConflict:
         ):
             _invoice(
                 test_db_session, number, customer=rooftop,
+                customer_name_raw="QOQA SRL",
                 customer_piva_raw=PIVA_QOQA, match_method=method,
             )
 
@@ -90,6 +91,46 @@ class TestDetachOnPivaConflict:
         for number in ("M/2026", "F/2026", "U/2026"):
             inv = test_db_session.query(Invoice).filter_by(invoice_number=number).one()
             assert inv.customer_id == rooftop.id
+
+    def test_concordant_name_blocks_detach(self, test_db_session):
+        """P.IVA in contraddizione ma nome fattura CONCORDE col cliente
+        attuale: il valore avvelenato è sulla FATTURA (fulltext storico) e
+        l'abbinamento è giusto — niente detach, solo review."""
+        rooftop = _customer(test_db_session, "Rooftop SRL", PIVA_ROOFTOP)
+        _customer(test_db_session, "QOQA SRL", PIVA_QOQA)
+        inv = _invoice(
+            test_db_session, "R1/2026", customer=rooftop,
+            customer_name_raw="Rooftop S.R.L.",  # concorda col cliente
+            customer_piva_raw=PIVA_QOQA,          # P.IVA avvelenata
+            match_method="legacy",
+        )
+
+        stats = repair_matches(test_db_session)
+
+        assert stats["piva_conflict_detached"] == 0
+        assert stats["piva_conflict_review"] == 1
+        test_db_session.refresh(inv)
+        assert inv.customer_id == rooftop.id
+        log = test_db_session.query(ActivityLog).filter_by(
+            action="repair_piva_conflict_review"
+        ).all()
+        assert len(log) == 1
+
+    def test_missing_name_blocks_detach(self, test_db_session):
+        """Senza nome raw non c'è evidenza su CHI ha la P.IVA giusta:
+        review manuale, mai detach automatico."""
+        rooftop = _customer(test_db_session, "Rooftop SRL", PIVA_ROOFTOP)
+        _customer(test_db_session, "QOQA SRL", PIVA_QOQA)
+        inv = _invoice(
+            test_db_session, "R2/2026", customer=rooftop,
+            customer_name_raw=None, customer_piva_raw=PIVA_QOQA,
+            match_method="legacy",
+        )
+        stats = repair_matches(test_db_session)
+        assert stats["piva_conflict_detached"] == 0
+        assert stats["piva_conflict_review"] == 1
+        test_db_session.refresh(inv)
+        assert inv.customer_id == rooftop.id
 
     def test_paid_invoices_not_detached(self, test_db_session):
         """Il repair v1 lavora sulle non pagate (le pagate emergono
@@ -136,6 +177,44 @@ class TestLegacyRematch:
         assert inv.customer_id == battiato.id
         assert inv.match_method == "piva"
 
+    def test_relink_blocked_when_name_confirms_current_customer(self, test_db_session):
+        """La P.IVA della fattura punta a un altro cliente ma il NOME
+        conferma quello attuale: P.IVA sospetta → review, non relink."""
+        izakaya = _customer(test_db_session, "iZAKAYA8", None)
+        _customer(test_db_session, "Battiato Loris", PIVA_QOQA)
+        inv = _invoice(
+            test_db_session, "1079/2026", customer=izakaya,
+            customer_name_raw="IZAKAYA8",  # concorda col cliente attuale
+            customer_piva_raw=PIVA_QOQA,
+            match_method="legacy",
+        )
+        stats = repair_matches(test_db_session)
+        assert stats["legacy_piva_relink_detached"] == 0
+        assert stats["legacy_review_logged"] == 1
+        test_db_session.refresh(inv)
+        assert inv.customer_id == izakaya.id
+
+    def test_name_exact_disagreement_logged_for_review(self, test_db_session):
+        """Il motore nuovo troverebbe un name_exact AUTOMATICO su un
+        cliente diverso: non si tocca nulla ma la review viene tracciata
+        (era il ramo mancante)."""
+        wrong = _customer(test_db_session, "Cliente Sbagliato SRL", None)
+        _customer(test_db_session, "QOQA SRL", None)
+        inv = _invoice(
+            test_db_session, "NE/2026", customer=wrong,
+            customer_name_raw="QOQA S.R.L.", match_method="legacy",
+        )
+        stats = repair_matches(test_db_session)
+        assert stats["legacy_review_logged"] >= 1
+        test_db_session.refresh(inv)
+        assert inv.customer_id == wrong.id
+        log = test_db_session.query(ActivityLog).filter_by(
+            action="repair_legacy_review"
+        ).all()
+        assert any(
+            (entry.details or {}).get("invoice_number") == "NE/2026" for entry in log
+        )
+
     def test_uncertain_disagreement_only_logged(self, test_db_session):
         """Senza certezza P.IVA il repair non tocca nulla: solo un
         ActivityLog di review."""
@@ -167,6 +246,7 @@ class TestReconciliation:
         test_db_session.commit()
         inv = _invoice(
             test_db_session, "993/2026", customer=rooftop,
+            customer_name_raw="QOQA SRL",
             customer_piva_raw=PIVA_QOQA, match_method="legacy", case_id=case.id,
         )
         todo = RecoveryAction(
@@ -199,10 +279,12 @@ class TestReconciliation:
         # Fattura sbagliata (di QOQA) + fattura PROPRIA di Rooftop, entrambe scadute
         _invoice(
             test_db_session, "993/2026", customer=rooftop,
+            customer_name_raw="QOQA SRL",
             customer_piva_raw=PIVA_QOQA, match_method="legacy", case_id=case.id,
         )
         _invoice(
             test_db_session, "500/2026", customer=rooftop,
+            customer_name_raw="Rooftop SRL",
             customer_piva_raw=PIVA_ROOFTOP, match_method="piva", case_id=case.id,
         )
 

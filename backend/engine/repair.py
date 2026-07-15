@@ -41,10 +41,12 @@ from backend.database import (
 )
 from backend.engine.matching import (
     match_invoice_to_customer, piva_contradiction, run_matching,
+    PIVA_NAME_MISMATCH_THRESHOLD,
 )
 from backend.engine.cases import (
     close_case, get_open_case, is_overdue_unpaid, _refresh_customer_status,
 )
+from backend.engine.normalizer import are_similar
 from backend.engine.piva import validate_piva
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,18 @@ logger = logging.getLogger(__name__)
 HUMAN_DECIDED_METHODS = ("manual", "fuzzy_confirmed", "unlinked")
 
 REPAIR_MARKER_KEY = "match_repair_v1"
+
+# Sopra questa somiglianza il nome della fattura CONFERMA il cliente attuale.
+NAME_CONCORDANT_THRESHOLD = 75
+
+
+def _name_score_vs_customer(invoice: Invoice, customer: Customer):
+    """Somiglianza nome-fattura vs cliente attuale, o None se non calcolabile."""
+    inv_name = (invoice.customer_name_raw or "").strip()
+    if not inv_name or not customer.ragione_sociale:
+        return None
+    _, score = are_similar(inv_name, customer.ragione_sociale, threshold=100)
+    return int(score)
 
 
 def _detach(invoice: Invoice) -> None:
@@ -76,6 +90,7 @@ def repair_matches(session: Session) -> Dict[str, Any]:
     now = datetime.utcnow()
     stats = {
         "piva_conflict_detached": 0,
+        "piva_conflict_review": 0,
         "legacy_promoted": 0,
         "legacy_piva_relink_detached": 0,
         "legacy_review_logged": 0,
@@ -99,29 +114,51 @@ def repair_matches(session: Session) -> Dict[str, Any]:
             customers_by_id[c.id] = c
     all_customers = session.query(Customer).all()
 
-    # ── Passo 1: detach deterministico su contraddizione P.IVA ──────
+    # ── Passo 1: detach su contraddizione P.IVA confermata dal nome ──
+    # La contraddizione P.IVA da sola NON basta: il valore avvelenato può
+    # stare sulla FATTURA (customer_piva_raw scrappato dal full-text prima
+    # delle guardie: es. la P.IVA del venditore), nel qual caso
+    # l'abbinamento per nome è quello giusto e scollegarlo lo
+    # distruggerebbe. Si scollega solo quando anche il NOME dice che la
+    # fattura è di qualcun altro (score < soglia anti-poisoning); ogni
+    # altra contraddizione va in review manuale.
     for inv in attached:
         if inv.match_method in HUMAN_DECIDED_METHODS:
             continue
         cust = customers_by_id.get(inv.customer_id)
         if cust is None or not piva_contradiction(inv, cust):
             continue
-        session.add(ActivityLog(
-            action="repair_piva_conflict",
-            entity_type="invoice",
-            entity_id=inv.id,
-            details={
-                "invoice_number": inv.invoice_number,
-                "old_customer_id": cust.id,
-                "old_customer_name": cust.ragione_sociale,
-                "invoice_piva": validate_piva(inv.customer_piva_raw),
-                "customer_piva": validate_piva(cust.partita_iva),
-                "old_match_method": inv.match_method,
-            },
-        ))
-        _detach(inv)
-        touched_customer_ids.add(cust.id)
-        stats["piva_conflict_detached"] += 1
+        name_score = _name_score_vs_customer(inv, cust)
+        details = {
+            "invoice_number": inv.invoice_number,
+            "old_customer_id": cust.id,
+            "old_customer_name": cust.ragione_sociale,
+            "invoice_piva": validate_piva(inv.customer_piva_raw),
+            "customer_piva": validate_piva(cust.partita_iva),
+            "old_match_method": inv.match_method,
+            "name_score": name_score,
+        }
+        if name_score is not None and name_score < PIVA_NAME_MISMATCH_THRESHOLD:
+            session.add(ActivityLog(
+                action="repair_piva_conflict",
+                entity_type="invoice",
+                entity_id=inv.id,
+                details=details,
+            ))
+            _detach(inv)
+            touched_customer_ids.add(cust.id)
+            stats["piva_conflict_detached"] += 1
+        else:
+            # Nome concordante, ambiguo o assente: nessuna azione
+            # automatica, emerge dall'audit (verdetto 'bad'/'warn') e
+            # decide l'operatore.
+            session.add(ActivityLog(
+                action="repair_piva_conflict_review",
+                entity_type="invoice",
+                entity_id=inv.id,
+                details=details,
+            ))
+            stats["piva_conflict_review"] += 1
 
     # ── Passo 2: re-match advisory delle 'legacy' rimaste ───────────
     for inv in attached:
@@ -129,6 +166,10 @@ def repair_matches(session: Session) -> Dict[str, Any]:
             continue
         cust = customers_by_id.get(inv.customer_id)
         if cust is None:
+            continue
+        if piva_contradiction(inv, cust):
+            # Già gestita (o mandata in review) dal passo 1: qui un relink
+            # aggirerebbe la guardia nome appena applicata.
             continue
         result = match_invoice_to_customer(inv, all_customers, session)
         if result.customer is not None and result.customer.id == inv.customer_id:
@@ -138,23 +179,54 @@ def repair_matches(session: Session) -> Dict[str, Any]:
             stats["legacy_promoted"] += 1
         elif result.customer is not None and result.method == "piva":
             # Certezza P.IVA su un cliente DIVERSO (il vecchio cliente non
-            # ha P.IVA, altrimenti sarebbe già scattato il passo 1):
-            # detach e riabbinamento via matching sicuro.
+            # ha P.IVA, altrimenti sarebbe già scattato il passo 1).
+            # Stessa cautela del passo 1: se il nome della fattura CONFERMA
+            # il cliente attuale, la P.IVA della fattura è sospetta →
+            # review, non relink.
+            name_score = _name_score_vs_customer(inv, cust)
+            log_details = {
+                "invoice_number": inv.invoice_number,
+                "old_customer_id": cust.id,
+                "old_customer_name": cust.ragione_sociale,
+                "new_customer_id": result.customer.id,
+                "new_customer_name": result.customer.ragione_sociale,
+                "name_score_vs_old": name_score,
+            }
+            if name_score is not None and name_score >= NAME_CONCORDANT_THRESHOLD:
+                session.add(ActivityLog(
+                    action="repair_legacy_review",
+                    entity_type="invoice",
+                    entity_id=inv.id,
+                    details=log_details,
+                ))
+                stats["legacy_review_logged"] += 1
+            else:
+                session.add(ActivityLog(
+                    action="repair_legacy_piva_relink",
+                    entity_type="invoice",
+                    entity_id=inv.id,
+                    details=log_details,
+                ))
+                _detach(inv)
+                touched_customer_ids.add(cust.id)
+                stats["legacy_piva_relink_detached"] += 1
+        elif result.customer is not None and result.customer.id != inv.customer_id:
+            # Disaccordo AUTOMATICO non-P.IVA (name_exact univoco su un
+            # altro cliente): il più forte dopo la P.IVA — non si tocca
+            # nulla ma va tracciato per la review.
             session.add(ActivityLog(
-                action="repair_legacy_piva_relink",
+                action="repair_legacy_review",
                 entity_type="invoice",
                 entity_id=inv.id,
                 details={
                     "invoice_number": inv.invoice_number,
-                    "old_customer_id": cust.id,
-                    "old_customer_name": cust.ragione_sociale,
-                    "new_customer_id": result.customer.id,
-                    "new_customer_name": result.customer.ragione_sociale,
+                    "customer_id": cust.id,
+                    "customer_name": cust.ragione_sociale,
+                    "disagree_customer_id": result.customer.id,
+                    "disagree_method": result.method,
                 },
             ))
-            _detach(inv)
-            touched_customer_ids.add(cust.id)
-            stats["legacy_piva_relink_detached"] += 1
+            stats["legacy_review_logged"] += 1
         elif result.suggested_customer is not None and result.suggested_customer.id != inv.customer_id:
             # Il motore nuovo la vedrebbe diversamente ma senza certezza:
             # non si tocca nulla, si lascia traccia per la review manuale
@@ -191,7 +263,13 @@ def repair_matches(session: Session) -> Dict[str, Any]:
         try:
             run_matching(session)
         except Exception as e:
+            # Rollback esplicito: senza, la sessione resta invalidata e il
+            # passo 4 (riconciliazione) salterebbe in blocco.
             logger.error(f"Post-repair matching failed (next sync will retry): {e}")
+            try:
+                session.rollback()
+            except Exception:
+                pass
 
     # ── Passo 4: riconciliazione dei clienti che hanno perso fatture ─
     for cust_id in touched_customer_ids:
@@ -242,8 +320,22 @@ def reconcile_customer_after_detach(
 
 
 def run_repair_if_needed() -> Optional[Dict[str, Any]]:
-    """Entry point per lo startup: esegue il repair se mai completato."""
+    """Entry point per lo startup: esegue il repair se mai completato.
+
+    Prende il lock globale del sync: un sync manuale via API nei primi
+    secondi dopo il deploy non deve interlacciarsi col detach (matching e
+    auto-create concorrenti creerebbero duplicati/quarantene). Import
+    lazy per non trascinare i router FastAPI dentro il modulo engine.
+    """
     from backend.database import get_session_direct
+    from backend.api.sync import _sync_lock
+
+    if not _sync_lock.acquire(timeout=300):
+        logger.error(
+            "Match repair skipped: sync lock busy after 300s "
+            "(will retry at next startup)"
+        )
+        return None
     session = get_session_direct()
     try:
         return repair_matches(session)
@@ -253,3 +345,4 @@ def run_repair_if_needed() -> Optional[Dict[str, Any]]:
         return None
     finally:
         session.close()
+        _sync_lock.release()

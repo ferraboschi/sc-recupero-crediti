@@ -124,6 +124,39 @@ class TestUniformAjaxPagination:
         assert partial is True
         assert len(invoices) == 10
 
+    def test_login_page_mid_pagination_marks_partial(self, monkeypatch):
+        """Sessione scaduta a metà: il POST xcrud restituisce la pagina di
+        login (200, zero righe). Non è la fine naturale della lista — il
+        fetch deve risultare PARTIAL o la payment detection marcherebbe
+        pagate tutte le fatture oltre il punto di rottura."""
+        rendered = _page([_row("FT-R")])
+        page1 = _page([_row(f"FT-{i}") for i in range(10)], with_key=False, with_header=False)
+        login_page = (
+            '<html><body><h1>Accesso alla piattaforma</h1>'
+            '<input type="password" name="pwd"></body></html>'
+        )
+        conn, _ = _connector(monkeypatch, rendered, [page1, login_page])
+
+        invoices, partial = conn.fetch_overdue_invoices()
+
+        assert partial is True
+        assert len(invoices) == 10
+
+    def test_empty_number_row_with_doc_id_counts_as_drop(self, monkeypatch):
+        rendered = _page([_row("FT-R")])
+        ghost_row = (
+            '<tr><td></td><td>01/05/2026</td><td>Cliente</td>'
+            '<td>10,00</td><td>10,00</td>'
+            '<td><a data-doc_id="77" href="#">x</a></td></tr>'
+        )
+        page1 = _page([_row("FT-0"), ghost_row], with_key=False, with_header=False)
+        conn, _ = _connector(monkeypatch, rendered, [page1])
+
+        invoices, partial = conn.fetch_overdue_invoices()
+
+        assert partial is True
+        assert [inv["invoice_number"] for inv in invoices] == ["FT-0"]
+
 
 class TestDetailMultiAttempt:
     DETAIL_FORM = """

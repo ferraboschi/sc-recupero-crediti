@@ -292,6 +292,40 @@ class TestCustomerAdoption:
         assert rows[0].shopify_id == "gid://shopify/Customer/777"
         assert rows[0].email == "qoqa@example.com"
         assert rows[0].phone == "+39 333 000 1111"
+        # Il nome derivato dalle fatture NON viene sovrascritto da Shopify:
+        # è quello su cui lavora il matching per nome.
+        assert rows[0].ragione_sociale == "QOQA"
+
+    def test_empty_shopify_name_never_overwrites(self, monkeypatch, test_db_session):
+        """Un profilo Shopify senza company produce ragione_sociale="":
+        non deve azzerare il nome buono già in anagrafica."""
+        existing = Customer(
+            shopify_id="gid://shopify/Customer/777",
+            ragione_sociale="QOQA SRL",
+            ragione_sociale_normalized="qoqa",
+            source="shopify",
+        )
+        test_db_session.add(existing)
+        test_db_session.commit()
+
+        def empty_name_fetch(self):
+            return [{
+                "shopify_id": "gid://shopify/Customer/777",
+                "ragione_sociale": "",
+                "partita_iva": None, "codice_fiscale": None, "codice_sdi": None,
+                "phone": None, "phones": None, "email": "x@example.com", "tags": "B2B",
+            }]
+
+        monkeypatch.setattr(FakeShopify, "fetch_b2b_customers", empty_name_fetch)
+        self._run(monkeypatch, test_db_session)
+
+        # re-query: il task chiude la sessione e stacca le istanze
+        row = test_db_session.query(Customer).filter_by(
+            shopify_id="gid://shopify/Customer/777"
+        ).one()
+        assert row.ragione_sociale == "QOQA SRL"
+        assert row.ragione_sociale_normalized == "qoqa"
+        assert row.email == "x@example.com"
 
     def test_new_customer_still_created_when_no_orphan(self, monkeypatch, test_db_session):
         result = self._run(monkeypatch, test_db_session)
@@ -385,6 +419,36 @@ class TestMatchAuditV2:
         items = resp.json()["items"]
         assert len(items) == 1
         assert items[0]["verdict"] == "bad"
+
+
+# ── Reassign: confronto P.IVA normalizzato ma NON validato ───────────
+
+class TestReassignPivaGuard:
+    def test_it_prefix_same_piva_no_false_409(self, test_client, test_db_session):
+        cust = Customer(ragione_sociale="QOQA SRL", partita_iva=PIVA_A, source="shopify")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        inv = _mk_invoice(
+            test_db_session, "RA/2026", customer_piva_raw=f"IT{PIVA_A}",
+        )
+        resp = test_client.put(
+            f"/api/positions/{inv.id}/reassign?new_customer_id={cust.id}"
+        )
+        assert resp.status_code == 200
+
+    def test_malformed_piva_still_blocks(self, test_client, test_db_session):
+        """Una P.IVA presente ma checksum-invalida NON deve bypassare il
+        blocco: è un guard di sicurezza manuale, non un match automatico."""
+        cust = Customer(ragione_sociale="Altro SRL", partita_iva=PIVA_B, source="shopify")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        inv = _mk_invoice(
+            test_db_session, "RB/2026", customer_piva_raw="12345678901",  # invalida
+        )
+        resp = test_client.put(
+            f"/api/positions/{inv.id}/reassign?new_customer_id={cust.id}"
+        )
+        assert resp.status_code == 409
 
 
 # ── Matching: name_exact con P.IVA non verificabile ──────────────────

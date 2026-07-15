@@ -175,13 +175,15 @@ def _sync_invoices_task() -> dict:
                             f"capping to {detail_limit} per sync cycle"
                         )
                         invoices_needing_detail = invoices_needing_detail[:detail_limit]
+                attempted_numbers = set()
+                if invoices_needing_detail:
                     fatturapro.enrich_invoices_from_detail(invoices_needing_detail, delay=0.3)
 
                     # Marca il tentativo (riuscito o no) così il prossimo
                     # ciclo ruota su fatture diverse.
-                    attempted_numbers = [
+                    attempted_numbers = {
                         inv["invoice_number"] for inv in invoices_needing_detail
-                    ]
+                    }
                     session.query(Invoice).filter(
                         Invoice.source_platform == "fatturapro",
                         Invoice.invoice_number.in_(attempted_numbers),
@@ -245,6 +247,13 @@ def _sync_invoices_task() -> dict:
                             customer_piva_raw=inv.get("customer_piva"),
                             source_platform="fatturapro",
                             source_id=inv.get("doc_id"),
+                            # Il bulk-update dei tentativi gira PRIMA di
+                            # questo insert: senza lo stamp qui, le fatture
+                            # nuove monopolizzerebbero il cap al prossimo
+                            # ciclo pur essendo appena state arricchite.
+                            detail_attempted_at=(
+                                datetime.utcnow() if inv_num in attempted_numbers else None
+                            ),
                         )
                         session.add(new_invoice)
                         created += 1
@@ -446,24 +455,45 @@ def _sync_customers_task() -> dict:
                         shopify_id=cust["shopify_id"]
                     ).first()
 
+                    was_adopted = False
+                    cust_piva = validate_piva(cust.get("partita_iva"))
                     if not existing:
-                        cust_piva = validate_piva(cust.get("partita_iva"))
                         orphan = orphans_by_piva.pop(cust_piva, None) if cust_piva else None
                         if orphan is not None:
                             orphan.shopify_id = cust["shopify_id"]
                             existing = orphan
+                            was_adopted = True
                             adopted += 1
                             logger.info(
                                 f"Adopted fatturapro-born customer "
                                 f"'{orphan.ragione_sociale}' (P.IVA {cust_piva}) "
                                 f"→ Shopify {cust['shopify_id']}"
                             )
+                    elif cust_piva and cust_piva in orphans_by_piva:
+                        # Il cliente Shopify esiste già E c'è un orfano con
+                        # la stessa P.IVA: duplicato che manderà le fatture
+                        # in quarantena piva_ambiguous. Il merge di due
+                        # anagrafiche (fatture/pratiche/azioni) è manuale:
+                        # lo si segnala, non lo si improvvisa.
+                        dup = orphans_by_piva[cust_piva]
+                        logger.warning(
+                            f"Duplicate customers with P.IVA {cust_piva}: "
+                            f"Shopify '{existing.ragione_sociale}' (id {existing.id}) "
+                            f"+ fatturapro-born '{dup.ragione_sociale}' (id {dup.id}) "
+                            f"— merge manuale necessario"
+                        )
 
                     if existing:
-                        existing.ragione_sociale = cust.get("ragione_sociale", existing.ragione_sociale)
-                        existing.ragione_sociale_normalized = normalize_ragione_sociale(
-                            cust.get("ragione_sociale", "")
-                        )
+                        # Mai sovrascrivere un nome buono con uno vuoto (un
+                        # profilo Shopify senza company produce ""), e per i
+                        # clienti ADOTTATI tenere il nome derivato dalle
+                        # fatture: è quello su cui lavora il matching.
+                        parsed_name = (cust.get("ragione_sociale") or "").strip()
+                        if parsed_name and not (was_adopted and existing.ragione_sociale):
+                            existing.ragione_sociale = parsed_name
+                            existing.ragione_sociale_normalized = normalize_ragione_sociale(
+                                parsed_name
+                            )
                         existing.partita_iva = cust.get("partita_iva") or existing.partita_iva
                         existing.codice_fiscale = cust.get("codice_fiscale") or existing.codice_fiscale
                         existing.codice_sdi = cust.get("codice_sdi") or existing.codice_sdi
