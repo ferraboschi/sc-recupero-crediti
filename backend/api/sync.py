@@ -133,64 +133,36 @@ def _sync_invoices_task() -> dict:
                 piva_enriched = 0
                 due_enriched = 0
 
-                # ── ENRICHMENT dettaglio (P.IVA + scadenza reale) ──
-                # Serve il dettaglio per le fatture nuove e per quelle già
-                # note senza P.IVA o senza scadenza reale.
-                existing_rows = session.query(
-                    Invoice.invoice_number, Invoice.customer_piva_raw,
-                    Invoice.due_date_source, Invoice.detail_attempted_at,
-                ).filter(Invoice.source_platform == "fatturapro").all()
-                complete_invoice_numbers = {
-                    row.invoice_number for row in existing_rows
-                    if row.customer_piva_raw and row.due_date_source == "real"
-                }
-                attempted_at_by_number = {
-                    row.invoice_number: row.detail_attempted_at
-                    for row in existing_rows
-                }
+                # ── ENRICHMENT via scadenzario + anagrafica ──
+                # La scadenza reale viene dallo scadenzario (join per numero
+                # fattura), la P.IVA/telefono/email dall'anagrafica (join per
+                # nome destinatario). Sostituisce lo scraping del form di
+                # dettaglio (nomi campo Base64, richiesta xcrud stateful non
+                # replicabile). Soft-fail: se una lista non arriva, si procede
+                # senza — le scadenze restano 'assumed' fino al prossimo giro.
+                from backend.connectors.fatturapro import doc_key as _doc_key
+                try:
+                    scadenze_map, _scad_ok = fatturapro.fetch_scadenze_map()
+                except Exception as e:
+                    logger.error(f"Scadenzario fetch failed: {e}")
+                    scadenze_map = {}
+                try:
+                    clienti_map, _cli_ok = fatturapro.fetch_clienti_map()
+                except Exception as e:
+                    logger.error(f"Anagrafica fetch failed: {e}")
+                    clienti_map = {}
 
-                invoices_needing_detail = [
-                    inv for inv in raw_invoices
-                    if inv.get("doc_id")
-                    and inv["invoice_number"] not in complete_invoice_numbers
-                ]
-
-                # Rotazione: prima le fatture mai tentate, poi quelle col
-                # tentativo più vecchio. Senza questo ordinamento il cap
-                # riprovava per sempre le stesse N fatture in testa alla
-                # lista (le più recenti), lasciando le altre a digiuno.
-                invoices_needing_detail.sort(
-                    key=lambda inv: (
-                        attempted_at_by_number.get(inv["invoice_number"]) is not None,
-                        attempted_at_by_number.get(inv["invoice_number"]) or datetime.min,
-                    )
-                )
-
-                # Cap enrichment to avoid long-running syncs
-                detail_limit = config.DETAIL_ENRICHMENT_LIMIT
-                if invoices_needing_detail:
-                    if len(invoices_needing_detail) > detail_limit:
-                        logger.info(
-                            f"Detail enrichment: {len(invoices_needing_detail)} invoices need it, "
-                            f"capping to {detail_limit} per sync cycle"
-                        )
-                        invoices_needing_detail = invoices_needing_detail[:detail_limit]
-                attempted_numbers = set()
-                if invoices_needing_detail:
-                    fatturapro.enrich_invoices_from_detail(invoices_needing_detail, delay=0.3)
-
-                    # Marca il tentativo (riuscito o no) così il prossimo
-                    # ciclo ruota su fatture diverse.
-                    attempted_numbers = {
-                        inv["invoice_number"] for inv in invoices_needing_detail
-                    }
-                    session.query(Invoice).filter(
-                        Invoice.source_platform == "fatturapro",
-                        Invoice.invoice_number.in_(attempted_numbers),
-                    ).update(
-                        {Invoice.detail_attempted_at: datetime.utcnow()},
-                        synchronize_session=False,
-                    )
+                # Aggancia scadenza + P.IVA/contatti a ogni fattura grezza
+                for inv in raw_invoices:
+                    due = scadenze_map.get(_doc_key(inv["invoice_number"]))
+                    if due:
+                        inv["due_date"] = due
+                    cust = clienti_map.get((inv.get("customer_name") or "").strip().lower())
+                    if cust:
+                        if cust.get("piva"):
+                            inv["customer_piva"] = cust["piva"]
+                        inv["customer_phone"] = cust.get("phone")
+                        inv["customer_email"] = cust.get("email")
 
                 # Build set of invoice numbers currently overdue in FatturaPro
                 fetched_invoice_numbers = set()
@@ -216,16 +188,16 @@ def _sync_invoices_task() -> dict:
                             existing.customer_name_raw = inv.get("customer_name")
                         if inv.get("date"):
                             existing.issue_date = inv["date"]
-                        # Enrich P.IVA if we found one and existing doesn't have it
-                        if inv.get("customer_piva") and not existing.customer_piva_raw:
+                        # P.IVA dall'anagrafica (join per nome): fonte
+                        # autorevole. Sovrascrive anche un valore vecchio
+                        # sbagliato (es. P.IVA del venditore scrappata dal
+                        # full-text) → il repair/matching potrà correggere
+                        # l'abbinamento.
+                        if inv.get("customer_piva") and existing.customer_piva_raw != inv["customer_piva"]:
                             existing.customer_piva_raw = inv["customer_piva"]
                             piva_enriched += 1
-                            logger.info(
-                                f"Enriched existing invoice {inv_num} with P.IVA: "
-                                f"{inv['customer_piva']}"
-                            )
-                        # Scadenza REALE trovata: sovrascrive anche una
-                        # scadenza 'assumed' sintetizzata in passato.
+                        # Scadenza REALE dallo scadenzario: sovrascrive anche
+                        # una scadenza 'assumed' sintetizzata in passato.
                         if inv.get("due_date") and existing.due_date_source != "real":
                             existing.due_date = inv["due_date"]
                             existing.due_date_source = "real"
@@ -247,13 +219,6 @@ def _sync_invoices_task() -> dict:
                             customer_piva_raw=inv.get("customer_piva"),
                             source_platform="fatturapro",
                             source_id=inv.get("doc_id"),
-                            # Il bulk-update dei tentativi gira PRIMA di
-                            # questo insert: senza lo stamp qui, le fatture
-                            # nuove monopolizzerebbero il cap al prossimo
-                            # ciclo pur essendo appena state arricchite.
-                            detail_attempted_at=(
-                                datetime.utcnow() if inv_num in attempted_numbers else None
-                            ),
                         )
                         session.add(new_invoice)
                         created += 1
@@ -307,16 +272,43 @@ def _sync_invoices_task() -> dict:
                     logger.warning("PARTIAL fetch — payment detection skipped")
 
                 session.commit()
+
+                # ── Contatti (telefono/email) dall'anagrafica FatturaPro ──
+                # Aggancia per nome ai Customer che ne sono privi: risolve i
+                # profili "muti" nati dalle fatture (senza passare da Shopify).
+                contacts_enriched = 0
+                if clienti_map:
+                    for customer in session.query(Customer).filter(
+                        (Customer.phone.is_(None)) | (Customer.email.is_(None))
+                    ).all():
+                        info = clienti_map.get((customer.ragione_sociale or "").strip().lower())
+                        if not info:
+                            continue
+                        changed = False
+                        if info.get("phone") and not customer.phone:
+                            customer.phone = info["phone"]
+                            changed = True
+                        if info.get("email") and not customer.email:
+                            customer.email = info["email"]
+                            changed = True
+                        if changed:
+                            customer.updated_at = datetime.utcnow()
+                            contacts_enriched += 1
+                    if contacts_enriched:
+                        session.commit()
+
                 result["fatturapro"]["success"] = True
                 result["fatturapro"]["created"] = created
                 result["fatturapro"]["updated"] = updated
                 result["fatturapro"]["paid_detected"] = paid_detected
                 result["fatturapro"]["piva_enriched"] = piva_enriched
                 result["fatturapro"]["due_date_enriched"] = due_enriched
+                result["fatturapro"]["contacts_enriched"] = contacts_enriched
                 logger.info(
                     f"FatturaPro sync: created={created}, updated={updated}, "
                     f"paid_detected={paid_detected}, piva_enriched={piva_enriched}, "
-                    f"due_dates={due_enriched}, partial={result['fatturapro']['partial']}"
+                    f"due_dates={due_enriched}, contacts={contacts_enriched}, "
+                    f"partial={result['fatturapro']['partial']}"
                 )
             else:
                 result["fatturapro"]["error"] = (
@@ -1001,6 +993,30 @@ def _full_sync_task() -> dict:
         except Exception as e:
             logger.error(f"Customer sync failed: {e}", exc_info=True)
             results["customers"] = {"error": str(e)}
+
+        # Step 2.5: Repair una-tantum degli abbinamenti (marker match_repair_v2).
+        # Gira QUI, dopo che il sync fatture ha popolato le P.IVA reali
+        # dall'anagrafica (allo startup non c'erano ancora → 0 detach): ora
+        # le contraddizioni P.IVA sono visibili e i casi legacy tipo
+        # QOQA→Rooftop possono essere separati. Il lock è già del full sync,
+        # quindi si chiama repair_matches direttamente (niente doppio lock).
+        # SOLO su sync fatture completo: con un fetch parziale le P.IVA non
+        # sono tutte popolate e il repair (one-shot) sprecherebbe l'occasione.
+        inv_res = results.get("invoices", {})
+        fp_res = inv_res.get("fatturapro", {}) if isinstance(inv_res, dict) else {}
+        if fp_res.get("success") and not fp_res.get("partial"):
+            try:
+                from backend.engine.repair import repair_matches
+                repair_session = get_session_direct()
+                try:
+                    results["repair"] = repair_matches(repair_session)
+                finally:
+                    repair_session.close()
+            except Exception as e:
+                logger.error(f"Match repair (in sync) failed: {e}", exc_info=True)
+                results["repair"] = {"error": str(e)}
+        else:
+            logger.info("Match repair skipped: invoice sync incomplete/partial (will retry next cycle)")
 
         # Step 3: Matching (abbinamenti sicuri + quarantena suggerimenti)
         try:

@@ -6,8 +6,8 @@ with BeautifulSoup4 for parsing HTML responses from the xcrud AJAX framework.
 
 import logging
 import re
-from datetime import datetime
-from typing import Optional, List, Dict, Any
+from datetime import datetime, date
+from typing import Optional, List, Dict, Any, Tuple
 import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -15,6 +15,46 @@ from urllib.parse import urljoin
 from backend.config import config
 
 logger = logging.getLogger(__name__)
+
+
+def doc_key(raw: str) -> str:
+    """Chiave canonica per il JOIN fattura↔scadenzario/anagrafica.
+
+    Lo scadenzario elenca "1170/SAK del 24/06/2026", la lista fatture
+    "2026/00001170/SAK - Fattura": entrambe collassano su "1170/SAK"
+    (progressivo senza zeri iniziali + suffisso serie, anno scartato).
+    Replica la logica provata in produzione da SC-order-app.
+    """
+    head = re.split(r"\s+del\s+", str(raw or ""), flags=re.IGNORECASE)[0]
+    head = re.sub(r"\s*[-–]\s*(Fattura|Nota.*|Ricevuta).*", "", head, flags=re.IGNORECASE).strip()
+    parts = [p.strip() for p in head.split("/") if p.strip()]
+    numeric = [p for p in parts if p.isdigit()]
+    suffix = next((p.upper() for p in parts if re.search(r"[A-Za-z]", p)), "")
+
+    def _is_year(p: str) -> bool:
+        # Anno "nudo" a 4 cifre (1900-2099); il progressivo zero-paddato
+        # ("00001093", 8 char) non viene scambiato per un anno.
+        return len(p) == 4 and 1900 <= int(p) <= 2099
+
+    # Scarta l'anno solo se resta almeno un altro gruppo numerico (il progressivo)
+    candidates = [p for p in numeric if not _is_year(p)] or numeric
+    if not candidates:
+        return head.upper()
+    # Il progressivo è il gruppo (rimasto) con la stringa più lunga
+    prog = max(candidates, key=len)
+    num = str(int(prog))
+    return f"{num}/{suffix}" if suffix else num
+
+
+def _it_date_to_date(s: str) -> Optional[date]:
+    """'gg/mm/aaaa' → date, o None."""
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", str(s or ""))
+    if not m:
+        return None
+    try:
+        return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        return None
 
 
 class FatturaProConnector:
@@ -492,6 +532,180 @@ class FatturaProConnector:
             logger.error(f"Error fetching overdue invoices: {e}", exc_info=True)
             return all_invoices, True  # Return what we have, flagged as partial
 
+    # ── Liste ausiliarie: scadenzario (scadenze reali) + anagrafica (P.IVA/contatti) ──
+    # Sostituiscono lo scraping del form di dettaglio (nomi campo Base64,
+    # richiesta xcrud stateful non replicabile): due liste xcrud semplici,
+    # paginate come la lista fatture. Approccio provato in produzione da
+    # SC-order-app.
+
+    @staticmethod
+    def _parse_xcrud_rows(html: str) -> List[List[str]]:
+        """Righe di una tabella xcrud → liste di celle (testo)."""
+        out = []
+        soup = BeautifulSoup(html, "html.parser")
+        for row in soup.find_all("tr"):
+            if row.find("th"):
+                continue
+            cells = [td.get_text(strip=True) for td in row.find_all("td")]
+            if cells:
+                out.append(cells)
+        return out
+
+    @staticmethod
+    def _xcrud_tokens(html: str) -> Tuple[Optional[str], Optional[str]]:
+        """Estrae (key, instance) dai campi hidden di una pagina xcrud.
+
+        Per clienti.php e scadenzario.php SIA key SIA instance sono hash
+        di sessione per-pagina (NON il nome letterale della tabella): vanno
+        letti dai hidden e riportati alla richiesta AJAX successiva.
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        key_el = soup.find("input", {"name": "key"})
+        inst_el = soup.find("input", {"name": "instance"})
+        key = key_el.get("value") if key_el else None
+        instance = inst_el.get("value") if inst_el else None
+        return key, instance
+
+    def _paginate_xcrud_list(
+        self, path: str, page_size: int = 100, max_pages: int = 100,
+    ) -> Tuple[List[List[str]], bool]:
+        """Scarica TUTTE le righe di una lista xcrud (es. scadenzario.php,
+        clienti.php), paginando via key+instance letti dai hidden.
+
+        Returns (rows, complete): complete=False se il fetch si è interrotto
+        (chiave mancante, errore xcrud, login scaduto a metà).
+        """
+        rows: List[List[str]] = []
+        first = self.client.get(f"{self.base_url}/{path}", timeout=self.timeout)
+        first.raise_for_status()
+        if self._looks_like_auth_page(first):
+            logger.warning(f"{path}: session expired — cannot fetch")
+            return rows, False
+        rows.extend(self._parse_xcrud_rows(first.text))
+        key, instance = self._xcrud_tokens(first.text)
+        if not key or not instance:
+            # Nessuna paginazione possibile: se la prima pagina è piena,
+            # mancano righe.
+            complete = len(rows) < page_size
+            return rows, complete
+
+        start = 0
+        for _ in range(max_pages):
+            resp = self.client.post(
+                f"{self.base_url}/xcrud/xcrud_ajax.php",
+                data={
+                    "xcrud[key]": key,
+                    "xcrud[instance]": instance,
+                    "xcrud[orderby]": "",
+                    "xcrud[start]": str(start),
+                    "xcrud[limit]": str(page_size),
+                    "xcrud[task]": "list",
+                },
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": f"{self.base_url}/{path}",
+                },
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            if "xcrud-error" in resp.text:
+                logger.warning(f"{path}: xcrud error during pagination — PARTIAL")
+                return rows, False
+            batch = self._parse_xcrud_rows(resp.text)
+            if not batch:
+                if self._looks_like_auth_page(resp):
+                    logger.warning(f"{path}: session expired mid-pagination — PARTIAL")
+                    return rows, False
+                break
+            rows.extend(batch)
+            nk, ni = self._xcrud_tokens(resp.text)
+            if nk:
+                key = nk
+            if ni:
+                instance = ni
+            if len(batch) < page_size:
+                break
+            start += page_size
+        else:
+            logger.warning(f"{path}: reached max_pages — PARTIAL")
+            return rows, False
+        return rows, True
+
+    def fetch_scadenze_map(self) -> Tuple[Dict[str, date], bool]:
+        """Scadenze reali dallo scadenzario → {doc_key: due_date}.
+
+        Colonne: Scadenza · Proroga · Documento · Cliente · Modalità ·
+        Banca · Iban · Importo · Sospeso. Una riga per rata.
+        - la Proroga (col 1) sovrascrive la Scadenza (col 0);
+        - le rate con Sospeso == 0 (saldate) vengono ignorate;
+        - per ogni fattura si tiene la scadenza aperta più VECCHIA.
+
+        Returns ({doc_key: date}, complete).
+        """
+        if not self._authenticated and not self.login():
+            return {}, False
+        rows, complete = self._paginate_xcrud_list("scadenzario.php")
+        result: Dict[str, date] = {}
+        for cells in rows:
+            if len(cells) < 3:
+                continue
+            due = _it_date_to_date(cells[1]) or _it_date_to_date(cells[0])
+            if not due:
+                continue
+            # Rata esplicitamente saldata (Sospeso == 0)
+            sospeso = (cells[8] if len(cells) > 8 else "").strip()
+            if re.match(r"^0([.,]0+)?$", sospeso):
+                continue
+            k = doc_key(cells[2])
+            if not k:
+                continue
+            prev = result.get(k)
+            if prev is None or due < prev:
+                result[k] = due
+        logger.info(
+            f"Scadenzario: {len(result)} invoices with a real due date "
+            f"from {len(rows)} ledger rows{'' if complete else ' (PARTIAL)'}"
+        )
+        return result, complete
+
+    def fetch_clienti_map(self) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+        """Anagrafica clienti → {nome_lower: {piva, phone, email}}.
+
+        Colonne: Denominazione · Partita IVA · Codice Fiscale · Indirizzo ·
+        Numero Civico · Cap · Comune · Provincia · Telefono · Email.
+        La lista fatture porta solo il NOME del destinatario: qui si
+        recuperano P.IVA, telefono ed email da agganciare per nome.
+
+        Returns ({nome_lower: {...}}, complete).
+        """
+        if not self._authenticated and not self.login():
+            return {}, False
+        rows, complete = self._paginate_xcrud_list("clienti.php")
+        result: Dict[str, Dict[str, Any]] = {}
+        email_re = re.compile(r"[^\s@<>\"']+@[^\s@<>\"']+\.[^\s@<>\"']+")
+        for cells in rows:
+            if not cells:
+                continue
+            name = (cells[0] or "").strip()
+            if not name:
+                continue
+            piva_raw = (cells[1] if len(cells) > 1 else "").strip()
+            piva = re.sub(r"[^0-9A-Za-z]", "", piva_raw).upper() or None
+            phone = (cells[8] if len(cells) > 8 else "").strip() or None
+            email = None
+            for c in cells:
+                m = email_re.search(c or "")
+                if m:
+                    email = m.group(0).lower()
+                    break
+            if piva or phone or email:
+                result[name.lower()] = {"piva": piva, "phone": phone, "email": email}
+        logger.info(
+            f"Anagrafica: {len(result)} customers with P.IVA/contacts "
+            f"from {len(rows)} rows{'' if complete else ' (PARTIAL)'}"
+        )
+        return result, complete
+
     @staticmethod
     def _looks_like_auth_page(response) -> bool:
         """True se la risposta è la pagina di login (sessione scaduta)."""
@@ -702,7 +916,13 @@ class FatturaProConnector:
             return 0.0
 
     def fetch_invoice_detail(self, doc_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch detailed information for a single invoice.
+        """DEPRECATO — non più usato dal sync.
+
+        Lo scraping del form di dettaglio non è affidabile: i nomi dei campi
+        sono codificati in Base64 e la richiesta xcrud `edit` è stateful (in
+        produzione restituiva la shell → 0 P.IVA / 0 scadenze su 588). P.IVA
+        e scadenze arrivano ora da fetch_clienti_map()/fetch_scadenze_map().
+        Conservato solo finché i test dedicati non vengono rimossi.
 
         Estrae dalla pagina di dettaglio (form di edit) la P.IVA del
         destinatario e — quando presente — la SCADENZA reale della fattura.

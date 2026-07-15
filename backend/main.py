@@ -84,15 +84,9 @@ async def startup_event():
         except Exception as e:
             logger.error(f"Case backfill error: {e}")
 
-        try:
-            # Repair una-tantum degli abbinamenti (detach su contraddizione
-            # P.IVA + rematch sicuro; stesso pattern marker del backfill).
-            # Solo dati già in DB, nessuno scraping: sicuro allo startup,
-            # e girando PRIMA di start_scheduler non compete con alcun sync.
-            from backend.engine.repair import run_repair_if_needed
-            run_repair_if_needed()
-        except Exception as e:
-            logger.error(f"Match repair error: {e}")
+        # NB: il repair degli abbinamenti NON gira più allo startup — è uno
+        # step del full sync (_full_sync_task), così vede le P.IVA reali già
+        # popolate dall'anagrafica invece di girare a vuoto sul boot.
 
         if not config.COMPANY_PIVA:
             logger.error(

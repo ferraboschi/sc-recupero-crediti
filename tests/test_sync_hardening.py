@@ -124,13 +124,14 @@ class TestShopifyPagination:
 # ── Harness per i task di sync ───────────────────────────────────────
 
 class FakeFatturaPro:
-    """Connettore finto: lista fissa, enrichment che registra le chiamate."""
+    """Connettore finto: lista fissa + scadenzario/anagrafica configurabili."""
 
     instances = []
+    scadenze_map = {}
+    clienti_map = {}
 
     def __init__(self, *a, **kw):
         FakeFatturaPro.instances.append(self)
-        self.enriched = None
 
     def login(self):
         return True
@@ -138,19 +139,23 @@ class FakeFatturaPro:
     def fetch_overdue_invoices(self):
         return list(self.raw_invoices), False
 
-    def enrich_invoices_from_detail(self, invoices, delay=0.5):
-        self.enriched = list(invoices)
-        return invoices
+    def fetch_scadenze_map(self):
+        return dict(FakeFatturaPro.scadenze_map), True
+
+    def fetch_clienti_map(self):
+        return dict(FakeFatturaPro.clienti_map), True
 
     def close(self):
         pass
 
 
-def _run_invoice_sync(monkeypatch, session, raw_invoices):
+def _run_invoice_sync(monkeypatch, session, raw_invoices, scadenze=None, clienti=None):
     """Esegue _sync_invoices_task con connettore e sessione finti."""
     from backend.api import sync as sync_mod
     FakeFatturaPro.raw_invoices = raw_invoices
     FakeFatturaPro.instances = []
+    FakeFatturaPro.scadenze_map = scadenze or {}
+    FakeFatturaPro.clienti_map = clienti or {}
     monkeypatch.setattr(sync_mod, "FatturaProConnector", FakeFatturaPro)
     monkeypatch.setattr(sync_mod, "get_session_direct", lambda: session)
     return sync_mod._sync_invoices_task()
@@ -220,30 +225,68 @@ class TestPaymentDetectionStreak:
         assert b.missing_streak == 0
 
 
-# ── Rotazione enrichment dettaglio ───────────────────────────────────
+# ── Enrichment via scadenzario + anagrafica ──────────────────────────
 
-class TestEnrichmentRotation:
-    def test_never_attempted_first_then_oldest(self, monkeypatch, test_db_session):
-        now = datetime.utcnow()
-        # A: tentata ieri; B: mai tentata; C: tentata 3 giorni fa
-        _mk_invoice(test_db_session, "A/2026", detail_attempted_at=now - timedelta(days=1))
-        _mk_invoice(test_db_session, "B/2026")
-        _mk_invoice(test_db_session, "C/2026", detail_attempted_at=now - timedelta(days=3))
+class TestScadenzarioAnagraficaEnrichment:
+    def test_real_due_date_joined_by_number(self, monkeypatch, test_db_session):
+        # CUSTODE: la lista non ha scadenza; lo scadenzario la fornisce.
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session,
+            [_raw("2026/00001093/SAK - Fattura", name="Custode srl")],
+            scadenze={"1093/SAK": date(2026, 7, 15)},
+        )
+        assert result["fatturapro"]["due_date_enriched"] == 1
+        inv = test_db_session.query(Invoice).filter(
+            Invoice.invoice_number.like("%1093%")
+        ).one()
+        assert inv.due_date == date(2026, 7, 15)
+        assert inv.due_date_source == "real"
 
-        monkeypatch.setattr(config, "DETAIL_ENRICHMENT_LIMIT", 2)
+    def test_piva_joined_by_customer_name(self, monkeypatch, test_db_session):
+        # La P.IVA arriva dall'anagrafica per nome — così Rooftop (IT) non
+        # può assorbire una fattura QOQA (P.IVA diversa).
         _run_invoice_sync(
             monkeypatch, test_db_session,
-            [_raw("A/2026", doc_id="da"), _raw("B/2026", doc_id="db"), _raw("C/2026", doc_id="dc")],
+            [_raw("993/SAK", name="Rooftop srl")],
+            clienti={"rooftop srl": {"piva": "18148341003", "phone": None, "email": None}},
         )
+        inv = test_db_session.query(Invoice).filter_by(invoice_number="993/SAK").one()
+        assert inv.customer_piva_raw == "18148341003"
 
-        enriched = FakeFatturaPro.instances[0].enriched
-        assert [inv["invoice_number"] for inv in enriched] == ["B/2026", "C/2026"]
+    def test_wrong_old_piva_overwritten_from_anagrafica(self, monkeypatch, test_db_session):
+        # Una P.IVA vecchia sbagliata (venditore) viene corretta dall'anagrafica
+        _mk_invoice(test_db_session, "500/SAK", customer_name_raw="Rooftop srl",
+                    customer_piva_raw="10280600965")  # P.IVA venditore, sbagliata
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session,
+            [_raw("500/SAK", name="Rooftop srl")],
+            clienti={"rooftop srl": {"piva": "18148341003", "phone": None, "email": None}},
+        )
+        assert result["fatturapro"]["piva_enriched"] == 1
+        inv = test_db_session.query(Invoice).filter_by(invoice_number="500/SAK").one()
+        assert inv.customer_piva_raw == "18148341003"
 
-    def test_attempt_timestamp_recorded(self, monkeypatch, test_db_session):
-        _mk_invoice(test_db_session, "B/2026")
-        _run_invoice_sync(monkeypatch, test_db_session, [_raw("B/2026", doc_id="db")])
-        b = test_db_session.query(Invoice).filter_by(invoice_number="B/2026").one()
-        assert b.detail_attempted_at is not None
+    def test_contacts_enriched_on_matching_customer(self, monkeypatch, test_db_session):
+        cust = Customer(ragione_sociale="Rooftop srl", source="fatturapro")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session,
+            [_raw("993/SAK", name="Rooftop srl")],
+            clienti={"rooftop srl": {"piva": "18148341003", "phone": "0212345", "email": "info@rooftop.it"}},
+        )
+        assert result["fatturapro"]["contacts_enriched"] == 1
+        c = test_db_session.query(Customer).filter_by(ragione_sociale="Rooftop srl").one()
+        assert c.phone == "0212345"
+        assert c.email == "info@rooftop.it"
+
+    def test_soft_fail_when_lists_unavailable(self, monkeypatch, test_db_session):
+        # Nessuno scadenzario/anagrafica: il sync procede comunque
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session, [_raw("X/2026", name="ACME")],
+        )
+        assert result["fatturapro"]["success"] is True
+        assert result["fatturapro"]["created"] == 1
 
 
 # ── Adozione clienti per P.IVA nel sync Shopify ──────────────────────
