@@ -129,6 +129,8 @@ class FakeFatturaPro:
     instances = []
     scadenze_map = {}
     clienti_map = {}
+    scadenze_complete = True
+    clienti_complete = True
 
     def __init__(self, *a, **kw):
         FakeFatturaPro.instances.append(self)
@@ -140,22 +142,25 @@ class FakeFatturaPro:
         return list(self.raw_invoices), False
 
     def fetch_scadenze_map(self):
-        return dict(FakeFatturaPro.scadenze_map), True
+        return dict(FakeFatturaPro.scadenze_map), FakeFatturaPro.scadenze_complete
 
     def fetch_clienti_map(self):
-        return dict(FakeFatturaPro.clienti_map), True
+        return dict(FakeFatturaPro.clienti_map), FakeFatturaPro.clienti_complete
 
     def close(self):
         pass
 
 
-def _run_invoice_sync(monkeypatch, session, raw_invoices, scadenze=None, clienti=None):
+def _run_invoice_sync(monkeypatch, session, raw_invoices, scadenze=None, clienti=None,
+                      scadenze_complete=True, clienti_complete=True):
     """Esegue _sync_invoices_task con connettore e sessione finti."""
     from backend.api import sync as sync_mod
     FakeFatturaPro.raw_invoices = raw_invoices
     FakeFatturaPro.instances = []
     FakeFatturaPro.scadenze_map = scadenze or {}
     FakeFatturaPro.clienti_map = clienti or {}
+    FakeFatturaPro.scadenze_complete = scadenze_complete
+    FakeFatturaPro.clienti_complete = clienti_complete
     monkeypatch.setattr(sync_mod, "FatturaProConnector", FakeFatturaPro)
     monkeypatch.setattr(sync_mod, "get_session_direct", lambda: session)
     return sync_mod._sync_invoices_task()
@@ -287,6 +292,42 @@ class TestScadenzarioAnagraficaEnrichment:
         )
         assert result["fatturapro"]["success"] is True
         assert result["fatturapro"]["created"] == 1
+
+    def test_proroga_updates_existing_real_due_date(self, monkeypatch, test_db_session):
+        # due_date già 'real' 15/04; lo scadenzario ora dà una proroga 15/09
+        _mk_invoice(test_db_session, "655/SAK", issue_date=date(2026, 3, 15),
+                    due_date=date(2026, 4, 15), due_date_source="real")
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session,
+            [_raw("655/SAK", name="Belfiore")],
+            scadenze={"655/SAK": date(2026, 9, 15)},
+        )
+        assert result["fatturapro"]["due_date_enriched"] == 1
+        inv = test_db_session.query(Invoice).filter_by(invoice_number="655/SAK").one()
+        assert inv.due_date == date(2026, 9, 15)  # la proroga si è propagata
+
+    def test_partial_scadenzario_does_not_apply_due_dates(self, monkeypatch, test_db_session):
+        # Scadenzario PARZIALE: non congelare scadenze 'real' potenzialmente
+        # sbagliate (la rata più vecchia potrebbe mancare)
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session,
+            [_raw("A/2026", name="ACME")],
+            scadenze={"A/2026": date(2026, 8, 1)},
+            scadenze_complete=False,
+        )
+        assert result["fatturapro"]["scadenzario_ok"] is False
+        inv = test_db_session.query(Invoice).filter_by(invoice_number="A/2026").one()
+        assert inv.due_date_source != "real"
+
+    def test_completeness_flags_in_result(self, monkeypatch, test_db_session):
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session, [_raw("A/2026", name="ACME")],
+            scadenze={"A/2026": date(2026, 8, 1)},
+            clienti={"acme": {"piva": PIVA_A, "phone": None, "email": None}},
+            clienti_complete=False,
+        )
+        assert result["fatturapro"]["scadenzario_ok"] is True
+        assert result["fatturapro"]["anagrafica_ok"] is False
 
 
 # ── Adozione clienti per P.IVA nel sync Shopify ──────────────────────

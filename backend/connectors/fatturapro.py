@@ -682,6 +682,12 @@ class FatturaProConnector:
             return {}, False
         rows, complete = self._paginate_xcrud_list("clienti.php")
         result: Dict[str, Dict[str, Any]] = {}
+        # Nomi ambigui: stessa Denominazione su entità con P.IVA diverse.
+        # La P.IVA qui è AUTOREVOLE (guida il matching): assegnare quella
+        # sbagliata dell'omonimo creerebbe abbinamenti errati. Meglio non
+        # fornire nulla per un nome ambiguo che una P.IVA di un'altra azienda.
+        ambiguous: set = set()
+        piva_fmt = re.compile(r"^([A-Z]{2,3})?\d{8,15}$")
         email_re = re.compile(r"[^\s@<>\"']+@[^\s@<>\"']+\.[^\s@<>\"']+")
         for cells in rows:
             if not cells:
@@ -689,8 +695,15 @@ class FatturaProConnector:
             name = (cells[0] or "").strip()
             if not name:
                 continue
+            key = name.lower()
+            if key in ambiguous:
+                continue
             piva_raw = (cells[1] if len(cells) > 1 else "").strip()
             piva = re.sub(r"[^0-9A-Za-z]", "", piva_raw).upper() or None
+            # Scarta valori non conformi al formato P.IVA (testo, note, CF
+            # di persona): non devono sovrascrivere una P.IVA valida.
+            if piva and not piva_fmt.match(piva):
+                piva = None
             phone = (cells[8] if len(cells) > 8 else "").strip() or None
             email = None
             for c in cells:
@@ -698,11 +711,28 @@ class FatturaProConnector:
                 if m:
                     email = m.group(0).lower()
                     break
+            prev = result.get(key)
+            if prev is not None:
+                # Omonimo: se le P.IVA valide divergono, il nome è ambiguo →
+                # rimuovi l'entry, il match per nome non è affidabile.
+                if prev.get("piva") and piva and prev["piva"] != piva:
+                    ambiguous.add(key)
+                    result.pop(key, None)
+                    continue
+                # Stessa (o mancante) P.IVA: completa i campi vuoti
+                if not prev.get("piva") and piva:
+                    prev["piva"] = piva
+                if not prev.get("phone") and phone:
+                    prev["phone"] = phone
+                if not prev.get("email") and email:
+                    prev["email"] = email
+                continue
             if piva or phone or email:
-                result[name.lower()] = {"piva": piva, "phone": phone, "email": email}
+                result[key] = {"piva": piva, "phone": phone, "email": email}
         logger.info(
             f"Anagrafica: {len(result)} customers with P.IVA/contacts "
-            f"from {len(rows)} rows{'' if complete else ' (PARTIAL)'}"
+            f"from {len(rows)} rows ({len(ambiguous)} ambiguous names skipped)"
+            f"{'' if complete else ' (PARTIAL)'}"
         )
         return result, complete
 

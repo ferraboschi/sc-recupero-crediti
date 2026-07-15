@@ -141,22 +141,33 @@ def _sync_invoices_task() -> dict:
                 # replicabile). Soft-fail: se una lista non arriva, si procede
                 # senza — le scadenze restano 'assumed' fino al prossimo giro.
                 from backend.connectors.fatturapro import doc_key as _doc_key
+                scad_ok = cli_ok = False
                 try:
-                    scadenze_map, _scad_ok = fatturapro.fetch_scadenze_map()
+                    scadenze_map, scad_ok = fatturapro.fetch_scadenze_map()
                 except Exception as e:
                     logger.error(f"Scadenzario fetch failed: {e}")
                     scadenze_map = {}
                 try:
-                    clienti_map, _cli_ok = fatturapro.fetch_clienti_map()
+                    clienti_map, cli_ok = fatturapro.fetch_clienti_map()
                 except Exception as e:
                     logger.error(f"Anagrafica fetch failed: {e}")
                     clienti_map = {}
+                result["fatturapro"]["scadenzario_ok"] = bool(scad_ok)
+                result["fatturapro"]["anagrafica_ok"] = bool(cli_ok)
 
-                # Aggancia scadenza + P.IVA/contatti a ogni fattura grezza
+                # Aggancia scadenza + P.IVA/contatti a ogni fattura grezza.
+                # La scadenza si applica SOLO da uno scadenzario COMPLETO: da
+                # un fetch parziale la rata più vecchia potrebbe mancare e si
+                # congelerebbe una scadenza troppo tardi (source 'real' non
+                # più correggibile). 'due_from_ledger' marca le fatture con
+                # scadenza autorevole di QUESTO ciclo, così una proroga
+                # aggiorna anche una due_date già 'real' (real→real).
                 for inv in raw_invoices:
-                    due = scadenze_map.get(_doc_key(inv["invoice_number"]))
-                    if due:
-                        inv["due_date"] = due
+                    if scad_ok:
+                        due = scadenze_map.get(_doc_key(inv["invoice_number"]))
+                        if due:
+                            inv["due_date"] = due
+                            inv["due_from_ledger"] = True
                     cust = clienti_map.get((inv.get("customer_name") or "").strip().lower())
                     if cust:
                         if cust.get("piva"):
@@ -196,12 +207,20 @@ def _sync_invoices_task() -> dict:
                         if inv.get("customer_piva") and existing.customer_piva_raw != inv["customer_piva"]:
                             existing.customer_piva_raw = inv["customer_piva"]
                             piva_enriched += 1
-                        # Scadenza REALE dallo scadenzario: sovrascrive anche
-                        # una scadenza 'assumed' sintetizzata in passato.
-                        if inv.get("due_date") and existing.due_date_source != "real":
-                            existing.due_date = inv["due_date"]
-                            existing.due_date_source = "real"
-                            due_enriched += 1
+                        # Scadenza REALE dallo scadenzario: sovrascrive una
+                        # 'assumed' e — se viene dallo scadenzario di questo
+                        # ciclo (due_from_ledger) — aggiorna anche una 'real'
+                        # già presente il cui valore è cambiato (PROROGA): lo
+                        # scadenzario è la fonte autorevole e va riflesso.
+                        if inv.get("due_date"):
+                            from_ledger = inv.get("due_from_ledger")
+                            if existing.due_date_source != "real":
+                                existing.due_date = inv["due_date"]
+                                existing.due_date_source = "real"
+                                due_enriched += 1
+                            elif from_ledger and existing.due_date != inv["due_date"]:
+                                existing.due_date = inv["due_date"]
+                                due_enriched += 1
                         # Keep status as open if it was paid before but reappeared
                         if existing.status == "paid" and inv.get("balance", 0) > 0:
                             existing.status = "open"
@@ -1000,11 +1019,18 @@ def _full_sync_task() -> dict:
         # le contraddizioni P.IVA sono visibili e i casi legacy tipo
         # QOQA→Rooftop possono essere separati. Il lock è già del full sync,
         # quindi si chiama repair_matches direttamente (niente doppio lock).
-        # SOLO su sync fatture completo: con un fetch parziale le P.IVA non
-        # sono tutte popolate e il repair (one-shot) sprecherebbe l'occasione.
+        # SOLO su enrichment COMPLETO: il repair è one-shot (marker v2) e la
+        # P.IVA che deve leggere viene dall'ANAGRAFICA. Se lista fatture O
+        # anagrafica sono parziali/fallite, le P.IVA non sono tutte popolate:
+        # rimandare al prossimo ciclo invece di bruciare il marker a vuoto.
         inv_res = results.get("invoices", {})
         fp_res = inv_res.get("fatturapro", {}) if isinstance(inv_res, dict) else {}
-        if fp_res.get("success") and not fp_res.get("partial"):
+        enrichment_complete = (
+            fp_res.get("success")
+            and not fp_res.get("partial")
+            and fp_res.get("anagrafica_ok")
+        )
+        if enrichment_complete:
             try:
                 from backend.engine.repair import repair_matches
                 repair_session = get_session_direct()
@@ -1016,7 +1042,11 @@ def _full_sync_task() -> dict:
                 logger.error(f"Match repair (in sync) failed: {e}", exc_info=True)
                 results["repair"] = {"error": str(e)}
         else:
-            logger.info("Match repair skipped: invoice sync incomplete/partial (will retry next cycle)")
+            logger.info(
+                "Match repair skipped: invoice/anagrafica fetch incomplete "
+                "(partial=%s, anagrafica_ok=%s) — will retry next cycle",
+                fp_res.get("partial"), fp_res.get("anagrafica_ok"),
+            )
 
         # Step 3: Matching (abbinamenti sicuri + quarantena suggerimenti)
         try:

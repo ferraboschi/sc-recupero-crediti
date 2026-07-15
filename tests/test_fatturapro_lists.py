@@ -142,6 +142,37 @@ class TestClientiMap:
         cmap, _ = conn.fetch_clienti_map()
         assert cmap["rooftop srl"]["piva"] == "18148341003"
 
+    def test_homonym_with_divergent_piva_is_skipped(self, monkeypatch):
+        # Due entità con la STESSA denominazione ma P.IVA diverse: il nome è
+        # ambiguo → non deve fornire una P.IVA (rischio abbinamento errato).
+        html = """
+        <table><tr><th>Denominazione</th><th>Partita IVA</th><th>Codice Fiscale</th>
+        <th>Indirizzo</th><th>Civico</th><th>Cap</th><th>Comune</th><th>Prov</th>
+        <th>Telefono</th><th>Email</th><th></th></tr>
+        <tr><td>Bar Roma</td><td>11111111119</td><td>x</td><td>V</td><td>1</td>
+        <td>1</td><td>Roma</td><td>RM</td><td>061</td><td>a@x.it</td><td></td></tr>
+        <tr><td>Bar Roma</td><td>22222222220</td><td>y</td><td>V</td><td>2</td>
+        <td>2</td><td>Milano</td><td>MI</td><td>022</td><td>b@x.it</td><td></td></tr>
+        </table>
+        """
+        conn = _connector_with_list(monkeypatch, {"clienti.php": html})
+        cmap, _ = conn.fetch_clienti_map()
+        assert "bar roma" not in cmap
+
+    def test_malformed_piva_dropped(self, monkeypatch):
+        html = """
+        <table><tr><th>Denominazione</th><th>Partita IVA</th><th>CF</th><th>Ind</th>
+        <th>Civ</th><th>Cap</th><th>Com</th><th>Pr</th><th>Tel</th><th>Email</th><th></th></tr>
+        <tr><td>Note Cliente srl</td><td>DA VERIFICARE</td><td>x</td><td>V</td><td>1</td>
+        <td>1</td><td>Roma</td><td>RM</td><td>061</td><td>note@x.it</td><td></td></tr>
+        </table>
+        """
+        conn = _connector_with_list(monkeypatch, {"clienti.php": html})
+        cmap, _ = conn.fetch_clienti_map()
+        # P.IVA non conforme scartata, ma i contatti restano utilizzabili
+        assert cmap["note cliente srl"]["piva"] is None
+        assert cmap["note cliente srl"]["email"] == "note@x.it"
+
 
 class TestPaginationTokens:
     def test_reads_key_and_instance_from_hidden(self):
