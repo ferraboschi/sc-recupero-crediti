@@ -644,7 +644,12 @@ class FatturaProConnector:
         """
         if not self._authenticated and not self.login():
             return {}, False
-        rows, complete = self._paginate_xcrud_list("scadenzario.php")
+        # Lo scadenzario storico è GRANDE (>10k righe: una per rata, saldate
+        # incluse, dal 2022): il primo run in produzione ha esaurito 100
+        # pagine senza finire → PARTIAL → scadenze non applicate. A ~0,2s a
+        # pagina, 400 pagine (~40k righe) costano al massimo ~90s: accettabile
+        # per un job giornaliero in background.
+        rows, complete = self._paginate_xcrud_list("scadenzario.php", max_pages=400)
         result: Dict[str, date] = {}
         for cells in rows:
             if len(cells) < 3:
