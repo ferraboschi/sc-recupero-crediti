@@ -54,7 +54,11 @@ logger = logging.getLogger(__name__)
 # Abbinamenti decisi esplicitamente da un operatore: mai toccati dal repair.
 HUMAN_DECIDED_METHODS = ("manual", "fuzzy_confirmed", "unlinked")
 
-REPAIR_MARKER_KEY = "match_repair_v1"
+# v2: rigira dopo l'introduzione dell'estrazione P.IVA dall'anagrafica
+# (fetch_clienti_map). Il repair v1 girò allo startup con le P.IVA ancora
+# assenti → 0 detach; v2 gira come step del full sync, DOPO che le P.IVA
+# reali sono state popolate, così le contraddizioni diventano visibili.
+REPAIR_MARKER_KEY = "match_repair_v2"
 
 # Sopra questa somiglianza il nome della fattura CONFERMA il cliente attuale.
 NAME_CONCORDANT_THRESHOLD = 75
