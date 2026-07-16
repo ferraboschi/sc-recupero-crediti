@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 import StatsWidget from '../components/StatsWidget'
+import { getSyncMarker, waitForSyncCompletion } from '../utils/syncPolling'
 
 const ACTION_LABELS = {
   first_contact: 'I Contatto',
@@ -143,16 +144,30 @@ export default function Dashboard() {
 
   const handleSync = async () => {
     setSyncing(true)
-    setSyncMessage('')
+    setSyncMessage('Sincronizzazione in corso…')
     try {
+      // /sync/full risponde subito 'sync_started' (gira in background):
+      // prima si prende il marker, poi si attende che cambi — altrimenti
+      // si mostrano dati PRE-sync spacciandoli per l'esito del sync.
+      let markerBefore = ''
+      try {
+        markerBefore = await getSyncMarker()
+      } catch {
+        // status non leggibile: si polla comunque, al peggio scatta il timeout
+      }
       await client.post('/sync/full')
-      setSyncMessage('Sincronizzazione completata con successo')
-      const syncNow = new Date()
-      setLastSync(syncNow)
-      localStorage.setItem('lastSyncTime', syncNow.toISOString())
+      const completed = await waitForSyncCompletion(markerBefore)
+      if (completed) {
+        setSyncMessage('Sincronizzazione completata con successo')
+        const syncNow = new Date()
+        setLastSync(syncNow)
+        localStorage.setItem('lastSyncTime', syncNow.toISOString())
+      } else {
+        setSyncMessage('Sync ancora in corso in background — i dati mostrati potrebbero non essere definitivi')
+      }
       await fetchData()
       await fetchTodos()
-      setTimeout(() => setSyncMessage(''), 3000)
+      setTimeout(() => setSyncMessage(''), 5000)
     } catch (err) {
       setSyncMessage('Errore nella sincronizzazione')
       console.error(err)
@@ -397,7 +412,11 @@ export default function Dashboard() {
               {lastSync ? `Agg: ${lastSync.toLocaleString('it-IT')}` : ''}
             </p>
             {syncMessage && (
-              <p className={`text-sm font-medium ${syncMessage.includes('Errore') ? 'text-accent-red' : 'text-accent-green'}`}>
+              <p className={`text-sm font-medium ${
+                syncMessage.includes('Errore') ? 'text-accent-red'
+                  : syncMessage.includes('in corso') ? 'text-accent-amber'
+                  : 'text-accent-green'
+              }`}>
                 {syncMessage}
               </p>
             )}

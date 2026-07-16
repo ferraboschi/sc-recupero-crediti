@@ -139,14 +139,42 @@ export default function Positions() {
     fetchSuggestions()
   }, [])
 
-  const handleConfirmSuggestion = async (id) => {
+  const handleConfirmSuggestion = async (sug) => {
+    // Sui suggerimenti a bassa confidenza la conferma immediata era
+    // un'asimmetria pericolosa (Rifiuta chiedeva conferma, Conferma no).
+    if (sug.low_confidence && !window.confirm(
+      `Suggerimento a BASSA CONFIDENZA (${sug.suggested_method} ${formatScore(sug.suggested_score)}): `
+      + `abbinare davvero la fattura ${sug.invoice_number} a "${sug.suggested_customer?.ragione_sociale}"?`
+    )) return
     try {
-      setSuggestionActingId(id)
-      await client.post(`/positions/${id}/confirm-suggestion`)
+      setSuggestionActingId(sug.id)
+      await client.post(`/positions/${sug.id}/confirm-suggestion`)
       await fetchSuggestions()
       setPositionsRefreshKey(k => k + 1)
     } catch (err) {
       setSuggestionsError('Errore durante la conferma del suggerimento')
+      console.error(err)
+    } finally {
+      setSuggestionActingId(null)
+    }
+  }
+
+  const handleCreateCustomer = async (sug) => {
+    // Terza via quando il suggerimento è sbagliato: prima l'operatore era
+    // spinto a confermare l'errore, e Rifiuta rendeva la fattura 'unlinked'
+    // per sempre (l'auto-create del sync salta i suggerimenti pendenti).
+    if (!window.confirm(
+      `Verrà creato il NUOVO cliente "${sug.customer_name_raw}" e la fattura `
+      + `${sug.invoice_number} gli verrà abbinata. Continuare?`
+    )) return
+    try {
+      setSuggestionActingId(sug.id)
+      await client.post(`/positions/${sug.id}/create-customer`)
+      await fetchSuggestions()
+      setPositionsRefreshKey(k => k + 1)
+    } catch (err) {
+      // Il 409 spiega quale cliente esiste già (usare Riassegna): mostrarlo.
+      setSuggestionsError(err.response?.data?.detail || 'Errore durante la creazione del cliente')
       console.error(err)
     } finally {
       setSuggestionActingId(null)
@@ -338,11 +366,21 @@ export default function Positions() {
 
                   <div className="flex gap-2 shrink-0">
                     <button
-                      onClick={() => handleConfirmSuggestion(sug.id)}
+                      onClick={() => handleConfirmSuggestion(sug)}
                       disabled={suggestionActingId === sug.id}
                       className="px-4 py-2 rounded-lg text-sm font-medium bg-accent-green/15 hover:bg-accent-green/25 text-accent-green border border-accent-green/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Conferma
+                    </button>
+                    <button
+                      onClick={() => handleCreateCustomer(sug)}
+                      disabled={suggestionActingId === sug.id || !sug.customer_name_raw}
+                      title={sug.customer_name_raw
+                        ? `Crea il cliente "${sug.customer_name_raw}" e abbina la fattura`
+                        : 'La fattura non ha un nome destinatario'}
+                      className="px-4 py-2 rounded-lg text-sm font-medium bg-accent-teal/10 hover:bg-accent-teal/20 text-accent-teal border border-accent-teal/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Crea nuovo cliente
                     </button>
                     <button
                       onClick={() => handleRejectSuggestion(sug.id)}
