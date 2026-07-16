@@ -46,22 +46,10 @@ class Config:
     # CORS - frontend origin (GitHub Pages)
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "https://recupero.sakecompany.com,http://localhost:5173").split(",")
 
-    # P.IVA della propria azienda (Sake Company): blacklist per lo scraping
-    # FatturaPro — una P.IVA estratta uguale a questa è sempre quella del
-    # venditore, mai del destinatario. Se assente, il pattern full-text
-    # dell'enrichment viene disabilitato (fail-closed).
-    COMPANY_PIVA = os.getenv("COMPANY_PIVA", "").strip().upper()
-
     # Business rules
     # Soglia minima perché un fuzzy match generi un SUGGERIMENTO (mai un
     # abbinamento automatico). 75 copre i nomi corti reali tipo "F-T SRL".
     FUZZY_MATCH_THRESHOLD = 75
-
-    # Fatture arricchite dalla pagina di dettaglio FatturaPro per ciclo di
-    # sync (P.IVA + scadenza reale). ~0.45s a fattura: 150 ≈ 70s in più per
-    # un job in background, e la coda ruota (detail_attempted_at) quindi
-    # l'intero parco converge in pochi giorni.
-    DETAIL_ENRICHMENT_LIMIT = int(os.getenv("DETAIL_ENRICHMENT_LIMIT", "150"))
 
     @classmethod
     def shopify_api_base(cls) -> str:

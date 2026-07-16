@@ -250,11 +250,11 @@ export default function System() {
             <div key={name} className="px-6 py-4 flex items-center justify-between">
               <div className="flex items-center gap-4">
                 <div className="w-10 h-10 rounded-lg bg-dark-surface flex items-center justify-center text-lg font-bold text-txt-secondary">
-                  {name === 'fatturapro' ? 'FP' : name === 'fattura24' ? 'F24' : name === 'shopify' ? 'SH' : name === 'company_piva' ? 'PI' : name.slice(0, 2).toUpperCase()}
+                  {name === 'fatturapro' ? 'FP' : name === 'fattura24' ? 'F24' : name === 'shopify' ? 'SH' : name.slice(0, 2).toUpperCase()}
                 </div>
                 <div>
                   <p className="font-semibold text-txt-primary capitalize">
-                    {name === 'company_piva' ? 'P.IVA azienda' : name}
+                    {name}
                   </p>
                   {conn.api_version && (
                     <p className="text-xs text-txt-muted">API v{conn.api_version}</p>
