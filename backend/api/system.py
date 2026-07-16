@@ -131,7 +131,11 @@ async def get_system_status():
             }
 
         cust_result = _sync_status.get("customers", {}).get("result")
-        if cust_result:
+        if not connectors["shopify"]["configured"]:
+            # Senza credenziali il task clienti "riesce" senza far nulla
+            # (success=True): il connettore NON deve risultare 'ok'.
+            connectors["shopify"]["status"] = "unconfigured"
+        elif cust_result:
             shopify_err = cust_result.get("shopify_error")
             if shopify_err:
                 connectors["shopify"]["status"] = "error"
@@ -141,7 +145,7 @@ async def get_system_status():
 
         # --- 3. Sync Status ---
         sync_info = {}
-        for key in ["invoices", "customers", "matching", "cases"]:
+        for key in ["invoices", "customers", "matching", "order_matching", "cases"]:
             s = _sync_status.get(key, {})
             last = s.get("last_sync")
             stale = False
@@ -359,6 +363,8 @@ def _summarize_sync_result(key: str, result: dict) -> str:
         return "FP: errore"
 
     if key == "customers":
+        if result.get("unconfigured"):
+            return "Shopify non configurato"
         created = result.get("created", 0)
         shopify_err = result.get("shopify_error")
         parts = []
@@ -376,6 +382,19 @@ def _summarize_sync_result(key: str, result: dict) -> str:
         suggested = result.get("suggested", 0)
         unm = result.get("unmatched", 0)
         return f"{exact} sicure, {suggested} da confermare, {unm} non associate"
+
+    if key == "order_matching":
+        if result.get("error"):
+            return f"Errore: {result['error']}"
+        matched = result.get("matched", 0)
+        errors = result.get("errors") or []
+        near = result.get("near_misses") or []
+        parts = [f"{matched} fatture agganciate a ordini Shopify"]
+        if errors:
+            parts.append(f"{len(errors)} clienti in errore")
+        if near:
+            parts.append(f"{len(near)} near-miss")
+        return ", ".join(parts)
 
     if key == "cases":
         opened = result.get("opened", 0) + result.get("reopened", 0)

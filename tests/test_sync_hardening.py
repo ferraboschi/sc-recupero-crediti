@@ -428,7 +428,8 @@ class TestOrderMatching:
             "total_price": 100.0, "created_at": "2026-05-01T00:00:00",
             "financial_status": "paid",
         }]
-        assert _find_best_order_match(inv, orders) is None
+        best, near = _find_best_order_match(inv, orders)
+        assert best is None and near is None
 
     def test_best_match_prefers_closest(self, test_db_session):
         from backend.api.sync import _find_best_order_match
@@ -441,7 +442,7 @@ class TestOrderMatching:
              "total_price": 100.0, "created_at": "2026-05-09T00:00:00",
              "financial_status": "paid"},
         ]
-        best = _find_best_order_match(inv, orders)
+        best, _ = _find_best_order_match(inv, orders)
         assert best["id"] == "2"
 
 

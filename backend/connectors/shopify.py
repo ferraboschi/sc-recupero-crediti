@@ -396,23 +396,38 @@ class ShopifyConnector(BaseConnector):
 
         Returns:
             List of order dicts with: id, order_number, name,
-            total_price, created_at, financial_status
+            total_price, subtotal_price, total_tax, created_at,
+            financial_status
         """
         numeric_id = self._extract_id_from_gid(shopify_id)
         orders: List[Dict[str, Any]] = []
-        params: Dict[str, Any] = {
-            "customer_id": numeric_id,
-            "status": "any",
-            "limit": 250,
-            "created_at_min": f"{since_date}T00:00:00+00:00",
-            "fields": (
-                "id,order_number,name,total_price,"
-                "created_at,financial_status"
-            ),
-        }
+        # subtotal_price/total_tax servono al matching ordine→fattura:
+        # l'importo dell'ordine può essere ex-IVA mentre la fattura è
+        # IVA inclusa (o viceversa) — si confrontano entrambi.
+        fields = (
+            "id,order_number,name,total_price,subtotal_price,"
+            "total_tax,created_at,financial_status"
+        )
+        cursor: Optional[str] = None
         page = 0
         while True:
             page += 1
+            # Paginazione via header Link (come fetch_b2b_customers).
+            # La vecchia paginazione since_id era ROTTA: la prima pagina
+            # arriva newest-first (created_at desc) e since_id impone
+            # id-crescenti dall'ultimo id letto → si rileggevano in loop
+            # gli stessi ordini recenti e i vecchi non arrivavano mai.
+            # Con page_info Shopify RITIENE i filtri della richiesta
+            # originale e rifiuta di riceverli di nuovo: nelle pagine
+            # successive restano solo limit/fields/page_info.
+            params: Dict[str, Any] = {"limit": 250, "fields": fields}
+            if cursor:
+                params["page_info"] = cursor
+            else:
+                params["customer_id"] = numeric_id
+                params["status"] = "any"
+                params["created_at_min"] = f"{since_date}T00:00:00+00:00"
+
             try:
                 resp = self.get(
                     "orders.json",
@@ -430,16 +445,19 @@ class ShopifyConnector(BaseConnector):
                 raise
 
             batch = resp.get("orders", [])
-            if not batch:
-                break
-
             for o in batch:
                 orders.append({
                     "id": str(o["id"]),
                     "order_number": o.get("order_number"),
                     "name": o.get("name", ""),
                     "total_price": float(
-                        o.get("total_price", 0)
+                        o.get("total_price") or 0
+                    ),
+                    "subtotal_price": float(
+                        o.get("subtotal_price") or 0
+                    ),
+                    "total_tax": float(
+                        o.get("total_tax") or 0
                     ),
                     "created_at": o.get("created_at", ""),
                     "financial_status": o.get(
@@ -447,13 +465,9 @@ class ShopifyConnector(BaseConnector):
                     ),
                 })
 
-            if len(batch) < 250:
+            cursor = self._extract_next_cursor()
+            if not batch or not cursor:
                 break
-
-            # Shopify REST pagination via Link header
-            # For simplicity, use since_id
-            last_id = batch[-1]["id"]
-            params["since_id"] = last_id
 
         logger.info(
             f"Fetched {len(orders)} orders for customer "
