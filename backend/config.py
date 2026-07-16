@@ -46,12 +46,6 @@ class Config:
     # CORS - frontend origin (GitHub Pages)
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "https://recupero.sakecompany.com,http://localhost:5173").split(",")
 
-    # P.IVA della propria azienda (Sake Company): blacklist per lo scraping
-    # FatturaPro — una P.IVA estratta uguale a questa è sempre quella del
-    # venditore, mai del destinatario. Se assente, il pattern full-text
-    # dell'enrichment viene disabilitato (fail-closed).
-    COMPANY_PIVA = os.getenv("COMPANY_PIVA", "").strip().upper()
-
     # Business rules
     # Soglia minima perché un fuzzy match generi un SUGGERIMENTO (mai un
     # abbinamento automatico). 75 copre i nomi corti reali tipo "F-T SRL".

@@ -105,15 +105,6 @@ async def get_system_status():
                 "status": "unknown",
                 "last_result": None,
             },
-            "company_piva": {
-                "configured": bool(config.COMPANY_PIVA),
-                "status": "ok" if config.COMPANY_PIVA else "not_configured",
-                "note": (
-                    None if config.COMPANY_PIVA else
-                    "COMPANY_PIVA assente: pattern full-text dell'enrichment "
-                    "P.IVA disabilitato (fail-closed)"
-                ),
-            },
         }
 
         # Fattura24: API dismessa — se ci sono fatture in DB sono importate via CSV
@@ -249,16 +240,6 @@ async def get_system_status():
                 "level": "error",
                 "component": "fatturapro",
                 "message": f"FatturaPro errore: {connectors['fatturapro']['last_result'].get('error', 'sconosciuto')}"
-            })
-
-        if not config.COMPANY_PIVA:
-            alerts.append({
-                "level": "warning",
-                "component": "company_piva",
-                "message": (
-                    "COMPANY_PIVA non impostata su Render: l'enrichment P.IVA "
-                    "full-text è disabilitato per sicurezza (fail-closed)"
-                )
             })
 
         shopify_err = connectors["shopify"].get("error")

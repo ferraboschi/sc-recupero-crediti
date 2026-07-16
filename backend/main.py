@@ -88,13 +88,6 @@ async def startup_event():
         # step del full sync (_full_sync_task), così vede le P.IVA reali già
         # popolate dall'anagrafica invece di girare a vuoto sul boot.
 
-        if not config.COMPANY_PIVA:
-            logger.error(
-                "COMPANY_PIVA non impostata: il pattern full-text "
-                "dell'enrichment P.IVA da FatturaPro resta DISABILITATO "
-                "(fail-closed). Impostarla su Render per riattivarlo."
-            )
-
         try:
             logger.info("Starting scheduler...")
             start_scheduler()

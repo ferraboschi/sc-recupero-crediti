@@ -65,7 +65,7 @@ Per sviluppo locale il sistema usa SQLite automaticamente (nessun setup database
    - `DATABASE_URL` → connection string Supabase
    - `FATTURAPRO_API_KEY`, `FATTURAPRO_DOMAIN`
    - `SHOPIFY_STORE_URL`, `SHOPIFY_ACCESS_TOKEN`
-   - `JWT_SECRET`, `AUTH_PASSWORD`, `COMPANY_PIVA`
+   - `JWT_SECRET`, `AUTH_PASSWORD`
    - `CORS_ORIGINS` → `https://recupero.sakecompany.com`
 4. Il deploy è automatico ad ogni push su `main`
 
@@ -99,7 +99,6 @@ Per setup completo con Nginx + SSL: `sudo bash deploy/setup.sh`
 | `FATTURA24_API_KEY` | Chiave API Fattura24 (legacy) |
 | `SHOPIFY_STORE_URL` | URL negozio Shopify |
 | `SHOPIFY_ACCESS_TOKEN` | Token API Shopify |
-| `COMPANY_PIVA` | P.IVA di Sake Company (blacklist scraping: senza, l'enrichment full-text resta disabilitato) |
 | `JWT_SECRET` | Segreto JWT (obbligatoria) |
 | `AUTH_PASSWORD` | Password di accesso (obbligatoria) |
 | `CORS_ORIGINS` | Origini CORS consentite |
