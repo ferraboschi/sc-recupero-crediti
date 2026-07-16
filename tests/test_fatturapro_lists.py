@@ -217,6 +217,38 @@ class TestClientiMap:
         cmap, _ = conn.fetch_clienti_map()
         assert "bar roma" not in cmap
 
+    def test_homonym_with_piva_on_one_side_only_is_skipped(self, monkeypatch):
+        # Omonimi dove SOLO UNA riga ha la P.IVA: prima venivano mergiati e
+        # la P.IVA di un'entità finiva servita anche per l'omonima → ambiguo.
+        html = """
+        <table><tr><th>Denominazione</th><th>Partita IVA</th><th>Codice Fiscale</th>
+        <th>Indirizzo</th><th>Civico</th><th>Cap</th><th>Comune</th><th>Prov</th>
+        <th>Telefono</th><th>Email</th><th></th></tr>
+        <tr><td>Bar Roma</td><td>11111111119</td><td>x</td><td>V</td><td>1</td>
+        <td>1</td><td>Roma</td><td>RM</td><td>061</td><td>a@x.it</td><td></td></tr>
+        <tr><td>Bar Roma</td><td></td><td>y</td><td>V</td><td>2</td>
+        <td>2</td><td>Milano</td><td>MI</td><td>022</td><td>b@x.it</td><td></td></tr>
+        </table>
+        """
+        conn = _connector_with_list(monkeypatch, {"clienti.php": html})
+        cmap, _ = conn.fetch_clienti_map()
+        assert "bar roma" not in cmap
+
+    def test_swiss_piva_with_iva_suffix_kept(self, monkeypatch):
+        # Il formato svizzero ufficiale porta il suffisso ' IVA'/' MWST':
+        # non fa parte del numero e non deve far scartare la P.IVA (caso
+        # QOQA: senza P.IVA la contraddizione non è mai rilevabile).
+        html = """
+        <table><tr><th>Denominazione</th><th>Partita IVA</th><th>CF</th><th>Ind</th>
+        <th>Civ</th><th>Cap</th><th>Com</th><th>Pr</th><th>Tel</th><th>Email</th><th></th></tr>
+        <tr><td>QoQa Services SA</td><td>CHE-123.456.789 IVA</td><td>x</td><td>V</td><td>1</td>
+        <td>1</td><td>Bulle</td><td>CH</td><td>041</td><td>q@qoqa.ch</td><td></td></tr>
+        </table>
+        """
+        conn = _connector_with_list(monkeypatch, {"clienti.php": html})
+        cmap, _ = conn.fetch_clienti_map()
+        assert cmap["qoqa services sa"]["piva"] == "CHE123456789"
+
     def test_malformed_piva_dropped(self, monkeypatch):
         html = """
         <table><tr><th>Denominazione</th><th>Partita IVA</th><th>CF</th><th>Ind</th>

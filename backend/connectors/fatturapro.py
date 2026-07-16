@@ -793,6 +793,11 @@ class FatturaProConnector:
             if key in ambiguous:
                 continue
             piva_raw = (cells[1] if len(cells) > 1 else "").strip()
+            # I formati esteri portano spesso un suffisso descrittivo che
+            # non fa parte del numero (svizzero: 'CHE-123.456.789 IVA' /
+            # 'MWST' / 'TVA'): va tolto PRIMA del check di formato, o la
+            # P.IVA valida viene scartata per colpa del suffisso.
+            piva_raw = re.sub(r"\s+(IVA|MWST|TVA|VAT)\.?$", "", piva_raw, flags=re.IGNORECASE)
             piva = re.sub(r"[^0-9A-Za-z]", "", piva_raw).upper() or None
             # Scarta valori non conformi al formato P.IVA (testo, note, CF
             # di persona): non devono sovrascrivere una P.IVA valida.
@@ -807,15 +812,16 @@ class FatturaProConnector:
                     break
             prev = result.get(key)
             if prev is not None:
-                # Omonimo: se le P.IVA valide divergono, il nome è ambiguo →
-                # rimuovi l'entry, il match per nome non è affidabile.
-                if prev.get("piva") and piva and prev["piva"] != piva:
+                # Omonimo: se le P.IVA divergono O una sola delle due righe
+                # ce l'ha, il nome non identifica l'entità → ambiguo, si
+                # rimuove l'entry. (Il caso 'presente solo su una' prima
+                # veniva mergiato in silenzio: la P.IVA di un'entità finiva
+                # servita anche per le fatture dell'omonima.)
+                if (prev.get("piva") or piva) and prev.get("piva") != piva:
                     ambiguous.add(key)
                     result.pop(key, None)
                     continue
-                # Stessa (o mancante) P.IVA: completa i campi vuoti
-                if not prev.get("piva") and piva:
-                    prev["piva"] = piva
+                # Stessa P.IVA (o assente su entrambe): completa i campi vuoti
                 if not prev.get("phone") and phone:
                     prev["phone"] = phone
                 if not prev.get("email") and email:
