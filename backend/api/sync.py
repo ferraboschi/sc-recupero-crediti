@@ -142,8 +142,12 @@ def _sync_invoices_task() -> dict:
                 # senza — le scadenze restano 'assumed' fino al prossimo giro.
                 from backend.connectors.fatturapro import doc_key as _doc_key
                 scad_ok = cli_ok = False
+                # Solo le scadenze delle fatture attualmente da incassare:
+                # permette allo scadenzario di fermarsi appena coperte tutte
+                # invece di scorrere decine di migliaia di rate saldate.
+                target_keys = {_doc_key(inv["invoice_number"]) for inv in raw_invoices}
                 try:
-                    scadenze_map, scad_ok = fatturapro.fetch_scadenze_map()
+                    scadenze_map, scad_ok = fatturapro.fetch_scadenze_map(target_keys=target_keys)
                 except Exception as e:
                     logger.error(f"Scadenzario fetch failed: {e}")
                     scadenze_map = {}

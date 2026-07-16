@@ -141,7 +141,7 @@ class FakeFatturaPro:
     def fetch_overdue_invoices(self):
         return list(self.raw_invoices), False
 
-    def fetch_scadenze_map(self):
+    def fetch_scadenze_map(self, target_keys=None, max_pages=400, patience=20):
         return dict(FakeFatturaPro.scadenze_map), FakeFatturaPro.scadenze_complete
 
     def fetch_clienti_map(self):
