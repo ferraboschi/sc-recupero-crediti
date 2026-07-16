@@ -631,7 +631,10 @@ class FatturaProConnector:
             return rows, False
         return rows, True
 
-    def fetch_scadenze_map(self) -> Tuple[Dict[str, date], bool]:
+    def fetch_scadenze_map(
+        self, target_keys: Optional[set] = None,
+        max_pages: int = 400, patience: int = 20,
+    ) -> Tuple[Dict[str, date], bool]:
         """Scadenze reali dallo scadenzario → {doc_key: due_date}.
 
         Colonne: Scadenza · Proroga · Documento · Cliente · Modalità ·
@@ -640,36 +643,126 @@ class FatturaProConnector:
         - le rate con Sospeso == 0 (saldate) vengono ignorate;
         - per ogni fattura si tiene la scadenza aperta più VECCHIA.
 
+        Lo scadenzario storico è ENORME (>40k righe: una per rata dal 2022,
+        saldate incluse) e non ha un filtro "solo aperte". Ma servono solo le
+        scadenze delle fatture attualmente da incassare (target_keys, ~600):
+        si pagina ordinando per data DESC (le non pagate sono recenti → in
+        testa) e ci si ferma quando TUTTE le target sono coperte, o dopo
+        `patience` pagine senza un nuovo match target. Così si leggono
+        centinaia di righe invece di decine di migliaia, e il fetch risulta
+        COMPLETO (le rate più vecchie sono tutte saldate, quindi irrilevanti).
+        Senza target_keys si scarre l'intero scadenzario (fallback).
+
         Returns ({doc_key: date}, complete).
         """
         if not self._authenticated and not self.login():
             return {}, False
-        # Lo scadenzario storico è GRANDE (>10k righe: una per rata, saldate
-        # incluse, dal 2022): il primo run in produzione ha esaurito 100
-        # pagine senza finire → PARTIAL → scadenze non applicate. A ~0,2s a
-        # pagina, 400 pagine (~40k righe) costano al massimo ~90s: accettabile
-        # per un job giornaliero in background.
-        rows, complete = self._paginate_xcrud_list("scadenzario.php", max_pages=400)
+
         result: Dict[str, date] = {}
-        for cells in rows:
-            if len(cells) < 3:
-                continue
-            due = _it_date_to_date(cells[1]) or _it_date_to_date(cells[0])
-            if not due:
-                continue
-            # Rata esplicitamente saldata (Sospeso == 0)
-            sospeso = (cells[8] if len(cells) > 8 else "").strip()
-            if re.match(r"^0([.,]0+)?$", sospeso):
-                continue
-            k = doc_key(cells[2])
-            if not k:
-                continue
-            prev = result.get(k)
-            if prev is None or due < prev:
-                result[k] = due
+        targets = set(target_keys) if target_keys else None
+        covered: set = set()
+        pages_without_new = 0
+        total_rows = 0
+        complete = False
+
+        def _ingest(cells_list) -> int:
+            """Aggiunge le rate aperte; ritorna quante NUOVE target ha coperto."""
+            nonlocal total_rows
+            new_targets = 0
+            for cells in cells_list:
+                total_rows += 1
+                if len(cells) < 3:
+                    continue
+                due = _it_date_to_date(cells[1]) or _it_date_to_date(cells[0])
+                if not due:
+                    continue
+                sospeso = (cells[8] if len(cells) > 8 else "").strip()
+                if re.match(r"^0([.,]0+)?$", sospeso):
+                    continue  # rata saldata
+                k = doc_key(cells[2])
+                if not k:
+                    continue
+                if targets is not None and k not in targets:
+                    continue
+                if targets is not None and k not in covered:
+                    covered.add(k)
+                    new_targets += 1
+                prev = result.get(k)
+                if prev is None or due < prev:
+                    result[k] = due
+            return new_targets
+
+        try:
+            first = self.client.get(f"{self.base_url}/scadenzario.php", timeout=self.timeout)
+            first.raise_for_status()
+            if self._looks_like_auth_page(first):
+                logger.warning("scadenzario.php: session expired — cannot fetch")
+                return {}, False
+            _ingest(self._parse_xcrud_rows(first.text))
+            key, instance = self._xcrud_tokens(first.text)
+            if not key or not instance:
+                complete = total_rows < 100
+                return result, complete
+
+            PAGE = 100
+            start = PAGE
+            for _ in range(max_pages):
+                if targets is not None and covered >= targets:
+                    complete = True
+                    break
+                resp = self.client.post(
+                    f"{self.base_url}/xcrud/xcrud_ajax.php",
+                    data={
+                        "xcrud[key]": key,
+                        "xcrud[instance]": instance,
+                        "xcrud[orderby]": "scadenze.DataScadenzaPagamento",
+                        "xcrud[order]": "desc",
+                        "xcrud[start]": str(start),
+                        "xcrud[limit]": str(PAGE),
+                        "xcrud[task]": "list",
+                    },
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": f"{self.base_url}/scadenzario.php",
+                    },
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                if "xcrud-error" in resp.text:
+                    logger.warning("scadenzario.php: xcrud error during pagination — PARTIAL")
+                    break
+                batch = self._parse_xcrud_rows(resp.text)
+                if not batch:
+                    complete = not self._looks_like_auth_page(resp)
+                    break
+                new_targets = _ingest(batch)
+                nk, ni = self._xcrud_tokens(resp.text)
+                if nk:
+                    key = nk
+                if ni:
+                    instance = ni
+                if len(batch) < PAGE:
+                    complete = True
+                    break
+                # Convergenza: se abbiamo un set target e non troviamo nuove
+                # scadenze aperte da `patience` pagine, il resto sono rate
+                # saldate → fetch di fatto completo per i nostri scopi.
+                if targets is not None:
+                    pages_without_new = 0 if new_targets else pages_without_new + 1
+                    if pages_without_new >= patience:
+                        complete = True
+                        break
+                start += PAGE
+            else:
+                logger.warning("scadenzario.php: reached max_pages — PARTIAL")
+        except Exception as e:
+            logger.error(f"Scadenzario fetch error: {e}")
+            return result, False
+
+        cov = f", {len(covered)}/{len(targets)} target covered" if targets is not None else ""
         logger.info(
             f"Scadenzario: {len(result)} invoices with a real due date "
-            f"from {len(rows)} ledger rows{'' if complete else ' (PARTIAL)'}"
+            f"from {total_rows} ledger rows{cov}{'' if complete else ' (PARTIAL)'}"
         )
         return result, complete
 

@@ -85,36 +85,94 @@ def _connector_with_list(monkeypatch, path_to_html):
     return conn
 
 
+class _FakeResp:
+    def __init__(self, html):
+        self.text = html
+        self.url = "https://cloud.fatturapro.click/scadenzario.php"
+
+    def raise_for_status(self):
+        return None
+
+
+def _connector_scadenzario(monkeypatch, html):
+    """Connettore per fetch_scadenze_map: client.get serve l'HTML in una
+    pagina sola (niente key/instance → nessuna paginazione, complete=True)."""
+    conn = FatturaProConnector()
+    conn._authenticated = True
+    monkeypatch.setattr(conn.client, "get", lambda *a, **kw: _FakeResp(html))
+    return conn
+
+
 class TestScadenzeMap:
     def test_custode_has_two_due_dates(self, monkeypatch):
-        conn = _connector_with_list(monkeypatch, {"scadenzario.php": SCADENZARIO_HTML})
+        conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
         smap, complete = conn.fetch_scadenze_map()
         assert complete
         assert smap[doc_key("690/SAK del 20/04/2026")] == date(2026, 5, 20)
         assert smap[doc_key("1093/SAK del 15/06/2026")] == date(2026, 7, 15)
 
     def test_belfiore_655_present(self, monkeypatch):
-        conn = _connector_with_list(monkeypatch, {"scadenzario.php": SCADENZARIO_HTML})
+        conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
         smap, _ = conn.fetch_scadenze_map()
         assert smap[doc_key("655/SAK")] == date(2026, 4, 15)
 
     def test_proroga_overrides_scadenza(self, monkeypatch):
-        conn = _connector_with_list(monkeypatch, {"scadenzario.php": SCADENZARIO_HTML})
+        conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
         smap, _ = conn.fetch_scadenze_map()
         # 500/SAK: scadenza 01/03 ma proroga 30/06 → vince la proroga
         assert smap[doc_key("500/SAK")] == date(2026, 6, 30)
 
     def test_settled_installment_ignored(self, monkeypatch):
-        conn = _connector_with_list(monkeypatch, {"scadenzario.php": SCADENZARIO_HTML})
+        conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
         smap, _ = conn.fetch_scadenze_map()
         # 400/SAK ha Sospeso=0,00 → rata saldata, non deve comparire
         assert doc_key("400/SAK") not in smap
 
     def test_multiple_installments_keeps_earliest(self, monkeypatch):
-        conn = _connector_with_list(monkeypatch, {"scadenzario.php": SCADENZARIO_HTML})
+        conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
         smap, _ = conn.fetch_scadenze_map()
         # 300/SAK ha due rate aperte (05/02 e 05/01) → tiene la più vecchia
         assert smap[doc_key("300/SAK")] == date(2026, 1, 5)
+
+    def test_target_keys_only_covers_requested(self, monkeypatch):
+        # Con target_keys si tengono solo le fatture richieste
+        conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
+        smap, complete = conn.fetch_scadenze_map(target_keys={doc_key("655/SAK")})
+        assert complete
+        assert doc_key("655/SAK") in smap
+        assert doc_key("690/SAK") not in smap
+
+    def test_convergence_stops_early_when_targets_covered(self, monkeypatch):
+        # Pagina 1 (via GET) con key+instance → una rata target; le pagine
+        # AJAX successive sono piene di rate saldate/altre. Coperto il target,
+        # il fetch si ferma senza scorrere tutto ed è COMPLETO.
+        def row(num, due, sosp):
+            return (f'<tr><td>{due}</td><td></td><td>{num}</td><td>Cli</td>'
+                    f'<td>B</td><td>U</td><td>I</td><td>10</td><td>{sosp}</td><td></td></tr>')
+        page1 = ('<table><tr><th>Scadenza</th></tr>'
+                 + row("999/SAK del 01/07/2026", "01/08/2026", "10,00")  # target, aperta
+                 + '</table><input name="key" value="k1"><input name="instance" value="scad_9">')
+        # pagine AJAX: 100 righe di rate SALDATE (nessun nuovo target)
+        settled = ('<table>' + ''.join(
+            row(f"{i}/OLD del 01/01/2023", "01/01/2023", "0,00") for i in range(100)
+        ) + '</table>')
+
+        conn = FatturaProConnector()
+        conn._authenticated = True
+        monkeypatch.setattr(conn.client, "get", lambda *a, **kw: _FakeResp(page1))
+        posts = {"n": 0}
+
+        def fake_post(*a, **kw):
+            posts["n"] += 1
+            return _FakeResp(settled)
+
+        monkeypatch.setattr(conn.client, "post", fake_post)
+        smap, complete = conn.fetch_scadenze_map(
+            target_keys={doc_key("999/SAK")}, patience=3
+        )
+        assert complete                      # target coperto → completo
+        assert smap[doc_key("999/SAK")] == date(2026, 8, 1)
+        assert posts["n"] == 0               # target già in pagina 1: nessun AJAX
 
 
 class TestClientiMap:
