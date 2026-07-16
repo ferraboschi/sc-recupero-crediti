@@ -76,24 +76,34 @@ FROM customers WHERE ragione_sociale ILIKE '%belfiore%';
 
 ### 3. Anagrafica Shopify (telefono, email, numero d'ordine)
 
-Fix inclusi: paginazione ordini corretta (prima gli ordini vecchi non
-venivano MAI letti oltre i primi 250), criteri di match ordine→fattura
-allargati (importo anche al netto IVA, finestra 90 giorni), contatti
-copiati anche sui profili nati dalle fatture quando condividono la P.IVA
-col cliente Shopify, P.IVA spazzatura da `address2` non più salvata.
+**CAUSA RADICE VERIFICATA IN PRODUZIONE (16/07, dashboard Render+Shopify):
+il servizio punta allo STORE SBAGLIATO.** Su Render `SHOPIFY_STORE_URL` =
+`https://sakesommelierassociation.myshopify.com` (lo store SSA dei corsi),
+che ha **zero clienti col tag B2B**: il sync clienti non ha mai scritto
+nulla ("successo" con 0 creati) e i fetch ordini interrogano customer_id
+inesistenti su quello store → 0 ordini per tutti, sempre. I clienti B2B
+reali (Domò/Yoho/Belfiore… con ordini e contatti) stanno sullo store
+**sake-company.myshopify.com** — verificato dall'admin Shopify.
 
-Due verifiche che SOLO il proprietario può fare:
+Azione (2 minuti, solo il proprietario può farla — richiede il token):
 
-1. **Scope del token Shopify** (Dev Dashboard → app): servono
-   `read_customers`, `read_orders` e — importante — `read_all_orders`:
-   senza quest'ultimo Shopify restituisce SILENZIOSAMENTE solo gli ordini
-   degli ultimi 60 giorni, e le fatture da recuperare sono per definizione
-   più vecchie. Nessun errore nei log: solo zero match.
-2. **Tag B2B**: viene importato solo chi ha il tag `B2B` su Shopify. Un
-   cliente senza tag è invisibile all'app (niente contatti, niente ordini).
+1. Render → sc-recupero-api → Environment:
+   - `SHOPIFY_STORE_URL` → `https://sake-company.myshopify.com`
+   - `SHOPIFY_ACCESS_TOKEN` → token Admin API di un'app dello store
+     sake-company con scope `read_customers`, `read_orders` e
+     `read_all_orders` (senza quest'ultimo Shopify restituisce in silenzio
+     solo gli ordini degli ultimi 60 giorni). Va bene una custom app
+     esistente con quegli scope o una nuova ("SC Recupero").
+2. Salvare (il servizio si ri-deploya da solo) e lanciare un full sync.
 
-Dopo il deploy, pagina Sistema → stato sync: ora mostra anche l'esito
-dell'order matching (prima gli errori restavano sepolti nel JSON).
+Fix di codice inclusi in questa PR (necessari comunque): paginazione
+ordini corretta (prima gli ordini oltre i primi 250 non venivano MAI
+letti), criteri di match allargati (importo anche al netto IVA, finestra
+90 giorni, ordini annullati esclusi), contatti copiati anche sui profili
+nati dalle fatture quando condividono la P.IVA, P.IVA spazzatura da
+`address2` non più salvata. Nota: viene importato solo chi ha il tag
+`B2B` sullo store. Dopo il deploy, pagina Sistema → stato sync mostra
+anche l'esito dell'order matching (prima gli errori restavano sepolti).
 
 ### 4. Domò Milano ↔ YOHO MILANO (fatture F24)
 
@@ -153,10 +163,11 @@ FROM customers WHERE ragione_sociale ILIKE '%gahe%' OR ragione_sociale ILIKE '%m
 
 ## Nota operativa sul sync
 
-Il servizio Render è su piano free: l'istanza dorme e il job delle 08:30
-può non scattare (lo scheduler è in-process, il tick perso non viene
-recuperato). Il sync di fatto gira 60 secondi dopo il wake. Se serve
-puntualità: upgrade del piano, oppure un ping esterno (UptimeRobot) alle
-08:25, oppure un Render Cron Job che chiama `POST /api/sync/full`.
+VERIFICATO su Render (16/07): il servizio `sc-recupero-api` è già sul
+piano **Starter (a pagamento)** — niente spin-down, lo scheduler delle
+08:30 è affidabile — e l'**auto-deploy da `main` è attivo**. Il
+`plan: free` che compariva in `render.yaml` era solo il default del
+blueprint ed è stato allineato a `starter` in questa PR.
 Il bottone Sync della Dashboard ora attende il VERO completamento prima di
-dire "completata" (prima mostrava i dati pre-sync come esito).
+dire "completata" (prima mostrava i dati pre-sync come esito, anche a
+sync fallito).
