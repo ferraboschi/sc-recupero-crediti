@@ -18,7 +18,9 @@ from typing import Optional, Dict, Any, List
 from sqlalchemy.orm import Session
 
 from backend.database import Invoice, Customer
-from backend.engine.normalizer import normalize_ragione_sociale, are_similar
+from backend.engine.normalizer import (
+    normalize_ragione_sociale, name_similarity_score,
+)
 from backend.engine.piva import validate_piva
 from backend.config import config
 
@@ -90,8 +92,10 @@ def match_invoice_to_customer(
             candidate = piva_matches[0]
             # Guardia anti-poisoning: P.IVA uguale ma nome completamente
             # diverso = P.IVA probabilmente corrotta → quarantena.
+            # Lo score è robusto ai nomi-persona: "MERCURI CHRISTIAN" è
+            # concorde con "Dr. Gahe di Mercuri Christian".
             if inv_name and candidate.ragione_sociale:
-                _, name_score = are_similar(inv_name, candidate.ragione_sociale, threshold=100)
+                name_score = name_similarity_score(inv_name, candidate.ragione_sociale)
                 if name_score < PIVA_NAME_MISMATCH_THRESHOLD:
                     logger.warning(
                         f"Invoice {invoice.invoice_number}: P.IVA {inv_piva} matches "
@@ -116,7 +120,7 @@ def match_invoice_to_customer(
             if inv_name:
                 best = max(
                     piva_matches,
-                    key=lambda c: are_similar(inv_name, c.ragione_sociale or "", threshold=100)[1],
+                    key=lambda c: name_similarity_score(inv_name, c.ragione_sociale or ""),
                 )
             result.suggested_customer = best
             result.suggested_method = "piva_ambiguous"
@@ -173,6 +177,9 @@ def match_invoice_to_customer(
             return result
 
     # ── Strategia 3: fuzzy → SOLO suggerimento ──────────────────────
+    # Lo score include il confronto 'light' (pattern 'di Nome Cognome'
+    # conservato): la fattura intestata alla sola persona suggerisce
+    # l'insegna completa invece di restare orfana.
     if inv_name:
         best_customer = None
         best_score = 0
@@ -180,11 +187,8 @@ def match_invoice_to_customer(
             cust_piva = validate_piva(c.partita_iva)
             if inv_piva and cust_piva and inv_piva != cust_piva:
                 continue
-            is_sim, score = are_similar(
-                inv_name, c.ragione_sociale or "",
-                threshold=config.FUZZY_MATCH_THRESHOLD,
-            )
-            if is_sim and score > best_score:
+            score = name_similarity_score(inv_name, c.ragione_sociale or "")
+            if score >= config.FUZZY_MATCH_THRESHOLD and score > best_score:
                 best_customer = c
                 best_score = score
         if best_customer:
@@ -243,6 +247,14 @@ def run_matching(session: Session) -> Dict[str, Any]:
             result.suggested_score = result.score
             result.customer = None
             result.method = None
+
+        # Un suggerimento SOLO-fuzzy su una fattura scollegata/rifiutata a
+        # mano è già stato respinto una volta: non riproporlo a ogni sync
+        # ("non verrà più riproposta in automatico" deve essere vero).
+        if invoice.match_method == "unlinked" and result.suggested_method == "fuzzy":
+            result.suggested_customer = None
+            result.suggested_method = None
+            result.suggested_score = None
 
         if result.customer is not None:
             invoice.customer_id = result.customer.id

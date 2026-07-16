@@ -132,19 +132,21 @@ class TestDetachOnPivaConflict:
         test_db_session.refresh(inv)
         assert inv.customer_id == rooftop.id
 
-    def test_paid_invoices_not_detached(self, test_db_session):
-        """Il repair v1 lavora sulle non pagate (le pagate emergono
-        dall'audit con include_paid e si trattano a mano)."""
+    def test_paid_invoices_detached_too(self, test_db_session):
+        """Anche una PAGATA mal attribuita viene scollegata dal passo 1:
+        inquina i totali storici del profilo sbagliato e il detach è
+        innocuo per i solleciti."""
         rooftop = _customer(test_db_session, "Rooftop SRL", PIVA_ROOFTOP)
-        _customer(test_db_session, "QOQA SRL", PIVA_QOQA)
+        qoqa = _customer(test_db_session, "QOQA SRL", PIVA_QOQA)
         inv = _invoice(
             test_db_session, "PAID/2026", customer=rooftop, status="paid",
+            customer_name_raw="QOQA SRL",
             customer_piva_raw=PIVA_QOQA, match_method="legacy",
         )
         stats = repair_matches(test_db_session)
-        assert stats["piva_conflict_detached"] == 0
+        assert stats["piva_conflict_detached"] == 1
         test_db_session.refresh(inv)
-        assert inv.customer_id == rooftop.id
+        assert inv.customer_id == qoqa.id
 
 
 class TestLegacyRematch:
@@ -194,26 +196,58 @@ class TestLegacyRematch:
         test_db_session.refresh(inv)
         assert inv.customer_id == izakaya.id
 
-    def test_name_exact_disagreement_logged_for_review(self, test_db_session):
-        """Il motore nuovo troverebbe un name_exact AUTOMATICO su un
-        cliente diverso: non si tocca nulla ma la review viene tracciata
-        (era il ramo mancante)."""
+    def test_name_exact_disagreement_relinks(self, test_db_session):
+        """Il motore nuovo trova un name_exact AUTOMATICO su un cliente
+        diverso e il nome 'light' lo conferma: detach + riabbinamento
+        (il caso 'fattura YOHO sul profilo Domò')."""
         wrong = _customer(test_db_session, "Cliente Sbagliato SRL", None)
-        _customer(test_db_session, "QOQA SRL", None)
+        qoqa = _customer(test_db_session, "QOQA SRL", None)
         inv = _invoice(
             test_db_session, "NE/2026", customer=wrong,
             customer_name_raw="QOQA S.R.L.", match_method="legacy",
         )
         stats = repair_matches(test_db_session)
-        assert stats["legacy_review_logged"] >= 1
+        assert stats["name_exact_relink_detached"] == 1
         test_db_session.refresh(inv)
-        assert inv.customer_id == wrong.id
+        assert inv.customer_id == qoqa.id
+        assert inv.match_method == "name_exact"
         log = test_db_session.query(ActivityLog).filter_by(
-            action="repair_legacy_review"
+            action="repair_name_exact_relink"
         ).all()
         assert any(
             (entry.details or {}).get("invoice_number") == "NE/2026" for entry in log
         )
+
+    def test_yoho_case_relinked_from_domo(self, test_db_session):
+        """Caso reale segnalato: fattura F24 di YOHO MILANO (senza P.IVA)
+        auto-abbinata dal vecchio motore fuzzy a Domò Milano (token
+        'milano' condiviso, score 81). Appena il cliente YOHO esiste, il
+        repair la sposta sul profilo giusto."""
+        domo = _customer(test_db_session, "Domò Milano", None)
+        yoho = _customer(test_db_session, "YOHO MILANO SRL", None)
+        inv = _invoice(
+            test_db_session, "45/2025", customer=domo,
+            customer_name_raw="YOHO MILANO SRL", match_method="legacy",
+        )
+        stats = repair_matches(test_db_session)
+        assert stats["name_exact_relink_detached"] == 1
+        test_db_session.refresh(inv)
+        assert inv.customer_id == yoho.id
+
+    def test_name_exact_relink_blocked_by_collapsed_keys(self, test_db_session):
+        """Guardia anti-collasso: 'Osteria di Mario Rossi' e 'Osteria di
+        Luigi Bianchi' condividono la chiave normalizzata 'osteria' ma sono
+        insegne DIVERSE — il nome 'light' non conferma → review, no relink."""
+        current = _customer(test_db_session, "Cliente Attuale SRL", None)
+        _customer(test_db_session, "Osteria di Mario Rossi", None)
+        inv = _invoice(
+            test_db_session, "OST/2026", customer=current,
+            customer_name_raw="Osteria di Luigi Bianchi", match_method="legacy",
+        )
+        stats = repair_matches(test_db_session)
+        assert stats["name_exact_relink_detached"] == 0
+        test_db_session.refresh(inv)
+        assert inv.customer_id == current.id
 
     def test_uncertain_disagreement_only_logged(self, test_db_session):
         """Senza certezza P.IVA il repair non tocca nulla: solo un
@@ -297,15 +331,71 @@ class TestReconciliation:
         assert own.customer_id == rooftop.id
 
 
-class TestIdempotence:
-    def test_second_run_skips(self, test_db_session):
-        _customer(test_db_session, "Rooftop SRL", PIVA_ROOFTOP)
+class TestRecurrence:
+    def test_second_run_is_idempotent(self, test_db_session):
+        """Il repair è RICORRENTE: la seconda run non skippa, ma non trova
+        più nulla da scollegare (il detach è auto-esaurente)."""
+        rooftop = _customer(test_db_session, "Rooftop SRL", PIVA_ROOFTOP)
+        qoqa = _customer(test_db_session, "QOQA SRL", PIVA_QOQA)
+        inv = _invoice(
+            test_db_session, "993/2026", customer=rooftop,
+            customer_name_raw="QOQA SRL", customer_piva_raw=PIVA_QOQA,
+            match_method="legacy",
+        )
         stats1 = repair_matches(test_db_session)
-        assert "skipped" not in stats1
+        assert stats1["piva_conflict_detached"] == 1
         stats2 = repair_matches(test_db_session)
-        assert stats2 == {"skipped": True}
+        assert "skipped" not in stats2
+        assert stats2["piva_conflict_detached"] == 0
+        test_db_session.refresh(inv)
+        assert inv.customer_id == qoqa.id
         marker = test_db_session.query(SyncState).filter_by(key=REPAIR_MARKER_KEY).one()
         assert marker.result["done"] is True
+
+    def test_late_piva_enrichment_repaired_next_run(self, test_db_session):
+        """Il buco del vecchio one-shot: la P.IVA arriva dall'anagrafica
+        DOPO la prima run del repair. Con il repair ricorrente la
+        contraddizione emersa dopo viene riparata al giro successivo."""
+        rooftop = _customer(test_db_session, "Rooftop SRL", PIVA_ROOFTOP)
+        qoqa = _customer(test_db_session, "QOQA SRL", PIVA_QOQA)
+        inv = _invoice(
+            test_db_session, "993/2026", customer=rooftop,
+            customer_name_raw="QOQA SRL", customer_piva_raw=None,
+            match_method="legacy",
+        )
+        repair_matches(test_db_session)
+        test_db_session.refresh(inv)
+        assert inv.customer_id in (rooftop.id, qoqa.id)  # senza P.IVA: name_exact relink possibile
+        # Simula l'enrichment del ciclo successivo
+        inv.customer_piva_raw = PIVA_QOQA
+        inv.customer_id = rooftop.id
+        inv.match_method = "legacy"
+        test_db_session.commit()
+        stats2 = repair_matches(test_db_session)
+        assert stats2["piva_conflict_detached"] == 1
+        test_db_session.refresh(inv)
+        assert inv.customer_id == qoqa.id
+
+    def test_review_logs_deduplicated(self, test_db_session):
+        """La stessa situazione di review non si rilogga a ogni sync."""
+        rooftop = _customer(test_db_session, "Rooftop SRL", PIVA_ROOFTOP)
+        _customer(test_db_session, "QOQA SRL", PIVA_QOQA)
+        _invoice(
+            test_db_session, "R1/2026", customer=rooftop,
+            customer_name_raw="Rooftop S.R.L.",  # concorda col cliente
+            customer_piva_raw=PIVA_QOQA,          # P.IVA avvelenata
+            match_method="legacy",
+        )
+        stats1 = repair_matches(test_db_session)
+        stats2 = repair_matches(test_db_session)
+        # La review si CONTA a ogni run (fotografa lo stato corrente)...
+        assert stats1["piva_conflict_review"] == 1
+        assert stats2["piva_conflict_review"] == 1
+        # ...ma il log non si duplica.
+        log = test_db_session.query(ActivityLog).filter_by(
+            action="repair_piva_conflict_review"
+        ).all()
+        assert len(log) == 1
 
     def test_no_customers_no_crash(self, test_db_session):
         stats = repair_matches(test_db_session)

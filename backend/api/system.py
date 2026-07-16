@@ -412,7 +412,7 @@ async def match_audit(
     include_paid=true copre anche le pagate (che inquinano i totali del
     profilo pur non contando nelle scadute).
     """
-    from backend.engine.normalizer import are_similar
+    from backend.engine.normalizer import name_similarity_score
     from backend.engine.piva import validate_piva
 
     session = get_session_direct()
@@ -437,12 +437,14 @@ async def match_audit(
             if not cust:
                 continue
 
+            # Score robusto ai nomi-persona (stesso predicato di matcher e
+            # repair): "MERCURI CHRISTIAN" è concorde con l'insegna
+            # "Dr. Gahe di Mercuri Christian", non un caso 'bad'.
             name_score = None
             if inv.customer_name_raw and cust.ragione_sociale:
-                _, name_score = are_similar(
-                    inv.customer_name_raw, cust.ragione_sociale, threshold=100
+                name_score = name_similarity_score(
+                    inv.customer_name_raw, cust.ragione_sociale
                 )
-                name_score = int(name_score)
 
             inv_piva = validate_piva(inv.customer_piva_raw)
             cust_piva = validate_piva(cust.partita_iva)

@@ -1017,16 +1017,14 @@ def _full_sync_task() -> dict:
             logger.error(f"Customer sync failed: {e}", exc_info=True)
             results["customers"] = {"error": str(e)}
 
-        # Step 2.5: Repair una-tantum degli abbinamenti (marker match_repair_v2).
-        # Gira QUI, dopo che il sync fatture ha popolato le P.IVA reali
-        # dall'anagrafica (allo startup non c'erano ancora → 0 detach): ora
-        # le contraddizioni P.IVA sono visibili e i casi legacy tipo
-        # QOQA→Rooftop possono essere separati. Il lock è già del full sync,
+        # Step 2.5: Repair RICORRENTE degli abbinamenti. Gira QUI, dopo che
+        # il sync fatture ha popolato le P.IVA reali dall'anagrafica: le
+        # contraddizioni P.IVA sono visibili e i casi legacy tipo
+        # QOQA→Rooftop vengono separati. Il lock è già del full sync,
         # quindi si chiama repair_matches direttamente (niente doppio lock).
-        # SOLO su enrichment COMPLETO: il repair è one-shot (marker v2) e la
-        # P.IVA che deve leggere viene dall'ANAGRAFICA. Se lista fatture O
-        # anagrafica sono parziali/fallite, le P.IVA non sono tutte popolate:
-        # rimandare al prossimo ciclo invece di bruciare il marker a vuoto.
+        # SOLO su enrichment COMPLETO: la P.IVA che il repair legge viene
+        # dall'ANAGRAFICA — con fetch parziali un detach potrebbe basarsi su
+        # dati incompleti; si salta il ciclo e si ritenta al successivo.
         inv_res = results.get("invoices", {})
         fp_res = inv_res.get("fatturapro", {}) if isinstance(inv_res, dict) else {}
         enrichment_complete = (
