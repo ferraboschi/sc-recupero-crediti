@@ -114,9 +114,15 @@ class TestNormalizeRagioneSociale:
         assert normalize_ragione_sociale("cooperativa ACME") == "acme"
 
     def test_keep_ampersand(self):
-        """Test that ampersands are preserved."""
-        assert normalize_ragione_sociale("Johnson & Johnson S.R.L.") == "johnson & johnson"
+        """La '&' si conserva e la spaziatura attorno NON è distintiva:
+        'M & M' e 'M&M' sono la stessa insegna → stessa chiave."""
+        assert normalize_ragione_sociale("Johnson & Johnson S.R.L.") == "johnson&johnson"
         assert normalize_ragione_sociale("SHU&SHU") == "shu&shu"
+        assert (
+            normalize_ragione_sociale("Belfiore M & M srl")
+            == normalize_ragione_sociale("Belfiore M&M srl")
+            == "belfiore m&m"
+        )
 
     def test_keep_hyphen(self):
         """Test that hyphens are preserved."""
@@ -365,3 +371,39 @@ class TestAreSimilar:
         is_similar, score = are_similar(None, None)
         assert isinstance(is_similar, bool)
         assert isinstance(score, (int, float))
+
+
+class TestPersonAwareSimilarity:
+    """Scorer robusti ai nomi-persona (ditte individuali 'X di Nome Cognome')."""
+
+    def test_light_keeps_person_pattern(self):
+        from backend.engine.normalizer import normalize_ragione_sociale_light
+        assert normalize_ragione_sociale("Dr. Gahe di Mercuri Christian") == "dr gahe"
+        assert (
+            normalize_ragione_sociale_light("Dr. Gahe di Mercuri Christian")
+            == "dr gahe di mercuri christian"
+        )
+
+    def test_person_only_invoice_is_concordant(self):
+        """Il caso Dr. Gahe: la fattura intestata alla sola persona è
+        CONCORDE con l'insegna completa (era 25, sotto ogni soglia)."""
+        from backend.engine.normalizer import name_similarity_score
+        assert name_similarity_score(
+            "MERCURI CHRISTIAN", "Dr. Gahe di Mercuri Christian"
+        ) >= 75
+        assert name_similarity_score(
+            "CHRISTIAN MERCURI", "Dr. Gahe di Mercuri Christian"
+        ) >= 75
+
+    def test_unrelated_names_stay_dissimilar(self):
+        from backend.engine.normalizer import name_similarity_score
+        assert name_similarity_score("QOQA Services SA", "Rooftop SRL") < 40
+
+    def test_light_guard_blocks_collapsed_keys(self):
+        """Due insegne 'Osteria di <persona diversa>' collassano sulla
+        stessa chiave di matching ma il confronto light le distingue."""
+        from backend.engine.normalizer import light_similarity_score
+        assert light_similarity_score(
+            "Osteria di Luigi Bianchi", "Osteria di Mario Rossi"
+        ) < 75
+        assert light_similarity_score("YOHO MILANO SRL", "YOHO MILANO") >= 75

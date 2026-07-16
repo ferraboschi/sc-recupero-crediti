@@ -1,4 +1,4 @@
-"""Repair pass una-tantum degli abbinamenti fattura→cliente.
+"""Repair pass RICORRENTE degli abbinamenti fattura→cliente.
 
 Ripara i danni lasciati dal vecchio motore di matching (i casi
 "fattura di QOQA sul profilo Rooftop"), che il rework ha smesso di
@@ -12,12 +12,15 @@ Passi:
    scollegate con match_method=None (NON 'unlinked': quello è il freno delle
    decisioni umane e bloccherebbe per sempre il riabbinamento automatico).
    Escluse le decisioni esplicite dell'operatore (manual/fuzzy_confirmed/
-   unlinked).
-2. RE-MATCH advisory delle fatture 'legacy' rimaste: se il motore NUOVO
-   concorda con l'abbinamento esistente → match_method promosso all'esito
-   reale; se il motore troverebbe con certezza P.IVA un cliente DIVERSO →
-   detach (il riabbinamento passa comunque dal matching sicuro); ogni altro
-   disaccordo → solo ActivityLog di review, l'abbinamento non si tocca.
+   unlinked). Include le PAGATE: una pagata mal attribuita inquina i totali
+   storici del profilo e scollegarla è innocuo per i solleciti.
+2. RE-MATCH advisory degli abbinamenti MACCHINA rimasti (legacy, piva,
+   name_exact, auto_created, …): se il motore NUOVO concorda → provenance
+   'legacy' promossa all'esito reale; se troverebbe con certezza (P.IVA
+   univoca, o name_exact univoco confermato dal nome 'light') un cliente
+   DIVERSO → detach (il riabbinamento passa comunque dal matching sicuro);
+   ogni altro disaccordo → solo ActivityLog di review, l'abbinamento non
+   si tocca.
 3. run_matching — riabbina subito le fatture scollegate (P.IVA univoca o
    quarantena: mai un riabbinamento cieco). Loop-safe by-design: la
    Strategia 1 abbina per la P.IVA DELLA FATTURA, che per costruzione del
@@ -25,9 +28,12 @@ Passi:
 4. Riconciliazione dei clienti che hanno perso fatture: pratiche rimaste
    senza scadute chiuse ('no_overdue', riapribile), stato-cache refreshato.
 
-Idempotente via marker SyncState 'match_repair_v1' scritto nello STESSO
-commit del detach (pattern case_backfill: tutto-o-niente, retry al
-prossimo avvio). Versionare la key per un eventuale secondo giro.
+Il repair gira a OGNI full sync con enrichment completo: i passi sono
+idempotenti (detach solo su evidenza deterministica, review deduplicate
+via ActivityLog). Il marker SyncState registra solo l'ultima esecuzione
+per l'osservabilità — non è più un gate one-shot: le contraddizioni che
+emergono nei cicli successivi (P.IVA arricchite dopo, clienti creati
+dopo) vengono riparate al giro successivo invece di restare congelate.
 """
 
 import logging
@@ -46,7 +52,9 @@ from backend.engine.matching import (
 from backend.engine.cases import (
     close_case, get_open_case, is_overdue_unpaid, _refresh_customer_status,
 )
-from backend.engine.normalizer import are_similar
+from backend.engine.normalizer import (
+    name_similarity_score, light_similarity_score_strict,
+)
 from backend.engine.piva import validate_piva
 
 logger = logging.getLogger(__name__)
@@ -54,10 +62,8 @@ logger = logging.getLogger(__name__)
 # Abbinamenti decisi esplicitamente da un operatore: mai toccati dal repair.
 HUMAN_DECIDED_METHODS = ("manual", "fuzzy_confirmed", "unlinked")
 
-# v2: rigira dopo l'introduzione dell'estrazione P.IVA dall'anagrafica
-# (fetch_clienti_map). Il repair v1 girò allo startup con le P.IVA ancora
-# assenti → 0 detach; v2 gira come step del full sync, DOPO che le P.IVA
-# reali sono state popolate, così le contraddizioni diventano visibili.
+# Marker di osservabilità (ultima esecuzione + stats). La key resta 'v2'
+# per continuità con lo storico in produzione.
 REPAIR_MARKER_KEY = "match_repair_v2"
 
 # Sopra questa somiglianza il nome della fattura CONFERMA il cliente attuale.
@@ -65,12 +71,47 @@ NAME_CONCORDANT_THRESHOLD = 75
 
 
 def _name_score_vs_customer(invoice: Invoice, customer: Customer):
-    """Somiglianza nome-fattura vs cliente attuale, o None se non calcolabile."""
+    """Somiglianza nome-fattura vs cliente attuale, o None se non calcolabile.
+
+    Usa lo score robusto ai nomi-persona: la fattura di una ditta
+    individuale intestata alla sola persona è CONCORDE con l'insegna
+    completa 'X di Nome Cognome' (mai un detach su quella base).
+    """
     inv_name = (invoice.customer_name_raw or "").strip()
     if not inv_name or not customer.ragione_sociale:
         return None
-    _, score = are_similar(inv_name, customer.ragione_sociale, threshold=100)
-    return int(score)
+    return name_similarity_score(inv_name, customer.ragione_sociale)
+
+
+# Chiavi dei details che identificano una situazione di review: se un log
+# della stessa azione con gli stessi valori esiste già, la review è nota.
+_REVIEW_IDENTITY_KEYS = (
+    "old_customer_id", "new_customer_id", "suggested_customer_id",
+    "disagree_customer_id", "customer_id", "invoice_piva", "customer_piva",
+)
+
+
+def _log_review(session, action: str, invoice: Invoice, details: dict,
+                stats: Dict[str, Any], stat_key: str) -> None:
+    """Registra una review contando SEMPRE nelle stats ma scrivendo
+    l'ActivityLog una sola volta: il repair è ricorrente e la stessa
+    situazione non deve rilogggarsi a ogni sync."""
+    stats[stat_key] += 1
+    existing = session.query(ActivityLog).filter_by(
+        action=action, entity_type="invoice", entity_id=invoice.id,
+    ).all()
+    for entry in existing:
+        prev = entry.details or {}
+        if all(
+            prev.get(k) == details.get(k)
+            for k in _REVIEW_IDENTITY_KEYS
+            if k in prev or k in details
+        ):
+            return
+    session.add(ActivityLog(
+        action=action, entity_type="invoice", entity_id=invoice.id,
+        details=details,
+    ))
 
 
 def _detach(invoice: Invoice) -> None:
@@ -86,10 +127,8 @@ def _detach(invoice: Invoice) -> None:
 
 
 def repair_matches(session: Session) -> Dict[str, Any]:
-    """Esegue il repair se il marker non risulta già completato."""
+    """Esegue il repair (ricorrente: il marker registra solo l'ultima run)."""
     marker = session.query(SyncState).filter_by(key=REPAIR_MARKER_KEY).first()
-    if marker and (marker.result or {}).get("done"):
-        return {"skipped": True}
 
     now = datetime.utcnow()
     stats = {
@@ -97,18 +136,19 @@ def repair_matches(session: Session) -> Dict[str, Any]:
         "piva_conflict_review": 0,
         "legacy_promoted": 0,
         "legacy_piva_relink_detached": 0,
+        "name_exact_relink_detached": 0,
         "legacy_review_logged": 0,
+        "no_candidate_review": 0,
         "cases_closed": 0,
         "customers_reconciled": 0,
     }
     touched_customer_ids = set()
 
+    # Include le pagate: il passo 1 le può scollegare (ripulisce i totali
+    # storici del profilo sbagliato); il passo 2 le salta.
     attached = (
         session.query(Invoice)
-        .filter(
-            Invoice.customer_id.isnot(None),
-            Invoice.status != "paid",
-        )
+        .filter(Invoice.customer_id.isnot(None))
         .all()
     )
     cust_ids = {inv.customer_id for inv in attached}
@@ -156,17 +196,20 @@ def repair_matches(session: Session) -> Dict[str, Any]:
             # Nome concordante, ambiguo o assente: nessuna azione
             # automatica, emerge dall'audit (verdetto 'bad'/'warn') e
             # decide l'operatore.
-            session.add(ActivityLog(
-                action="repair_piva_conflict_review",
-                entity_type="invoice",
-                entity_id=inv.id,
-                details=details,
-            ))
-            stats["piva_conflict_review"] += 1
+            _log_review(
+                session, "repair_piva_conflict_review", inv, details,
+                stats, "piva_conflict_review",
+            )
 
-    # ── Passo 2: re-match advisory delle 'legacy' rimaste ───────────
+    # ── Passo 2: re-match advisory degli abbinamenti macchina ────────
+    # Non solo 'legacy': anche piva/name_exact/auto_created sbagliati dal
+    # vecchio codice restavano congelati per sempre (run_matching processa
+    # solo customer_id NULL). Interviene solo su esiti deterministici;
+    # tutto il resto è review deduplicata.
     for inv in attached:
-        if inv.customer_id is None or inv.match_method != "legacy":
+        if inv.customer_id is None or inv.status == "paid":
+            continue
+        if inv.match_method in HUMAN_DECIDED_METHODS:
             continue
         cust = customers_by_id.get(inv.customer_id)
         if cust is None:
@@ -175,12 +218,14 @@ def repair_matches(session: Session) -> Dict[str, Any]:
             # Già gestita (o mandata in review) dal passo 1: qui un relink
             # aggirerebbe la guardia nome appena applicata.
             continue
-        result = match_invoice_to_customer(inv, all_customers, session)
+        result = match_invoice_to_customer(inv, all_customers, session, advisory=True)
         if result.customer is not None and result.customer.id == inv.customer_id:
-            # Il motore nuovo concorda: promozione della provenance.
-            inv.match_method = result.method
-            inv.match_score = result.score
-            stats["legacy_promoted"] += 1
+            # Il motore nuovo concorda: promozione della provenance (solo
+            # per le 'legacy' — gli altri metodi sono già provenance vera).
+            if inv.match_method == "legacy":
+                inv.match_method = result.method
+                inv.match_score = result.score
+                stats["legacy_promoted"] += 1
         elif result.customer is not None and result.method == "piva":
             # Certezza P.IVA su un cliente DIVERSO (il vecchio cliente non
             # ha P.IVA, altrimenti sarebbe già scattato il passo 1).
@@ -197,13 +242,10 @@ def repair_matches(session: Session) -> Dict[str, Any]:
                 "name_score_vs_old": name_score,
             }
             if name_score is not None and name_score >= NAME_CONCORDANT_THRESHOLD:
-                session.add(ActivityLog(
-                    action="repair_legacy_review",
-                    entity_type="invoice",
-                    entity_id=inv.id,
-                    details=log_details,
-                ))
-                stats["legacy_review_logged"] += 1
+                _log_review(
+                    session, "repair_legacy_review", inv, log_details,
+                    stats, "legacy_review_logged",
+                )
             else:
                 session.add(ActivityLog(
                     action="repair_legacy_piva_relink",
@@ -214,32 +256,66 @@ def repair_matches(session: Session) -> Dict[str, Any]:
                 _detach(inv)
                 touched_customer_ids.add(cust.id)
                 stats["legacy_piva_relink_detached"] += 1
+        elif result.customer is not None and result.method == "name_exact":
+            # Il nome normalizzato della fattura coincide ESATTAMENTE e
+            # UNIVOCAMENTE con un ALTRO cliente (e per costruzione non con
+            # quello attuale): è il caso 'fattura YOHO sul profilo Domò'.
+            # Guardia anti-collasso del normalizzatore: il nome 'light'
+            # (pattern 'di Nome Cognome' conservato) deve confermare il
+            # candidato, altrimenti due insegne diverse collassate sulla
+            # stessa chiave ('Osteria di Mario Rossi' / 'Osteria di Luigi
+            # Bianchi') produrrebbero un relink sbagliato. Serve lo scorer
+            # STRICT (token_sort, non token_set): col subset-bonus il
+            # collasso monolaterale ('Osteria di Mario Rossi' vs 'Osteria
+            # SRL') varrebbe 100 e passerebbe la guardia.
+            light = light_similarity_score_strict(
+                inv.customer_name_raw or "",
+                result.customer.ragione_sociale or "",
+            )
+            log_details = {
+                "invoice_number": inv.invoice_number,
+                "old_customer_id": cust.id,
+                "old_customer_name": cust.ragione_sociale,
+                "new_customer_id": result.customer.id,
+                "new_customer_name": result.customer.ragione_sociale,
+                "light_score_vs_new": light,
+            }
+            if light >= NAME_CONCORDANT_THRESHOLD:
+                session.add(ActivityLog(
+                    action="repair_name_exact_relink",
+                    entity_type="invoice",
+                    entity_id=inv.id,
+                    details=log_details,
+                ))
+                _detach(inv)
+                touched_customer_ids.add(cust.id)
+                stats["name_exact_relink_detached"] += 1
+            else:
+                _log_review(
+                    session, "repair_legacy_review", inv, log_details,
+                    stats, "legacy_review_logged",
+                )
         elif result.customer is not None and result.customer.id != inv.customer_id:
-            # Disaccordo AUTOMATICO non-P.IVA (name_exact univoco su un
-            # altro cliente): il più forte dopo la P.IVA — non si tocca
-            # nulla ma va tracciato per la review.
-            session.add(ActivityLog(
-                action="repair_legacy_review",
-                entity_type="invoice",
-                entity_id=inv.id,
-                details={
+            # Disaccordo AUTOMATICO di un metodo futuro non gestito sopra:
+            # non si tocca nulla ma va tracciato per la review.
+            _log_review(
+                session, "repair_legacy_review", inv,
+                {
                     "invoice_number": inv.invoice_number,
                     "customer_id": cust.id,
                     "customer_name": cust.ragione_sociale,
                     "disagree_customer_id": result.customer.id,
                     "disagree_method": result.method,
                 },
-            ))
-            stats["legacy_review_logged"] += 1
+                stats, "legacy_review_logged",
+            )
         elif result.suggested_customer is not None and result.suggested_customer.id != inv.customer_id:
             # Il motore nuovo la vedrebbe diversamente ma senza certezza:
             # non si tocca nulla, si lascia traccia per la review manuale
             # (visibile anche nell'audit abbinamenti).
-            session.add(ActivityLog(
-                action="repair_legacy_review",
-                entity_type="invoice",
-                entity_id=inv.id,
-                details={
+            _log_review(
+                session, "repair_legacy_review", inv,
+                {
                     "invoice_number": inv.invoice_number,
                     "customer_id": cust.id,
                     "customer_name": cust.ragione_sociale,
@@ -247,8 +323,25 @@ def repair_matches(session: Session) -> Dict[str, Any]:
                     "suggested_method": result.suggested_method,
                     "suggested_score": result.suggested_score,
                 },
-            ))
-            stats["legacy_review_logged"] += 1
+                stats, "legacy_review_logged",
+            )
+        elif result.customer is None and result.suggested_customer is None:
+            # Il motore nuovo non trova NULLA per questa fattura: se il
+            # nome è anche dissimile dal cliente attuale l'abbinamento è
+            # sospetto — prima era un buco silenzioso (nessuna azione,
+            # nessun log), ora almeno emerge in review.
+            name_score = _name_score_vs_customer(inv, cust)
+            if name_score is not None and name_score < PIVA_NAME_MISMATCH_THRESHOLD:
+                _log_review(
+                    session, "repair_no_candidate_review", inv,
+                    {
+                        "invoice_number": inv.invoice_number,
+                        "customer_id": cust.id,
+                        "customer_name": cust.ragione_sociale,
+                        "name_score": name_score,
+                    },
+                    stats, "no_candidate_review",
+                )
 
     # Marker nello stesso commit del detach: o tutto o niente.
     if not marker:
@@ -257,13 +350,27 @@ def repair_matches(session: Session) -> Dict[str, Any]:
     marker.last_sync = now
     marker.result = {"done": True, **stats}
     marker.updated_at = now
-    session.add(ActivityLog(action="match_repair_done", details=dict(stats)))
+    # match_repair_done si logga solo quando la run ha MODIFICATO qualcosa
+    # (detach/promozioni): il repair è ricorrente e le run passive — anche
+    # con review pendenti già note — non devono intasare il log.
+    mutated = (
+        stats["piva_conflict_detached"]
+        or stats["legacy_piva_relink_detached"]
+        or stats["name_exact_relink_detached"]
+        or stats["legacy_promoted"]
+    )
+    if mutated:
+        session.add(ActivityLog(action="match_repair_done", details=dict(stats)))
     session.commit()
 
     # ── Passo 3: riabbinamento sicuro delle fatture scollegate ──────
     # (run_matching processa tutte le fatture con customer_id NULL e fa
     # commit da sé; se qui fallisce, il prossimo sync lo ripete comunque.)
-    if stats["piva_conflict_detached"] or stats["legacy_piva_relink_detached"]:
+    if (
+        stats["piva_conflict_detached"]
+        or stats["legacy_piva_relink_detached"]
+        or stats["name_exact_relink_detached"]
+    ):
         try:
             run_matching(session)
         except Exception as e:
@@ -321,32 +428,3 @@ def reconcile_customer_after_detach(
         customer.next_action_date = None
         customer.next_action_type = None
         customer.updated_at = datetime.utcnow()
-
-
-def run_repair_if_needed() -> Optional[Dict[str, Any]]:
-    """Entry point per lo startup: esegue il repair se mai completato.
-
-    Prende il lock globale del sync: un sync manuale via API nei primi
-    secondi dopo il deploy non deve interlacciarsi col detach (matching e
-    auto-create concorrenti creerebbero duplicati/quarantene). Import
-    lazy per non trascinare i router FastAPI dentro il modulo engine.
-    """
-    from backend.database import get_session_direct
-    from backend.api.sync import _sync_lock
-
-    if not _sync_lock.acquire(timeout=300):
-        logger.error(
-            "Match repair skipped: sync lock busy after 300s "
-            "(will retry at next startup)"
-        )
-        return None
-    session = get_session_direct()
-    try:
-        return repair_matches(session)
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Match repair FAILED (will retry at next startup): {e}", exc_info=True)
-        return None
-    finally:
-        session.close()
-        _sync_lock.release()

@@ -97,6 +97,9 @@ export default function ClientDetail() {
   // Registrazione automatica del sollecito dopo Copia/WhatsApp
   const [sollecitoToast, setSollecitoToast] = useState(null)
   const [sollecitoError, setSollecitoError] = useState(null)
+  // Fatture in quarantena suggerite a questo cliente ("In attesa di conferma")
+  const [suggestionActingId, setSuggestionActingId] = useState(null)
+  const [suggestionError, setSuggestionError] = useState(null)
 
   const fetchData = useCallback(async () => {
     try {
@@ -439,6 +442,50 @@ export default function ClientDetail() {
     registerSollecito('whatsapp_copy')
   }
 
+  // Stessa regola del backend (/positions/suggestions): fuzzy sotto 85,
+  // oppure score bassissimo qualunque sia il metodo.
+  const isLowConfidence = (sug) =>
+    ((sug.suggested_score || 0) < 85 && sug.suggested_method === 'fuzzy')
+    || (sug.suggested_score || 0) < 40
+
+  const formatScore = (score) => {
+    if (score === null || score === undefined) return ''
+    return Math.round(score <= 1 ? score * 100 : score)
+  }
+
+  const handleConfirmSuggestion = async (sug) => {
+    if (isLowConfidence(sug) && !window.confirm(
+      `Suggerimento a BASSA CONFIDENZA (${sug.suggested_method} ${formatScore(sug.suggested_score)}): `
+      + `abbinare davvero la fattura ${sug.invoice_number} a "${data?.ragione_sociale}"?`
+    )) return
+    try {
+      setSuggestionActingId(sug.id)
+      setSuggestionError(null)
+      await client.post(`/positions/${sug.id}/confirm-suggestion`)
+      await fetchData()
+    } catch (err) {
+      setSuggestionError(err.response?.data?.detail || 'Errore durante la conferma del suggerimento')
+      console.error(err)
+    } finally {
+      setSuggestionActingId(null)
+    }
+  }
+
+  const handleRejectSuggestion = async (sug) => {
+    if (!window.confirm('La fattura resterà senza cliente e non verrà più proposta automaticamente. Continuare?')) return
+    try {
+      setSuggestionActingId(sug.id)
+      setSuggestionError(null)
+      await client.post(`/positions/${sug.id}/reject-suggestion`)
+      await fetchData()
+    } catch (err) {
+      setSuggestionError(err.response?.data?.detail || 'Errore durante il rifiuto del suggerimento')
+      console.error(err)
+    } finally {
+      setSuggestionActingId(null)
+    }
+  }
+
   const ACTION_NUMBER_LABELS = ['PRIMA', 'SECONDA', 'TERZA', 'QUARTA', 'QUINTA', 'SESTA', 'SETTIMA', 'OTTAVA', 'NONA', 'DECIMA']
   const contactActionCount = data?.contact_action_count || 0
   const nextActionNumber = contactActionCount + 1
@@ -472,6 +519,7 @@ export default function ClientDetail() {
   if (error) return <div className="p-6 text-accent-red">{error}</div>
   if (!data) return null
 
+  const pendingSuggestions = data.pending_suggestions || []
   const overdueInvoices = data.invoices?.items?.filter(inv => inv.days_overdue > 0 && inv.status !== 'paid') || []
   const totalOverdue = overdueInvoices.reduce((sum, inv) => sum + inv.amount_due, 0)
   const allUnpaid = data.invoices?.items?.filter(inv => inv.status !== 'paid') || []
@@ -723,6 +771,88 @@ export default function ClientDetail() {
           </div>
         </div>
       </div>
+
+      {/* FATTURE IN QUARANTENA SUGGERITE A QUESTO CLIENTE: senza questa
+          sezione una fattura in attesa di conferma non compariva MAI sul
+          profilo (caso Belfiore 655/2026) e l'operatore concludeva che il
+          sistema non la conosceva. */}
+      {pendingSuggestions.length > 0 && (
+        <div className="sc-card overflow-hidden border-2 border-accent-amber/30">
+          <div className="sc-card-header bg-accent-amber/5">
+            <div>
+              <h2 className="text-base font-bold text-accent-amber">
+                In attesa di conferma ({pendingSuggestions.length})
+              </h2>
+              <p className="text-xs text-txt-muted mt-0.5">
+                Fatture abbinate a questo cliente in via provvisoria: NON contano nei totali finché non le confermi.
+              </p>
+            </div>
+          </div>
+
+          {suggestionError && (
+            <div className="mx-5 mt-4 p-3 rounded-lg text-sm bg-accent-red/10 text-accent-red border border-accent-red/20">
+              {suggestionError}
+            </div>
+          )}
+
+          <div className="divide-y divide-dark-border">
+            {pendingSuggestions.map(sug => (
+              <div key={sug.id} className="p-4 flex flex-wrap items-center gap-4">
+                <div className="w-44 shrink-0">
+                  <p className="text-sm font-medium text-txt-primary">{sug.invoice_number}</p>
+                  <p className="text-sm text-txt-secondary">{formatCurrency(sug.amount_due)}</p>
+                  <div className="flex items-center gap-1.5 mt-0.5">
+                    <span className="text-xs text-txt-muted">
+                      {sug.due_date ? `scad. ${formatDate(sug.due_date)}` : formatDate(sug.issue_date)}
+                    </span>
+                    <span className={`sc-badge ${
+                      sug.source_platform === 'fatturapro' ? 'bg-accent-purple/15 text-accent-purple' : 'bg-accent-teal/15 text-accent-teal'
+                    }`}>
+                      {sug.source_platform === 'fatturapro' ? 'FPro' : 'F24'}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex-1 min-w-[180px]">
+                  <p className="text-xs font-semibold text-txt-label uppercase tracking-wider mb-1">Destinatario fattura</p>
+                  <p className="text-sm text-txt-primary">{sug.customer_name_raw || '-'}</p>
+                  <div className="flex items-center gap-2 mt-1 flex-wrap">
+                    <span className="sc-badge bg-[rgba(148,163,184,0.15)] text-txt-secondary">
+                      {sug.suggested_method} {formatScore(sug.suggested_score)}
+                    </span>
+                    {isLowConfidence(sug) && (
+                      <span className="sc-badge bg-[rgba(251,191,36,0.15)] text-accent-amber">bassa confidenza</span>
+                    )}
+                    {sug.status === 'paid' && (
+                      <span className="badge-paid sc-badge">Pagata</span>
+                    )}
+                    {sug.status !== 'paid' && (sug.days_overdue || 0) > 0 && (
+                      <span className="text-xs font-medium text-accent-red">+{sug.days_overdue}gg</span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex gap-2 shrink-0">
+                  <button
+                    onClick={() => handleConfirmSuggestion(sug)}
+                    disabled={suggestionActingId === sug.id}
+                    className="px-4 py-2 rounded-lg text-sm font-medium bg-accent-green/15 hover:bg-accent-green/25 text-accent-green border border-accent-green/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Conferma
+                  </button>
+                  <button
+                    onClick={() => handleRejectSuggestion(sug)}
+                    disabled={suggestionActingId === sug.id}
+                    className="px-4 py-2 rounded-lg text-sm font-medium bg-transparent hover:bg-accent-red/10 text-accent-red border border-accent-red/40 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Rifiuta
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* SEZIONE 1: FATTURE */}
       <div className="sc-card overflow-hidden">

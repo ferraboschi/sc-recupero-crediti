@@ -1,6 +1,7 @@
 """Normalizer module - normalizes Italian company names (ragione sociali) for matching."""
 
 import re
+import functools
 import logging
 import unicodedata
 from typing import Tuple
@@ -60,32 +61,18 @@ def remove_accents(text: str) -> str:
     return "".join([c for c in nfkd_form if not unicodedata.combining(c)])
 
 
-def normalize_ragione_sociale(name: str) -> str:
-    """
-    Normalize Italian company name (ragione sociale) for matching.
+@functools.lru_cache(maxsize=8192)
+def _normalize_impl(name: str, strip_person: bool) -> str:
+    """Implementazione condivisa della normalizzazione.
 
-    Removes:
-    - Legal forms (S.R.L., SPA, etc.)
-    - "di" + personal name patterns
-    - Punctuation and extra whitespace
-    - Common prefixes
-    - Accents and diacritics
+    strip_person controlla il taglio del pattern finale "di Nome Cognome":
+    la chiave di matching lo rimuove (le fatture spesso omettono la parte
+    persona), la chiave 'light' lo conserva (le fatture delle ditte
+    individuali spesso riportano SOLO la persona).
 
-    Converts to lowercase.
-
-    Args:
-        name: The raw company name to normalize
-
-    Returns:
-        Normalized company name suitable for matching
-
-    Examples:
-        >>> normalize_ragione_sociale("SHU&SHU DI SHU KEI S.A.S.")
-        "shu&shu"
-        >>> normalize_ragione_sociale("ACME S.R.L.")
-        "acme"
-        >>> normalize_ragione_sociale("Società ROSSI s.p.a.")
-        "rossi"
+    Memoizzata: è una funzione pura e i nomi cliente si ripetono identici
+    per ogni fattura del run (repair ricorrente: O(fatture × clienti)
+    normalizzazioni regex senza cache).
     """
     if not name:
         return ""
@@ -119,13 +106,14 @@ def normalize_ragione_sociale(name: str) -> str:
     # Clean up before di pattern matching
     normalized = normalized.strip()
 
-    # Handle "di" + personal name pattern
-    # E.g., "SHU&SHU DI SHU KEI" -> "SHU&SHU"
-    # Only when 2+ words follow "di" (nome+cognome): a single word after
-    # "di" is usually part of the real name ("Osteria di Mare"), and
-    # stripping it would collapse different businesses onto the same key.
-    di_pattern = re.compile(r"\s+di\s+\w+(?:\s+\w+)+\s*$")
-    normalized = di_pattern.sub("", normalized)
+    if strip_person:
+        # Handle "di" + personal name pattern
+        # E.g., "SHU&SHU DI SHU KEI" -> "SHU&SHU"
+        # Only when 2+ words follow "di" (nome+cognome): a single word after
+        # "di" is usually part of the real name ("Osteria di Mare"), and
+        # stripping it would collapse different businesses onto the same key.
+        di_pattern = re.compile(r"\s+di\s+\w+(?:\s+\w+)+\s*$")
+        normalized = di_pattern.sub("", normalized)
 
     # Remove common prefixes
     prefix_pattern = "|".join(re.escape(prefix.lower()) for prefix in COMMON_PREFIXES)
@@ -136,10 +124,58 @@ def normalize_ragione_sociale(name: str) -> str:
     # Keep & and - as they can be part of company names
     normalized = re.sub(r"[^\w&\-\s]", "", normalized)
 
+    # La spaziatura attorno a '&' non è distintiva: 'M & M' e 'M&M' sono la
+    # stessa insegna e devono produrre la stessa chiave.
+    normalized = re.sub(r"\s*&\s*", "&", normalized)
+
     # Remove extra whitespace
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
     return normalized
+
+
+def normalize_ragione_sociale(name: str) -> str:
+    """
+    Normalize Italian company name (ragione sociale) for matching.
+
+    Removes:
+    - Legal forms (S.R.L., SPA, etc.)
+    - "di" + personal name patterns
+    - Punctuation and extra whitespace
+    - Common prefixes
+    - Accents and diacritics
+
+    Converts to lowercase.
+
+    Args:
+        name: The raw company name to normalize
+
+    Returns:
+        Normalized company name suitable for matching
+
+    Examples:
+        >>> normalize_ragione_sociale("SHU&SHU DI SHU KEI S.A.S.")
+        "shu&shu"
+        >>> normalize_ragione_sociale("ACME S.R.L.")
+        "acme"
+        >>> normalize_ragione_sociale("Società ROSSI s.p.a.")
+        "rossi"
+    """
+    return _normalize_impl(name, strip_person=True)
+
+
+def normalize_ragione_sociale_light(name: str) -> str:
+    """Normalizzazione 'light': come normalize_ragione_sociale ma CONSERVA
+    il pattern finale "di Nome Cognome".
+
+    Serve ai confronti di somiglianza: la fattura di una ditta individuale
+    è spesso intestata alla sola persona ("MERCURI CHRISTIAN"), che la
+    chiave di matching ("dr gahe") butta via per costruzione.
+
+    >>> normalize_ragione_sociale_light("Dr. Gahe di Mercuri Christian")
+    "dr gahe di mercuri christian"
+    """
+    return _normalize_impl(name, strip_person=False)
 
 
 def are_similar(
@@ -183,3 +219,41 @@ def are_similar(
     )
 
     return is_similar, score
+
+
+def light_similarity_score(name1: str, name2: str) -> int:
+    """Somiglianza sulle chiavi 'light' (pattern 'di Nome Cognome' conservato)."""
+    norm1 = normalize_ragione_sociale_light(name1)
+    norm2 = normalize_ragione_sociale_light(name2)
+    if not norm1 or not norm2:
+        return 0
+    return int(fuzz.token_set_ratio(norm1, norm2))
+
+
+def light_similarity_score_strict(name1: str, name2: str) -> int:
+    """Come light_similarity_score ma SENZA il bonus-subset di
+    token_set_ratio: serve alle guardie che devono CONFERMARE un
+    candidato (non solo non-smentirlo). Con token_set_ratio un lato che
+    porta il pattern 'di Nome Cognome' e uno che non lo porta valgono
+    100 per puro contenimento ('Osteria di Mario Rossi' vs 'Osteria
+    SRL') — che è esattamente il collasso da bloccare, non una conferma.
+    """
+    norm1 = normalize_ragione_sociale_light(name1)
+    norm2 = normalize_ragione_sociale_light(name2)
+    if not norm1 or not norm2:
+        return 0
+    return int(fuzz.token_sort_ratio(norm1, norm2))
+
+
+def name_similarity_score(name1: str, name2: str) -> int:
+    """Somiglianza robusta ai nomi-persona: max tra lo score sulle chiavi
+    de-personalizzate (are_similar) e quello sulle chiavi 'light'.
+
+    "MERCURI CHRISTIAN" vs "Dr. Gahe di Mercuri Christian" vale 25 sulle
+    chiavi di matching ('mercuri christian' vs 'dr gahe') ma 100 sulle
+    chiavi light: per le GUARDIE (anti-poisoning P.IVA, repair, audit) la
+    persona contenuta per intero nell'insegna è concordanza, non
+    dissomiglianza.
+    """
+    _, full_score = are_similar(name1, name2, threshold=100)
+    return int(max(full_score, light_similarity_score(name1, name2)))

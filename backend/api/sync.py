@@ -31,7 +31,7 @@ from backend.engine.cases import update_case_lifecycle
 from backend.engine.piva import validate_piva
 from backend.scheduler import get_scheduler_status
 from backend.config import config
-from backend.engine.normalizer import normalize_ragione_sociale
+from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,16 @@ logger = logging.getLogger(__name__)
 # assenza, una riga persa silenziosamente dal fetch diventava una falsa
 # "pagata" e spariva da tutti i conteggi scadute.
 PAID_ABSENCE_STREAK = 2
+
+# Finestra massima |data fattura − data ordine| per l'aggancio
+# ordine→fattura. I 30 giorni originali erano troppo stretti: qui si
+# lavora su crediti VECCHI e sui pre-order sake la fattura arriva anche
+# mesi dopo l'ordine.
+ORDER_MATCH_MAX_DAYS = 90
+
+# Cap dei near-miss riportati nel result dell'order matching: il result
+# viene persistito in sync_state, non deve gonfiarsi senza limite.
+ORDER_MATCH_MAX_NEAR_MISSES = 50
 router = APIRouter()
 
 # Sync mutex to prevent concurrent syncs — used by ALL sync operations
@@ -450,6 +460,10 @@ def _sync_customers_task() -> dict:
                 shopify = ShopifyConnector()
                 raw_customers = shopify.fetch_b2b_customers()
                 created, updated, adopted = 0, 0, 0
+                orphan_contacts = 0
+                # P.IVA scartate perché non validano (checksum/formato):
+                # loggate una sola volta per valore.
+                discarded_pivas = set()
 
                 # Clienti nati dalle fatture (auto-create, shopify_id NULL):
                 # se su Shopify esiste lo stesso esercizio (stessa P.IVA
@@ -472,6 +486,17 @@ def _sync_customers_task() -> dict:
 
                     was_adopted = False
                     cust_piva = validate_piva(cust.get("partita_iva"))
+                    raw_piva = (cust.get("partita_iva") or "").strip()
+                    if raw_piva and not cust_piva and raw_piva not in discarded_pivas:
+                        # parse_piva_from_address2 spezza address2 su '-'
+                        # senza validare: "Scala B - Interno 3" produce
+                        # partita_iva="Scala B". La spazzatura si logga
+                        # (una volta per valore) e non si scrive MAI.
+                        discarded_pivas.add(raw_piva)
+                        logger.warning(
+                            f"P.IVA non valida da Shopify scartata: {raw_piva!r} "
+                            f"(cliente Shopify {cust['shopify_id']})"
+                        )
                     if not existing:
                         orphan = orphans_by_piva.pop(cust_piva, None) if cust_piva else None
                         if orphan is not None:
@@ -489,8 +514,25 @@ def _sync_customers_task() -> dict:
                         # la stessa P.IVA: duplicato che manderà le fatture
                         # in quarantena piva_ambiguous. Il merge di due
                         # anagrafiche (fatture/pratiche/azioni) è manuale:
-                        # lo si segnala, non lo si improvvisa.
+                        # lo si segnala, non lo si improvvisa. I CONTATTI
+                        # Shopify però si copiano sull'orfano DOVE MANCANO
+                        # (stesso pattern dell'enrichment FatturaPro): è
+                        # l'orfano a portare le fatture da recuperare e
+                        # senza telefono/email resterebbe un profilo muto.
                         dup = orphans_by_piva[cust_piva]
+                        dup_changed = False
+                        if cust.get("phone") and not dup.phone:
+                            dup.phone = cust["phone"]
+                            dup_changed = True
+                        if cust.get("email") and not dup.email:
+                            dup.email = cust["email"]
+                            dup_changed = True
+                        if cust.get("phones") and not dup.phones_json:
+                            dup.phones_json = cust["phones"]
+                            dup_changed = True
+                        if dup_changed:
+                            dup.updated_at = datetime.utcnow()
+                            orphan_contacts += 1
                         logger.warning(
                             f"Duplicate customers with P.IVA {cust_piva}: "
                             f"Shopify '{existing.ragione_sociale}' (id {existing.id}) "
@@ -509,7 +551,12 @@ def _sync_customers_task() -> dict:
                             existing.ragione_sociale_normalized = normalize_ragione_sociale(
                                 parsed_name
                             )
-                        existing.partita_iva = cust.get("partita_iva") or existing.partita_iva
+                        # P.IVA: si scrive SOLO se validata (checksum) —
+                        # mai degradare una P.IVA valida esistente con la
+                        # spazzatura di address2; una valida in arrivo
+                        # corregge invece anche un valore invalido salvato.
+                        if cust_piva:
+                            existing.partita_iva = cust_piva
                         existing.codice_fiscale = cust.get("codice_fiscale") or existing.codice_fiscale
                         existing.codice_sdi = cust.get("codice_sdi") or existing.codice_sdi
                         existing.phone = cust.get("phone") or existing.phone
@@ -525,7 +572,9 @@ def _sync_customers_task() -> dict:
                             ragione_sociale_normalized=normalize_ragione_sociale(
                                 cust.get("ragione_sociale", "")
                             ),
-                            partita_iva=cust.get("partita_iva"),
+                            # Solo P.IVA validata: la spazzatura di
+                            # address2 non entra nemmeno alla creazione.
+                            partita_iva=cust_piva,
                             codice_fiscale=cust.get("codice_fiscale"),
                             codice_sdi=cust.get("codice_sdi"),
                             phone=cust.get("phone"),
@@ -542,11 +591,16 @@ def _sync_customers_task() -> dict:
                 result["created"] = created
                 result["updated"] = updated
                 result["adopted"] = adopted
+                result["orphan_contacts_enriched"] = orphan_contacts
+                result["piva_discarded"] = len(discarded_pivas)
                 logger.info(
-                    f"Shopify sync: created={created}, updated={updated}, adopted={adopted}"
+                    f"Shopify sync: created={created}, updated={updated}, "
+                    f"adopted={adopted}, orphan_contacts={orphan_contacts}, "
+                    f"piva_discarded={len(discarded_pivas)}"
                 )
             else:
                 result["success"] = True  # Not an error, just unconfigured
+                result["unconfigured"] = True
                 logger.debug("Shopify not configured")
         except Exception as e:
             logger.error(f"Shopify sync failed: {e}", exc_info=True)
@@ -716,13 +770,13 @@ def _match_orders_task() -> dict:
     """Match invoices to Shopify orders by customer + amount + date.
 
     For each customer with a shopify_id, fetches their Shopify orders
-    and matches unlinked invoices by amount (±1% tolerance) and date
-    proximity (invoice issue_date within 7 days of order created_at).
+    and matches unlinked invoices by amount (±1% tolerance on total OR
+    subtotal) and date proximity (within ORDER_MATCH_MAX_DAYS days).
     """
     session = get_session_direct()
     result = {
         "matched": 0, "customers_processed": 0,
-        "errors": [], "already_matched": 0,
+        "errors": [], "already_matched": 0, "near_misses": [],
     }
     try:
         # Get all customers that have a shopify_id
@@ -738,10 +792,14 @@ def _match_orders_task() -> dict:
 
         for cust in customers:
             # Get unmatched invoices for this customer
+            # Ordinamento stabile: quando due fatture contendono lo stesso
+            # ordine, l'assegnazione greedy deve essere riproducibile anche
+            # su Postgres (senza ORDER BY l'ordine delle righe non lo è) —
+            # vince la fattura più vecchia.
             unmatched_invoices = session.query(Invoice).filter(
                 Invoice.customer_id == cust.id,
                 Invoice.shopify_order_id.is_(None),
-            ).all()
+            ).order_by(Invoice.issue_date.asc(), Invoice.id.asc()).all()
 
             if not unmatched_invoices:
                 continue
@@ -761,21 +819,43 @@ def _match_orders_task() -> dict:
             if not orders:
                 continue
 
-            # Build order lookup for matching
+            # Ordini già agganciati ad altre fatture del cliente: lo
+            # stesso ordine non deve saldare due fatture, né in questo
+            # run né rispetto ai run precedenti.
+            used_order_ids = {
+                oid for (oid,) in session.query(
+                    Invoice.shopify_order_id
+                ).filter(
+                    Invoice.customer_id == cust.id,
+                    Invoice.shopify_order_id.isnot(None),
+                ).all()
+            }
+
             for inv in unmatched_invoices:
-                best_match = _find_best_order_match(
-                    inv, orders
+                best_match, near_miss = _find_best_order_match(
+                    inv, orders, used_order_ids
                 )
                 if best_match:
                     inv.shopify_order_id = best_match["id"]
                     inv.shopify_order_number = (
                         best_match["name"]
                     )
+                    used_order_ids.add(best_match["id"])
                     result["matched"] += 1
                     logger.info(
                         f"Matched invoice {inv.invoice_number}"
                         f" → order {best_match['name']}"
                     )
+                elif near_miss and len(
+                    result["near_misses"]
+                ) < ORDER_MATCH_MAX_NEAR_MISSES:
+                    # Miglior candidato SCARTATO: rende diagnosticabile
+                    # il tuning dei criteri (perché una fattura non si è
+                    # agganciata? di quanto ha mancato importo/finestra?).
+                    result["near_misses"].append({
+                        "invoice": inv.invoice_number,
+                        **near_miss,
+                    })
 
         session.commit()
 
@@ -805,34 +885,57 @@ def _match_orders_task() -> dict:
 
 
 def _find_best_order_match(
-    invoice, orders
+    invoice, orders, used_order_ids=None
 ):
     """Find the best Shopify order match for an invoice.
 
     Matching criteria:
-    1. Amount match: order total within 1% of invoice amount
-    2. Date proximity: order within 30 days of invoice date
-       (invoices are often issued days/weeks after the order)
+    1. Importo: fattura entro l'1% (min €0.50) del total_price O del
+       subtotal_price dell'ordine — l'ordine può essere ex-IVA mentre
+       la fattura è IVA inclusa (differenza sistematica ~22%: sul solo
+       total_price il match non scattava mai).
+    2. Data: |data fattura − data ordine| ≤ ORDER_MATCH_MAX_DAYS.
 
-    Returns the best matching order or None.
+    Gli ordini in used_order_ids (già agganciati ad altre fatture)
+    sono esclusi: lo stesso ordine non può saldare due fatture.
+
+    Returns:
+        (best_order, near_miss) — best_order è None se nessun match;
+        near_miss descrive il miglior candidato SCARTATO (ordine, delta
+        importo, distanza in giorni) per la diagnostica del tuning.
     """
     if not invoice.issue_date:
         # Senza data il match per solo importo è troppo fragile (il primo
         # ordine entro tolleranza vince e il link è sticky: mai più
         # ricontrollato). Meglio nessun match: la data arriva col sync.
-        return None
+        return None, None
 
+    used_order_ids = used_order_ids or set()
     best = None
     best_score = float("inf")
+    near_miss = None
+    near_score = float("inf")
 
     for order in orders:
-        # Amount check (1% tolerance, minimum €0.50)
-        amt_diff = abs(
-            order["total_price"] - invoice.amount
+        if order["id"] in used_order_ids:
+            continue
+
+        # Un ordine annullato/stornato/rimborsato non può essere la pezza
+        # d'appoggio di un credito aperto: citarlo al debitore sarebbe un
+        # errore, e brucerebbe l'aggancio per l'ordine reale gemello
+        # (ripiazzato identico dopo un pagamento fallito).
+        if order.get("cancelled_at") or order.get("financial_status") in ("voided", "refunded"):
+            continue
+
+        # Delta importo: il migliore tra totale (IVA inclusa) e
+        # imponibile (ex-IVA) dell'ordine.
+        amounts = [order["total_price"]]
+        if order.get("subtotal_price"):
+            amounts.append(order["subtotal_price"])
+        amt_diff = min(
+            abs(a - invoice.amount) for a in amounts
         )
         tolerance = max(invoice.amount * 0.01, 0.50)
-        if amt_diff > tolerance:
-            continue
 
         # Date check — parse order date
         try:
@@ -846,7 +949,21 @@ def _find_best_order_match(
         day_diff = abs(
             (invoice.issue_date - order_date).days
         )
-        if day_diff > 30:
+
+        if amt_diff > tolerance or day_diff > ORDER_MATCH_MAX_DAYS:
+            # Candidato scartato: si tiene il più vicino (importo e
+            # data normalizzati) come near-miss diagnostico.
+            miss_score = (
+                amt_diff / max(invoice.amount, 1)
+                + day_diff / ORDER_MATCH_MAX_DAYS
+            )
+            if miss_score < near_score:
+                near_score = miss_score
+                near_miss = {
+                    "order": order.get("name") or str(order["id"]),
+                    "amount_delta": round(amt_diff, 2),
+                    "days": day_diff,
+                }
             continue
 
         # Score: lower is better (prefer closer date +
@@ -856,7 +973,7 @@ def _find_best_order_match(
             best_score = score
             best = order
 
-    return best
+    return best, near_miss
 
 
 def _run_matching_task() -> dict:
@@ -1017,16 +1134,14 @@ def _full_sync_task() -> dict:
             logger.error(f"Customer sync failed: {e}", exc_info=True)
             results["customers"] = {"error": str(e)}
 
-        # Step 2.5: Repair una-tantum degli abbinamenti (marker match_repair_v2).
-        # Gira QUI, dopo che il sync fatture ha popolato le P.IVA reali
-        # dall'anagrafica (allo startup non c'erano ancora → 0 detach): ora
-        # le contraddizioni P.IVA sono visibili e i casi legacy tipo
-        # QOQA→Rooftop possono essere separati. Il lock è già del full sync,
+        # Step 2.5: Repair RICORRENTE degli abbinamenti. Gira QUI, dopo che
+        # il sync fatture ha popolato le P.IVA reali dall'anagrafica: le
+        # contraddizioni P.IVA sono visibili e i casi legacy tipo
+        # QOQA→Rooftop vengono separati. Il lock è già del full sync,
         # quindi si chiama repair_matches direttamente (niente doppio lock).
-        # SOLO su enrichment COMPLETO: il repair è one-shot (marker v2) e la
-        # P.IVA che deve leggere viene dall'ANAGRAFICA. Se lista fatture O
-        # anagrafica sono parziali/fallite, le P.IVA non sono tutte popolate:
-        # rimandare al prossimo ciclo invece di bruciare il marker a vuoto.
+        # SOLO su enrichment COMPLETO: la P.IVA che il repair legge viene
+        # dall'ANAGRAFICA — con fetch parziali un detach potrebbe basarsi su
+        # dati incompleti; si salta il ciclo e si ritenta al successivo.
         inv_res = results.get("invoices", {})
         fp_res = inv_res.get("fatturapro", {}) if isinstance(inv_res, dict) else {}
         enrichment_complete = (
@@ -1296,18 +1411,56 @@ async def import_csv(file: UploadFile = File(...)):
 
             inv_num = mapped["invoice_number"]
 
-            # Check if already exists
-            existing = session.query(Invoice).filter_by(
+            # Check if already exists — MA la numerazione delle fatture
+            # italiane riparte ogni anno: la "45" del 2025 (YOHO) NON è
+            # la "45" del 2024 (Domò), e la chiave dell'upsert non ha né
+            # anno né cliente. Aggiornare la riga sbagliata sovrascrive
+            # una fattura GIÀ ABBINATA cambiandole nome e importi senza
+            # ri-matcharla: si aggiorna solo la riga con lo STESSO nome
+            # cliente normalizzato; altrimenti è un'altra fattura reale
+            # e si crea una nuova riga.
+            csv_name_norm = normalize_ragione_sociale(
+                mapped.get("customer_name") or ""
+            )
+            issue_date = parse_date(mapped.get("issue_date"))
+            existing = None
+            for cand in session.query(Invoice).filter_by(
                 invoice_number=inv_num,
                 source_platform="fatture24"
-            ).first()
+            ).all():
+                cand_name_norm = normalize_ragione_sociale(
+                    cand.customer_name_raw or ""
+                )
+                # Nome mancante da un lato: impossibile distinguere,
+                # si mantiene il comportamento di update. La chiave
+                # normalizzata diverge sui nomi-persona ('MERCURI
+                # CHRISTIAN' vs 'Dr. Gahe di Mercuri Christian' → chiavi
+                # diverse): un re-import della STESSA fattura nell'altra
+                # forma è concordante per lo scorer robusto, gatato
+                # sull'anno per non riunire clienti diversi.
+                nomi_concordi = (
+                    not csv_name_norm or not cand_name_norm
+                    or csv_name_norm == cand_name_norm
+                    or (
+                        name_similarity_score(
+                            mapped.get("customer_name") or "",
+                            cand.customer_name_raw or "",
+                        ) >= 100
+                        and (
+                            not issue_date or not cand.issue_date
+                            or issue_date.year == cand.issue_date.year
+                        )
+                    )
+                )
+                if nomi_concordi:
+                    existing = cand
+                    break
 
             amount = parse_amount(mapped.get("amount", "0"))
             amount_due = parse_amount(mapped.get("amount_due", "0"))
             if amount_due == 0 and amount > 0:
                 amount_due = amount  # If no separate balance, assume full amount due
 
-            issue_date = parse_date(mapped.get("issue_date"))
             due_date = parse_date(mapped.get("due_date"))
 
             days_overdue = 0

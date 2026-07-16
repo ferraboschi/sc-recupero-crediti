@@ -183,6 +183,40 @@ async def get_customer_detail(
             for inv in invoices
         ]
 
+        # Fatture in QUARANTENA suggerite a QUESTO cliente (customer_id NULL +
+        # suggested_customer_id → lui): senza questa lista non compaiono MAI
+        # sul profilo e l'operatore che le cerca qui conclude che il sistema
+        # non le conosce (caso Belfiore 655/2026). Le 'paid' sono INCLUSE:
+        # una quarantenata marcata pagata sparirebbe altrimenti ovunque
+        # (/positions/suggestions filtra status != 'paid').
+        pending_invoices = (
+            session.query(Invoice)
+            .filter(
+                Invoice.customer_id.is_(None),
+                Invoice.suggested_customer_id == customer_id,
+            )
+            .order_by(Invoice.due_date.desc())
+            .all()
+        )
+
+        pending_suggestions = [
+            {
+                "id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "amount": float(inv.amount),
+                "amount_due": float(inv.amount_due),
+                "issue_date": inv.issue_date.isoformat() if inv.issue_date else None,
+                "due_date": inv.due_date.isoformat() if inv.due_date else None,
+                "days_overdue": inv.days_overdue,
+                "status": inv.status,
+                "suggested_method": inv.suggested_method,
+                "suggested_score": inv.suggested_score,
+                "customer_name_raw": inv.customer_name_raw,
+                "source_platform": inv.source_platform,
+            }
+            for inv in pending_invoices
+        ]
+
         # Get recovery actions
         actions = (
             session.query(RecoveryAction)
@@ -262,6 +296,7 @@ async def get_customer_detail(
                 "count": len(invoices),
                 "items": invoice_list,
             },
+            "pending_suggestions": pending_suggestions,
             "recovery_actions": action_list,
             "contact_action_count": contact_action_count,
             "case": case_block,

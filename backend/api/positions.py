@@ -259,7 +259,13 @@ async def list_suggestions(session: Session = Depends(get_session)):
                 "source_platform": inv.source_platform,
                 "suggested_method": inv.suggested_method,
                 "suggested_score": inv.suggested_score,
-                "low_confidence": (inv.suggested_score or 0) < 85 and inv.suggested_method == "fuzzy",
+                # Bassa confidenza: fuzzy sotto 85, oppure score bassissimo
+                # QUALUNQUE sia il metodo (un 'piva_name_mismatch' a 20 era
+                # presentato come un suggerimento qualsiasi).
+                "low_confidence": (
+                    ((inv.suggested_score or 0) < 85 and inv.suggested_method == "fuzzy")
+                    or (inv.suggested_score or 0) < 40
+                ),
                 "suggested_customer": {
                     "id": cust.id,
                     "ragione_sociale": cust.ragione_sociale,
@@ -368,6 +374,136 @@ async def reject_suggestion(position_id: int, session: Session = Depends(get_ses
         raise
     except Exception as e:
         logger.error(f"Error rejecting suggestion: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.post("/{position_id}/create-customer")
+async def create_customer_from_invoice(position_id: int, session: Session = Depends(get_session)):
+    """Crea un NUOVO cliente dai dati grezzi della fattura e la abbina.
+
+    Serve quando il suggerimento in quarantena è sbagliato (es. fattura
+    YOHO MILANO suggerita a Domò Milano): prima l'operatore poteva solo
+    confermare l'errore o rifiutare (fattura 'unlinked' per sempre), e
+    l'auto-create del sync salta le fatture con suggerimento pendente —
+    il cliente giusto non nasceva mai da solo.
+    """
+    from backend.engine.normalizer import normalize_ragione_sociale
+    from backend.engine.piva import validate_piva
+
+    try:
+        position = session.query(Invoice).filter(Invoice.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+        if position.customer_id:
+            raise HTTPException(
+                status_code=400,
+                detail="La fattura è già abbinata a un cliente: usa Riassegna per correggerla",
+            )
+
+        name = (position.customer_name_raw or "").strip()
+        if not name:
+            raise HTTPException(
+                status_code=400,
+                detail="La fattura non ha un nome destinatario: impossibile creare il cliente",
+            )
+
+        # P.IVA solo se VALIDA (checksum/formato): una P.IVA sporca sul nuovo
+        # cliente produrrebbe abbinamenti sbagliati a cascata nei sync futuri.
+        piva = validate_piva(position.customer_piva_raw)
+        name_norm = normalize_ragione_sociale(name)
+
+        # Duplicati: se l'entità esiste già l'operatore deve usare Riassegna,
+        # non creare un doppione che spacca lo storico del credito.
+        if piva:
+            # validate_piva toglie il prefisso 'IT'; in anagrafica può esserci
+            # ancora la variante prefissata (es. clienti importati da Shopify).
+            existing = session.query(Customer).filter(
+                Customer.partita_iva.in_([piva, f"IT{piva}"])
+            ).first()
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Esiste già un cliente con questa P.IVA: "
+                        f"'{existing.ragione_sociale}' (ID {existing.id}). "
+                        f"Usa Riassegna per abbinare la fattura a quel cliente."
+                    ),
+                )
+        if name_norm:
+            # La colonna ragione_sociale_normalized contiene chiavi scritte
+            # da versioni diverse del normalizzatore (mai backfillate): il
+            # confronto affidabile è sul ricalcolo fresh, come fa il
+            # matching (Strategia 2). Un omonimo con P.IVA valida DIVERSA
+            # da quella della fattura è un'entità diversa (stessa regola di
+            # matching/auto-create): non blocca la creazione.
+            existing = None
+            for c in session.query(Customer).all():
+                if normalize_ragione_sociale(c.ragione_sociale or "") != name_norm:
+                    continue
+                cust_piva = validate_piva(c.partita_iva)
+                if piva and cust_piva and piva != cust_piva:
+                    continue
+                existing = c
+                break
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Esiste già un cliente con lo stesso nome: "
+                        f"'{existing.ragione_sociale}' (ID {existing.id}). "
+                        f"Usa Riassegna per abbinare la fattura a quel cliente."
+                    ),
+                )
+
+        customer = Customer(
+            ragione_sociale=name,
+            ragione_sociale_normalized=name_norm,
+            partita_iva=piva,
+            source="manual",
+        )
+        session.add(customer)
+        session.flush()  # serve l'ID per abbinare la fattura
+
+        position.customer_id = customer.id
+        position.case_id = None  # la pratica giusta viene agganciata dal lifecycle
+        position.match_method = "manual"
+        position.match_score = 100
+        position.suggested_customer_id = None
+        position.suggested_method = None
+        position.suggested_score = None
+        session.commit()
+
+        session.add(ActivityLog(
+            action="customer_created_from_invoice",
+            entity_type="customer",
+            entity_id=customer.id,
+            details={
+                "invoice_id": position.id,
+                "invoice_number": position.invoice_number,
+                "ragione_sociale": customer.ragione_sociale,
+                "partita_iva": customer.partita_iva,
+                "source_platform": position.source_platform,
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"Customer '{customer.ragione_sociale}' (ID {customer.id}) created "
+            f"from invoice {position.invoice_number} and linked"
+        )
+
+        return {
+            "id": position.id,
+            "customer_id": customer.id,
+            "customer_name": customer.ragione_sociale,
+            "partita_iva": customer.partita_iva,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating customer from invoice: {e}", exc_info=True)
         session.rollback()
         raise
 

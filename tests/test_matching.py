@@ -477,3 +477,54 @@ class TestRunMatching:
         assert invoice.suggested_customer_id == customer.id
         assert invoice.suggested_method == "piva"
         assert invoice.suggested_score == 100
+
+
+class TestPersonNameMatching:
+    """I casi 'Dr. Gahe di Mercuri Christian': fattura intestata alla persona."""
+
+    def test_piva_match_with_person_name_passes_guard(self, test_db_session):
+        """P.IVA giusta e univoca + nome-persona: la guardia anti-poisoning
+        non deve più mettere in quarantena (prima: score 25 < 40)."""
+        customer = make_customer(
+            test_db_session, "Dr. Gahe di Mercuri Christian", PIVA_A
+        )
+        invoice = make_invoice(test_db_session, name="MERCURI CHRISTIAN", piva=PIVA_A)
+
+        result = match_invoice_to_customer(
+            invoice, [customer], test_db_session
+        )
+        assert result.customer is not None
+        assert result.customer.id == customer.id
+        assert result.method == "piva"
+
+    def test_person_name_without_piva_gets_suggestion(self, test_db_session):
+        """Senza P.IVA il nome-persona non può auto-abbinare, ma deve
+        almeno produrre un suggerimento in quarantena (prima: nulla,
+        e l'auto-create creava un profilo duplicato)."""
+        customer = make_customer(
+            test_db_session, "Dr. Gahe di Mercuri Christian", None
+        )
+        invoice = make_invoice(test_db_session, name="MERCURI CHRISTIAN")
+
+        result = match_invoice_to_customer(
+            invoice, [customer], test_db_session
+        )
+        assert result.customer is None
+        assert result.suggested_customer is not None
+        assert result.suggested_customer.id == customer.id
+        assert result.suggested_method == "fuzzy"
+
+    def test_run_matching_unlinked_fuzzy_not_resuggested(self, test_db_session):
+        """Un suggerimento SOLO-fuzzy rifiutato/scollegato a mano non si
+        ripresenta a ogni sync: 'non verrà più riproposta' deve essere vero."""
+        make_customer(test_db_session, "Domò Milano", None)
+        invoice = make_invoice(
+            test_db_session, name="YOHO MILANO SRL", match_method="unlinked",
+        )
+
+        stats = run_matching(test_db_session)
+        assert stats['suggested'] == 0
+
+        test_db_session.refresh(invoice)
+        assert invoice.customer_id is None
+        assert invoice.suggested_customer_id is None
