@@ -153,21 +153,27 @@ export default function Dashboard() {
       try {
         markerBefore = await getSyncMarker()
       } catch {
-        // status non leggibile: si polla comunque, al peggio scatta il timeout
+        // status non leggibile ORA: il polling adotta il primo marker
+        // osservato come baseline e attende comunque un cambio reale
       }
       await client.post('/sync/full')
-      const completed = await waitForSyncCompletion(markerBefore)
-      if (completed) {
+      const { completed, errors } = await waitForSyncCompletion(markerBefore)
+      if (completed && errors.length === 0) {
         setSyncMessage('Sincronizzazione completata con successo')
         const syncNow = new Date()
         setLastSync(syncNow)
         localStorage.setItem('lastSyncTime', syncNow.toISOString())
+      } else if (completed) {
+        // La pipeline è arrivata in fondo ma uno o più step sono falliti:
+        // niente messaggio verde né lastSync — i dati NON sono aggiornati.
+        setSyncMessage(`Errore nella sincronizzazione: step ${errors.join(', ')} falliti — dati non aggiornati`)
       } else {
         setSyncMessage('Sync ancora in corso in background — i dati mostrati potrebbero non essere definitivi')
       }
       await fetchData()
       await fetchTodos()
-      setTimeout(() => setSyncMessage(''), 5000)
+      await fetchConnectorStatus()
+      setTimeout(() => setSyncMessage(''), 8000)
     } catch (err) {
       setSyncMessage('Errore nella sincronizzazione')
       console.error(err)

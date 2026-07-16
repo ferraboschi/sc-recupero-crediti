@@ -254,6 +254,52 @@ class TestCreateCustomerFromInvoice:
         assert "YOHO MILANO" in detail
         assert "Riassegna" in detail
 
+    def test_409_duplicate_name_with_stale_normalized_column(
+        self, test_client, test_db_session
+    ):
+        """La colonna ragione_sociale_normalized in prod contiene chiavi di
+        VERSIONI PRECEDENTI del normalizzatore (mai backfillate): la guardia
+        deve ricalcolare la chiave al volo, non fidarsi della colonna."""
+        existing = Customer(
+            ragione_sociale="SHU&SHU SRL",
+            # chiave scritta dal vecchio normalizzatore ('&' spaziato)
+            ragione_sociale_normalized="shu & shu",
+            partita_iva=None,
+            source="shopify",
+        )
+        test_db_session.add(existing)
+        test_db_session.commit()
+        inv = self._make_unmatched_invoice(
+            test_db_session, name="SHU & SHU S.R.L.", piva=None
+        )
+
+        response = test_client.post(f"/api/positions/{inv.id}/create-customer")
+        assert response.status_code == 409
+        assert "SHU&SHU SRL" in response.json()["detail"]
+
+    def test_homonym_with_conflicting_piva_does_not_block(
+        self, test_client, test_db_session
+    ):
+        """Omonimo con P.IVA valida DIVERSA da quella della fattura: è
+        un'ALTRA entità (stessa regola di matching/auto-create) — la
+        creazione del nuovo cliente non va bloccata."""
+        other_piva = "98765432103"  # checksum-valida, diversa da VALID_PIVA
+        existing = Customer(
+            ragione_sociale="YOHO MILANO S.R.L.",
+            ragione_sociale_normalized="yoho milano",
+            partita_iva=other_piva,
+            source="shopify",
+        )
+        test_db_session.add(existing)
+        test_db_session.commit()
+        inv = self._make_unmatched_invoice(test_db_session)  # piva=VALID_PIVA
+
+        response = test_client.post(f"/api/positions/{inv.id}/create-customer")
+        assert response.status_code == 200
+        test_db_session.refresh(inv)
+        assert inv.customer_id is not None
+        assert inv.customer_id != existing.id
+
 
 class TestLowConfidenceBadge:
     """low_confidence in /positions/suggestions: fuzzy<85 oppure score<40."""

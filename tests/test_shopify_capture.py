@@ -43,14 +43,16 @@ def _mk_invoice(session, number, **kw):
     return inv
 
 
-def _order(oid, total, subtotal=None, created="2026-05-01"):
+def _order(oid, total, subtotal=None, created="2026-05-01",
+           financial_status="paid", cancelled_at=None):
     return {
         "id": str(oid), "name": f"#SAK{oid}", "order_number": oid,
         "total_price": total,
         "subtotal_price": subtotal if subtotal is not None else total,
         "total_tax": 0.0,
         "created_at": f"{created}T00:00:00+02:00",
-        "financial_status": "paid",
+        "financial_status": financial_status,
+        "cancelled_at": cancelled_at,
     }
 
 
@@ -183,6 +185,30 @@ class TestOrderMatchCriteria:
             used_order_ids={"1"},
         )
         assert best is None
+
+    def test_cancelled_order_skipped_for_real_twin(self, test_db_session):
+        """Pagamento fallito → ordine annullato e ripiazzato identico:
+        stesso importo e stessa data. Deve vincere il gemello REALE, mai
+        l'annullato (citarlo al debitore sarebbe un errore)."""
+        from backend.api.sync import _find_best_order_match
+        inv = _mk_invoice(test_db_session, "C/2026", amount=100.0,
+                          issue_date=date(2026, 5, 10))
+        cancelled = _order(1, total=100.0, created="2026-05-10",
+                           cancelled_at="2026-05-10T09:00:00+02:00")
+        real = _order(2, total=100.0, created="2026-05-10")
+        best, _ = _find_best_order_match(inv, [cancelled, real])
+        assert best is not None and best["id"] == "2"
+
+    def test_voided_and_refunded_orders_never_match(self, test_db_session):
+        from backend.api.sync import _find_best_order_match
+        inv = _mk_invoice(test_db_session, "V/2026", amount=100.0,
+                          issue_date=date(2026, 5, 10))
+        for status in ("voided", "refunded"):
+            best, _ = _find_best_order_match(
+                inv, [_order(1, total=100.0, created="2026-05-10",
+                             financial_status=status)]
+            )
+            assert best is None, status
 
 
 class TestOrderMatchingTask:
@@ -416,6 +442,32 @@ class TestCsvImportCollision:
         domo = next(r for r in rows if r.customer_name_raw == "Domò SRL")
         assert domo.customer_id == cust_id  # abbinamento intatto
         assert domo.amount == 500.0
+
+    def test_reimport_with_person_name_variant_updates_not_duplicates(
+        self, monkeypatch, test_client, test_db_session
+    ):
+        # La chiave normalizzata diverge sui nomi-persona: la STESSA
+        # fattura re-importata con l'insegna completa invece del solo
+        # nome persona (stesso anno) deve aggiornare, non duplicarsi.
+        from backend.api import sync as sync_mod
+        monkeypatch.setattr(sync_mod, "get_session_direct", lambda: test_db_session)
+        _mk_invoice(
+            test_db_session, "899", source_platform="fatture24",
+            customer_name_raw="MERCURI CHRISTIAN",
+            amount=300.0, amount_due=300.0, issue_date=date(2026, 2, 1),
+        )
+
+        resp = self._import(
+            test_client,
+            "Numero;Cliente;Importo;Data\n"
+            "899;Dr. Gahe di Mercuri Christian;300,00;01/02/2026\n",
+        )
+
+        body = resp.json()
+        assert body["updated"] == 1
+        assert body["created"] == 0
+        rows = test_db_session.query(Invoice).filter_by(invoice_number="899").all()
+        assert len(rows) == 1
 
     def test_same_number_same_customer_still_updates(
         self, monkeypatch, test_client, test_db_session

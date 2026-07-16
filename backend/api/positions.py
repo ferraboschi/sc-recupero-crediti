@@ -431,9 +431,21 @@ async def create_customer_from_invoice(position_id: int, session: Session = Depe
                     ),
                 )
         if name_norm:
-            existing = session.query(Customer).filter(
-                Customer.ragione_sociale_normalized == name_norm
-            ).first()
+            # La colonna ragione_sociale_normalized contiene chiavi scritte
+            # da versioni diverse del normalizzatore (mai backfillate): il
+            # confronto affidabile è sul ricalcolo fresh, come fa il
+            # matching (Strategia 2). Un omonimo con P.IVA valida DIVERSA
+            # da quella della fattura è un'entità diversa (stessa regola di
+            # matching/auto-create): non blocca la creazione.
+            existing = None
+            for c in session.query(Customer).all():
+                if normalize_ragione_sociale(c.ragione_sociale or "") != name_norm:
+                    continue
+                cust_piva = validate_piva(c.partita_iva)
+                if piva and cust_piva and piva != cust_piva:
+                    continue
+                existing = c
+                break
             if existing:
                 raise HTTPException(
                     status_code=409,

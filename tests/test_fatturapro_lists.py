@@ -234,6 +234,24 @@ class TestClientiMap:
         cmap, _ = conn.fetch_clienti_map()
         assert "bar roma" not in cmap
 
+    def test_homonym_empty_row_first_still_ambiguous(self, monkeypatch):
+        # Come sopra ma con la riga VUOTA prima della gemella con P.IVA:
+        # l'esito non deve dipendere dall'ordine delle righe (prima la
+        # riga vuota non veniva registrata e il check non scattava).
+        html = """
+        <table><tr><th>Denominazione</th><th>Partita IVA</th><th>Codice Fiscale</th>
+        <th>Indirizzo</th><th>Civico</th><th>Cap</th><th>Comune</th><th>Prov</th>
+        <th>Telefono</th><th>Email</th><th></th></tr>
+        <tr><td>Bar Roma</td><td></td><td></td><td></td><td></td>
+        <td></td><td></td><td></td><td></td><td></td><td></td></tr>
+        <tr><td>Bar Roma</td><td>11111111119</td><td>x</td><td>V</td><td>1</td>
+        <td>1</td><td>Roma</td><td>RM</td><td>061</td><td>a@x.it</td><td></td></tr>
+        </table>
+        """
+        conn = _connector_with_list(monkeypatch, {"clienti.php": html})
+        cmap, _ = conn.fetch_clienti_map()
+        assert "bar roma" not in cmap
+
     def test_swiss_piva_with_iva_suffix_kept(self, monkeypatch):
         # Il formato svizzero ufficiale porta il suffisso ' IVA'/' MWST':
         # non fa parte del numero e non deve far scartare la P.IVA (caso

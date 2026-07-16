@@ -827,8 +827,17 @@ class FatturaProConnector:
                 if not prev.get("email") and email:
                     prev["email"] = email
                 continue
-            if piva or phone or email:
-                result[key] = {"piva": piva, "phone": phone, "email": email}
+            # Registra SEMPRE la riga (anche senza dati): il check di
+            # ambiguità degli omonimi deve vedere anche le righe vuote,
+            # altrimenti l'esito dipende dall'ordine (riga vuota prima
+            # della gemella con P.IVA → P.IVA servita per il nome condiviso).
+            result[key] = {"piva": piva, "phone": phone, "email": email}
+        # Le entry senza alcun dato utile escono solo ORA, ad ambiguità
+        # già calcolata.
+        result = {
+            k: v for k, v in result.items()
+            if v["piva"] or v["phone"] or v["email"]
+        }
         logger.info(
             f"Anagrafica: {len(result)} customers with P.IVA/contacts "
             f"from {len(rows)} rows ({len(ambiguous)} ambiguous names skipped)"

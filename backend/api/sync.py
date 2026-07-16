@@ -31,7 +31,7 @@ from backend.engine.cases import update_case_lifecycle
 from backend.engine.piva import validate_piva
 from backend.scheduler import get_scheduler_status
 from backend.config import config
-from backend.engine.normalizer import normalize_ragione_sociale
+from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
 
 logger = logging.getLogger(__name__)
 
@@ -792,10 +792,14 @@ def _match_orders_task() -> dict:
 
         for cust in customers:
             # Get unmatched invoices for this customer
+            # Ordinamento stabile: quando due fatture contendono lo stesso
+            # ordine, l'assegnazione greedy deve essere riproducibile anche
+            # su Postgres (senza ORDER BY l'ordine delle righe non lo è) —
+            # vince la fattura più vecchia.
             unmatched_invoices = session.query(Invoice).filter(
                 Invoice.customer_id == cust.id,
                 Invoice.shopify_order_id.is_(None),
-            ).all()
+            ).order_by(Invoice.issue_date.asc(), Invoice.id.asc()).all()
 
             if not unmatched_invoices:
                 continue
@@ -914,6 +918,13 @@ def _find_best_order_match(
 
     for order in orders:
         if order["id"] in used_order_ids:
+            continue
+
+        # Un ordine annullato/stornato/rimborsato non può essere la pezza
+        # d'appoggio di un credito aperto: citarlo al debitore sarebbe un
+        # errore, e brucerebbe l'aggancio per l'ordine reale gemello
+        # (ripiazzato identico dopo un pagamento fallito).
+        if order.get("cancelled_at") or order.get("financial_status") in ("voided", "refunded"):
             continue
 
         # Delta importo: il migliore tra totale (IVA inclusa) e
@@ -1411,6 +1422,7 @@ async def import_csv(file: UploadFile = File(...)):
             csv_name_norm = normalize_ragione_sociale(
                 mapped.get("customer_name") or ""
             )
+            issue_date = parse_date(mapped.get("issue_date"))
             existing = None
             for cand in session.query(Invoice).filter_by(
                 invoice_number=inv_num,
@@ -1420,8 +1432,27 @@ async def import_csv(file: UploadFile = File(...)):
                     cand.customer_name_raw or ""
                 )
                 # Nome mancante da un lato: impossibile distinguere,
-                # si mantiene il comportamento di update.
-                if not csv_name_norm or not cand_name_norm or csv_name_norm == cand_name_norm:
+                # si mantiene il comportamento di update. La chiave
+                # normalizzata diverge sui nomi-persona ('MERCURI
+                # CHRISTIAN' vs 'Dr. Gahe di Mercuri Christian' → chiavi
+                # diverse): un re-import della STESSA fattura nell'altra
+                # forma è concordante per lo scorer robusto, gatato
+                # sull'anno per non riunire clienti diversi.
+                nomi_concordi = (
+                    not csv_name_norm or not cand_name_norm
+                    or csv_name_norm == cand_name_norm
+                    or (
+                        name_similarity_score(
+                            mapped.get("customer_name") or "",
+                            cand.customer_name_raw or "",
+                        ) >= 100
+                        and (
+                            not issue_date or not cand.issue_date
+                            or issue_date.year == cand.issue_date.year
+                        )
+                    )
+                )
+                if nomi_concordi:
                     existing = cand
                     break
 
@@ -1430,7 +1461,6 @@ async def import_csv(file: UploadFile = File(...)):
             if amount_due == 0 and amount > 0:
                 amount_due = amount  # If no separate balance, assume full amount due
 
-            issue_date = parse_date(mapped.get("issue_date"))
             due_date = parse_date(mapped.get("due_date"))
 
             days_overdue = 0

@@ -52,7 +52,9 @@ from backend.engine.matching import (
 from backend.engine.cases import (
     close_case, get_open_case, is_overdue_unpaid, _refresh_customer_status,
 )
-from backend.engine.normalizer import name_similarity_score, light_similarity_score
+from backend.engine.normalizer import (
+    name_similarity_score, light_similarity_score_strict,
+)
 from backend.engine.piva import validate_piva
 
 logger = logging.getLogger(__name__)
@@ -216,7 +218,7 @@ def repair_matches(session: Session) -> Dict[str, Any]:
             # Già gestita (o mandata in review) dal passo 1: qui un relink
             # aggirerebbe la guardia nome appena applicata.
             continue
-        result = match_invoice_to_customer(inv, all_customers, session)
+        result = match_invoice_to_customer(inv, all_customers, session, advisory=True)
         if result.customer is not None and result.customer.id == inv.customer_id:
             # Il motore nuovo concorda: promozione della provenance (solo
             # per le 'legacy' — gli altri metodi sono già provenance vera).
@@ -262,8 +264,11 @@ def repair_matches(session: Session) -> Dict[str, Any]:
             # (pattern 'di Nome Cognome' conservato) deve confermare il
             # candidato, altrimenti due insegne diverse collassate sulla
             # stessa chiave ('Osteria di Mario Rossi' / 'Osteria di Luigi
-            # Bianchi') produrrebbero un relink sbagliato.
-            light = light_similarity_score(
+            # Bianchi') produrrebbero un relink sbagliato. Serve lo scorer
+            # STRICT (token_sort, non token_set): col subset-bonus il
+            # collasso monolaterale ('Osteria di Mario Rossi' vs 'Osteria
+            # SRL') varrebbe 100 e passerebbe la guardia.
+            light = light_similarity_score_strict(
                 inv.customer_name_raw or "",
                 result.customer.ragione_sociale or "",
             )

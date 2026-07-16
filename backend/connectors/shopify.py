@@ -404,9 +404,11 @@ class ShopifyConnector(BaseConnector):
         # subtotal_price/total_tax servono al matching ordine→fattura:
         # l'importo dell'ordine può essere ex-IVA mentre la fattura è
         # IVA inclusa (o viceversa) — si confrontano entrambi.
+        # cancelled_at serve a scartare gli ordini annullati: non possono
+        # essere la pezza d'appoggio di un credito aperto.
         fields = (
             "id,order_number,name,total_price,subtotal_price,"
-            "total_tax,created_at,financial_status"
+            "total_tax,created_at,financial_status,cancelled_at"
         )
         cursor: Optional[str] = None
         page = 0
@@ -463,6 +465,7 @@ class ShopifyConnector(BaseConnector):
                     "financial_status": o.get(
                         "financial_status", ""
                     ),
+                    "cancelled_at": o.get("cancelled_at"),
                 })
 
             cursor = self._extract_next_cursor()

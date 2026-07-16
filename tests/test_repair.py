@@ -249,6 +249,23 @@ class TestLegacyRematch:
         test_db_session.refresh(inv)
         assert inv.customer_id == current.id
 
+    def test_name_exact_relink_blocked_on_one_sided_collapse(self, test_db_session):
+        """Collasso MONOLATERALE: la chiave della fattura è stata prodotta
+        troncando 'di Nome Cognome' ('Osteria di Mario Rossi' → 'osteria')
+        e coincide con un cliente 'Osteria SRL' — insegna potenzialmente
+        diversa. Col token_set_ratio la guardia valeva 100 per puro
+        contenimento (subset): serve lo scorer strict → review, no relink."""
+        current = _customer(test_db_session, "Cliente Attuale SRL", None)
+        _customer(test_db_session, "Osteria SRL", None)
+        inv = _invoice(
+            test_db_session, "OST2/2026", customer=current,
+            customer_name_raw="Osteria di Mario Rossi", match_method="legacy",
+        )
+        stats = repair_matches(test_db_session)
+        assert stats["name_exact_relink_detached"] == 0
+        test_db_session.refresh(inv)
+        assert inv.customer_id == current.id
+
     def test_uncertain_disagreement_only_logged(self, test_db_session):
         """Senza certezza P.IVA il repair non tocca nulla: solo un
         ActivityLog di review."""

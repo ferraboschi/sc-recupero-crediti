@@ -1,6 +1,7 @@
 """Normalizer module - normalizes Italian company names (ragione sociali) for matching."""
 
 import re
+import functools
 import logging
 import unicodedata
 from typing import Tuple
@@ -60,6 +61,7 @@ def remove_accents(text: str) -> str:
     return "".join([c for c in nfkd_form if not unicodedata.combining(c)])
 
 
+@functools.lru_cache(maxsize=8192)
 def _normalize_impl(name: str, strip_person: bool) -> str:
     """Implementazione condivisa della normalizzazione.
 
@@ -67,6 +69,10 @@ def _normalize_impl(name: str, strip_person: bool) -> str:
     la chiave di matching lo rimuove (le fatture spesso omettono la parte
     persona), la chiave 'light' lo conserva (le fatture delle ditte
     individuali spesso riportano SOLO la persona).
+
+    Memoizzata: è una funzione pura e i nomi cliente si ripetono identici
+    per ogni fattura del run (repair ricorrente: O(fatture × clienti)
+    normalizzazioni regex senza cache).
     """
     if not name:
         return ""
@@ -222,6 +228,21 @@ def light_similarity_score(name1: str, name2: str) -> int:
     if not norm1 or not norm2:
         return 0
     return int(fuzz.token_set_ratio(norm1, norm2))
+
+
+def light_similarity_score_strict(name1: str, name2: str) -> int:
+    """Come light_similarity_score ma SENZA il bonus-subset di
+    token_set_ratio: serve alle guardie che devono CONFERMARE un
+    candidato (non solo non-smentirlo). Con token_set_ratio un lato che
+    porta il pattern 'di Nome Cognome' e uno che non lo porta valgono
+    100 per puro contenimento ('Osteria di Mario Rossi' vs 'Osteria
+    SRL') — che è esattamente il collasso da bloccare, non una conferma.
+    """
+    norm1 = normalize_ragione_sociale_light(name1)
+    norm2 = normalize_ragione_sociale_light(name2)
+    if not norm1 or not norm2:
+        return 0
+    return int(fuzz.token_sort_ratio(norm1, norm2))
 
 
 def name_similarity_score(name1: str, name2: str) -> int:

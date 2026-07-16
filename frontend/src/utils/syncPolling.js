@@ -7,7 +7,8 @@
  * l'ULTIMO step della pipeline del full sync (invoices → customers →
  * matching → auto-create → order matching → cases) e persiste il proprio
  * stato anche in caso di errore, quindi il suo last_sync che cambia segnala
- * la fine dell'intera pipeline.
+ * la fine dell'intera pipeline — NON il suo successo: gli errori per-step
+ * vanno letti dai result (collectSyncErrors).
  */
 
 import client from '../api/client'
@@ -22,19 +23,50 @@ export async function getSyncMarker() {
 }
 
 /**
+ * Step della pipeline falliti nell'ultimo sync, letti dai result persistiti.
+ * Il marker che cambia dice solo che la pipeline è ARRIVATA in fondo: ogni
+ * step ha il proprio try/except e può essere fallito senza fermare gli altri.
+ */
+export function collectSyncErrors(lastSync) {
+  const failed = []
+  for (const [step, info] of Object.entries(lastSync || {})) {
+    const r = info?.result
+    if (!r) continue
+    const fp = r.fatturapro
+    if (r.error || r.shopify_error || (fp && (fp.error || fp.success === false))) {
+      failed.push(step)
+    }
+  }
+  return failed
+}
+
+/**
  * Polla /sync/status finché il marker cambia rispetto a markerBefore.
- * Ritorna true se il sync è completato, false al timeout (sync ancora
- * in corso in background: il chiamante lo dica onestamente all'utente).
+ * Ritorna { completed, errors }: completed=false al timeout (sync ancora
+ * in corso in background: il chiamante lo dica onestamente all'utente);
+ * errors = step falliti quando completed=true.
  */
 export async function waitForSyncCompletion(markerBefore) {
+  let baseline = markerBefore
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
     try {
-      const marker = await getSyncMarker()
-      if (marker && marker !== markerBefore) return true
+      const res = await client.get('/sync/status')
+      const lastSync = res.data?.last_sync
+      const marker = lastSync?.cases?.last_sync || ''
+      if (!baseline) {
+        // Baseline non letta prima del POST (errore transitorio): il primo
+        // marker osservato NON distingue il sync precedente da quello in
+        // corso — lo si adotta come riferimento e si attende che cambi.
+        baseline = marker
+        continue
+      }
+      if (marker && marker !== baseline) {
+        return { completed: true, errors: collectSyncErrors(lastSync) }
+      }
     } catch {
       // errore transitorio di polling: si riprova al giro successivo
     }
   }
-  return false
+  return { completed: false, errors: [] }
 }
