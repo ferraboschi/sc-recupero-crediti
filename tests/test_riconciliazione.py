@@ -413,6 +413,147 @@ class TestRecuperato:
         assert r["storico_stimato"]["importo"] == 300.0
 
 
+class TestRecuperatoAttribuzione:
+    """I due difetti dell'audit avversario sul 'recuperato certo':
+
+    5a — un sollecito ANNULLATO ('registrato per errore', undo) NON è un
+         primo sollecito: il pagamento successivo non lo abbiamo recuperato.
+    5c — attribuzione per-CLIENTE invece che per-FATTURA: una fattura NUOVA,
+         emessa e pagata nei termini mesi dopo un vecchio sollecito, NON è
+         ciò che stavamo recuperando. La fattura deve essere stata emessa
+         PRIMA della prima azione di recupero.
+    """
+
+    def _azione(self, session, customer_id, when, cancelled=False):
+        a = RecoveryAction(
+            customer_id=customer_id, action_type="first_contact",
+            created_at=when, completed_at=when,
+            cancelled=cancelled,
+            cancelled_reason="undo" if cancelled else None,
+        )
+        session.add(a)
+        session.commit()
+        return a
+
+    # ── 5a ───────────────────────────────────────────────────────────
+    def test_azione_annullata_non_e_un_sollecito(self, test_client, test_db_session):
+        """5a: cliente con UN SOLO sollecito annullato + fattura pagata dopo →
+        oggi il KPI lo conta (bug), deve diventare 0."""
+        c = _customer(test_db_session, "SoloAnnullata")
+        self._azione(test_db_session, c.id,
+                     datetime.utcnow() - timedelta(days=10), cancelled=True)
+        # Fattura VECCHIA (emessa prima) pagata DOPO l'azione annullata:
+        # senza il fix conterebbe, perché l'annullata fa da 'primo sollecito'.
+        _invoice(test_db_session, "P/1", amount=500.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=c.id,
+                 issue_date=date(2026, 1, 1),
+                 paid_at=datetime.utcnow() - timedelta(days=1),
+                 amount_due_at_paid=200.0)
+
+        r = test_client.get("/api/dashboard/riconciliazione").json()["recuperato"]
+        assert r["certo"]["importo"] == 0.0, "un sollecito annullato non recupera nulla"
+        assert r["certo"]["fatture"] == 0
+
+    # ── 5c ───────────────────────────────────────────────────────────
+    def test_fattura_nuova_pagata_nei_termini_non_e_recupero(self, test_client, test_db_session):
+        """5c: sollecito a gennaio, fattura NUOVA emessa a maggio e pagata nei
+        termini → oggi conta (bug), deve diventare 0."""
+        c = _customer(test_db_session, "ClienteFedele")
+        self._azione(test_db_session, c.id, datetime(2026, 1, 15))
+        _invoice(test_db_session, "NEW/1", amount=500.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=c.id,
+                 issue_date=date(2026, 5, 1),
+                 paid_at=datetime(2026, 5, 20),
+                 amount_due_at_paid=500.0)
+
+        r = test_client.get("/api/dashboard/riconciliazione").json()["recuperato"]
+        assert r["certo"]["importo"] == 0.0, "una fattura nuova non era da recuperare"
+        assert r["certo"]["fatture"] == 0
+
+    def test_fattura_vecchia_pagata_dopo_il_sollecito_conta(self, test_client, test_db_session):
+        """5c controllo POSITIVO: fattura emessa PRIMA del sollecito e pagata
+        dopo → DEVE contare (prima e dopo il fix)."""
+        c = _customer(test_db_session, "Recuperato")
+        self._azione(test_db_session, c.id, datetime(2026, 1, 15))
+        _invoice(test_db_session, "OLD/1", amount=500.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=c.id,
+                 issue_date=date(2025, 11, 1),
+                 paid_at=datetime(2026, 2, 1),
+                 amount_due_at_paid=200.0)
+
+        r = test_client.get("/api/dashboard/riconciliazione").json()["recuperato"]
+        assert r["certo"]["importo"] == 200.0
+        assert r["certo"]["fatture"] == 1
+
+    def test_issue_date_null_non_evapora_un_recupero_legittimo(self, test_client, test_db_session):
+        """REGOLA: issue_date NULL (riga legacy) NON deve far sparire un
+        recupero legittimo — il filtro per data non evapora ciò che non ha
+        una data di emissione."""
+        c = _customer(test_db_session, "Legacy")
+        self._azione(test_db_session, c.id, datetime(2026, 1, 15))
+        _invoice(test_db_session, "LEG/1", amount=500.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=c.id,
+                 issue_date=None,
+                 paid_at=datetime(2026, 2, 1),
+                 amount_due_at_paid=150.0)
+
+        r = test_client.get("/api/dashboard/riconciliazione").json()["recuperato"]
+        assert r["certo"]["importo"] == 150.0, "issue_date NULL non deve evaporare"
+        assert r["certo"]["fatture"] == 1
+
+    def test_coerenza_recuperato_fra_i_consumatori(self, test_client, test_db_session):
+        """I 4 consumatori concordano nello stesso istante: /riconciliazione,
+        snapshot e /evoluzione danno lo STESSO recuperato certo; e i casi-bug
+        (annullata, fattura nuova) non contano da nessuna parte, /pipeline
+        inclusa."""
+        from backend.engine.overdue_history import record_overdue_snapshot
+
+        # 1) recupero LEGITTIMO: azione vecchia, fattura vecchia pagata dopo
+        buono = _customer(test_db_session, "Buono", recovery_status="first_contact")
+        self._azione(test_db_session, buono.id, datetime(2026, 1, 10))
+        _invoice(test_db_session, "OK/1", amount=400.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=buono.id,
+                 issue_date=date(2025, 12, 1),
+                 paid_at=datetime(2026, 2, 1), amount_due_at_paid=300.0)
+
+        # 2) caso-bug 5a: solo un'azione annullata + fattura pagata dopo
+        ann = _customer(test_db_session, "Annullata", recovery_status="idle")
+        self._azione(test_db_session, ann.id, datetime(2026, 1, 10), cancelled=True)
+        _invoice(test_db_session, "ANN/1", amount=200.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=ann.id,
+                 issue_date=date(2025, 12, 1),
+                 paid_at=datetime(2026, 2, 1), amount_due_at_paid=200.0)
+
+        # 3) caso-bug 5c: azione valida, ma fattura NUOVA pagata nei termini
+        nuovo = _customer(test_db_session, "Nuovo", recovery_status="first_contact")
+        self._azione(test_db_session, nuovo.id, datetime(2026, 1, 10))
+        _invoice(test_db_session, "NUO/1", amount=999.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=nuovo.id,
+                 issue_date=date(2026, 5, 1),
+                 paid_at=datetime(2026, 5, 15), amount_due_at_paid=999.0)
+
+        snap = record_overdue_snapshot(test_db_session)
+        recon = test_client.get("/api/dashboard/riconciliazione").json()["recuperato"]
+        evo = test_client.get("/api/dashboard/evoluzione").json()["serie"]
+        pipe = test_client.get("/api/dashboard/pipeline").json()["stages"]["resolved"]
+
+        # Solo il recupero legittimo conta: 1 fattura, 300 di residuo
+        assert recon["certo"]["fatture"] == 1
+        assert recon["certo"]["importo"] == 300.0
+
+        # riconciliazione == snapshot (stessa funzione condivisa)
+        assert snap.recuperato_certo == recon["certo"]["importo"]
+        assert snap.recuperato_certo_fatture == recon["certo"]["fatture"]
+
+        # snapshot == /evoluzione (l'ultimo punto è lo snapshot di oggi)
+        punto = evo[-1]
+        assert punto["recuperato_certo"] == snap.recuperato_certo
+        assert punto["fatture"]["recuperato_certo"] == snap.recuperato_certo_fatture
+
+        # /pipeline: il 'recuperato' conta solo il cliente legittimo
+        assert pipe["count"] == 1, "annullata e fattura-nuova non sono recuperi"
+
+
 # ── D. /pipeline non si contraddice più da solo ──────────────────────
 
 class TestPipelineCoerente:

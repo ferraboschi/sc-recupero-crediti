@@ -47,6 +47,10 @@ CASE_STAGES = (
     "lawyer", "waiting", "archived", "sconosciuto",
 )
 
+# I tipi di azione che valgono come "sollecito" (contano nel recuperato).
+# 'note'/'archive'/'wait' non sono contatti col debitore.
+RECOVERY_ACTION_TYPES = ("first_contact", "second_contact", "lawyer")
+
 
 def is_overdue_unpaid(inv: Invoice) -> bool:
     """Fattura che tiene viva una pratica: scaduta, non pagata, non contestata."""
@@ -140,9 +144,75 @@ def compute_overdue_buckets(session) -> dict:
     return {"scaduto_totale": totale, **per_bucket}
 
 
+def first_recovery_action_subquery(session):
+    """Prima azione di recupero NON annullata, per cliente.
+
+    Ritorna una subquery `(customer_id, first_action)` dove `first_action` è
+    il MIN(created_at) fra i solleciti (RECOVERY_ACTION_TYPES) che il cliente
+    ha davvero ricevuto.
+
+    UNA definizione sola, condivisa da tutti i consumatori del "recuperato"
+    (/riconciliazione, snapshot, /pipeline, /attivita): se ognuno se la
+    riscrivesse a mano, prima o poi divergerebbero e un endpoint direbbe un
+    numero e lo snapshot un altro.
+
+    Filtra `cancelled IS NOT TRUE` (BUG 5a): un sollecito annullato è
+    "registrato per errore" (lo dice /undo) — non è un primo sollecito, e il
+    pagamento successivo non lo abbiamo recuperato noi. `isnot(True)` copre
+    anche i NULL (colonna aggiunta via ALTER), come i 30+ punti che già
+    filtrano così nel resto del codebase.
+    """
+    return (
+        session.query(
+            RecoveryAction.customer_id,
+            func.min(RecoveryAction.created_at).label("first_action"),
+        )
+        .filter(
+            RecoveryAction.action_type.in_(RECOVERY_ACTION_TYPES),
+            RecoveryAction.cancelled.isnot(True),
+        )
+        .group_by(RecoveryAction.customer_id)
+        .subquery()
+    )
+
+
+def recovered_invoice_clause(first_action_sq):
+    """La fattura era già in circolo quando è partito il sollecito.
+
+    BUG 5c: l'attribuzione per-CLIENTE (join sul solo customer_id) contava
+    come "recuperata" una fattura NUOVA — emessa e pagata nei termini mesi
+    dopo un vecchio sollecito. Ma una fattura emessa DOPO il primo sollecito
+    non può essere ciò che stavamo recuperando.
+
+    Discriminante scelto: `issue_date < first_action` (la data di emissione,
+    non `invoice_ids`/`case_id`). Motivo:
+    - `invoice_ids` è NULL su tutte le azioni ante-migrazione (colonna
+      aggiunta via ALTER), e la PRIMA azione — quella che qui conta — è
+      proprio la più vecchia, quindi la più spesso priva di invoice_ids:
+      legarci il recupero farebbe evaporare i recuperi storici legittimi.
+      In più un sollecito cita spesso un SOTTOINSIEME delle fatture scadute,
+      quindi il legame sarebbe anche troppo stretto.
+    - `Invoice.case_id` è volatile (azzerato a ogni scollega/repair, chiuso
+      col ciclo): inaffidabile per le pagate storiche.
+    - `issue_date` è scritta al sync dal documento ed è già la data con cui
+      il motore data il ciclo di recupero (cases.py) — proxy robusto.
+
+    issue_date NULL: la fattura NON evapora (`OR issue_date IS NULL`). Una
+    riga legacy senza data di emissione è quasi sempre un recupero storico
+    legittimo; una fattura NUOVA, invece, arriva dal sync con la sua data.
+    Tenere i NULL protegge i recuperi legittimi (la regola: non evaporarli)
+    e riapre il 5c solo per la rara coincidenza NULL-e-nuova-e-pagata.
+    """
+    return (
+        (Invoice.issue_date < first_action_sq.c.first_action)
+        | Invoice.issue_date.is_(None)
+    )
+
+
 def compute_recuperato_certo(session):
     """Recuperato CERTO, cumulato: fatture pagate DOPO il primo sollecito, a
-    residuo (amount_due_at_paid), con paid_at valorizzata.
+    residuo (amount_due_at_paid), con paid_at valorizzata, ed emesse PRIMA
+    del sollecito.
 
     Ritorna la coppia (fatture, importo). È la stessa definizione che
     /riconciliazione espone come `recuperato.certo`: condividerla tiene lo
@@ -153,19 +223,7 @@ def compute_recuperato_certo(session):
     ante-migrazione resta un affare di /riconciliazione — non entra nella
     serie, dove sommeremmo mele e pere.
     """
-    first_action = (
-        session.query(
-            RecoveryAction.customer_id,
-            func.min(RecoveryAction.created_at).label("first_action"),
-        )
-        .filter(
-            RecoveryAction.action_type.in_(
-                ["first_contact", "second_contact", "lawyer"]
-            )
-        )
-        .group_by(RecoveryAction.customer_id)
-        .subquery()
-    )
+    first_action = first_recovery_action_subquery(session)
     certo = (
         session.query(
             func.count(Invoice.id),
@@ -176,6 +234,7 @@ def compute_recuperato_certo(session):
             Invoice.status == "paid",
             Invoice.paid_at.isnot(None),
             Invoice.paid_at >= first_action.c.first_action,
+            recovered_invoice_clause(first_action),
         )
         .one()
     )

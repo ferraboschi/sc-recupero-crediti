@@ -13,7 +13,8 @@ from backend.database import (
 from backend.engine.overdue import (
     overdue_clause, workable_clause, stage_expr,
     compute_overdue_buckets, compute_recuperato_certo,
-    OVERDUE_BUCKETS, CASE_STAGES,
+    first_recovery_action_subquery, recovered_invoice_clause,
+    OVERDUE_BUCKETS, CASE_STAGES, RECOVERY_ACTION_TYPES,
 )
 from backend.engine.cases import business_day_start
 
@@ -547,21 +548,11 @@ async def get_attivita(session: Session = Depends(get_session)):
             })
 
         # ── INCASSATI ──
-        # ONLY invoices paid AFTER the first recovery action on that customer.
-        # Subquery: first recovery action date per customer
-        first_action_sub = (
-            session.query(
-                RecoveryAction.customer_id,
-                func.min(RecoveryAction.created_at).label("first_action"),
-            )
-            .filter(
-                RecoveryAction.action_type.in_(
-                    ["first_contact", "second_contact", "lawyer"]
-                ),
-            )
-            .group_by(RecoveryAction.customer_id)
-            .subquery()
-        )
+        # ONLY invoices paid AFTER the first recovery action on that customer,
+        # and issued BEFORE it (una fattura nuova non era da recuperare).
+        # Definizione condivisa (engine/overdue.py): niente azioni annullate
+        # (5a), niente fatture emesse dopo il sollecito (5c).
+        first_action_sub = first_recovery_action_subquery(session)
 
         incassati_raw = (
             session.query(
@@ -582,6 +573,7 @@ async def get_attivita(session: Session = Depends(get_session)):
                 Invoice.status == "paid",
                 Invoice.updated_at >= first_action_sub.c.first_action,
                 Customer.excluded.is_(False),
+                recovered_invoice_clause(first_action_sub),
             )
             .group_by(
                 Customer.id, Customer.ragione_sociale,
@@ -808,22 +800,16 @@ def _recuperato(session: Session) -> dict:
       con quel che c'è — updated_at e l'importo pieno — e si DICHIARA
       stimato, invece di spacciarlo per certo.
     """
-    first_action = (
-        session.query(
-            RecoveryAction.customer_id,
-            func.min(RecoveryAction.created_at).label("first_action"),
-        )
-        .filter(RecoveryAction.action_type.in_(["first_contact", "second_contact", "lawyer"]))
-        .group_by(RecoveryAction.customer_id)
-        .subquery()
-    )
+    # Prima azione NON annullata per cliente (5a), definizione condivisa.
+    first_action = first_recovery_action_subquery(session)
 
     # Certo: paid_at valorizzata, dopo il primo sollecito, somma del RESIDUO.
     # Definizione condivisa con lo snapshot storico (engine/overdue.py): il
     # "recuperato" della serie storica e quello della cascata sono lo stesso.
     certo_fatture, certo_importo = compute_recuperato_certo(session)
 
-    # Stimato: SOLO le righe senza paid_at (mai sovrapposto al certo).
+    # Stimato: SOLO le righe senza paid_at (mai sovrapposto al certo), emesse
+    # prima del sollecito come il certo (5c: stessa clausola condivisa).
     stimato = (
         session.query(
             func.count(Invoice.id),
@@ -834,6 +820,7 @@ def _recuperato(session: Session) -> dict:
             Invoice.status == "paid",
             Invoice.paid_at.is_(None),
             Invoice.updated_at >= first_action.c.first_action,
+            recovered_invoice_clause(first_action),
         )
         .one()
     )
@@ -843,8 +830,12 @@ def _recuperato(session: Session) -> dict:
             "fatture": certo_fatture,
             "importo": round(certo_importo, 2),
             "stimato": False,
-            "label": "Recuperato",
-            "nota": "Pagato dopo il primo sollecito, a residuo: data di pagamento certa.",
+            "label": "Presunto incassato",
+            "nota": (
+                "Dedotto dalla sparizione dalla lista da incassare, non da un "
+                "pagamento verificato. Solo fatture emesse prima del primo "
+                "sollecito e sparite dopo, a residuo."
+            ),
         },
         "storico_stimato": {
             "fatture": int(stimato[0] or 0),
@@ -855,7 +846,7 @@ def _recuperato(session: Session) -> dict:
                 "Stima: fatture pagate prima che il sistema registrasse la data "
                 "di pagamento. La data è dedotta dall'ultima modifica della riga "
                 "e l'importo è quello pieno (il residuo non è più recuperabile). "
-                "Non sommare a 'Recuperato' come se fosse certo."
+                "Non sommare a 'Presunto incassato' come se fosse certo."
             ),
         },
     }
@@ -919,21 +910,11 @@ async def get_pipeline(session: Session = Depends(get_session)):
             .scalar() or 0
         )
 
-        # Of which: recovered (invoices paid AFTER first recovery action)
-        # Subquery: first recovery action date per customer
-        first_action_date = (
-            session.query(
-                RecoveryAction.customer_id,
-                func.min(RecoveryAction.created_at).label("first_action"),
-            )
-            .filter(
-                RecoveryAction.action_type.in_(
-                    ["first_contact", "second_contact", "lawyer"]
-                ),
-            )
-            .group_by(RecoveryAction.customer_id)
-            .subquery()
-        )
+        # Of which: recovered (invoices paid AFTER first recovery action and
+        # issued BEFORE it). Definizione condivisa (engine/overdue.py): niente
+        # azioni annullate (5a), niente fatture emesse dopo il sollecito (5c),
+        # così /pipeline non diverge da /riconciliazione e dallo snapshot.
+        first_action_date = first_recovery_action_subquery(session)
 
         # Only count invoices paid (updated_at) AFTER the first recovery action
         recovered_query = (
@@ -945,6 +926,7 @@ async def get_pipeline(session: Session = Depends(get_session)):
             .filter(
                 Invoice.status == "paid",
                 Invoice.updated_at >= first_action_date.c.first_action,
+                recovered_invoice_clause(first_action_date),
             )
         )
         recovered_invoices = recovered_query.all()
@@ -996,13 +978,13 @@ async def get_incassato_per_anno(session: Session = Depends(get_session)):
             & (Invoice.due_date < cast(Invoice.updated_at, Date))
         )
 
-        # Subquery: customer IDs that had recovery actions
+        # Subquery: customer IDs that had a NON-cancelled recovery action (5a:
+        # un cliente col solo sollecito annullato non è un cliente sollecitato).
         recovered_customer_ids = (
             session.query(func.distinct(RecoveryAction.customer_id))
             .filter(
-                RecoveryAction.action_type.in_(
-                    ["first_contact", "second_contact", "lawyer"]
-                ),
+                RecoveryAction.action_type.in_(RECOVERY_ACTION_TYPES),
+                RecoveryAction.cancelled.isnot(True),
             )
             .subquery()
         )
