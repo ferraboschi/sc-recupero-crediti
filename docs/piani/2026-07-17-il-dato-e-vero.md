@@ -81,7 +81,80 @@ perdere: ognuno merita una valutazione a sé.
    `Sapa-Bistrot Srl` → `-bistrot`, `L'Ong Srl` → `l`. Chiavi storpiate (non collisioni):
    priorità bassa, ma `l` è sotto `MIN_DISTINCTIVE_NAME_LEN` → cliente non abbinabile.
 
-7. **`normalize_piva` esplode su input non-stringa** (`piva.py:26`, `raw.strip()`).
+7. **`inv["customer_phone"]` / `inv["customer_email"]` sono codice morto** (`sync.py:234-235`).
+   Grep: 2 hit totali, **entrambi scritture, zero letture** — né nel ramo `existing` né in
+   `Invoice(...)`. I contatti raggiungono i `Customer` solo dal blocco separato di
+   `sync.py:~358`, direttamente da `clienti_map`. Righe innocue ma fuorvianti: sembrano
+   alimentare qualcosa e non alimentano niente. Pulizia a sé, da non mischiare a un fix di
+   correttezza.
+
+8. **La soglia `MIN_DISTINCTIVE_NAME_LEN = 4` esclude i nomi di 3 lettere** (`matching.py:35`).
+   Dopo il fix delle sigle nude, `Ong Srl` → `ong` e `Spa Srl` → `spa`: chiavi valide ma di 3
+   caratteri, sotto soglia → Strategia 2 saltata → abbinabili **solo via P.IVA**. Abbassare a
+   3 renderebbe abbinabili i nomi di 3 lettere in tutto il sistema: decisione del
+   proprietario, con un rischio di collisione da misurare prima.
+
+9. **AZIONE PROPRIETARIO — una cattura di `documenti.php` sbloccherebbe tre cose.** Una GET
+   autenticata di `documenti.php?s=1` salvata su file risponderebbe a: (a) i **nomi veri delle
+   colonne** (sono nei link di ordinamento dei `<th>` — quasi certamente da lì viene
+   `documenti.Data`, l'unico nome esistente in tutto il repo, dal commit iniziale `f108a80`);
+   (b) se xcrud espone un **totale dichiarato** (oggi `complete` è euristico:
+   `batch < page_size`); (c) con un POST, se `limit=2000` o `limit='all'` è onorato.
+   Attenzione: **le etichette NON sono i nomi delle colonne** — nello scadenzario l'etichetta
+   è "Scadenza" ma la colonna è `scadenze.DataScadenzaPagamento`. Senza la cattura, il
+   tiebreaker classico resta indecidibile.
+
+10. **`fetch_scadenze_map`: `covered` si marca sulla PRIMA rata vista, ma `result` deve tenere
+    la più VECCHIA** (`min()`). Con l'ordinamento DESC una rata più vecchia dello stesso
+    documento sta in una pagina successiva: se la convergenza chiude il loop prima,
+    `result[k]` resta la rata più recente. Direzione **conservativa** (scadenza più in là → si
+    sollecita più tardi, mai un sollecito indebito) e comunque molto meglio dell'`assumed` di
+    oggi. Preesistente; il fix del Task 5 lo rende solo più raggiungibile.
+
+11. **`SC-order-app` ha lo stesso bug di paginazione** (`server/fatturapro.mjs:122`): stesso
+    `documenti.Data`, stesso `PAGE=10`, e senza nemmeno la deduplica di `_add_batch`. Se il
+    difetto qui è reale, lo è anche lì.
+
+12. **Il docstring di `normalize_ragione_sociale` mente**: promette `"Società ROSSI s.p.a."` →
+    `"rossi"`, il reale è `"societa rossi"`. `COMMON_PREFIXES` contiene `"società"` accentato,
+    ma gli accenti si tolgono PRIMA del regex dei prefissi → quel prefisso non si rimuove mai.
+    Direzione sicura (meno collassi), ma la promessa è falsa.
+
+13. **`_DI_PERSON` (`matching.py`) duplica `di_pattern` (`normalizer.py:123`)** e le due DEVONO
+    restare allineate: è il rispecchiamento a rendere totale la guardia sui titolari. Se
+    divergono si aprono buchi silenziosi. È l'unico punto fragile del Task 3. Valutare se
+    `_person_part` e il confronto stiano meglio in `normalizer.py`, dove `di_pattern` vive già
+    e dove vive tutto il resto dello scoring (oggi `matching.py` chiama rapidfuzz diretto).
+
+14. **La guardia `light` a 75 in `matching.py` è irraggiungibile per costruzione.** Dopo il
+    person-guard: `light(x) = key(x) + eventuale suffisso persona`, quindi a chiavi già uguali
+    le forme light differiscono SOLO per la persona — che il person-guard intercetta prima.
+    Verificato: 0/252 combinazioni brute-force, mai raggiunta nella suite. Lasciata come rete
+    di sicurezza (difesa in profondità), commento corretto. Da rimuovere solo con una
+    decisione esplicita.
+
+15. **Il tono riparte da zero anche dopo l'AVVOCATO, non solo dopo l'archiviazione**
+    (`cases.py`, `_find_reopenable_case`). L'invariante di `database.py` dice "archiviazione
+    **/ passata all'avvocato**", e `open_new_case` infatti eredita su `archived` **OR**
+    `_case_has_lawyer_actions(...)`. Ma la barriera del Task 8 copre solo `archived`.
+    **Riprodotto eseguendo**: pratica con 2 contatti + azione `lawyer`, chiusa `paid` oltre i
+    30gg; la sua fattura riscade → viene scavalcata (non archiviata, non riapribile) e la
+    `no_overdue` antecedente viene riaperta → `contact_count: 0`, atteso 3. Stessa violazione,
+    trigger diverso, non coperta nemmeno dalla guardia del Task 7.
+    **Perché non è stata chiusa**: NON è simmetrica. Un `if archived or has_lawyer: return None`
+    messo prima delle regole di riapertura toglierebbe la riapribilità a una `no_overdue` che
+    ha azioni legali proprie, contraddicendo la regola documentata ("sempre, se era chiusa
+    'no_overdue'") e perdendo il ripristino dei todo. Va ordinato con cura (prima la
+    riapribilità, poi la barriera). Nessun test lo asserisce: è codice mancante, non un
+    test-bug.
+
+16. **`invoice_ids: []` produce un sollecito "0 fatture"** (`recovery.py`). Accettato oggi, con
+    numerazione reale e messaggio vuoto. Il frontend lo può davvero mandare: `selectedInvoices`
+    parte da `new Set()` e i pulsanti "Copia Messaggio" (`ClientDetail.jsx:502,527`) non sono
+    gated sulla selezione — `:396` ritorna `''`. Un sollecito registrato con messaggio vuoto
+    avanza il tono senza che il cliente riceva nulla.
+
+17. **`normalize_piva` esplode su input non-stringa** (`piva.py:26`, `raw.strip()`).
    `normalize_piva(12345678903)` → `AttributeError`; `b"IT..."` → `TypeError`. Oggi **non
    raggiungibile** — verificato tracciando ogni writer: `fatturapro.py:795` e
    `shopify.py:219` fanno `.strip()`, l'import CSV usa `csv.DictReader` (stringhe, non
