@@ -27,6 +27,41 @@ JWT_SECRET=ci-test-secret AUTH_PASSWORD=ci-test-password python -m pytest tests/
 
 ---
 
+## Backlog emerso dai controagenti (NON in questo piano)
+
+Difetti veri, trovati attaccando i fix di questo piano, ma fuori dal suo scopo. Da non
+perdere: ognuno merita una valutazione a sé.
+
+1. **`_FOREIGN_RE` non valida niente** (`piva.py:18`). `^[A-Z]{2,3}\d{8,15}$` accetta
+   qualsiasi prefisso di 2-3 lettere + 8-15 cifre, senza checksum né controllo del paese.
+   Misurato: su 18.252 prefissi possibili, **18.251 saltano ancora il checksum** dopo il
+   Task 1 (`DE1234567890123` — la Germania ha 9 cifre; `FR123456789`; `XX12345678` — paese
+   inesistente). Ci cascano anche le **etichette italiane** che restano incollate alle cifre
+   dopo il `re.sub`: `VAT 12345678903` → `VAT12345678903` e `P.I. 12345678903` →
+   `PI12345678903`, entrambe "valide". Effetto: la stessa azienda scritta in 5 modi genera
+   4 chiavi di match distinte. **Fix vero:** whitelist di codici paese ISO con lunghezza
+   per-paese; tutto ciò che non è in whitelist va rifiutato o spogliato prima del checksum.
+   È un lavoro di design, non un bug fix.
+
+2. **Nessuno segnala mai "P.IVA malformata".** Emerso dal controagente sulle regressioni:
+   prima del Task 1, una P.IVA corrotta *con* prefisso `IT` compariva nell'audit come
+   `⛔ P.IVA DIVERSA` — ma la stessa corrotta *senza* prefisso era già silenziosa. Era
+   rilevamento accidentale e incoerente, non una guardia progettata. Dopo il Task 1 il
+   comportamento è coerente (sempre silenzioso), il che è meglio — ma resta il buco: il
+   sistema non dice mai all'operatore che una fattura ha la P.IVA rotta, e la dicitura
+   "DIVERSA" era comunque fuorviante su una stringa malformata. **Appartiene al Piano 3**
+   (audit nella scheda cliente): serve un esito `piva_malformata` distinto da
+   `piva_contradiction`.
+
+3. **`normalize_piva` esplode su input non-stringa** (`piva.py:26`, `raw.strip()`).
+   `normalize_piva(12345678903)` → `AttributeError`; `b"IT..."` → `TypeError`. Oggi **non
+   raggiungibile** — verificato tracciando ogni writer: `fatturapro.py:795` e
+   `shopify.py:219` fanno `.strip()`, l'import CSV usa `csv.DictReader` (stringhe, non
+   openpyxl), e `customer_piva_raw` è `Column(String)`. Gap di robustezza, non bug vivo.
+   Nota: `normalize_piva(0)` → `""` silenzioso.
+
+---
+
 ### Task 1: Il prefisso `IT` non deve più saltare il checksum
 
 **Perché:** `validate_piva("1234567890")` (10 cifre) → `None`, ma `validate_piva("IT1234567890")`
