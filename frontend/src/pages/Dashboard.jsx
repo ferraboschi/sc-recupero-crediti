@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 import StatsWidget from '../components/StatsWidget'
-import { getSyncMarker, waitForSyncCompletion } from '../utils/syncPolling'
+import { getSyncMarker, getSyncStatus, collectSyncErrors } from '../utils/syncPolling'
 
 const ACTION_LABELS = {
   first_contact: 'I Contatto',
@@ -47,7 +47,9 @@ export default function Dashboard() {
   const [error, setError] = useState(null)
   const [syncing, setSyncing] = useState(false)
   const [syncMessage, setSyncMessage] = useState('')
+  const [syncProgress, setSyncProgress] = useState(null)
   const [lastSync, setLastSync] = useState(null)
+  const [autoSyncLast, setAutoSyncLast] = useState(null)
   const [todos, setTodos] = useState([])
   const [todoCounts, setTodoCounts] = useState({})
   const [todoLoading, setTodoLoading] = useState(true)
@@ -136,19 +138,34 @@ export default function Dashboard() {
     }
   }
 
+  // Ultimo sync AUTOMATICO/manuale dal server (marker 'cases', sopravvive ai
+  // riavvii perché persistito): alimenta la riga "ultimo sync HH:MM".
+  const fetchSchedulerInfo = async () => {
+    try {
+      const payload = await getSyncStatus()
+      const casesLast = payload?.last_sync?.cases?.last_sync
+      if (casesLast) setAutoSyncLast(new Date(casesLast))
+    } catch {
+      // non bloccante: la riga informativa resta senza orario
+    }
+  }
+
   useEffect(() => {
     fetchData()
     fetchTodos()
     fetchConnectorStatus()
+    fetchSchedulerInfo()
   }, [])
 
   const handleSync = async () => {
     setSyncing(true)
-    setSyncMessage('Sincronizzazione in corso…')
+    setSyncMessage('')
+    setSyncProgress(null)
     try {
       // /sync/full risponde subito 'sync_started' (gira in background):
-      // prima si prende il marker, poi si attende che cambi — altrimenti
-      // si mostrano dati PRE-sync spacciandoli per l'esito del sync.
+      // prima si prende il marker, poi si polla /sync/status per mostrare il
+      // PROGRESSO live sotto il pulsante e capire quando la pipeline è finita
+      // (marker 'cases' cambiato) — altrimenti si mostrano dati PRE-sync.
       let markerBefore = ''
       try {
         markerBefore = await getSyncMarker()
@@ -157,25 +174,72 @@ export default function Dashboard() {
         // osservato come baseline e attende comunque un cambio reale
       }
       await client.post('/sync/full')
-      const { completed, errors } = await waitForSyncCompletion(markerBefore)
-      if (completed && errors.length === 0) {
-        setSyncMessage('Sincronizzazione completata con successo')
-        const syncNow = new Date()
-        setLastSync(syncNow)
-        localStorage.setItem('lastSyncTime', syncNow.toISOString())
-      } else if (completed) {
-        // La pipeline è arrivata in fondo ma uno o più step sono falliti:
-        // niente messaggio verde né lastSync — i dati NON sono aggiornati.
-        setSyncMessage(`Errore nella sincronizzazione: step ${errors.join(', ')} falliti — dati non aggiornati`)
-      } else {
-        setSyncMessage('Sync ancora in corso in background — i dati mostrati potrebbero non essere definitivi')
+
+      // Polling LIVE ogni ~1.5s (max ~4 min): aggiorna il pannello di
+      // avanzamento. I DATI che servono per lavorare (fatture, abbinamenti,
+      // pratiche) sono pronti al passo 6 (marker 'cases' cambiato): a quel
+      // punto mostro subito "Dati aggiornati" e ricarico la vista, SENZA
+      // aspettare l'aggancio ordini (passo 7, enrichment) che continua
+      // visibile nel pannello. Così il pulsante è reattivo (~2 min) invece
+      // di sembrare bloccato per l'intera pipeline.
+      const POLL_MS = 1500
+      const MAX_POLLS = 160
+      let baseline = markerBefore
+      let coreDone = false
+      for (let i = 0; i < MAX_POLLS; i++) {
+        await new Promise(resolve => setTimeout(resolve, POLL_MS))
+        let payload
+        try {
+          payload = await getSyncStatus()
+        } catch {
+          continue // errore transitorio di polling: si riprova
+        }
+        if (payload?.progress) setSyncProgress(payload.progress)
+        const lastSyncData = payload?.last_sync
+        const marker = lastSyncData?.cases?.last_sync || ''
+        if (!baseline) {
+          // Baseline non letta prima del POST: si adotta il primo marker
+          // osservato e si attende comunque che cambi.
+          baseline = marker
+          continue
+        }
+        const markerChanged = marker && marker !== baseline
+
+        if (markerChanged && !coreDone) {
+          // Passo 6 completato: i dati core sono pronti. Esito dai soli
+          // step core (collectSyncErrors esclude già l'aggancio ordini).
+          coreDone = true
+          const errors = collectSyncErrors(lastSyncData)
+          if (errors.length === 0) {
+            setSyncMessage('Dati aggiornati ✓')
+            const syncNow = new Date()
+            setLastSync(syncNow)
+            localStorage.setItem('lastSyncTime', syncNow.toISOString())
+          } else {
+            setSyncMessage(`Errore nella sincronizzazione: step ${errors.join(', ')} falliti — dati non aggiornati`)
+          }
+          // Ricarica SUBITO la vista coi dati freschi (non attende gli ordini).
+          fetchData()
+          fetchTodos()
+          fetchConnectorStatus()
+          fetchSchedulerInfo()
+        }
+
+        // Fine dell'INTERA pipeline (incluso l'aggancio ordini): pannello via.
+        if (payload?.progress?.running === false) break
       }
-      await fetchData()
-      await fetchTodos()
-      await fetchConnectorStatus()
-      setTimeout(() => setSyncMessage(''), 8000)
+
+      if (!coreDone) {
+        // Timeout prima ancora del passo 6: sync ancora in corso in background.
+        setSyncMessage('Sync ancora in corso in background — i dati mostrati potrebbero non essere definitivi')
+        await fetchData()
+        await fetchTodos()
+      }
+      // Il pannello di progresso e il messaggio spariscono dopo qualche secondo.
+      setTimeout(() => { setSyncMessage(''); setSyncProgress(null) }, 8000)
     } catch (err) {
       setSyncMessage('Errore nella sincronizzazione')
+      setSyncProgress(null)
       console.error(err)
     } finally {
       setSyncing(false)
@@ -413,27 +477,53 @@ export default function Dashboard() {
             )}
           </div>
 
-          <div className="flex items-center gap-4 ml-auto">
-            <p className="text-sm text-txt-muted hidden md:block">
-              {lastSync ? `Agg: ${lastSync.toLocaleString('it-IT')}` : ''}
-            </p>
-            {syncMessage && (
-              <p className={`text-sm font-medium ${
-                syncMessage.includes('Errore') ? 'text-accent-red'
-                  : syncMessage.includes('in corso') ? 'text-accent-amber'
-                  : 'text-accent-green'
-              }`}>
-                {syncMessage}
+          <div className="flex flex-col items-end gap-1 ml-auto">
+            <div className="flex items-center gap-4">
+              <p className="text-sm text-txt-muted hidden md:block">
+                {lastSync ? `Agg: ${lastSync.toLocaleString('it-IT')}` : ''}
               </p>
-            )}
-            <button onClick={handleSync} disabled={syncing}
-              className={`sc-btn-primary flex items-center gap-2 ${
-                syncing ? 'opacity-50 cursor-not-allowed' : ''
-              }`}>
-              {syncing ? 'Sync...' : 'Sincronizza'}
-            </button>
+              {syncMessage && (
+                <p className={`text-sm font-medium ${
+                  syncMessage.includes('Errore') ? 'text-accent-red'
+                    : syncMessage.includes('in corso') ? 'text-accent-amber'
+                    : 'text-accent-green'
+                }`}>
+                  {syncMessage}
+                </p>
+              )}
+              <button onClick={handleSync} disabled={syncing}
+                className={`sc-btn-primary flex items-center gap-2 ${
+                  syncing ? 'opacity-50 cursor-not-allowed' : ''
+                }`}>
+                {syncing ? 'Sync...' : 'Sincronizza'}
+              </button>
+            </div>
+            <p className="text-xs text-txt-muted">
+              Sincronizzazione automatica ogni ora
+              {autoSyncLast ? ` · ultimo sync ${autoSyncLast.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}` : ''}
+            </p>
           </div>
         </div>
+
+        {/* Progresso live del sync: barra + passo corrente sotto il pulsante.
+            Rassicura l'operatore durante i ~2-3 min del full sync invece di
+            un messaggio statico che sembra rotto. */}
+        {syncProgress?.running && (
+          <div className="mt-4 bg-dark-surface border border-dark-border rounded-lg px-4 py-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-medium text-txt-primary">
+                Passo {syncProgress.step_index}/{syncProgress.total_steps} — {syncProgress.step_label}…
+              </span>
+              <span className="text-xs text-txt-muted">Sincronizzazione in corso</span>
+            </div>
+            <div className="w-full h-2 bg-dark-card rounded-full overflow-hidden">
+              <div
+                className="h-full bg-accent-teal transition-all duration-500"
+                style={{ width: `${syncProgress.total_steps ? Math.round((syncProgress.step_index / syncProgress.total_steps) * 100) : 0}%` }}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Connector warnings */}

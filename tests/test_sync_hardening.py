@@ -506,6 +506,160 @@ class TestMatchAuditV2:
         assert len(items) == 1
         assert items[0]["verdict"] == "bad"
 
+    def test_include_paid_denominator_coherent(self, test_client, test_db_session):
+        # Con include_paid il total_invoices del gruppo deve coprire ANCHE le
+        # pagate: altrimenti problem_count (che le include) supera il
+        # denominatore → "2 fatture su 0". Cliente con 2 PAGATE problematiche.
+        cust = self._customer(test_db_session, "Ferro Distribuzione SRL", PIVA_A)
+        for n in ("100/2026", "101/2026"):
+            _mk_invoice(
+                test_db_session, n, customer_id=cust.id, status="paid",
+                customer_name_raw="Altra Azienda SRL", customer_piva_raw=PIVA_B,
+                match_method="legacy",
+            )
+        resp = test_client.get("/api/system/match-audit?include_paid=true")
+        groups = resp.json()["groups"]
+        assert len(groups) == 1
+        g = groups[0]
+        assert g["problem_count"] == 2
+        assert g["total_invoices"] == 2      # coerente: mai "2 su 0"
+        assert g["problem_count"] <= g["total_invoices"]
+
+    def test_grouped_by_customer_totals(self, test_client, test_db_session):
+        # Un cliente con 3 fatture non-pagate: 2 problematiche (P.IVA in
+        # conflitto) + 1 ok. Il gruppo deve dire "2 problemi su 3 totali".
+        cust = self._customer(test_db_session, "Ferro Distribuzione SRL", PIVA_A)
+        _mk_invoice(
+            test_db_session, "F1/2026", customer_id=cust.id,
+            customer_name_raw="Ferro Distribuzione SRL", customer_piva_raw=PIVA_B,
+        )
+        _mk_invoice(
+            test_db_session, "F2/2026", customer_id=cust.id,
+            customer_name_raw="Ferro Distribuzione SRL", customer_piva_raw=PIVA_B,
+        )
+        _mk_invoice(
+            test_db_session, "F3/2026", customer_id=cust.id,
+            customer_name_raw="Ferro Distribuzione SRL", customer_piva_raw=PIVA_A,
+        )
+        data = test_client.get("/api/system/match-audit").json()
+        assert len(data["groups"]) == 1
+        g = data["groups"][0]
+        assert g["customer_id"] == cust.id
+        assert g["total_invoices"] == 3
+        assert g["problem_count"] == 2
+        assert len(g["items"]) == 2
+        assert g["worst_verdict"] == "bad"
+        assert g["problems_amount_due"] == 200.0
+        # Il cliente HA già una P.IVA valida (diversa): non si può assegnare.
+        assert g["items"][0]["can_assign_piva"] is False
+
+    def test_can_assign_piva_when_invoice_has_piva_and_customer_none(
+        self, test_client, test_db_session
+    ):
+        # Fattura con P.IVA valida, cliente SENZA P.IVA: caso "copia la P.IVA".
+        cust = self._customer(test_db_session, "Rossi SRL", None)
+        _mk_invoice(
+            test_db_session, "R1/2026", customer_id=cust.id,
+            customer_name_raw="Rossi SRL", customer_piva_raw=PIVA_A,
+        )
+        data = test_client.get("/api/system/match-audit").json()
+        item = data["groups"][0]["items"][0]
+        assert item["verdict"] == "warn"
+        assert item["can_assign_piva"] is True
+
+    def test_reviewed_invoice_excluded_then_included(self, test_client, test_db_session):
+        cust = self._customer(test_db_session, "Rossi SRL", None)
+        inv = _mk_invoice(
+            test_db_session, "R2/2026", customer_id=cust.id,
+            customer_name_raw="Rossi SRL", customer_piva_raw=PIVA_A,
+        )
+        # Di default è un problema visibile.
+        data = test_client.get("/api/system/match-audit").json()
+        assert data["total_problems"] == 1
+        assert data["reviewed_count"] == 0
+        assert len(data["groups"]) == 1
+        # Segna verificato → sparisce dai problemi, ma reviewed_count sale.
+        r = test_client.post(f"/api/positions/{inv.id}/mark-reviewed")
+        assert r.status_code == 200
+        data = test_client.get("/api/system/match-audit").json()
+        assert data["reviewed_count"] == 1
+        assert len(data["groups"]) == 0
+        # total_problems resta invoice-level (invariato).
+        assert data["total_problems"] == 1
+        # Con include_reviewed ricompare, marcata come verificata.
+        data = test_client.get(
+            "/api/system/match-audit?include_reviewed=true"
+        ).json()
+        assert len(data["groups"]) == 1
+        assert data["groups"][0]["items"][0]["reviewed"] is True
+
+
+# ── Azioni dell'audit: assegna P.IVA, segna/annulla verificato ───────
+
+class TestAuditActions:
+    def test_assign_piva_happy_path(self, test_client, test_db_session):
+        cust = Customer(ragione_sociale="Rossi SRL", partita_iva=None, source="manual")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        inv = _mk_invoice(
+            test_db_session, "AP1/2026", customer_id=cust.id, customer_piva_raw=PIVA_A,
+        )
+        r = test_client.post(f"/api/positions/{inv.id}/assign-piva-to-customer")
+        assert r.status_code == 200
+        assert r.json()["partita_iva"] == PIVA_A
+        test_db_session.refresh(cust)
+        assert cust.partita_iva == PIVA_A
+
+    def test_assign_piva_noop_when_same_normalized(self, test_client, test_db_session):
+        cust = Customer(ragione_sociale="Rossi SRL", partita_iva=PIVA_A, source="manual")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        inv = _mk_invoice(
+            test_db_session, "AP4/2026", customer_id=cust.id,
+            customer_piva_raw=f"IT{PIVA_A}",
+        )
+        r = test_client.post(f"/api/positions/{inv.id}/assign-piva-to-customer")
+        assert r.status_code == 200
+
+    def test_assign_piva_409_customer_has_different_valid(
+        self, test_client, test_db_session
+    ):
+        cust = Customer(ragione_sociale="Rossi SRL", partita_iva=PIVA_B, source="manual")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        inv = _mk_invoice(
+            test_db_session, "AP2/2026", customer_id=cust.id, customer_piva_raw=PIVA_A,
+        )
+        r = test_client.post(f"/api/positions/{inv.id}/assign-piva-to-customer")
+        assert r.status_code == 409
+        # Non deve aver sovrascritto.
+        test_db_session.refresh(cust)
+        assert cust.partita_iva == PIVA_B
+
+    def test_assign_piva_400_invoice_without_valid_piva(
+        self, test_client, test_db_session
+    ):
+        cust = Customer(ragione_sociale="Rossi SRL", partita_iva=None, source="manual")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        inv = _mk_invoice(
+            test_db_session, "AP3/2026", customer_id=cust.id,
+            customer_piva_raw="12345678901",  # checksum invalido = assente
+        )
+        r = test_client.post(f"/api/positions/{inv.id}/assign-piva-to-customer")
+        assert r.status_code == 400
+
+    def test_mark_and_unmark_reviewed_toggle_field(self, test_client, test_db_session):
+        inv = _mk_invoice(test_db_session, "MR1/2026")
+        r = test_client.post(f"/api/positions/{inv.id}/mark-reviewed")
+        assert r.status_code == 200
+        test_db_session.refresh(inv)
+        assert inv.audit_reviewed_at is not None
+        r = test_client.post(f"/api/positions/{inv.id}/unmark-reviewed")
+        assert r.status_code == 200
+        test_db_session.refresh(inv)
+        assert inv.audit_reviewed_at is None
+
 
 # ── Reassign: confronto P.IVA normalizzato ma NON validato ───────────
 
