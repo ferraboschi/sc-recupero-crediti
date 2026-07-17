@@ -4,9 +4,9 @@ import re
 import functools
 import logging
 import unicodedata
-from typing import Tuple
+from typing import List, Tuple
 
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 
 logger = logging.getLogger(__name__)
 
@@ -257,3 +257,46 @@ def name_similarity_score(name1: str, name2: str) -> int:
     """
     _, full_score = are_similar(name1, name2, threshold=100)
     return int(max(full_score, light_similarity_score(name1, name2)))
+
+
+# Sotto questa somiglianza (chiavi normalizzate) due nomi NON sono
+# "approssimabili": è rumore, non un refuso/variante dello stesso nome.
+SUGGEST_CUTOFF = 78
+
+
+def rank_similar(
+    query: str,
+    names: List[str],
+    limit: int = 6,
+    cutoff: int = SUGGEST_CUTOFF,
+) -> List[Tuple[int, int]]:
+    """Ranking 'forse intendevi': indici dei nomi più vicini alla query.
+
+    Confronta le chiavi NORMALIZZATE (accenti, forme legali S.r.l./Srl,
+    punteggiatura ignorati), così "Domo Milano" trova "Domò Milano" e
+    "Sakeya S.r.l." trova "Sakeya Srl"/"Sakeya", e i refusi sono tollerati
+    ("Sakya" → "Sakeya", "Ostria del Borgo" → "Osteria del Borgo").
+
+    Usa token_SORT_ratio (non token_set): è sensibile alla LUNGHEZZA, così
+    NON premia con 100 un'azienda diversa che condivide solo un token
+    generico. Es. "Domo Milano" NON suggerisce "Yoho Milano" (token 'domo'
+    vs 'yoho' diversi), e la query "milano" da sola non tira su mezza
+    città — proprio i falsi positivi da evitare. In cambio, una singola
+    parola parziale ("Domo" da sola) non basta: serve scrivere abbastanza
+    del nome ("domo milan" → "Domò Milano", 95).
+
+    Ritorna [(indice_in_names, score)] ordinati per score decrescente,
+    solo sopra `cutoff`, al massimo `limit` risultati.
+    """
+    qn = normalize_ragione_sociale(query)
+    if not qn:
+        return []
+    norms = [normalize_ragione_sociale(n or "") for n in names]
+    results = process.extract(
+        qn, norms,
+        scorer=fuzz.token_sort_ratio,
+        limit=limit,
+        score_cutoff=cutoff,
+    )
+    # process.extract su una lista ritorna (match, score, indice).
+    return [(idx, int(score)) for (_match, score, idx) in results]
