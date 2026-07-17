@@ -16,6 +16,7 @@ Pipeline (ordine vincolante — vedi design luglio 2026):
 import logging
 import csv
 import threading
+from collections import defaultdict
 from io import StringIO
 from fastapi import APIRouter, BackgroundTasks, UploadFile, File
 from datetime import datetime, date, timedelta
@@ -790,6 +791,17 @@ def _match_orders_task() -> dict:
 
         shopify = ShopifyConnector()
 
+        # UNA sola passata su tutti gli ordini dello store, poi indice
+        # locale per cliente: sostituisce le N chiamate per-cliente (una per
+        # cliente con fatture scoperte, ognuna a rischio 429→2s di attesa).
+        all_orders = shopify.fetch_all_orders()
+        orders_by_customer = defaultdict(list)
+        for o in all_orders:
+            cid = o.get("customer_id")
+            if cid:
+                orders_by_customer[cid].append(o)
+        result["orders_fetched"] = len(all_orders)
+
         for cust in customers:
             # Get unmatched invoices for this customer
             # Ordinamento stabile: quando due fatture contendono lo stesso
@@ -806,15 +818,10 @@ def _match_orders_task() -> dict:
 
             result["customers_processed"] += 1
 
-            try:
-                orders = shopify.fetch_customer_orders(
-                    cust.shopify_id
-                )
-            except Exception as e:
-                result["errors"].append(
-                    f"{cust.ragione_sociale}: {e}"
-                )
-                continue
+            # Ordini di questo cliente dall'indice (il shopify_id può essere
+            # un gid: normalizzato all'id numerico come nell'indice).
+            numeric_id = shopify._extract_id_from_gid(cust.shopify_id)
+            orders = orders_by_customer.get(numeric_id, [])
 
             if not orders:
                 continue
@@ -1108,7 +1115,14 @@ async def sync_cases(background_tasks: BackgroundTasks):
 
 def _full_sync_task() -> dict:
     """Run full sync sequentially:
-    invoices → customers → matching → auto-create → order matching → cases.
+    invoices → customers → matching → auto-create → cases → order matching.
+
+    L'aggancio ordini è l'ULTIMO passo e il più lento (interroga Shopify):
+    non serve per vedere/lavorare gli insoluti (attacca solo il numero
+    d'ordine alla fattura). Sta DOPO 'cases' apposta — il marker che la
+    Dashboard attende (cases.last_sync) scatta a ~2 min, così l'operatore
+    non aspetta i minuti dell'aggancio ordini, che prosegue in background.
+    Il fetch di fatture e clienti NUOVI resta invariato (passi 1-4).
 
     Uses a mutex to prevent concurrent full syncs from corrupting data.
     """
@@ -1182,17 +1196,10 @@ def _full_sync_task() -> dict:
             logger.error(f"Auto-create failed: {e}", exc_info=True)
             results["auto_create"] = {"error": str(e)}
 
-        # Step 5: Match invoices to Shopify orders
-        try:
-            results["order_matching"] = _match_orders_task()
-        except Exception as e:
-            logger.error(
-                f"Order matching failed: {e}", exc_info=True
-            )
-            results["order_matching"] = {"error": str(e)}
-
-        # Step 6: Case lifecycle. Con fetch fatture PARZIALE la payment
+        # Step 5: Case lifecycle. Con fetch fatture PARZIALE la payment
         # detection non è affidabile → niente chiusure (solo aperture).
+        # È l'ULTIMO passo "interattivo": il suo marker (cases.last_sync)
+        # segnala alla Dashboard che i dati che servono sono pronti.
         try:
             invoices_result = results.get("invoices", {})
             fp = invoices_result.get("fatturapro", {}) if isinstance(invoices_result, dict) else {}
@@ -1201,6 +1208,20 @@ def _full_sync_task() -> dict:
         except Exception as e:
             logger.error(f"Case lifecycle failed: {e}", exc_info=True)
             results["cases"] = {"error": str(e)}
+
+        logger.info("Interactive sync complete; order matching (enrichment) follows")
+
+        # Step 6 (background enrichment): aggancio ordini Shopify. Ultimo e
+        # più lento — la Dashboard ha già smesso di attendere (marker cases).
+        # Attacca solo shopify_order_id/number a fatture già presenti: non
+        # crea clienti né fatture, quindi ritardarlo non perde nulla di nuovo.
+        try:
+            results["order_matching"] = _match_orders_task()
+        except Exception as e:
+            logger.error(
+                f"Order matching failed: {e}", exc_info=True
+            )
+            results["order_matching"] = {"error": str(e)}
 
         logger.info(f"Full sync completed: {results}")
         return results

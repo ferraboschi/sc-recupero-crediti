@@ -30,6 +30,9 @@ export async function getSyncMarker() {
 export function collectSyncErrors(lastSync) {
   const failed = []
   for (const [step, info] of Object.entries(lastSync || {})) {
+    // order_matching è enrichment in background (parte DOPO il marker che
+    // attendiamo): un suo errore non significa "dati core non aggiornati".
+    if (step === 'order_matching') continue
     const r = info?.result
     if (!r) continue
     const fp = r.fatturapro

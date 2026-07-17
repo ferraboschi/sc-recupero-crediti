@@ -448,25 +448,7 @@ class ShopifyConnector(BaseConnector):
 
             batch = resp.get("orders", [])
             for o in batch:
-                orders.append({
-                    "id": str(o["id"]),
-                    "order_number": o.get("order_number"),
-                    "name": o.get("name", ""),
-                    "total_price": float(
-                        o.get("total_price") or 0
-                    ),
-                    "subtotal_price": float(
-                        o.get("subtotal_price") or 0
-                    ),
-                    "total_tax": float(
-                        o.get("total_tax") or 0
-                    ),
-                    "created_at": o.get("created_at", ""),
-                    "financial_status": o.get(
-                        "financial_status", ""
-                    ),
-                    "cancelled_at": o.get("cancelled_at"),
-                })
+                orders.append(self._parse_order(o))
 
             cursor = self._extract_next_cursor()
             if not batch or not cursor:
@@ -476,6 +458,80 @@ class ShopifyConnector(BaseConnector):
             f"Fetched {len(orders)} orders for customer "
             f"{numeric_id}"
         )
+        return orders
+
+    # Campi ordine necessari all'aggancio (importo IVA incl./escl., data,
+    # stato, annullamento) + `customer` per indicizzare per cliente.
+    _ORDER_FIELDS = (
+        "id,order_number,name,total_price,subtotal_price,"
+        "total_tax,created_at,financial_status,cancelled_at,customer"
+    )
+
+    @staticmethod
+    def _parse_order(o: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalizza un ordine grezzo Shopify nel dict usato dal matcher."""
+        cust = o.get("customer") or {}
+        cust_id = cust.get("id")
+        return {
+            "id": str(o["id"]),
+            "order_number": o.get("order_number"),
+            "name": o.get("name", ""),
+            "total_price": float(o.get("total_price") or 0),
+            "subtotal_price": float(o.get("subtotal_price") or 0),
+            "total_tax": float(o.get("total_tax") or 0),
+            "created_at": o.get("created_at", ""),
+            "financial_status": o.get("financial_status", ""),
+            "cancelled_at": o.get("cancelled_at"),
+            "customer_id": str(cust_id) if cust_id else None,
+        }
+
+    def fetch_all_orders(
+        self, since_date: str = "2022-01-01",
+    ) -> List[Dict[str, Any]]:
+        """Scarica TUTTI gli ordini dello store in un'unica passata paginata.
+
+        Sostituisce le 206 chiamate per-cliente (una per cliente con fatture
+        scoperte, ognuna a rischio 429→2s) con ~N pagine da 250: molte meno
+        richieste, molto meno rate-limit. Ogni ordine porta `customer_id`
+        così il chiamante può costruire un indice locale per cliente.
+        """
+        orders: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        page = 0
+        while True:
+            page += 1
+            params: Dict[str, Any] = {"limit": 250, "fields": self._ORDER_FIELDS}
+            if cursor:
+                params["page_info"] = cursor
+            else:
+                params["status"] = "any"
+                params["created_at_min"] = f"{since_date}T00:00:00+00:00"
+            try:
+                resp = self.get(
+                    "orders.json",
+                    headers=self._get_headers(),
+                    params=params,
+                )
+            except Exception as e:
+                # Fallimento persistente di UNA pagina: si restituisce
+                # l'indice PARZIALE già raccolto invece di abortire tutto
+                # l'aggancio ordini (i clienti scoperti riprovano al sync
+                # successivo). Prima, con la fetch per-cliente, un errore
+                # restava isolato a quel cliente: qui si preserva quel grado
+                # di resilienza. Nessun segreto nel log (solo pagina/errore).
+                logger.error(
+                    f"fetch_all_orders: errore a pagina {page}, uso l'indice "
+                    f"parziale ({len(orders)} ordini): {e}"
+                )
+                break
+            batch = resp.get("orders", [])
+            for o in batch:
+                orders.append(self._parse_order(o))
+            cursor = self._extract_next_cursor()
+            if not batch or not cursor:
+                break
+
+        logger.info(f"Fetched {len(orders)} orders total (all customers, {page} pages)")
         return orders
 
     @staticmethod

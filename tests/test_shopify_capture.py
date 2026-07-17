@@ -135,6 +135,43 @@ class TestOrderPagination:
         assert len(calls) == 1
         assert len(orders) == 1
 
+    def test_fetch_all_orders_paginates_and_indexes_customer(self, monkeypatch):
+        """Una passata su tutti gli ordini: nessun customer_id nei filtri,
+        paginazione via Link, e ogni ordine porta il customer_id per l'indice."""
+        conn = self._connector(monkeypatch)
+        raw = [
+            {"id": i, "order_number": i, "name": f"#SAK{i}",
+             "total_price": "100.00", "subtotal_price": "100.00",
+             "total_tax": "0.00", "created_at": "2026-05-01T00:00:00+02:00",
+             "financial_status": "paid", "cancelled_at": None,
+             "customer": {"id": 7000 + (i % 2)}}
+            for i in range(1, 401)
+        ]
+        pages = [raw[0:250], raw[250:400]]
+        calls = []
+
+        def fake_get(endpoint, headers=None, params=None):
+            calls.append(dict(params))
+            idx = len(calls) - 1
+            if idx < len(pages) - 1:
+                conn.last_response_headers = httpx.Headers(
+                    {"Link": ORDERS_LINK_NEXT.format(cursor=f"C{idx + 1}")}
+                )
+            else:
+                conn.last_response_headers = httpx.Headers({})
+            return {"orders": pages[idx]}
+
+        monkeypatch.setattr(conn, "get", fake_get)
+        monkeypatch.setattr(conn, "_get_headers", lambda: {})
+        orders = conn.fetch_all_orders()
+
+        assert len(orders) == 400
+        assert "customer_id" not in calls[0]  # nessun filtro per cliente
+        assert calls[1]["page_info"] == "C1"
+        # customer_id normalizzato a stringa dall'oggetto customer
+        assert orders[0]["customer_id"] in ("7000", "7001")
+        assert all(o["customer_id"] for o in orders)
+
 
 # ── Criteri di match ordine→fattura ──────────────────────────────────
 
@@ -212,15 +249,23 @@ class TestOrderMatchCriteria:
 
 
 class TestOrderMatchingTask:
-    def _run(self, monkeypatch, session, orders):
+    def _run(self, monkeypatch, session, orders, customer_id="555"):
         from backend.api import sync as sync_mod
+
+        # L'aggancio ora fa UNA passata (fetch_all_orders) e indicizza per
+        # cliente: gli ordini di test vanno taggati con il customer_id.
+        tagged = [{**o, "customer_id": customer_id} for o in orders]
 
         class FakeOrdersShopify:
             def __init__(self, *a, **kw):
                 pass
 
-            def fetch_customer_orders(self, shopify_id):
-                return list(orders)
+            def fetch_all_orders(self, since_date="2022-01-01"):
+                return list(tagged)
+
+            @staticmethod
+            def _extract_id_from_gid(sid):
+                return str(sid).split("/")[-1] if sid else sid
 
         monkeypatch.setattr(sync_mod, "ShopifyConnector", FakeOrdersShopify)
         monkeypatch.setattr(sync_mod, "get_session_direct", lambda: session)

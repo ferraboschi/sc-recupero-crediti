@@ -10,6 +10,7 @@ from datetime import datetime
 
 from backend.database import get_session, Customer, Invoice, ActivityLog, RecoveryAction
 from backend.engine.cases import get_open_case, contact_count, business_day_start
+from backend.engine.verify import verify_invoice_customer
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -179,6 +180,9 @@ async def get_customer_detail(
                 "status": inv.status,
                 "source_platform": inv.source_platform,
                 "shopify_order_number": inv.shopify_order_number,
+                # Controllo puntuale P.IVA + ragione sociale (istantaneo:
+                # confronta dati già in DB, nessun sync). Semaforo per-riga.
+                "verification": verify_invoice_customer(inv, customer),
             }
             for inv in invoices
         ]
@@ -213,6 +217,9 @@ async def get_customer_detail(
                 "suggested_score": inv.suggested_score,
                 "customer_name_raw": inv.customer_name_raw,
                 "source_platform": inv.source_platform,
+                # Verifica anche il suggerimento contro QUESTO cliente:
+                # aiuta a decidere Conferma/Rifiuta con lo stesso semaforo.
+                "verification": verify_invoice_customer(inv, customer),
             }
             for inv in pending_invoices
         ]
