@@ -612,3 +612,97 @@ class TestNameExactCollapse:
         )
         assert bi.suggested_customer is not None
         assert bi.suggested_method == "name_ambiguous"
+
+
+class TestOwnerConcordance:
+    """Quando ENTRAMBI i lati portano un titolare, è il TITOLARE a dover
+    concordare — non il nome intero.
+
+    Questi test sono scritti per FALSIFICARE la guardia, non per
+    confermarla: la versione precedente del fix (confronto light sul nome
+    intero, soglia 75) passava i casi facili e cadeva su questi.
+    """
+
+    # Stesse due persone DIVERSE, insegna condivisa di lunghezza crescente.
+    # Col confronto sul nome intero lo score saliva con l'insegna (65 -> 86)
+    # e sopra ~15 caratteri la guardia non esisteva più. Confrontando le
+    # persone la valutazione è INVARIANTE alla lunghezza dell'insegna.
+    @pytest.mark.parametrize("insegna", [
+        "Osteria",                                   # 7  (prima: 65, ok)
+        "Trattoria Bella",                           # 15 (prima: 75, BUCO)
+        "Ristorante Sakura",                         # 17 (prima: 76, BUCO)
+        "Antica Osteria del Borgo",                  # 24 (prima: 81, BUCO)
+        "Antica Osteria del Borgo Antico al Mare",   # 39 (prima: 86, BUCO)
+    ])
+    def test_different_owners_quarantined_at_any_insegna_length(
+        self, test_db_session, insegna
+    ):
+        """La curva di lunghezza deve essere PIATTA: la contraddizione fra
+        i titolari non si diluisce nell'insegna condivisa."""
+        customer = make_customer(
+            test_db_session, f"{insegna} di Mario Rossi", None
+        )
+        invoice = make_invoice(
+            test_db_session, name=f"{insegna.upper()} DI LUIGI BIANCHI",
+            piva=None,
+        )
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is None, (
+            f"insegna di {len(insegna)} caratteri: titolari diversi "
+            f"(Rossi/Bianchi) non devono MAI auto-abbinare"
+        )
+        assert result.suggested_method == "name_ambiguous"
+
+    # Traslitterazione cinese/vietnamita: i token di un nome sono
+    # sottoinsieme dell'altro. Col token_set il subset-bonus dava 100 e
+    # auto-abbinava — e i ristoranti asiatici sono il cuore dei clienti.
+    @pytest.mark.parametrize("cust_name,inv_name", [
+        ("Sakura di Wang Li", "SAKURA DI WANG LI HUA"),
+        ("Pho Viet di Nguyen Thi Lan", "PHO VIET DI NGUYEN THI LAN ANH"),
+        ("Ramen Ichiban di Sato Kenji", "RAMEN ICHIBAN DI SUZUKI TARO"),
+    ])
+    def test_nested_owner_names_quarantined(
+        self, test_db_session, cust_name, inv_name
+    ):
+        """Un titolare ANNIDATO nell'altro non è lo stesso titolare."""
+        customer = make_customer(test_db_session, cust_name, None)
+        invoice = make_invoice(test_db_session, name=inv_name, piva=None)
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is None, (
+            f"'{cust_name}' e '{inv_name}' hanno titolari diversi"
+        )
+        assert result.suggested_method == "name_ambiguous"
+
+    def test_extra_partner_quarantined(self, test_db_session):
+        """Il suffisso 'di ...' non è sempre UNA persona: un socio in più
+        è un'entità diversa (snc vs ditta individuale, P.IVA diverse)."""
+        customer = make_customer(test_db_session, "Osteria di Rossi Mario", None)
+        invoice = make_invoice(
+            test_db_session, name="OSTERIA DI ROSSI MARIO E BIANCHI LUIGI",
+            piva=None,
+        )
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is None
+        assert result.suggested_method == "name_ambiguous"
+
+    # Il rovescio: la guardia non deve essere isterica.
+    @pytest.mark.parametrize("cust_name,inv_name,perche", [
+        ("Osteria di Mario Rossi", "OSTERIA DI ROSSI MARIO",
+         "ordine invertito: stesso titolare"),
+        ("Dr. Gahe di Mercuri Christian", "DR. GAHE DI MERCURI CRISTIAN",
+         "refuso nel nome: stesso titolare"),
+    ])
+    def test_same_owner_still_auto_matches(
+        self, test_db_session, cust_name, inv_name, perche
+    ):
+        """token_sort tollera ordine e refusi: questi restano auto-match."""
+        customer = make_customer(test_db_session, cust_name, None)
+        invoice = make_invoice(test_db_session, name=inv_name, piva=None)
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is not None, perche
+        assert result.customer.id == customer.id
+        assert result.method == "name_exact"

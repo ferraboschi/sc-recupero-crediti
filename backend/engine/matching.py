@@ -12,15 +12,17 @@ Principi (nati dagli errori di abbinamento visti in produzione):
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
+from rapidfuzz import fuzz
 from sqlalchemy.orm import Session
 
 from backend.database import Invoice, Customer
 from backend.engine.normalizer import (
     normalize_ragione_sociale, name_similarity_score,
-    light_similarity_score,
+    light_similarity_score, normalize_ragione_sociale_light,
 )
 from backend.engine.piva import validate_piva
 from backend.config import config
@@ -39,6 +41,24 @@ MIN_DISTINCTIVE_NAME_LEN = 4
 # diverse collassate sulla stessa chiave normalizzata ('Osteria di Mario
 # Rossi' / 'Osteria di Luigi Bianchi') → quarantena, decide l'operatore.
 NAME_CONCORDANT_THRESHOLD = 75
+
+# La stessa regex del normalizzatore (normalizer.py, di_pattern): il
+# suffisso "di Nome Cognome" che la chiave normalizzata scarta. DEVE
+# restare allineata a quella: è ciò che rende la guardia TOTALE — ogni
+# volta che il normalizzatore ha tagliato una persona (cioè ogni volta che
+# la chiave può collassare), _person_part sa riestrarla. Se le due regex
+# divergono, la guardia sviluppa buchi silenziosi.
+_DI_PERSON = re.compile(r"\s+di\s+(\w+(?:\s+\w+)+)\s*$")
+
+# Le persone devono concordare quasi alla lettera: tolleriamo l'ordine
+# (Rossi Mario / Mario Rossi) e i refusi, non un titolare diverso.
+PERSON_CONCORDANT_THRESHOLD = 90
+
+
+def _person_part(raw: str) -> Optional[str]:
+    """La parte 'di Nome Cognome' di una ragione sociale, se c'è."""
+    m = _DI_PERSON.search(normalize_ragione_sociale_light(raw or ""))
+    return m.group(1) if m else None
 
 
 def piva_contradiction(invoice: Invoice, customer: Optional[Customer]) -> bool:
@@ -171,27 +191,49 @@ def match_invoice_to_customer(
                     f"is not on the customer — quarantined"
                 )
                 return result
-            # Il nome normalizzato coincide, ma la normalizzazione è
-            # aggressiva (taglia forme legali e 'di Nome Cognome'): due
-            # insegne diverse possono collassare sulla stessa chiave
-            # ('Osteria di Mario Rossi' / 'Osteria di Luigi Bianchi').
+            # Quando ENTRAMBI i lati portano una persona, è LA PERSONA a
+            # dover concordare: il confronto sul nome intero non serve,
+            # perché l'insegna condivisa diluisce la differenza fra i due
+            # titolari (stesse persone diverse: 'Osteria' → 65, 'Antica
+            # Osteria del Borgo' → 81) e il subset-bonus la azzera del tutto
+            # quando un nome è annidato nell'altro ('Wang Li' / 'Wang Li
+            # Hua', normale nella traslitterazione cinese → 100).
+            # token_sort, non token_set: niente subset-bonus. Invariante
+            # alla lunghezza dell'insegna, perché confronta solo le persone.
+            p_inv = _person_part(invoice.customer_name_raw)
+            p_cand = _person_part(candidate.ragione_sociale)
+            if p_inv and p_cand:
+                person_score = int(fuzz.token_sort_ratio(p_inv, p_cand))
+                if person_score < PERSON_CONCORDANT_THRESHOLD:
+                    result.suggested_customer = candidate
+                    result.suggested_method = "name_ambiguous"
+                    result.suggested_score = person_score
+                    log_warn(
+                        f"Invoice {invoice.invoice_number}: normalized name "
+                        f"matches '{candidate.ragione_sociale}' but the "
+                        f"owners differ ('{p_inv}' vs '{p_cand}', "
+                        f"score={person_score}) — quarantined"
+                    )
+                    return result
+
+            # Rete di sicurezza, per i casi che la guardia sopra non copre
+            # (persona assente su almeno un lato). NON è questa a fermare
+            # due titolari diversi: il suo scorer è token_set e la sua
+            # soglia è tarata sul nome intero, quindi si lascia diluire
+            # dall'insegna — è esattamente il motivo per cui esiste la
+            # guardia sulle persone.
             #
-            # Qui serve lo scorer NON-strict (token_set), al contrario di
-            # repair.py:271 — e non è un'incoerenza. La guardia scatta solo
-            # quando le chiavi normalizzate sono GIÀ uguali: sotto quella
-            # precondizione le uniche differenze possibili sono la forma
-            # legale e 'di Nome Cognome', quindi
-            #   - persona su UN lato solo (fattura 'SHU&SHU DI SHU KEI' vs
-            #     cliente 'SHU&SHU') = ASSENZA d'informazione, non
-            #     contraddizione → il subset-bonus la riconosce → 100 → ok;
-            #   - persone su ENTRAMBI i lati e DIVERSE = contraddizione →
-            #     niente subset → 65-71 → quarantena.
-            # Misurato: con strict le due popolazioni si sovrappongono
-            # (legit 56-73, collisioni 50-71: nessuna soglia le separa) e
-            # l'83% delle ditte individuali legittime degraderebbe a
-            # quarantena. Con token_set: legit 100, collisioni <=71.
-            # repair.py usa strict a ragione: lì si decide se spostare VIA
-            # una fattura già abbinata, e il conservatorismo non costa nulla.
+            # Scorer NON-strict (token_set), al contrario di repair.py:271 —
+            # e non è un'incoerenza. La guardia scatta solo quando le chiavi
+            # normalizzate sono GIÀ uguali: sotto quella precondizione le
+            # uniche differenze possibili sono la forma legale e 'di Nome
+            # Cognome'. Con la persona su UN lato solo ('SHU&SHU DI SHU KEI'
+            # vs 'SHU&SHU') si ha ASSENZA d'informazione, non
+            # contraddizione: il subset-bonus la riconosce → 100 → ok.
+            # Con lo strict quel caso legittimo varrebbe 56 e l'83% delle
+            # ditte individuali degraderebbe a quarantena; repair.py usa
+            # strict a ragione, perché lì si decide se spostare VIA una
+            # fattura già abbinata e il conservatorismo non costa nulla.
             light = light_similarity_score(
                 invoice.customer_name_raw or "",
                 candidate.ragione_sociale or "",
