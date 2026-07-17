@@ -414,8 +414,11 @@ async def match_audit(
     limit: int = Query(100, ge=1, le=500),
     only_problems: bool = Query(True, description="Solo esiti warn/bad"),
     include_paid: bool = Query(False, description="Audita anche le fatture pagate"),
+    include_reviewed: bool = Query(
+        False, description="Includi anche le fatture già segnate verificate"
+    ),
 ):
-    """Audit degli abbinamenti fattura→cliente.
+    """Audit degli abbinamenti fattura→cliente, RAGGRUPPATO per cliente.
 
     Per ogni fattura abbinata confronta il destinatario della fattura con la
     ragione sociale del cliente e l'accordo P.IVA:
@@ -427,11 +430,23 @@ async def match_audit(
     - ok:   il resto
 
     Serve a trovare le fatture finite nel profilo sbagliato (i casi
-    QOQA/Rooftop). Da lì: "Scollega" o riassegnazione manuale. Con
-    include_paid=true copre anche le pagate (che inquinano i totali del
-    profilo pur non contando nelle scadute).
+    QOQA/Rooftop). Da lì: "Scollega", riassegnazione, "Assegna P.IVA al
+    cliente" (quando la fattura ha una P.IVA valida e il cliente no) o
+    "Segna verificato". Con include_paid=true copre anche le pagate (che
+    inquinano i totali del profilo pur non contando nelle scadute).
+
+    Le fatture già verificate a mano (audit_reviewed_at valorizzato) escono
+    dai problemi, salvo include_reviewed=true.
+
+    Risposta:
+    - counts / total_audited / total_problems: conteggi per FATTURA (su tutte
+      le fatture auditate, retrocompat);
+    - reviewed_count: quante fatture problematiche sono già state verificate;
+    - items: elenco PIATTO dei problemi (retrocompat);
+    - groups: problemi RAGGRUPPATI per cliente (per l'indagine dall'operatore).
     """
     from backend.engine.verify import verify_invoice_customer
+    from backend.engine.piva import validate_piva
 
     session = get_session_direct()
     try:
@@ -448,8 +463,19 @@ async def match_audit(
             for c in session.query(Customer).filter(Customer.id.in_(cust_ids)).all():
                 customers[c.id] = c
 
-        results = []
+        # Totale fatture NON pagate per cliente (una sola query aggregata):
+        # serve a dire se il problema è 1 su N o riguarda tutte le fatture.
+        counts_by_customer = dict(
+            session.query(Invoice.customer_id, func.count(Invoice.id))
+            .filter(Invoice.status != "paid", Invoice.customer_id.isnot(None))
+            .group_by(Invoice.customer_id)
+            .all()
+        )
+
+        results = []          # elenco piatto (retrocompat)
+        groups_map = {}       # customer_id -> gruppo (solo clienti con problemi)
         counts = {"ok": 0, "warn": 0, "bad": 0}
+        reviewed_count = 0
         for inv in invoices:
             cust = customers.get(inv.customer_id)
             if not cust:
@@ -459,15 +485,25 @@ async def match_audit(
             # profilo cliente (backend/engine/verify.py).
             v = verify_invoice_customer(inv, cust)
             verdict = v["verdict"]
-
             counts[verdict] += 1
+
+            is_problem = verdict in ("warn", "bad")
+            is_reviewed = inv.audit_reviewed_at is not None
+
+            # Le fatture già verificate a mano escono dai problemi.
+            if is_problem and is_reviewed:
+                reviewed_count += 1
+                if not include_reviewed:
+                    continue
+
             if only_problems and verdict == "ok":
                 continue
 
-            results.append({
+            record = {
                 "invoice_id": inv.id,
                 "invoice_number": inv.invoice_number,
                 "amount_due": float(inv.amount_due),
+                "status": inv.status,
                 "customer_id": cust.id,
                 "customer_name": cust.ragione_sociale,
                 "customer_name_raw": inv.customer_name_raw,
@@ -479,16 +515,55 @@ async def match_audit(
                 "verdict": verdict,
                 "reasons": [v["message"]],
                 "verification": v,
-            })
+                "reviewed": is_reviewed,
+                # La fattura ha una P.IVA valida e il cliente no: si può
+                # copiare la P.IVA della fattura sul cliente con un click.
+                "can_assign_piva": (
+                    validate_piva(inv.customer_piva_raw) is not None
+                    and validate_piva(cust.partita_iva) is None
+                ),
+            }
+            results.append(record)
+
+            # I gruppi contengono SOLO i problemi (mai gli ok).
+            if is_problem:
+                g = groups_map.get(cust.id)
+                if g is None:
+                    g = {
+                        "customer_id": cust.id,
+                        "customer_name": cust.ragione_sociale,
+                        "customer_piva": cust.partita_iva,
+                        "total_invoices": counts_by_customer.get(cust.id, 0),
+                        "problem_count": 0,
+                        "worst_verdict": "warn",
+                        "problems_amount_due": 0.0,
+                        "items": [],
+                    }
+                    groups_map[cust.id] = g
+                g["items"].append(record)
+                g["problem_count"] += 1
+                g["problems_amount_due"] += float(inv.amount_due)
+                if verdict == "bad":
+                    g["worst_verdict"] = "bad"
+
+        groups = list(groups_map.values())
+        for g in groups:
+            g["problems_amount_due"] = round(g["problems_amount_due"], 2)
+        # Prima i clienti con almeno un critico, poi per numero di problemi.
+        groups.sort(
+            key=lambda g: (0 if g["worst_verdict"] == "bad" else 1, -g["problem_count"])
+        )
 
         page = results[skip:skip + limit]
         return {
             "counts": counts,
             "total_audited": len(invoices),
             "total_problems": counts["warn"] + counts["bad"],
+            "reviewed_count": reviewed_count,
             "skip": skip,
             "limit": limit,
             "items": page,
+            "groups": groups,
         }
     finally:
         session.close()

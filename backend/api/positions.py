@@ -2,6 +2,7 @@
 
 import logging
 import csv
+from datetime import datetime
 from io import StringIO
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -568,6 +569,161 @@ async def unlink_position(position_id: int, session: Session = Depends(get_sessi
         raise
     except Exception as e:
         logger.error(f"Error unlinking position: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.post("/{position_id}/assign-piva-to-customer")
+async def assign_piva_to_customer(position_id: int, session: Session = Depends(get_session)):
+    """Copia la P.IVA della FATTURA sul CLIENTE abbinato.
+
+    Caso incoerente segnalato dall'audit come 'Dubbio': la fattura riporta
+    una P.IVA valida ma il cliente in anagrafica non ne ha una. Con un click
+    l'operatore allinea l'anagrafica alla fattura, così i match futuri
+    diventano garantiti per P.IVA invece che per solo nome.
+
+    Guardie:
+    - 404 se la fattura o il cliente non esistono;
+    - 400 se la fattura non è abbinata o non ha una P.IVA valida;
+    - 409 se il cliente ha GIÀ una P.IVA valida DIVERSA (non la sovrascrivo
+      in silenzio: il messaggio riporta entrambe);
+    - no-op 200 se il cliente ha già la stessa P.IVA (validata).
+    """
+    from backend.engine.piva import validate_piva
+
+    try:
+        position = session.query(Invoice).filter(Invoice.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+        if not position.customer_id:
+            raise HTTPException(
+                status_code=400,
+                detail="La fattura non è abbinata a nessun cliente",
+            )
+
+        customer = session.query(Customer).filter(
+            Customer.id == position.customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Cliente non trovato")
+
+        # P.IVA solo se VALIDA (checksum/formato): copiare una P.IVA sporca
+        # sull'anagrafica produrrebbe abbinamenti sbagliati a cascata.
+        inv_piva = validate_piva(position.customer_piva_raw)
+        if not inv_piva:
+            raise HTTPException(
+                status_code=400,
+                detail="La fattura non riporta una P.IVA valida da assegnare",
+            )
+
+        cust_piva = validate_piva(customer.partita_iva)
+        if cust_piva:
+            if cust_piva == inv_piva:
+                # Già allineati: niente da fare.
+                return {
+                    "ok": True,
+                    "customer_id": customer.id,
+                    "partita_iva": customer.partita_iva,
+                }
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Il cliente '{customer.ragione_sociale}' ha già una P.IVA "
+                    f"valida diversa ('{cust_piva}') da quella della fattura "
+                    f"('{inv_piva}'): non la sovrascrivo. Verifica a mano quale "
+                    f"sia corretta."
+                ),
+            )
+
+        # ragione_sociale_normalized resta invariato: tocchiamo solo la P.IVA.
+        customer.partita_iva = inv_piva
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_assign_piva",
+            entity_type="customer",
+            entity_id=customer.id,
+            details={
+                "invoice_number": position.invoice_number,
+                "customer_id": customer.id,
+                "piva": inv_piva,
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"P.IVA '{inv_piva}' assegnata al cliente {customer.id} "
+            f"dalla fattura {position.invoice_number}"
+        )
+        return {"ok": True, "customer_id": customer.id, "partita_iva": inv_piva}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error assigning P.IVA to customer: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.post("/{position_id}/mark-reviewed")
+async def mark_reviewed(position_id: int, session: Session = Depends(get_session)):
+    """Segna la fattura come 'verificata a mano' nell'audit abbinamenti.
+
+    L'operatore ha controllato di persona questo abbinamento dubbio/critico
+    e lo considera corretto: da qui in poi non compare più tra i problemi
+    dell'audit (salvo include_reviewed=true).
+    """
+    try:
+        position = session.query(Invoice).filter(Invoice.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+
+        position.audit_reviewed_at = datetime.utcnow()
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_marked_reviewed",
+            entity_type="invoice",
+            entity_id=position_id,
+            details={"invoice_number": position.invoice_number},
+        ))
+        session.commit()
+
+        return {"ok": True, "invoice_id": position.id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error marking invoice reviewed: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.post("/{position_id}/unmark-reviewed")
+async def unmark_reviewed(position_id: int, session: Session = Depends(get_session)):
+    """Annulla la verifica manuale: la fattura torna tra i problemi dell'audit."""
+    try:
+        position = session.query(Invoice).filter(Invoice.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+
+        position.audit_reviewed_at = None
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_unmarked_reviewed",
+            entity_type="invoice",
+            entity_id=position_id,
+            details={"invoice_number": position.invoice_number},
+        ))
+        session.commit()
+
+        return {"ok": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error unmarking invoice reviewed: {e}", exc_info=True)
         session.rollback()
         raise
 

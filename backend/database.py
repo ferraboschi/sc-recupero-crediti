@@ -91,6 +91,10 @@ class Invoice(Base):
     # Ultimo tentativo di enrichment dal dettaglio FatturaPro: permette la
     # rotazione del cap (prima le mai tentate, poi le più vecchie).
     detail_attempted_at = Column(DateTime, nullable=True)
+    # Audit abbinamenti: quando l'operatore ha verificato a mano un
+    # abbinamento dubbio/critico e lo considera ok. Valorizzato = esce dai
+    # problemi dell'audit (a meno di include_reviewed).
+    audit_reviewed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -281,6 +285,8 @@ def _run_migrations(engine):
         "ALTER TABLE invoices ADD COLUMN missing_streak INTEGER DEFAULT 0",
         "ALTER TABLE invoices ADD COLUMN detail_attempted_at TIMESTAMP",
         "UPDATE invoices SET missing_streak = 0 WHERE missing_streak IS NULL",
+        # Audit abbinamenti: "Segna verificato" per le fatture già controllate
+        "ALTER TABLE invoices ADD COLUMN audit_reviewed_at TIMESTAMP",
     ]
     try:
         raw = engine.raw_connection()
