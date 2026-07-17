@@ -149,6 +149,103 @@ class TestRegisterSollecito:
         )
         assert resp.status_code == 400
 
+    def test_sollecito_rejects_invoices_of_another_customer(
+        self, test_client, test_db_session, overdue_customer
+    ):
+        """Il sollecito deve citare solo fatture DEL cliente.
+
+        Regressione: la storia della pratica si inquinava con fatture altrui, e
+        il frontend in race (ClientDetail.jsx fetch senza cancellazione) può
+        davvero mandarle: mostra il cliente 2 mentre l'URL dice 3.
+        """
+        cust_a, invoices_a = overdue_customer
+
+        # Cliente B, con una fattura scaduta tutta sua
+        cust_b = Customer(ragione_sociale="Altro Cliente SRL")
+        test_db_session.add(cust_b)
+        test_db_session.commit()
+        inv_b = Invoice(
+            invoice_number="FT-B1",
+            amount=900.0, amount_due=900.0,
+            issue_date=date.today() - timedelta(days=60),
+            due_date=date.today() - timedelta(days=30),
+            days_overdue=30,
+            status="open",
+            customer_id=cust_b.id,
+            source_platform="fatturapro",
+        )
+        test_db_session.add(inv_b)
+        test_db_session.commit()
+
+        resp = test_client.post(
+            f"/api/recovery/customers/{cust_a.id}/solleciti",
+            json={"invoice_ids": [inv_b.id, 999999], "channel": "whatsapp_copy"},
+        )
+
+        assert resp.status_code == 400
+        assert "999999" in resp.json()["detail"]
+        # nessuna azione registrata: la pratica di A resta pulita
+        assert test_db_session.query(RecoveryAction).filter(
+            RecoveryAction.customer_id == cust_a.id
+        ).count() == 0
+        assert get_open_case(test_db_session, cust_a.id) is None
+
+    def test_sollecito_accepts_own_invoices(
+        self, test_client, test_db_session, overdue_customer
+    ):
+        """Il caso positivo: le fatture PROPRIE passano e vengono registrate."""
+        cust, invoices = overdue_customer
+
+        resp = test_client.post(
+            f"/api/recovery/customers/{cust.id}/solleciti",
+            json={"invoice_ids": [inv.id for inv in invoices], "channel": "whatsapp_copy"},
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["registered"] is True
+        action = test_db_session.query(RecoveryAction).filter_by(id=data["action_id"]).first()
+        assert sorted(action.invoice_ids) == sorted(inv.id for inv in invoices)
+
+    def test_sollecito_dedup_rejects_foreign_invoices(
+        self, test_client, test_db_session, overdue_customer
+    ):
+        """Anche il merge del dedup giornaliero va protetto: il secondo copy
+        dello stesso giorno NON deve poter iniettare fatture altrui
+        nell'azione già registrata."""
+        cust_a, invoices_a = overdue_customer
+
+        cust_b = Customer(ragione_sociale="Terzo Cliente SRL")
+        test_db_session.add(cust_b)
+        test_db_session.commit()
+        inv_b = Invoice(
+            invoice_number="FT-C1",
+            amount=100.0, amount_due=100.0,
+            issue_date=date.today() - timedelta(days=50),
+            due_date=date.today() - timedelta(days=20),
+            days_overdue=20,
+            status="open",
+            customer_id=cust_b.id,
+            source_platform="fatturapro",
+        )
+        test_db_session.add(inv_b)
+        test_db_session.commit()
+
+        first = test_client.post(
+            f"/api/recovery/customers/{cust_a.id}/solleciti",
+            json={"invoice_ids": [invoices_a[0].id], "channel": "whatsapp_copy"},
+        ).json()
+
+        second = test_client.post(
+            f"/api/recovery/customers/{cust_a.id}/solleciti",
+            json={"invoice_ids": [inv_b.id], "channel": "whatsapp_link"},
+        )
+
+        assert second.status_code == 400
+        action = test_db_session.query(RecoveryAction).filter_by(id=first["action_id"]).first()
+        test_db_session.refresh(action)
+        assert action.invoice_ids == [invoices_a[0].id]
+
 
 class TestUndoSollecito:
     def test_undo_restores_state(self, test_client, test_db_session, overdue_customer):
