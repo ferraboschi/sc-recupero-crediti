@@ -411,3 +411,49 @@ class TestRecuperato:
         assert r["storico_stimato"]["fatture"] == 1
         assert r["certo"]["importo"] == 200.0
         assert r["storico_stimato"]["importo"] == 300.0
+
+
+# ── D. /pipeline non si contraddice più da solo ──────────────────────
+
+class TestPipelineCoerente:
+    def test_totale_non_conta_gli_esclusi_che_gli_stage_escludono(
+        self, test_client, test_db_session
+    ):
+        """total_with_overdue non filtrava gli esclusi, gli stage sì: il
+        totale era più grande della somma delle sue parti."""
+        escluso = _customer(test_db_session, "Escluso", excluded=True)
+        normale = _customer(test_db_session, "Normale", recovery_status="idle")
+        _invoice(test_db_session, "E/1", amount_due=50.0, customer_id=escluso.id)
+        _invoice(test_db_session, "O/1", amount_due=20.0, customer_id=normale.id)
+
+        d = test_client.get("/api/dashboard/pipeline").json()
+        assert d["total_with_overdue"] == 1, "l'escluso non è una posizione da lavorare"
+
+    def test_totale_pipeline_chiude_sugli_stage(self, test_client, test_db_session):
+        """Il totale è esattamente la somma dei clienti negli stage."""
+        escluso = _customer(test_db_session, "Escluso", excluded=True)
+        a = _customer(test_db_session, "A", recovery_status="idle")
+        b = _customer(test_db_session, "B", recovery_status="first_contact")
+        contestatore = _customer(test_db_session, "C", recovery_status="lawyer")
+        _invoice(test_db_session, "E/1", amount_due=50.0, customer_id=escluso.id)
+        _invoice(test_db_session, "A/1", amount_due=10.0, customer_id=a.id)
+        _invoice(test_db_session, "B/1", amount_due=20.0, customer_id=b.id)
+        _invoice(test_db_session, "C/1", amount_due=30.0, status="disputed",
+                 customer_id=contestatore.id)
+        _invoice(test_db_session, "ORF/1", amount_due=40.0, customer_id=None)
+
+        d = test_client.get("/api/dashboard/pipeline").json()
+        somma_clienti = sum(
+            s["count"] for k, s in d["stages"].items() if k != "resolved"
+        )
+        assert d["total_with_overdue"] == somma_clienti == 2
+
+    def test_stage_non_contano_i_contestati(self, test_client, test_db_session):
+        """Anche gli stage parlano la lingua del motore: niente contestati."""
+        c = _customer(test_db_session, "Contestatore", recovery_status="idle")
+        _invoice(test_db_session, "D/1", amount_due=999.0, status="disputed",
+                 customer_id=c.id)
+
+        d = test_client.get("/api/dashboard/pipeline").json()
+        assert d["stages"]["idle"]["amount"] == 0.0
+        assert d["total_with_overdue"] == 0

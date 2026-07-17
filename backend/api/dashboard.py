@@ -848,28 +848,22 @@ async def get_pipeline(session: Session = Depends(get_session)):
     Get pipeline/funnel data for the Attività page.
     Shows customers at each recovery stage — only those with overdue invoices.
     Resolved = ONLY customers who had recovery actions AND then paid.
+
+    Stage e totale parlano la STESSA lingua (il lavorabile): prima il
+    totale non filtrava gli esclusi mentre gli stage sì, e la pipeline si
+    contraddiceva da sola — il totale era più grande della somma delle sue
+    parti.
     """
     try:
-        from sqlalchemy import case  # noqa: F811
-
         # Only count customers who actually have overdue invoices (INNER join)
         pipeline_raw = (
             session.query(
                 Customer.recovery_status,
                 func.count(func.distinct(Customer.id)).label("count"),
-                func.sum(
-                    case((
-                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
-                        Invoice.amount_due
-                    ), else_=0)
-                ).label("total_overdue"),
+                func.sum(Invoice.amount_due).label("total_overdue"),
             )
             .join(Invoice, Invoice.customer_id == Customer.id)
-            .filter(
-                Customer.excluded.is_(False),
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
-            )
+            .filter(workable_clause())
             .group_by(Customer.recovery_status)
             .all()
         )
@@ -947,14 +941,13 @@ async def get_pipeline(session: Session = Depends(get_session)):
             "recovered_amount": float(recovered_amount or 0),
         }
 
-        # Total customers with overdue
+        # Total customers with overdue — STESSA definizione degli stage
+        # (lavorabile), altrimenti il totale non chiude sulla somma degli
+        # stage che dovrebbe riassumere.
         total_with_overdue = (
             session.query(func.count(func.distinct(Invoice.customer_id)))
-            .filter(
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
-                Invoice.customer_id.isnot(None),
-            )
+            .outerjoin(Customer, Invoice.customer_id == Customer.id)
+            .filter(workable_clause())
             .scalar() or 0
         )
 
