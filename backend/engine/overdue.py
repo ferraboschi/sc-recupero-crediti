@@ -19,9 +19,9 @@ La riconciliazione è il ponte fra i due: `bucket_expr` assegna ogni riga
 dell'universo a UNA categoria, e la somma delle categorie ridà l'universo.
 """
 
-from sqlalchemy import case
+from sqlalchemy import case, func
 
-from backend.database import Invoice, Customer
+from backend.database import Invoice, Customer, RecoveryAction
 
 # Ordine di PRECEDENZA delle categorie della cascata. Le condizioni si
 # sovrappongono nella realtà (una fattura può essere orfana E contestata,
@@ -98,3 +98,85 @@ def stage_expr():
         (Customer.recovery_status.in_(CASE_STAGES[:-1]), Customer.recovery_status),
         else_="sconosciuto",
     )
+
+
+def compute_overdue_buckets(session) -> dict:
+    """I bucket della cascata come DICT (non come query): importo e conteggio
+    fatture per categoria, più lo `scaduto_totale` (la cima).
+
+    È la STESSA, identica query di /riconciliazione. Condividere questa
+    funzione è ciò che impedisce alla serie storica (snapshot) e alla cascata
+    live di divergere: c'è una definizione sola, e le legge tutte e due.
+
+    Ritorna:
+        {"scaduto_totale": {"fatture": int, "importo": float},
+         "non_abbinati":   {...}, "esclusi": {...},
+         "contestati":     {...}, "lavorabile": {...}}
+
+    L'identità vale per costruzione (bucket_expr assegna ogni riga a un solo
+    ramo): scaduto_totale == non_abbinati + esclusi + contestati + lavorabile.
+    """
+    rows = (
+        session.query(
+            bucket_expr().label("bucket"),
+            func.count(Invoice.id).label("fatture"),
+            func.sum(Invoice.amount_due).label("importo"),
+        )
+        .outerjoin(Customer, Invoice.customer_id == Customer.id)
+        .filter(overdue_clause())
+        .group_by(bucket_expr())
+        .all()
+    )
+    per_bucket = {b: {"fatture": 0, "importo": 0.0} for b in OVERDUE_BUCKETS}
+    for bucket, fatture, importo in rows:
+        per_bucket[bucket] = {
+            "fatture": int(fatture or 0),
+            "importo": float(importo or 0),
+        }
+    totale = {
+        "fatture": sum(b["fatture"] for b in per_bucket.values()),
+        "importo": round(sum(b["importo"] for b in per_bucket.values()), 2),
+    }
+    return {"scaduto_totale": totale, **per_bucket}
+
+
+def compute_recuperato_certo(session):
+    """Recuperato CERTO, cumulato: fatture pagate DOPO il primo sollecito, a
+    residuo (amount_due_at_paid), con paid_at valorizzata.
+
+    Ritorna la coppia (fatture, importo). È la stessa definizione che
+    /riconciliazione espone come `recuperato.certo`: condividerla tiene lo
+    snapshot storico allineato al numero live, senza una seconda copia della
+    query che poi diverge.
+
+    NB: solo il "certo" (paid_at valorizzata). Lo "storico stimato"
+    ante-migrazione resta un affare di /riconciliazione — non entra nella
+    serie, dove sommeremmo mele e pere.
+    """
+    first_action = (
+        session.query(
+            RecoveryAction.customer_id,
+            func.min(RecoveryAction.created_at).label("first_action"),
+        )
+        .filter(
+            RecoveryAction.action_type.in_(
+                ["first_contact", "second_contact", "lawyer"]
+            )
+        )
+        .group_by(RecoveryAction.customer_id)
+        .subquery()
+    )
+    certo = (
+        session.query(
+            func.count(Invoice.id),
+            func.sum(func.coalesce(Invoice.amount_due_at_paid, 0.0)),
+        )
+        .join(first_action, Invoice.customer_id == first_action.c.customer_id)
+        .filter(
+            Invoice.status == "paid",
+            Invoice.paid_at.isnot(None),
+            Invoice.paid_at >= first_action.c.first_action,
+        )
+        .one()
+    )
+    return int(certo[0] or 0), float(certo[1] or 0.0)
