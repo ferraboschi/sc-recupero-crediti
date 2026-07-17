@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from backend.database import Invoice, Customer
 from backend.engine.normalizer import (
     normalize_ragione_sociale, name_similarity_score,
+    light_similarity_score,
 )
 from backend.engine.piva import validate_piva
 from backend.config import config
@@ -33,6 +34,11 @@ PIVA_NAME_MISMATCH_THRESHOLD = 40
 # Un nome normalizzato più corto di così non è abbastanza distintivo per un
 # abbinamento automatico.
 MIN_DISTINCTIVE_NAME_LEN = 4
+
+# Sopra questa somiglianza il nome CONFERMA il candidato. Sotto, due insegne
+# diverse collassate sulla stessa chiave normalizzata ('Osteria di Mario
+# Rossi' / 'Osteria di Luigi Bianchi') → quarantena, decide l'operatore.
+NAME_CONCORDANT_THRESHOLD = 75
 
 
 def piva_contradiction(invoice: Invoice, customer: Optional[Customer]) -> bool:
@@ -163,6 +169,41 @@ def match_invoice_to_customer(
                     f"Invoice {invoice.invoice_number}: exact name match to "
                     f"'{candidate.ragione_sociale}' but invoice P.IVA {inv_piva} "
                     f"is not on the customer — quarantined"
+                )
+                return result
+            # Il nome normalizzato coincide, ma la normalizzazione è
+            # aggressiva (taglia forme legali e 'di Nome Cognome'): due
+            # insegne diverse possono collassare sulla stessa chiave
+            # ('Osteria di Mario Rossi' / 'Osteria di Luigi Bianchi').
+            #
+            # Qui serve lo scorer NON-strict (token_set), al contrario di
+            # repair.py:271 — e non è un'incoerenza. La guardia scatta solo
+            # quando le chiavi normalizzate sono GIÀ uguali: sotto quella
+            # precondizione le uniche differenze possibili sono la forma
+            # legale e 'di Nome Cognome', quindi
+            #   - persona su UN lato solo (fattura 'SHU&SHU DI SHU KEI' vs
+            #     cliente 'SHU&SHU') = ASSENZA d'informazione, non
+            #     contraddizione → il subset-bonus la riconosce → 100 → ok;
+            #   - persone su ENTRAMBI i lati e DIVERSE = contraddizione →
+            #     niente subset → 65-71 → quarantena.
+            # Misurato: con strict le due popolazioni si sovrappongono
+            # (legit 56-73, collisioni 50-71: nessuna soglia le separa) e
+            # l'83% delle ditte individuali legittime degraderebbe a
+            # quarantena. Con token_set: legit 100, collisioni <=71.
+            # repair.py usa strict a ragione: lì si decide se spostare VIA
+            # una fattura già abbinata, e il conservatorismo non costa nulla.
+            light = light_similarity_score(
+                invoice.customer_name_raw or "",
+                candidate.ragione_sociale or "",
+            )
+            if light < NAME_CONCORDANT_THRESHOLD:
+                result.suggested_customer = candidate
+                result.suggested_method = "name_ambiguous"
+                result.suggested_score = light
+                log_warn(
+                    f"Invoice {invoice.invoice_number}: normalized name "
+                    f"matches '{candidate.ragione_sociale}' but light score "
+                    f"is {light} — quarantined"
                 )
                 return result
             result.customer = candidate

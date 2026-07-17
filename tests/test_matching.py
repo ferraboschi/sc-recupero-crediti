@@ -528,3 +528,87 @@ class TestPersonNameMatching:
         test_db_session.refresh(invoice)
         assert invoice.customer_id is None
         assert invoice.suggested_customer_id is None
+
+
+class TestNameExactCollapse:
+    """Il normalizzatore è aggressivo: due insegne diverse possono
+    collassare sulla stessa chiave. name_exact non deve abbinarle."""
+
+    def test_name_exact_requires_light_similarity(self, test_db_session):
+        """Due insegne diverse che collassano sulla stessa chiave NON si
+        abbinano in automatico: vanno in quarantena.
+
+        'Osteria di Mario Rossi' e 'Osteria di Luigi Bianchi' normalizzano
+        entrambe a 'osteria' (il normalizzatore taglia 'di Nome Cognome');
+        con un solo cliente a sistema la fattura di Bianchi veniva abbinata
+        a Rossi con score 100. Le due insegne portano persone DIVERSE:
+        contraddizione, nessun subset → light_similarity_score vale 65.
+        """
+        customer = make_customer(test_db_session, "Osteria di Mario Rossi", None)
+
+        invoice = make_invoice(
+            test_db_session, name="OSTERIA DI LUIGI BIANCHI", piva=None
+        )
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is None
+        assert result.method is None
+        assert result.suggested_customer is not None
+        assert result.suggested_customer.id == customer.id
+        assert result.suggested_method == "name_ambiguous"
+
+    def test_name_exact_still_matches_the_same_business(self, test_db_session):
+        """Il caso legittimo continua a funzionare: stessa insegna, grafie
+        diverse (la forma legale non conta)."""
+        customer = make_customer(test_db_session, "Trattoria Da Gino S.R.L.", None)
+
+        invoice = make_invoice(
+            test_db_session, name="TRATTORIA DA GINO SRL", piva=None
+        )
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is not None
+        assert result.customer.id == customer.id
+        assert result.method == "name_exact"
+
+    def test_monolateral_person_matches_but_bilateral_different_does_not(
+        self, test_db_session
+    ):
+        """La distinzione che regge tutto il fix, congelata.
+
+        Precondizione: le chiavi normalizzate sono già uguali.
+        - persona su UN lato (la fattura omette 'di Nome Cognome') = assenza
+          d'informazione -> auto-match legittimo
+        - persone su ENTRAMBI i lati e diverse = contraddizione -> quarantena
+        Se qualcuno "uniforma" gli scorer di matching e repair, questo test cade.
+        """
+        # Monolaterale: il cliente porta la persona, la fattura no.
+        mono_cust = make_customer(
+            test_db_session, "SHU&SHU di Shu Kei S.A.S.", None
+        )
+        mono_inv = make_invoice(
+            test_db_session, name="SHU&SHU S.A.S.", piva=None, number="MONO1"
+        )
+
+        mono = match_invoice_to_customer(mono_inv, [mono_cust], test_db_session)
+        assert mono.customer is not None, (
+            "assenza della persona su un lato non è contraddizione: "
+            "deve restare un auto-match"
+        )
+        assert mono.customer.id == mono_cust.id
+        assert mono.method == "name_exact"
+
+        # Bilaterale con persone DIVERSE: stessa chiave, ma contraddizione.
+        bi_cust = make_customer(test_db_session, "Osteria di Mario Rossi", None)
+        bi_inv = make_invoice(
+            test_db_session, name="Osteria di Luigi Bianchi", piva=None,
+            number="BI1",
+        )
+
+        bi = match_invoice_to_customer(bi_inv, [bi_cust], test_db_session)
+        assert bi.customer is None, (
+            "persone diverse sui due lati sono una contraddizione: "
+            "mai un auto-match"
+        )
+        assert bi.suggested_customer is not None
+        assert bi.suggested_method == "name_ambiguous"
