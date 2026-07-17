@@ -171,6 +171,25 @@ class TestSchedulerJobs:
         run_hourly_job()
         assert captured["include_order_matching"] is False
 
+    def test_hourly_skips_when_colliding_with_daily_slot(self, monkeypatch):
+        # Se il daily è al minuto 0 (stesso istante dell'orario) e siamo in
+        # quell'ora, l'orario cede la precedenza al full: NON deve girare
+        # (altrimenti il _sync_lock potrebbe far scartare il giornaliero).
+        import pytz
+        from datetime import datetime
+        from backend.config import config
+        from backend.scheduler import run_hourly_job
+
+        def boom(*a, **kw):
+            raise AssertionError("l'orario NON doveva girare in collisione col daily")
+
+        monkeypatch.setattr(sync_mod, "_full_sync_task", boom)
+        now_hour = datetime.now(pytz.timezone(config.TIMEZONE)).hour
+        monkeypatch.setattr(config, "SCHEDULER_MINUTE", 0)
+        monkeypatch.setattr(config, "SCHEDULER_HOUR", now_hour)
+        res = run_hourly_job()
+        assert "skipped" in res
+
     def test_daily_job_runs_full_sync(self, monkeypatch):
         captured = {}
 

@@ -75,6 +75,16 @@ def run_hourly_job():
     """
     from backend.api.sync import _full_sync_task
 
+    # Cede la precedenza al giornaliero quando gli slot coincidono: se il
+    # daily è configurato al minuto 0 (stesso istante dell'orario) e siamo in
+    # quell'ora, salta — così il _sync_lock non-bloccante non rischia di far
+    # scartare il full sync (con aggancio ordini) in favore di quello leggero.
+    now_local = datetime.now(pytz.timezone(config.TIMEZONE))
+    if config.SCHEDULER_MINUTE == 0 and now_local.hour == config.SCHEDULER_HOUR:
+        logger.info("Hourly job skipped: coincide con lo slot del daily full sync")
+        return {"skipped": "coincides with daily full sync",
+                "timestamp": datetime.utcnow().isoformat()}
+
     logger.info("Starting hourly job (light sync, no order matching)")
 
     try:

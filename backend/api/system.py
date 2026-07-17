@@ -463,13 +463,18 @@ async def match_audit(
             for c in session.query(Customer).filter(Customer.id.in_(cust_ids)).all():
                 customers[c.id] = c
 
-        # Totale fatture NON pagate per cliente (una sola query aggregata):
-        # serve a dire se il problema è 1 su N o riguarda tutte le fatture.
+        # Totale fatture per cliente (una sola query aggregata): serve a dire
+        # se il problema è 1 su N o riguarda tutte le fatture. DEVE coprire lo
+        # stesso universo dell'audit (rispetta include_paid), altrimenti il
+        # numeratore (problem_count, che include le pagate con include_paid)
+        # può superare il denominatore → "2 fatture su 0".
+        counts_query = session.query(
+            Invoice.customer_id, func.count(Invoice.id)
+        ).filter(Invoice.customer_id.isnot(None))
+        if not include_paid:
+            counts_query = counts_query.filter(Invoice.status != "paid")
         counts_by_customer = dict(
-            session.query(Invoice.customer_id, func.count(Invoice.id))
-            .filter(Invoice.status != "paid", Invoice.customer_id.isnot(None))
-            .group_by(Invoice.customer_id)
-            .all()
+            counts_query.group_by(Invoice.customer_id).all()
         )
 
         results = []          # elenco piatto (retrocompat)

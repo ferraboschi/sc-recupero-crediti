@@ -506,6 +506,25 @@ class TestMatchAuditV2:
         assert len(items) == 1
         assert items[0]["verdict"] == "bad"
 
+    def test_include_paid_denominator_coherent(self, test_client, test_db_session):
+        # Con include_paid il total_invoices del gruppo deve coprire ANCHE le
+        # pagate: altrimenti problem_count (che le include) supera il
+        # denominatore → "2 fatture su 0". Cliente con 2 PAGATE problematiche.
+        cust = self._customer(test_db_session, "Ferro Distribuzione SRL", PIVA_A)
+        for n in ("100/2026", "101/2026"):
+            _mk_invoice(
+                test_db_session, n, customer_id=cust.id, status="paid",
+                customer_name_raw="Altra Azienda SRL", customer_piva_raw=PIVA_B,
+                match_method="legacy",
+            )
+        resp = test_client.get("/api/system/match-audit?include_paid=true")
+        groups = resp.json()["groups"]
+        assert len(groups) == 1
+        g = groups[0]
+        assert g["problem_count"] == 2
+        assert g["total_invoices"] == 2      # coerente: mai "2 su 0"
+        assert g["problem_count"] <= g["total_invoices"]
+
     def test_grouped_by_customer_totals(self, test_client, test_db_session):
         # Un cliente con 3 fatture non-pagate: 2 problematiche (P.IVA in
         # conflitto) + 1 ok. Il gruppo deve dire "2 problemi su 3 totali".
