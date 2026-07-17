@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 import StatsWidget from '../components/StatsWidget'
+import RiconciliazioneCascata from '../components/RiconciliazioneCascata'
 import { getSyncMarker, getSyncStatus, collectSyncErrors } from '../utils/syncPolling'
 
 const ACTION_LABELS = {
@@ -541,6 +542,11 @@ export default function Dashboard() {
           </button>
         </div>
       )}
+
+      {/* Riconciliazione: la cascata che chiude i conti + l'evoluzione.
+          IN CIMA, prima delle KPI: è la lettura d'insieme che spiega da dove
+          nasce ogni numero (scaduto → deduzioni → lavorabile → recuperato). */}
+      <RiconciliazioneCascata formatCurrency={formatCurrency} />
 
       {/* Top Stats */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
