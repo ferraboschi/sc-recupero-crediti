@@ -37,12 +37,17 @@ class TestRankSimilar:
         assert top and top[0][0] == "Sakeya S.r.l."
         assert top[0][1] >= 80
 
-    def test_shared_token_ranks_below_real_variant(self):
-        # "Yoho Milano" condivide 'milano' con "Domo Milano" ma NON è la
-        # stessa azienda: deve restare sotto la variante reale.
-        top = self._top("Domo Milano")
-        assert top[0][0] == "Domò Milano"
-        assert top[0][1] > (dict(self._top("Domo Milano")).get("Yoho Milano", 0))
+    def test_shared_token_not_suggested(self):
+        # "Yoho Milano" condivide solo il token generico 'milano' con
+        # "Domo Milano" ma è un'azienda DIVERSA: NON deve comparire affatto.
+        names = dict(self._top("Domo Milano"))
+        assert "Domò Milano" in names
+        assert "Yoho Milano" not in names
+
+    def test_common_token_query_returns_nothing(self):
+        # Una singola parola generica ("milano") non deve tirare su mezza
+        # città: sono tutte aziende diverse.
+        assert rank_similar("milano", self.NAMES) == []
 
     def test_no_match_returns_empty(self):
         assert rank_similar("azienda inesistente xyz", self.NAMES) == []
