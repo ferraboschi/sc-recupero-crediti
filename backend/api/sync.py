@@ -359,7 +359,11 @@ def _sync_invoices_task() -> dict:
                 # Aggancia per nome ai Customer che ne sono privi: risolve i
                 # profili "muti" nati dalle fatture (senza passare da Shopify).
                 contacts_enriched = 0
-                if clienti_map:
+                # Come per la P.IVA: solo da anagrafica COMPLETA. Un fetch
+                # parziale non rileva l'omonimo, e qui si scriverebbe il
+                # TELEFONO dell'azienda sbagliata su un cliente — cioè il
+                # numero a cui parte il sollecito WhatsApp.
+                if cli_ok and clienti_map:
                     for customer in session.query(Customer).filter(
                         (Customer.phone.is_(None)) | (Customer.email.is_(None))
                     ).all():

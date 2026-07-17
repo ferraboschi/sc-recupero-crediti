@@ -357,6 +357,46 @@ class TestScadenzarioAnagraficaEnrichment:
         inv = test_db_session.query(Invoice).filter_by(invoice_number="B/2026").one()
         assert inv.customer_piva_raw == PIVA_A
 
+    def test_partial_anagrafica_does_not_apply_contacts(self, monkeypatch, test_db_session):
+        """Con anagrafica INCOMPLETA nemmeno i contatti si scrivono.
+
+        Stessa mappa, stesso guard cieco della P.IVA: l'omonimo mai letto non
+        innesca la rimozione dell'entry, e qui si scriverebbe il TELEFONO
+        dell'azienda sbagliata — il numero a cui parte il sollecito WhatsApp.
+        """
+        cust = Customer(ragione_sociale="Bar Roma", source="fatturapro")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session,
+            [_raw("B/2026", name="Bar Roma")],
+            clienti={"bar roma": {"piva": None, "phone": "0212345", "email": "info@barroma.it"}},
+            clienti_complete=False,
+        )
+        assert result["fatturapro"]["anagrafica_ok"] is False
+        assert result["fatturapro"]["contacts_enriched"] == 0
+        c = test_db_session.query(Customer).filter_by(ragione_sociale="Bar Roma").one()
+        assert c.phone is None
+        assert c.email is None
+
+    def test_complete_anagrafica_applies_contacts(self, monkeypatch, test_db_session):
+        # Direzione opposta: identico, ma anagrafica COMPLETA → i contatti si
+        # scrivono (l'entry ambigua sarebbe già stata rimossa dalla mappa).
+        cust = Customer(ragione_sociale="Bar Roma", source="fatturapro")
+        test_db_session.add(cust)
+        test_db_session.commit()
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session,
+            [_raw("B/2026", name="Bar Roma")],
+            clienti={"bar roma": {"piva": None, "phone": "0212345", "email": "info@barroma.it"}},
+            clienti_complete=True,
+        )
+        assert result["fatturapro"]["anagrafica_ok"] is True
+        assert result["fatturapro"]["contacts_enriched"] == 1
+        c = test_db_session.query(Customer).filter_by(ragione_sociale="Bar Roma").one()
+        assert c.phone == "0212345"
+        assert c.email == "info@barroma.it"
+
     def test_completeness_flags_in_result(self, monkeypatch, test_db_session):
         result = _run_invoice_sync(
             monkeypatch, test_db_session, [_raw("A/2026", name="ACME")],
