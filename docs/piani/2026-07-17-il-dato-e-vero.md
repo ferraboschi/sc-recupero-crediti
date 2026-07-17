@@ -154,7 +154,37 @@ perdere: ognuno merita una valutazione a sé.
     gated sulla selezione — `:396` ritorna `''`. Un sollecito registrato con messaggio vuoto
     avanza il tono senza che il cliente riceva nulla.
 
-17. **`normalize_piva` esplode su input non-stringa** (`piva.py:26`, `raw.strip()`).
+17. **`overdue_clause` fa evaporare le fatture con `status` NULL** (`overdue.py`). Il motore
+    (`is_overdue_unpaid`) le considera scadute (`None not in ('paid','disputed')` → True), ma
+    la clausola SQL `Invoice.status != 'paid'` in SQL dà NULL su un `status` NULL → la riga
+    esce dall'intero universo della cascata. L'identità regge (assente da entrambi i lati), ma
+    un credito che il motore inseguirebbe è invisibile nella riconciliazione. **Non
+    raggiungibile dal sync** (entrambi i punti di creazione omettono `status` → default
+    `'open'`); solo via SQL grezzo. Fix se si vuole blindare: `Invoice.status.is_distinct_from("paid")`
+    o `(status != 'paid') | status.is_(None)`.
+
+18. **`/attivita` "ultimo contatto" può mostrare un'azione annullata** (`dashboard.py:498`, la
+    sottoquery `ra_sub` con `MAX(created_at)`): non filtra `cancelled`. Non è una `first_action`
+    del recuperato (quelle sono state corrette), quindi il numero del recuperato è giusto; è
+    un'incoerenza di sola visualizzazione nella lista "contacted".
+
+19. **Due etichette "Recuperato" residue in `Attivita.jsx:255,273`** — ma su una metrica
+    DIVERSA dal "certo": lo stage pipeline "Incassato" = importo pieno di tutte le pagate dopo
+    l'azione (label backend già "Incassato"). I loro numeri sono ora corretti dai fix 5a/5c;
+    resta da decidere se rinominarle come la cascata ("Presunto incassato") per coerenza.
+
+20. **`GET /evoluzione` non marca i buchi della serie** (`dashboard.py`). Se il sync non gira
+    per N giorni (Render dorme, o si rompe), la serie ha N punti in meno e un grafico che
+    collega per indice disegnerebbe una retta sul buco, facendo sembrare lo scaduto
+    sceso/salito con continuità dove non c'è dato. L'API è onesta (date reali); manca un flag
+    di continuità, da gestire nel frontend o esponendo i giorni mancanti.
+
+21. **`cleanup_stale_f24` può riversare fatture nel "presunto incassato"** (`sync.py:~1381`):
+    marca in blocco le F24 stantie come `paid` con `paid_at=utcnow()`. Se i loro clienti hanno
+    avuto un sollecito e la fattura era emessa prima, quell'operazione manuale le conta come
+    recupero con data = adesso. Endpoint di manutenzione una-tantum, sorgente legacy.
+
+22. **`normalize_piva` esplode su input non-stringa** (`piva.py:26`, `raw.strip()`).
    `normalize_piva(12345678903)` → `AttributeError`; `b"IT..."` → `TypeError`. Oggi **non
    raggiungibile** — verificato tracciando ogni writer: `fatturapro.py:795` e
    `shopify.py:219` fanno `.strip()`, l'import CSV usa `csv.DictReader` (stringhe, non
