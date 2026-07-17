@@ -12,7 +12,6 @@ Principi (nati dagli errori di abbinamento visti in produzione):
 """
 
 import logging
-import re
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
@@ -22,7 +21,8 @@ from sqlalchemy.orm import Session
 from backend.database import Invoice, Customer
 from backend.engine.normalizer import (
     normalize_ragione_sociale, name_similarity_score,
-    light_similarity_score, normalize_ragione_sociale_light,
+    light_similarity_score, person_part_of,
+    legal_forms_of, is_ditta_individuale,
 )
 from backend.engine.piva import validate_piva
 from backend.config import config
@@ -42,23 +42,45 @@ MIN_DISTINCTIVE_NAME_LEN = 4
 # Rossi' / 'Osteria di Luigi Bianchi') → quarantena, decide l'operatore.
 NAME_CONCORDANT_THRESHOLD = 75
 
-# La stessa regex del normalizzatore (normalizer.py, di_pattern): il
-# suffisso "di Nome Cognome" che la chiave normalizzata scarta. DEVE
-# restare allineata a quella: è ciò che rende la guardia TOTALE — ogni
-# volta che il normalizzatore ha tagliato una persona (cioè ogni volta che
-# la chiave può collassare), _person_part sa riestrarla. Se le due regex
-# divergono, la guardia sviluppa buchi silenziosi.
-_DI_PERSON = re.compile(r"\s+di\s+(\w+(?:\s+\w+)+)\s*$")
-
 # Le persone devono concordare quasi alla lettera: tolleriamo l'ordine
 # (Rossi Mario / Mario Rossi) e i refusi, non un titolare diverso.
 PERSON_CONCORDANT_THRESHOLD = 90
 
 
-def _person_part(raw: str) -> Optional[str]:
-    """La parte 'di Nome Cognome' di una ragione sociale, se c'è."""
-    m = _DI_PERSON.search(normalize_ragione_sociale_light(raw or ""))
-    return m.group(1) if m else None
+def _distinct_legal_entities(name_a: str, name_b: str) -> bool:
+    """True se i due nomi NON possono essere la stessa entità giuridica:
+    uno è una ditta individuale (titolare esplicito + nessuna forma legale),
+    l'altro dichiara una forma societaria.
+
+    Perché è deterministico e non una soglia: una ditta individuale non è un
+    soggetto distinto dal suo titolare (la P.IVA è attribuita alla persona
+    fisica), una società di capitali sì. Sono due soggetti diversi, con due
+    P.IVA diverse, SEMPRE — anche quando l'azienda è la stessa nei fatti e
+    si è "trasformata": il passaggio ditta individuale → Srl è un
+    CONFERIMENTO d'azienda in una società nuova (non una trasformazione ex
+    art. 2498 c.c., che riguarda solo società fra loro), quindi apre una
+    P.IVA nuova e chiude quella del titolare. Le fatture dei due soggetti
+    non appartengono allo stesso profilo, e i solleciti nemmeno.
+
+    Serve informazione POSITIVA su entrambi i lati, e per questo la guardia
+    è stretta:
+    - 'Gaijin di Fois Stefano' (ditta indiv.) vs 'Gaijin Srl' (società) → True
+    - 'SHU&SHU DI SHU KEI S.A.S.' vs 'SHU&SHU S.A.S.' → False: il lato col
+      titolare dichiara la S.A.S., è una società di persone (che il socio
+      nella ragione sociale ce l'ha per obbligo), non una ditta individuale.
+    - 'Fronte Mare' vs 'Fronte Mare Srl' → False: il lato nudo non afferma
+      di essere una ditta individuale, ha solo la forma omessa — è assenza
+      d'informazione, il caso normalissimo dei record abbreviati.
+    - 'Trattoria Da Gino SNC' vs 'Trattoria Da Gino Srl' → False: due
+      società; la trasformazione SNC→Srl CONSERVA la P.IVA (stesso
+      soggetto, art. 2498 c.c.). Confrontare le forme fra società sarebbe
+      sbagliato, ed è il motivo per cui questa guardia NON lo fa.
+    """
+    if is_ditta_individuale(name_a) and legal_forms_of(name_b):
+        return True
+    if is_ditta_individuale(name_b) and legal_forms_of(name_a):
+        return True
+    return False
 
 
 def piva_contradiction(invoice: Invoice, customer: Optional[Customer]) -> bool:
@@ -84,7 +106,9 @@ class MatchResult:
     score: Optional[int] = None
     # Suggerimento in quarantena (mai auto-assegnato)
     suggested_customer: Optional[Customer] = None
-    suggested_method: Optional[str] = None  # fuzzy / piva_ambiguous / piva_name_mismatch / name_ambiguous
+    # fuzzy / piva_ambiguous / piva_name_mismatch / name_ambiguous /
+    # name_exact_piva_unverified / legal_form_conflict
+    suggested_method: Optional[str] = None
     suggested_score: Optional[int] = None
 
 
@@ -167,13 +191,23 @@ def match_invoice_to_customer(
     # ── Strategia 2: nome normalizzato esatto ───────────────────────
     if inv_name_norm and len(inv_name_norm) >= MIN_DISTINCTIVE_NAME_LEN:
         name_matches = []
+        legal_conflicts = []
         for c in customers:
             cust_piva = validate_piva(c.partita_iva)
             # P.IVA in conflitto = entità diverse, mai un match
             if inv_piva and cust_piva and inv_piva != cust_piva:
                 continue
             if normalize_ragione_sociale(c.ragione_sociale or "") == inv_name_norm:
-                name_matches.append(c)
+                # La chiave normalizzata butta via la forma legale: 'Gaijin
+                # di Fois Stefano' e 'Gaijin Srl' collassano entrambi su
+                # 'gaijin'. Una ditta individuale e una società però non
+                # sono lo stesso soggetto: candidato scartato qui, così se
+                # esiste ANCHE il profilo giusto ('Gaijin Srl') la fattura
+                # ci finisce da sola invece di finire in quarantena.
+                if _distinct_legal_entities(inv_name, c.ragione_sociale or ""):
+                    legal_conflicts.append(c)
+                else:
+                    name_matches.append(c)
         if len(name_matches) == 1:
             candidate = name_matches[0]
             if inv_piva and not validate_piva(candidate.partita_iva):
@@ -200,8 +234,8 @@ def match_invoice_to_customer(
             # Hua', normale nella traslitterazione cinese → 100).
             # token_sort, non token_set: niente subset-bonus. Invariante
             # alla lunghezza dell'insegna, perché confronta solo le persone.
-            p_inv = _person_part(invoice.customer_name_raw)
-            p_cand = _person_part(candidate.ragione_sociale)
+            p_inv = person_part_of(invoice.customer_name_raw)
+            p_cand = person_part_of(candidate.ragione_sociale)
             if p_inv and p_cand:
                 person_score = int(fuzz.token_sort_ratio(p_inv, p_cand))
                 if person_score < PERSON_CONCORDANT_THRESHOLD:
@@ -263,6 +297,21 @@ def match_invoice_to_customer(
             log_warn(
                 f"Invoice {invoice.invoice_number}: normalized name "
                 f"'{inv_name_norm}' shared by {len(name_matches)} customers — quarantined"
+            )
+            return result
+        if legal_conflicts:
+            # Nessun candidato compatibile, ma un omonimo di forma giuridica
+            # incompatibile c'è: NON è un match, però lasciare la fattura
+            # orfana la rende invisibile (è il difetto della segnalazione #5).
+            # Suggerimento esplicito: l'operatore conferma, o — quasi sempre
+            # la mossa giusta — usa "Crea nuovo cliente" dalla quarantena.
+            result.suggested_customer = legal_conflicts[0]
+            result.suggested_method = "legal_form_conflict"
+            result.suggested_score = 100
+            log_warn(
+                f"Invoice {invoice.invoice_number}: normalized name matches "
+                f"'{legal_conflicts[0].ragione_sociale}' but one side is a "
+                f"ditta individuale and the other a company — quarantined"
             )
             return result
 

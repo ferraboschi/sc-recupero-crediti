@@ -5,6 +5,10 @@ from backend.engine.normalizer import (
     normalize_ragione_sociale,
     are_similar,
     remove_accents,
+    legal_forms_of,
+    is_ditta_individuale,
+    LEGAL_FORMS,
+    TRAILING_LEGAL_FORMS,
 )
 
 
@@ -486,3 +490,69 @@ class TestAmbiguousNudeSigle:
         assert normalize_ragione_sociale("Spa Srl") == "spa"
         for name in ("Ong Srl", "Sapa Srl", "Spa Srl"):
             assert normalize_ragione_sociale(name), f"chiave vuota per {name!r}"
+
+
+class TestLegalFormsOf:
+    """legal_forms_of: l'operazione INVERSA della normalizzazione, che le
+    forme legali le butta via in silenzio."""
+
+    @pytest.mark.parametrize("name,expected", [
+        ("Gaijin Srl", {"SRL"}),
+        ("Gaijin S.R.L.", {"SRL"}),          # puntata e nuda: stessa forma
+        ("SHU&SHU DI SHU KEI S.A.S.", {"SAS"}),
+        ("Trattoria Da Gino SNC", {"SNC"}),
+        ("Belfiore SRLS", {"SRLS"}),         # non deve degradare a SRL
+        ("Gaijin di Fois Stefano", set()),
+        ("Fronte Mare", set()),
+    ])
+    def test_estrae_la_forma(self, name, expected):
+        assert set(legal_forms_of(name)) == expected
+
+    @pytest.mark.parametrize("name", [
+        "Hotel Spa",        # centro benessere, non S.p.A.
+        "Ristorante Ong",   # cognome
+        "Bar Sapa",         # Sa Pa / mosto cotto
+    ])
+    def test_le_sigle_nude_ambigue_non_sono_forme_legali(self, name):
+        """Dopo i fix del 17/07 SPA/ONG/SAPA nude non sono forme legali: se
+        legal_forms_of le riconoscesse, 'Hotel Spa' diventerebbe una societa'
+        e non si abbinerebbe piu' a 'Hotel Spa di Mario Rossi'."""
+        assert set(legal_forms_of(name)) == set()
+
+    def test_rispecchiamento_totale(self):
+        """LA GUARDIA STRUTTURALE: per OGNI sigla nota, legal_forms_of deve
+        vederla esattamente quando la chiave normalizzata la butta via.
+
+        È il rispecchiamento che a _DI_PERSON è mancato (piano 17/07, voce
+        13): se qualcuno aggiunge una sigla a LEGAL_FORMS e le due
+        operazioni divergono, la guardia sulle entità sviluppa un buco
+        silenzioso — la fattura torna ad auto-abbinarsi al profilo sbagliato.
+        Questo test fallisce PRIMA che accada.
+        """
+        for form in LEGAL_FORMS + TRAILING_LEGAL_FORMS:
+            name = f"Bersaglio {form}"
+            forms = legal_forms_of(name)
+            key = normalize_ragione_sociale(name)
+            # La sigla è stata TOLTA dalla chiave...
+            assert key == "bersaglio", f"{form}: chiave={key!r}"
+            # ...quindi legal_forms_of DEVE saperlo dire.
+            assert forms, f"{form}: tolta dalla chiave ma non rilevata"
+
+
+class TestIsDittaIndividuale:
+    """La FIRMA della ditta individuale: titolare + nessuna forma legale.
+    Non basta l'assenza di forma (i record la omettono di continuo)."""
+
+    @pytest.mark.parametrize("name,expected,perche", [
+        ("Gaijin di Fois Stefano", True, "titolare, nessuna forma"),
+        ("Osteria del Borgo di Mario Rossi", True, "idem"),
+        ("SHU&SHU DI SHU KEI S.A.S.", False,
+         "societa' di persone: il socio nella ragione sociale e' un obbligo"),
+        ("Gaijin Srl", False, "nessun titolare"),
+        ("Fronte Mare", False,
+         "forma OMESSA, non assente: non afferma di essere una ditta indiv."),
+        ("Osteria di Mare", False,
+         "'di' + una parola sola = parte del nome, non un titolare"),
+    ])
+    def test_firma(self, name, expected, perche):
+        assert is_ditta_individuale(name) is expected, perche
