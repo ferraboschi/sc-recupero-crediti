@@ -62,3 +62,14 @@ def validate_piva(raw: Optional[str]) -> Optional[str]:
 
 def is_valid_piva(raw: Optional[str]) -> bool:
     return validate_piva(raw) is not None
+
+
+def is_checksum_backed(raw: Optional[str]) -> bool:
+    """True SOLO se la P.IVA è garantita da checksum (italiana, 11 cifre).
+
+    Le P.IVA estere passano la sola validazione di FORMATO: due entità
+    diverse potrebbero condividere una stringa estera format-valida ma
+    inventata. Per una GARANZIA forte (semaforo verde) serve il checksum.
+    """
+    piva = validate_piva(raw)
+    return bool(piva and _ITALIAN_RE.match(piva))

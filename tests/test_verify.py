@@ -94,6 +94,30 @@ class TestWarning:
         assert v["customer_name"] == "Rooftop SRL"
 
 
+class TestReviewRegressions:
+    def test_whitespace_only_name_keeps_audit_verdict(self):
+        # Nome di soli spazi = "presente" con score 0 (come l'audit vecchio):
+        # con P.IVA uguale e nome vuoto/spazi resta bad, non ok.
+        v = verify_invoice_customer(_Inv(PIVA_A, "   "), _Cust(PIVA_A, "Rooftop SRL"))
+        assert v["verdict"] == "bad"
+        assert v["level"] == "critical"
+
+    def test_foreign_piva_match_is_not_verified(self):
+        # P.IVA estera (solo formato, nessun checksum): il verde-garanzia
+        # non deve scattare, anche con ragione sociale coincidente.
+        v = verify_invoice_customer(_Inv("CHE123456789", "QOQA SA"),
+                                    _Cust("CHE123456789", "QOQA SA"))
+        assert v["verdict"] == "ok"          # audit: nessun problema
+        assert v["level"] == "warning"       # semaforo: non garantibile
+        assert v["guaranteed"] is False
+
+    def test_italian_piva_match_still_verified(self):
+        v = verify_invoice_customer(_Inv(PIVA_A, "ACME SRL"),
+                                    _Cust(PIVA_A, "ACME S.R.L."))
+        assert v["level"] == "verified"
+        assert v["guaranteed"] is True
+
+
 class TestAuditVerdictUnchanged:
     """Il verdict (audit) resta più permissivo del level (semaforo):
     P.IVA uguale con nome decente = ok, ma non necessariamente verified."""

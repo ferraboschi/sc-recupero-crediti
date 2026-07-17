@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional
 from backend.engine.normalizer import (
     name_similarity_score, normalize_ragione_sociale,
 )
-from backend.engine.piva import validate_piva
+from backend.engine.piva import validate_piva, is_checksum_backed
 
 # Sotto questa somiglianza i nomi sono "dissimili" → critico.
 NAME_DISSIMILAR_THRESHOLD = 40
@@ -45,25 +45,35 @@ def verify_invoice_customer(
     `customer` può essere None (fattura senza cliente): in tal caso il
     confronto non è possibile e il livello è 'warning'.
     """
+    # Valori GREZZI (non strip-pati): la presenza del nome si valuta sul
+    # grezzo, come faceva l'audit precedente — un nome di soli spazi era
+    # "presente" (score 0), non "assente"; strip-parlo prima cambierebbe il
+    # verdetto. name_similarity_score normalizza internamente.
+    inv_name_src = getattr(invoice, "customer_name_raw", None) or ""
+    cust_name_src = (getattr(customer, "ragione_sociale", None) or "") if customer else ""
     inv_piva_raw = (getattr(invoice, "customer_piva_raw", None) or "").strip()
-    inv_name_raw = (getattr(invoice, "customer_name_raw", None) or "").strip()
     cust_piva_raw = (getattr(customer, "partita_iva", None) or "").strip() if customer else ""
-    cust_name_raw = (getattr(customer, "ragione_sociale", None) or "").strip() if customer else ""
+    # Versioni pulite solo per il DISPLAY affiancato.
+    inv_name_raw = inv_name_src.strip()
+    cust_name_raw = cust_name_src.strip()
 
     inv_piva = validate_piva(inv_piva_raw)
     cust_piva = validate_piva(cust_piva_raw)
 
     piva_match = bool(inv_piva and cust_piva and inv_piva == cust_piva)
     piva_conflict = bool(inv_piva and cust_piva and inv_piva != cust_piva)
+    # Garanzia forte (verde) solo con checksum reale: le P.IVA estere
+    # passano il solo formato, non basta a "garantire" l'identità.
+    piva_match_guaranteed = piva_match and is_checksum_backed(inv_piva)
 
     name_score: Optional[int] = None
     name_equivalent = False
-    if inv_name_raw and cust_name_raw:
-        name_score = name_similarity_score(inv_name_raw, cust_name_raw)
+    if inv_name_src and cust_name_src:
+        name_score = name_similarity_score(inv_name_src, cust_name_src)
         name_equivalent = (
             name_score >= NAME_EQUIVALENT_SCORE
-            or normalize_ragione_sociale(inv_name_raw)
-            == normalize_ragione_sociale(cust_name_raw)
+            or normalize_ragione_sociale(inv_name_src)
+            == normalize_ragione_sociale(cust_name_src)
         )
 
     _score = name_score if name_score is not None else 0
@@ -88,10 +98,10 @@ def verify_invoice_customer(
         verdict = "ok"
 
     # ── Livello SEMAFORO (severo: il verde è una GARANZIA, non basta
-    # l'assenza di problemi) ───────────────────────────────────────────
+    # l'assenza di problemi) — richiede P.IVA con CHECKSUM reale ────────
     if verdict == "bad":
         level = "critical"
-    elif piva_match and name_equivalent:
+    elif piva_match_guaranteed and name_equivalent:
         level = "verified"
     else:
         level = "warning"
@@ -134,6 +144,14 @@ def verify_invoice_customer(
             message = (
                 "⚠️ Il cliente ha una P.IVA ma la fattura non ne riporta una "
                 "valida: impossibile garantire la corrispondenza. Verifica manuale."
+            )
+        elif piva_match and not piva_match_guaranteed:
+            # P.IVA estera coincidente: match per sola uguaglianza di
+            # stringa (nessun checksum) → non è una garanzia piena.
+            message = (
+                "⚠️ La P.IVA (estera) coincide su entrambi, ma è validata solo "
+                "nel formato (nessun checksum): corrispondenza probabile, non "
+                "garantibile con certezza."
             )
         elif piva_match and not name_equivalent:
             message = (

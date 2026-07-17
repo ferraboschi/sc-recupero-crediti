@@ -506,11 +506,24 @@ class ShopifyConnector(BaseConnector):
             else:
                 params["status"] = "any"
                 params["created_at_min"] = f"{since_date}T00:00:00+00:00"
-            resp = self.get(
-                "orders.json",
-                headers=self._get_headers(),
-                params=params,
-            )
+            try:
+                resp = self.get(
+                    "orders.json",
+                    headers=self._get_headers(),
+                    params=params,
+                )
+            except Exception as e:
+                # Fallimento persistente di UNA pagina: si restituisce
+                # l'indice PARZIALE già raccolto invece di abortire tutto
+                # l'aggancio ordini (i clienti scoperti riprovano al sync
+                # successivo). Prima, con la fetch per-cliente, un errore
+                # restava isolato a quel cliente: qui si preserva quel grado
+                # di resilienza. Nessun segreto nel log (solo pagina/errore).
+                logger.error(
+                    f"fetch_all_orders: errore a pagina {page}, uso l'indice "
+                    f"parziale ({len(orders)} ordini): {e}"
+                )
+                break
             batch = resp.get("orders", [])
             for o in batch:
                 orders.append(self._parse_order(o))
