@@ -17,6 +17,9 @@ Riapertura della STESSA pratica (contatore preservato, todo ripristinati):
 - sempre, se era chiusa 'no_overdue'
 - entro REOPEN_PAID_WINDOW_DAYS se era chiusa 'paid' e una SUA fattura
   torna scaduta-non-pagata (guardia anti-flapping dello scraper)
+- MAI scavalcando un'archiviazione: si riprende l'ULTIMA decisione presa sul
+  debito, non una precedente. Una pratica chiusa PRIMA dell'archiviazione ha
+  il contatore di allora e riaprirla farebbe ripartire il tono da zero.
 
 Il debito archiviato è dichiarato INESIGIBILE: le sue fatture restano nella
 pratica archiviata (scadute e non pagate: è il motivo dell'archiviazione) e
@@ -246,6 +249,11 @@ def _archived_case_ids(session: Session) -> set:
 
 
 def _find_reopenable_case(session: Session, customer: Customer) -> Optional[RecoveryCase]:
+    """Pratica chiusa che il debito scaduto del cliente può far riaprire, o None.
+
+    I candidati si scorrono dalla chiusura più recente alla più vecchia:
+    riaprire significa riprendere l'ULTIMA decisione presa su questo debito.
+    """
     overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
     case_ids = {inv.case_id for inv in overdue if inv.case_id}
     if not case_ids:
@@ -261,6 +269,14 @@ def _find_reopenable_case(session: Session, customer: Customer) -> Optional[Reco
             return case
         if case.closed_reason == "paid" and case.closed_at and case.closed_at >= cutoff:
             return case
+        if case.closed_reason == "archived":
+            # Un'archiviazione non si scavalca: è la decisione più recente
+            # dell'operatore su questo cliente. Riaprire una pratica chiusa
+            # PRIMA di essa significa tornare indietro nel tempo e riprenderne
+            # il contatore a zero — il cliente appena passato al legale
+            # riceverebbe un primo sollecito cordiale. Fermarsi qui fa cadere
+            # il caso su open_new_case, che eredita il tono dall'archiviata.
+            return None
     return None
 
 
