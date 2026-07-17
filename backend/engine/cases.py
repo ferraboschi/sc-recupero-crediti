@@ -41,6 +41,10 @@ from backend.config import config
 from backend.database import (
     Customer, Invoice, RecoveryCase, RecoveryAction, ActivityLog, SyncState,
 )
+# Definizione unica di "scaduto" — vive in engine/overdue.py perché la
+# condividono motore e KPI. Ri-esportata qui: è da qui che la importano
+# gli 11 punti del motore.
+from backend.engine.overdue import is_overdue_unpaid  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +79,6 @@ PROGRESSION = {
 }
 
 BACKFILL_HISTORY_CAP_DAYS = 180
-
-
-def is_overdue_unpaid(inv: Invoice) -> bool:
-    """Fattura che tiene viva una pratica: scaduta, non pagata, non contestata."""
-    return inv.status not in ("paid", "disputed") and (inv.days_overdue or 0) > 0
 
 
 def get_open_case(session: Session, customer_id: int) -> Optional[RecoveryCase]:

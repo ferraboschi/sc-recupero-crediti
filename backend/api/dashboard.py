@@ -7,6 +7,10 @@ from sqlalchemy import func, extract
 from sqlalchemy.orm import Session, joinedload
 
 from backend.database import get_session, Invoice, Customer, RecoveryAction, RecoveryCase
+from backend.engine.overdue import (
+    overdue_clause, workable_clause, bucket_expr, stage_expr,
+    OVERDUE_BUCKETS, CASE_STAGES,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -17,24 +21,26 @@ async def get_dashboard(session: Session = Depends(get_session)):
     """
     Get dashboard overview with key statistics.
     Optimized: only returns the stats actually used by the frontend.
+
+    total_scaduto è l'UNIVERSO dello scaduto (contestati/esclusi/orfane
+    compresi): è la cima della cascata di /riconciliazione, che lo spiega
+    riga per riga. Il numero di testa e la cascata che lo scompone devono
+    essere lo stesso numero, o i conti non tornano di nuovo.
     """
     try:
         # Total OVERDUE amount (only invoices past due date)
         total_scaduto = session.query(func.sum(Invoice.amount_due)).filter(
-            Invoice.status != "paid",
-            Invoice.days_overdue > 0,
+            overdue_clause()
         ).scalar() or 0.0
 
         total_fatture_scadute = session.query(func.count(Invoice.id)).filter(
-            Invoice.status != "paid",
-            Invoice.days_overdue > 0,
+            overdue_clause()
         ).scalar() or 0
 
         total_clienti_scaduti = session.query(
             func.count(func.distinct(Invoice.customer_id))
         ).filter(
-            Invoice.status != "paid",
-            Invoice.days_overdue > 0,
+            overdue_clause(),
             Invoice.customer_id.isnot(None),
         ).scalar() or 0
 
@@ -119,6 +125,9 @@ async def get_todos(session: Session = Depends(get_session)):
         today = date.today()
 
         # Pre-load ALL overdue stats per customer in ONE query (avoids N+1)
+        # Definizione LAVORABILE: un todo propone un'azione, e il motore
+        # rifiuta i contestati. Contarli qui significa promettere lavoro che
+        # "Copia Messaggio" poi respinge con no_overdue.
         overdue_stats_raw = (
             session.query(
                 Invoice.customer_id,
@@ -127,11 +136,8 @@ async def get_todos(session: Session = Depends(get_session)):
                 func.min(Invoice.due_date).label("oldest_due_date"),
                 func.max(Invoice.days_overdue).label("max_days_overdue"),
             )
-            .filter(
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
-                Invoice.customer_id.isnot(None),
-            )
+            .outerjoin(Customer, Invoice.customer_id == Customer.id)
+            .filter(workable_clause())
             .group_by(Invoice.customer_id)
             .all()
         )
@@ -164,6 +170,8 @@ async def get_todos(session: Session = Depends(get_session)):
         )
 
         # 2. Idle customers with overdue invoices (need first contact)
+        # Stessa definizione LAVORABILE: il cliente con sole fatture
+        # contestate non è un todo — il motore non ha nulla da sollecitare.
         idle_customers_with_overdue = (
             session.query(
                 Customer,
@@ -173,9 +181,7 @@ async def get_todos(session: Session = Depends(get_session)):
             .join(Invoice, Invoice.customer_id == Customer.id)
             .filter(
                 Customer.recovery_status == "idle",
-                Customer.excluded.is_(False),
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
+                workable_clause(),
             )
             .group_by(Customer.id)
             .having(func.count(Invoice.id) > 0)
