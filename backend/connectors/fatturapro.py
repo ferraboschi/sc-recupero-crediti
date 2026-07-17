@@ -336,21 +336,87 @@ class FatturaProConnector:
             logger.error(f"Error retrieving xcrud key: {e}")
             return None
 
+    def _fetch_list_page(
+        self, xcrud_key: str, colmap: Dict[str, int], start: int, limit: int
+    ) -> Tuple[List[Dict[str, Any]], Optional[str], int, Optional[str]]:
+        """Una pagina della lista fatture via xcrud AJAX.
+
+        Returns (batch, new_key, drops, failure). `failure` è None solo se la
+        risposta è un frammento xcrud valido; altrimenti è il motivo. Chi
+        chiama NON deve mai leggere un fallimento come fine della lista: una
+        sessione scaduta a metà restituisce la pagina di login con status 200
+        e zero righe, che è indistinguibile da "finito" se non si guarda.
+        """
+        resp = self.client.post(
+            f"{self.base_url}/xcrud/xcrud_ajax.php",
+            data={
+                "xcrud[key]": xcrud_key,
+                "xcrud[orderby]": "documenti.Data",
+                "xcrud[order]": "desc",
+                "xcrud[start]": str(start),
+                "xcrud[limit]": str(limit),
+                "xcrud[instance]": "documenti",
+                "xcrud[task]": "list",
+            },
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{self.base_url}/documenti.php?s=1",
+            },
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+
+        if "xcrud-error" in resp.text:
+            return [], None, 0, "xcrud-error"
+
+        batch = self._parse_invoice_table(resp.text, colmap)
+        drops = self._last_parse_drops
+        if not batch and self._looks_like_auth_page(resp):
+            return [], None, drops, "session-expired"
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        new_key = soup.find("input", {"name": "key", "type": "hidden"})
+        return batch, (new_key.get("value") if new_key else None), drops, None
+
+    @staticmethod
+    def _looks_anomalous(batch: List[Dict[str, Any]]) -> bool:
+        """Batch con tutti i saldi a zero o tutte le date non parsabili:
+        indica colonne disallineate o HTML inatteso → scartarlo è più sicuro
+        che importarlo."""
+        return len(batch) >= 3 and (
+            all((inv.get("balance") or 0) == 0 for inv in batch)
+            or all(inv.get("date") is None for inv in batch)
+        )
+
     def fetch_overdue_invoices(self) -> tuple[List[Dict[str, Any]], bool]:
         """Fetch all overdue invoices from FatturaPro.
 
         Scrapes the documenti.php?s=1 page ("Da incassare" / invoices to collect).
-        First parses the initial page HTML, then paginates via xcrud AJAX.
+        La pagina iniziale serve per il column map e la chiave xcrud; le righe
+        arrivano da UNA sola query AJAX.
 
         Il mapping delle colonne viene derivato UNA volta dall'header della
         pagina iniziale e riusato per i frammenti AJAX (che spesso non hanno
         l'header): così un'eventuale colonna in più — es. Scadenza — non
-        disallinea gli importi delle pagine successive.
+        disallinea gli importi.
+
+        PERCHÉ UNA PAGINA SOLA. `xcrud[orderby]` è `documenti.Data`, che non è
+        univoca. Su un ordinamento non totale il DB è libero di restituire i
+        pari-data in un ordine diverso a ogni query, e con LIMIT/OFFSET quella
+        libertà diventa perdita di dati: la finestra scivola, RIPETE righe su
+        una pagina e ne SALTA altre, che non compaiono in NESSUNA pagina.
+        Nessuna riga è malformata, quindi dropped_rows resta 0 e il fetch si
+        dichiarava completo: le fatture saltate non venivano mai create
+        (invisibili — il caso Belfiore 655/2026), e quelle già in DB finivano
+        marcate 'paid' con amount_due=0 alla seconda assenza consecutiva.
+        Senza OFFSET non c'è finestra che possa scivolare, e l'ordine dei
+        pari-data torna irrilevante.
 
         Returns:
             (invoices, partial) — partial=True quando il fetch NON è
             certamente completo (chiave xcrud mancante, errore xcrud,
-            eccezione a metà paginazione, batch anomalo scartato).
+            eccezione a metà, batch anomalo scartato, completezza non
+            dimostrabile, finestra scivolata nel ripiego).
             Con partial=True il chiamante NON deve fare payment detection:
             una fattura assente da una lista incompleta non è pagata.
 
@@ -368,11 +434,27 @@ class FatturaProConnector:
         seen_numbers = set()
         partial = False
         dropped_rows = 0
-        PAGE_SIZE = 10  # xcrud default
+        # Righe che il gestionale rende da solo nella pagina HTML (paginazione
+        # sua, non nostra): serve SOLO a capire se quella pagina basta quando
+        # la chiave xcrud manca e non possiamo chiedere di più.
+        RENDERED_PAGE_SIZE = 10
+        # Limite della pagina unica. La lista "Da incassare" vale ~674k EUR e
+        # sta in ~1.300 righe: 5.000 lascia ~4x di margine di crescita senza
+        # chiedere al server una tabella smisurata. Non è una soglia di
+        # sicurezza — se un giorno non bastasse, la sonda qui sotto se ne
+        # accorge e si ripiega: sbagliarlo costa una richiesta in più, non un
+        # credito perso.
+        FETCH_LIMIT = 5000
+        PROBE_LIMIT = 10
 
         def _add_batch(batch):
-            """Accumula deduplicando per invoice_number (l'offset-pagination
-            senza tiebreaker può ripresentare righe al confine di pagina)."""
+            """Accumula deduplicando per invoice_number.
+
+            Sul percorso normale (pagina unica) non ci sono confini di pagina
+            e quindi nemmeno duplicati: la deduplica non costa nulla e resta
+            come rete. Nel ripiego a offset il ritorno `added` è invece la
+            spia dello scivolamento — vedi sotto.
+            """
             added = 0
             for inv in batch:
                 num = inv.get("invoice_number")
@@ -405,11 +487,11 @@ class FatturaProConnector:
             key_input = soup.find("input", {"name": "key", "type": "hidden"})
             if not key_input:
                 # Fallback: senza chiave si può leggere solo la pagina
-                # renderizzata.
+                # renderizzata, con la paginazione del gestionale.
                 initial_invoices = self._parse_invoice_table(response.text, colmap)
                 dropped_rows += self._last_parse_drops
                 _add_batch(initial_invoices)
-                if len(initial_invoices) >= PAGE_SIZE:
+                if len(initial_invoices) >= RENDERED_PAGE_SIZE:
                     # Ci sono quasi certamente altre pagine che non possiamo leggere
                     logger.warning("No xcrud key found with a full first page — PARTIAL fetch")
                     return all_invoices, True
@@ -418,10 +500,64 @@ class FatturaProConnector:
 
             xcrud_key = key_input.get("value")
 
-            # Paginate via xcrud AJAX with jQuery-style nested params.
-            # Si parte da start=0 così TUTTE le pagine (prima inclusa)
-            # condividono lo stesso ordinamento imposto.
-            start = 0
+            # ── La lista in una pagina sola ──
+            # Una query, start=0, limite ampio: niente OFFSET, niente finestra
+            # che possa scivolare fra i pari-data.
+            batch, new_key, drops, failure = self._fetch_list_page(
+                xcrud_key, colmap, 0, FETCH_LIMIT
+            )
+            dropped_rows += drops
+            if failure:
+                logger.warning(f"Invoice list unavailable ({failure}) — PARTIAL fetch")
+                return all_invoices, True
+            if self._looks_anomalous(batch):
+                logger.warning(
+                    "Anomalous invoice list (all-zero balances or unparseable "
+                    "dates) — discarded, PARTIAL fetch"
+                )
+                return all_invoices, True
+            if new_key:
+                xcrud_key = new_key
+
+            # ── La sonda: è DAVVERO tutta la lista? ──
+            # Una pagina più corta del limite chiesto NON dimostra la fine
+            # della lista: il server potrebbe aver troncato il limit in
+            # silenzio, e dichiarare "completa" una lista mozza è esattamente
+            # ciò che marca pagate le fatture non lette. Si chiede la riga
+            # successiva: se non c'è, la lista è finita — dimostrato, non
+            # supposto. Costa una richiesta.
+            probe, _, _, probe_failure = self._fetch_list_page(
+                xcrud_key, colmap, len(batch), PROBE_LIMIT
+            )
+            if probe_failure:
+                # Le righe lette restano buone (vanno create), ma la
+                # completezza non è dimostrabile: niente chiusure, niente paid.
+                logger.warning(f"Completeness probe failed ({probe_failure}) — PARTIAL fetch")
+                _add_batch(batch)
+                return all_invoices, True
+
+            if not probe:
+                _add_batch(batch)
+                logger.info(f"Fetched {len(all_invoices)} overdue invoices in a single page")
+                return all_invoices, dropped_rows > 0
+
+            # ── Ripiego: la pagina unica non è bastata ──
+            # O il server ha troncato il limit, o la lista supera FETCH_LIMIT.
+            # Per la sicurezza le due cose sono la stessa (la lista non è
+            # intera); per i dati no: le fatture vanno CREATE comunque, o
+            # tornano invisibili — e `partial` blocca solo chiusure e paid,
+            # non la creazione. Quindi si legge il resto nell'unico modo
+            # possibile, la paginazione a offset, con il rilevatore acceso.
+            # La pagina è quella che il server ci ha concesso: se ha troncato
+            # a 100, si va di 100 in 100.
+            page_size = len(batch) or RENDERED_PAGE_SIZE
+            logger.warning(
+                f"Single page returned {len(batch)} rows for a requested limit "
+                f"of {FETCH_LIMIT}, but more rows exist — falling back to "
+                f"offset pagination with page_size={page_size}"
+            )
+            _add_batch(batch)
+            start = len(batch)
             page = 1
             max_pages = 200  # Safety limit
 
@@ -433,56 +569,21 @@ class FatturaProConnector:
                     )
                     partial = True
                     break
-                ajax_resp = self.client.post(
-                    f"{self.base_url}/xcrud/xcrud_ajax.php",
-                    data={
-                        "xcrud[key]": xcrud_key,
-                        "xcrud[orderby]": "documenti.Data",
-                        "xcrud[order]": "desc",
-                        "xcrud[start]": str(start),
-                        "xcrud[limit]": str(PAGE_SIZE),
-                        "xcrud[instance]": "documenti",
-                        "xcrud[task]": "list",
-                    },
-                    headers={
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Referer": f"{self.base_url}/documenti.php?s=1",
-                    },
-                    timeout=self.timeout,
-                )
-                ajax_resp.raise_for_status()
 
-                # Check for xcrud error
-                if "xcrud-error" in ajax_resp.text:
-                    logger.warning(f"xcrud error at page {page}, stopping pagination — PARTIAL fetch")
+                batch, new_key, drops, failure = self._fetch_list_page(
+                    xcrud_key, colmap, start, page_size
+                )
+                dropped_rows += drops
+                if failure:
+                    logger.warning(
+                        f"Page {page}: pagination stopped ({failure}) — PARTIAL fetch"
+                    )
                     partial = True
                     break
-
-                batch = self._parse_invoice_table(ajax_resp.text, colmap)
-                dropped_rows += self._last_parse_drops
                 if not batch:
-                    # Un batch vuoto è la fine naturale SOLO se la risposta
-                    # è un frammento xcrud: una sessione scaduta a metà
-                    # paginazione restituisce la pagina di login con status
-                    # 200 (follow_redirects) e chiuderebbe il fetch come
-                    # completo → lista troncata + false "pagate".
-                    if self._looks_like_auth_page(ajax_resp):
-                        logger.warning(
-                            f"Page {page}: session expired mid-pagination "
-                            f"(login page returned) — PARTIAL fetch"
-                        )
-                        partial = True
-                    else:
-                        logger.debug(f"Page {page}: empty — pagination complete")
+                    logger.debug(f"Page {page}: empty — pagination complete")
                     break
-
-                # Sanity guard: un batch con tutti i saldi a zero o tutte le
-                # date non parsabili indica colonne disallineate o HTML
-                # inatteso → scartarlo è più sicuro che importarlo.
-                if len(batch) >= 3 and (
-                    all((inv.get("balance") or 0) == 0 for inv in batch)
-                    or all(inv.get("date") is None for inv in batch)
-                ):
+                if self._looks_anomalous(batch):
                     logger.warning(
                         f"Page {page}: anomalous batch (all-zero balances or "
                         f"unparseable dates) — discarded, PARTIAL fetch"
@@ -490,22 +591,36 @@ class FatturaProConnector:
                     partial = True
                     break
 
-                _add_batch(batch)
+                added = _add_batch(batch)
+                if new_key:
+                    xcrud_key = new_key
+
+                # Il rilevatore di scivolamento. Una riga già vista che
+                # ricompare a un offset più avanti significa che la lista si è
+                # mossa sotto di noi — e una finestra che ripete una riga ne
+                # sta saltando un'altra, in egual numero. Un duplicato non può
+                # essere legittimo: il numero documento porta anno,
+                # progressivo e serie ("2026/00001170/SAK - Fattura"), e la
+                # lista ha una riga per documento (le rate stanno nello
+                # scadenzario). Quindi il duplicato è una prova, non un
+                # sospetto. Si continua a raccogliere — le righe lette servono
+                # comunque — ma il fetch è parziale.
+                if added < len(batch):
+                    logger.warning(
+                        f"Page {page}: {len(batch) - added} rows already seen "
+                        f"at start={start} — the list shifted under us, so it "
+                        f"is also skipping rows — PARTIAL fetch"
+                    )
+                    partial = True
 
                 if page % 10 == 0:
                     logger.info(f"Page {page}: {len(batch)} invoices (running total: {len(all_invoices)})")
 
-                if len(batch) < PAGE_SIZE:
+                if len(batch) < page_size:
                     logger.debug(f"Page {page}: {len(batch)} invoices (last page)")
                     break
 
-                # Update xcrud key if the response issues a new one
-                batch_soup = BeautifulSoup(ajax_resp.text, "html.parser")
-                new_key = batch_soup.find("input", {"name": "key", "type": "hidden"})
-                if new_key:
-                    xcrud_key = new_key.get("value")
-
-                start += PAGE_SIZE
+                start += page_size
                 page += 1
 
             if dropped_rows:
