@@ -131,11 +131,15 @@ def compute_overdue_buckets(session) -> dict:
         .group_by(bucket_expr())
         .all()
     )
+    # Importo arrotondato al centesimo già QUI, non solo sul totale: così
+    # l'identità scaduto_totale == somma(bucket) regge anche col confronto
+    # grezzo (===) di un frontend, senza rumore IEEE sub-centesimo che
+    # farebbe lampeggiare "i conti non tornano" su una differenza di 1e-14.
     per_bucket = {b: {"fatture": 0, "importo": 0.0} for b in OVERDUE_BUCKETS}
     for bucket, fatture, importo in rows:
         per_bucket[bucket] = {
             "fatture": int(fatture or 0),
-            "importo": float(importo or 0),
+            "importo": round(float(importo or 0), 2),
         }
     totale = {
         "fatture": sum(b["fatture"] for b in per_bucket.values()),
