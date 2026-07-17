@@ -17,7 +17,7 @@ LEGAL_FORMS = [
     # Società a Responsabilità Limitata (e varianti)
     "S.R.L.S.", "SRLS",  # Semplificata — molto comune per società nuove
     "S.R.L.", "SRL",
-    "S.P.A.", "SPA",
+    "S.P.A.",
     "S.A.S.", "SAS",
     "S.N.C.", "SNC",
     "S.C.A.R.L.", "SCARL",
@@ -36,6 +36,13 @@ LEGAL_FORMS = [
     # Forme legali estere (per clienti stranieri fatturati in Italia)
     "LLC", "LTD", "GMBH", "SARL",
 ]
+
+# Forme la cui variante SENZA punti è una parola italiana vera: "spa" è un
+# centro benessere, comunissimo fra gli alberghi e i ristoranti che sono il
+# target del prodotto. La sigla PUNTATA ("S.p.A.") resta rimossa ovunque —
+# è inequivocabile; quella NUDA la gestiamo dopo il loop, perché è forma
+# legale solo se la società non ne ha già un'altra.
+NODOTS_ANYWHERE_UNSAFE = {"S.P.A."}
 
 # Sigle CORTE e ambigue (2 lettere, o parole reali come "sa"): rimosse SOLO
 # a fine nome, altrimenti mangiano pezzi veri della ragione sociale
@@ -84,16 +91,27 @@ def _normalize_impl(name: str, strip_person: bool) -> str:
     normalized = normalized.lower()
 
     # Remove legal forms (must handle both with and without dots)
-    # First, build patterns that handle dots flexibly (e.g., S.R.L. or SRL or S.r.l)
+    legal_form_found = False
     for form in LEGAL_FORMS:
-        # Create pattern that matches with or without dots and trailing dot
         escaped = re.escape(form.lower())
-        # Also create a dot-flexible version: "s.r.l." matches "s.r.l." and "srl" and "s.r.l"
-        normalized = re.sub(rf"(?<!\w){escaped}\.?(?!\w)", "", normalized)
-        # Also match without dots
+        # Dot-flexible: "s.r.l." matcha "s.r.l." e "s.r.l"
+        stripped = re.sub(rf"(?<!\w){escaped}\.?(?!\w)", "", normalized)
+        if stripped != normalized:
+            legal_form_found = True
+            normalized = stripped
+        # Variante senza punti ("srl"), salvo quelle ambigue con parole vere
         nodots = form.replace(".", "").lower()
-        if nodots != form.lower():
-            normalized = re.sub(rf"(?<!\w){re.escape(nodots)}(?!\w)", "", normalized)
+        if nodots != form.lower() and form not in NODOTS_ANYWHERE_UNSAFE:
+            stripped = re.sub(rf"(?<!\w){re.escape(nodots)}(?!\w)", "", normalized)
+            if stripped != normalized:
+                legal_form_found = True
+                normalized = stripped
+
+    # "spa" nuda: è la forma legale SOLO se la società non ne ha già un'altra
+    # e solo a fine nome. "Hotel Spa Milano Srl" → la forma è SRL, quindi
+    # 'spa' è parte del nome e va conservata.
+    if not legal_form_found:
+        normalized = re.sub(r"(?<!\w)spa\.?\s*$", "", normalized)
 
     # Remove short/ambiguous legal forms ONLY at the end of the name
     for form in TRAILING_LEGAL_FORMS:

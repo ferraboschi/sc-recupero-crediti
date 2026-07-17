@@ -407,3 +407,41 @@ class TestPersonAwareSimilarity:
             "Osteria di Luigi Bianchi", "Osteria di Mario Rossi"
         ) < 75
         assert light_similarity_score("YOHO MILANO SRL", "YOHO MILANO") >= 75
+
+
+class TestSpaIsAWord:
+    """'spa' è un centro benessere prima che una forma legale.
+
+    Una società ha UNA sola forma legale: se ne abbiamo già trovata una
+    (SRL, SNC, SAS...), allora 'spa' è una parola vera del nome e va
+    conservata — altrimenti due alberghi DIVERSI ('Hotel Spa Milano Srl'
+    e 'Hotel Milano Srl') producono la stessa chiave e una fattura può
+    essere abbinata all'azienda sbagliata.
+    """
+
+    def test_spa_word_is_not_stripped_when_another_legal_form_exists(self):
+        assert normalize_ragione_sociale("HOTEL SPA MILANO SRL") == "hotel spa milano"
+        assert normalize_ragione_sociale("HOTEL MILANO SRL") == "hotel milano"
+        assert normalize_ragione_sociale("Beauty Spa Srl") == "beauty spa"
+        assert normalize_ragione_sociale("Beauty Srl") == "beauty"
+        # Le due coppie NON devono collassare sulla stessa chiave.
+        assert (
+            normalize_ragione_sociale("HOTEL SPA MILANO SRL")
+            != normalize_ragione_sociale("HOTEL MILANO SRL")
+        )
+        assert (
+            normalize_ragione_sociale("Beauty Spa Srl")
+            != normalize_ragione_sociale("Beauty Srl")
+        )
+
+    def test_spa_as_legal_form_is_still_stripped(self):
+        # Puntata: inequivocabile, si rimuove ovunque.
+        assert normalize_ragione_sociale("Rossi S.p.A.") == "rossi"
+        assert normalize_ragione_sociale("Rossi S.P.A. Milano") == "rossi milano"
+        # Nuda a fine nome, nessun'altra forma legale → è la forma legale.
+        assert normalize_ragione_sociale("Rossi SPA") == "rossi"
+        # Le due grafie restano equivalenti.
+        assert (
+            normalize_ragione_sociale("Rossi SPA")
+            == normalize_ragione_sociale("Rossi S.p.A.")
+        )
