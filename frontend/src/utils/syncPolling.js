@@ -23,6 +23,16 @@ export async function getSyncMarker() {
 }
 
 /**
+ * Payload completo di GET /sync/status: { last_sync, progress, scheduler }.
+ * La Dashboard lo polla durante un sync per mostrare il progresso LIVE
+ * (progress.step_index/total_steps/step_label) sotto il pulsante Sincronizza.
+ */
+export async function getSyncStatus() {
+  const res = await client.get('/sync/status')
+  return res.data
+}
+
+/**
  * Step della pipeline falliti nell'ultimo sync, letti dai result persistiti.
  * Il marker che cambia dice solo che la pipeline è ARRIVATA in fondo: ogni
  * step ha il proprio try/except e può essere fallito senza fermare gli altri.
