@@ -13,6 +13,8 @@ Copertura:
 
 from datetime import date, datetime, timedelta
 
+from sqlalchemy import text
+
 from backend.database import Invoice, Customer, RecoveryAction
 
 
@@ -190,3 +192,222 @@ class TestDefinizioneScaduto:
 
         data = test_client.get("/api/dashboard").json()
         assert data["total_scaduto"] == 100.0
+
+
+# ── C. La cascata: ogni scalino DEVE chiudere ────────────────────────
+
+def _popola_tutte_le_sovrapposizioni(session):
+    """Dati che esercitano OGNI sovrapposizione fra le categorie.
+
+    È il punto del test: le categorie si sovrappongono nella realtà
+    (orfana+contestata, escluso+contestato...). Se si sommassero categorie
+    sovrapposte, la cascata non chiuderebbe — cioè avremmo ricostruito
+    esattamente il bug che stiamo curando.
+
+    Ritorna il totale dell'universo atteso.
+    """
+    escluso = _customer(session, "Escluso SRL", excluded=True)
+    normale = _customer(session, "Normale SRL", recovery_status="first_contact")
+    contestatore = _customer(session, "Contestatore SRL", recovery_status="idle")
+    senza_stato = _customer(session, "Senza Stato SRL")
+    # recovery_status NULL: riga legacy. Va forzato in SQL — passare None
+    # al modello non basta, SQLAlchemy applicherebbe il default 'idle'.
+    session.execute(
+        text("UPDATE customers SET recovery_status = NULL WHERE id = :id"),
+        {"id": senza_stato.id},
+    )
+    session.commit()
+
+    # non_abbinati (orfane) — anche in sovrapposizione con 'contestata'
+    _invoice(session, "ORF/1", amount_due=10.0, customer_id=None)
+    _invoice(session, "ORF/2", amount_due=20.0, customer_id=None, status="disputed")
+
+    # esclusi — anche in sovrapposizione con 'contestata'
+    _invoice(session, "ESC/1", amount_due=30.0, customer_id=escluso.id)
+    _invoice(session, "ESC/2", amount_due=40.0, customer_id=escluso.id,
+             status="disputed")
+
+    # contestati (abbinati, non esclusi)
+    _invoice(session, "CON/1", amount_due=50.0, customer_id=contestatore.id,
+             status="disputed")
+
+    # lavorabile
+    _invoice(session, "LAV/1", amount_due=60.0, customer_id=normale.id)
+    _invoice(session, "LAV/2", amount_due=70.0, customer_id=senza_stato.id)
+
+    # FUORI dall'universo: pagata, e non ancora scaduta
+    _invoice(session, "PAID/1", amount_due=0.0, amount=500.0, status="paid",
+             customer_id=normale.id, days_overdue=0)
+    _invoice(session, "FUT/1", amount_due=900.0, customer_id=normale.id,
+             days_overdue=0)
+
+    return 10.0 + 20.0 + 30.0 + 40.0 + 50.0 + 60.0 + 70.0  # = 280
+
+
+class TestIdentitaCascata:
+    """IL TEST PIÙ IMPORTANTE: se la cascata non chiude, il lavoro non serve."""
+
+    def test_identita_la_cascata_chiude(self, test_client, test_db_session):
+        """scaduto_totale == non_abbinati + esclusi + contestati + lavorabile"""
+        atteso = _popola_tutte_le_sovrapposizioni(test_db_session)
+
+        d = test_client.get("/api/dashboard/riconciliazione").json()
+        c = d["cascata"]
+
+        somma = (
+            c["non_abbinati"]["importo"]
+            + c["esclusi"]["importo"]
+            + c["contestati"]["importo"]
+            + c["lavorabile"]["importo"]
+        )
+        assert c["scaduto_totale"]["importo"] == atteso
+        assert somma == c["scaduto_totale"]["importo"], (
+            f"LA CASCATA NON CHIUDE: {somma} != {c['scaduto_totale']['importo']}"
+        )
+
+    def test_precedenza_orfana_batte_contestata(self, test_client, test_db_session):
+        """ORF/2 è orfana E contestata: conta UNA volta sola, fra le orfane."""
+        _popola_tutte_le_sovrapposizioni(test_db_session)
+        c = test_client.get("/api/dashboard/riconciliazione").json()["cascata"]
+
+        assert c["non_abbinati"]["importo"] == 30.0  # ORF/1 + ORF/2
+        # ORF/2 (20) NON è anche fra i contestati: lì c'è solo CON/1 (50)
+        assert c["contestati"]["importo"] == 50.0
+
+    def test_precedenza_escluso_batte_contestata(self, test_client, test_db_session):
+        """ESC/2 è di un escluso E contestata: conta fra gli esclusi."""
+        _popola_tutte_le_sovrapposizioni(test_db_session)
+        c = test_client.get("/api/dashboard/riconciliazione").json()["cascata"]
+
+        assert c["esclusi"]["importo"] == 70.0  # ESC/1 + ESC/2
+
+    def test_lavorabile_coincide_col_motore(self, test_client, test_db_session):
+        """Il lavorabile è ESATTAMENTE ciò che il motore lavora."""
+        _popola_tutte_le_sovrapposizioni(test_db_session)
+        c = test_client.get("/api/dashboard/riconciliazione").json()["cascata"]
+
+        assert c["lavorabile"]["importo"] == 130.0  # LAV/1 + LAV/2
+
+    def test_identita_stati_pratica(self, test_client, test_db_session):
+        """lavorabile == somma degli stati pratica (clienti senza stato inclusi)."""
+        _popola_tutte_le_sovrapposizioni(test_db_session)
+        d = test_client.get("/api/dashboard/riconciliazione").json()
+        c = d["cascata"]
+
+        per_stato = c["lavorabile"]["per_stato"]
+        somma = sum(s["importo"] for s in per_stato.values())
+        assert somma == c["lavorabile"]["importo"], (
+            f"gli stati non sommano al lavorabile: {somma} != {c['lavorabile']['importo']}"
+        )
+        # Il cliente con recovery_status NULL non si perde per strada
+        assert per_stato["sconosciuto"]["importo"] == 70.0
+        assert per_stato["first_contact"]["importo"] == 60.0
+
+    def test_identita_su_db_vuoto(self, test_client):
+        """La cascata chiude anche a zero (nessuna divisione per zero)."""
+        c = test_client.get("/api/dashboard/riconciliazione").json()["cascata"]
+        somma = (
+            c["non_abbinati"]["importo"] + c["esclusi"]["importo"]
+            + c["contestati"]["importo"] + c["lavorabile"]["importo"]
+        )
+        assert c["scaduto_totale"]["importo"] == 0.0
+        assert somma == 0.0
+
+    def test_conteggi_chiudono_come_gli_importi(self, test_client, test_db_session):
+        """Non solo gli euro: anche il numero di fatture deve chiudere."""
+        _popola_tutte_le_sovrapposizioni(test_db_session)
+        c = test_client.get("/api/dashboard/riconciliazione").json()["cascata"]
+
+        somma = (
+            c["non_abbinati"]["fatture"] + c["esclusi"]["fatture"]
+            + c["contestati"]["fatture"] + c["lavorabile"]["fatture"]
+        )
+        assert c["scaduto_totale"]["fatture"] == 7
+        assert somma == 7
+
+
+class TestRecuperato:
+    """Recuperato certo (paid_at) vs storico stimato (updated_at): mai mischiati."""
+
+    def test_recuperato_certo_usa_il_residuo(self, test_client, test_db_session):
+        """Pagata dopo il primo sollecito: conta il RESIDUO, non l'importo pieno."""
+        c = _customer(test_db_session, "Pagante")
+        azione = RecoveryAction(
+            customer_id=c.id, action_type="first_contact",
+            created_at=datetime.utcnow() - timedelta(days=10),
+            completed_at=datetime.utcnow() - timedelta(days=10),
+        )
+        test_db_session.add(azione)
+        test_db_session.commit()
+
+        _invoice(test_db_session, "P/1", amount=500.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=c.id,
+                 paid_at=datetime.utcnow() - timedelta(days=1),
+                 amount_due_at_paid=200.0)
+
+        r = test_client.get("/api/dashboard/riconciliazione").json()["recuperato"]
+        assert r["certo"]["importo"] == 200.0, "il residuo, non l'importo pieno"
+        assert r["certo"]["stimato"] is False
+
+    def test_pagata_prima_del_sollecito_non_e_recupero(self, test_client, test_db_session):
+        """Pagata PRIMA della prima azione: non l'abbiamo recuperata noi."""
+        c = _customer(test_db_session, "Spontaneo")
+        azione = RecoveryAction(
+            customer_id=c.id, action_type="first_contact",
+            created_at=datetime.utcnow() - timedelta(days=1),
+            completed_at=datetime.utcnow() - timedelta(days=1),
+        )
+        test_db_session.add(azione)
+        test_db_session.commit()
+
+        _invoice(test_db_session, "P/1", amount=500.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=c.id,
+                 paid_at=datetime.utcnow() - timedelta(days=30),
+                 amount_due_at_paid=200.0)
+
+        r = test_client.get("/api/dashboard/riconciliazione").json()["recuperato"]
+        assert r["certo"]["importo"] == 0.0
+
+    def test_storico_ante_migrazione_e_marcato_stimato(self, test_client, test_db_session):
+        """Senza paid_at la data di pagamento non esiste: è una STIMA, e si dice."""
+        c = _customer(test_db_session, "Storico")
+        azione = RecoveryAction(
+            customer_id=c.id, action_type="first_contact",
+            created_at=datetime.utcnow() - timedelta(days=10),
+            completed_at=datetime.utcnow() - timedelta(days=10),
+        )
+        test_db_session.add(azione)
+        test_db_session.commit()
+
+        # Riga ante-migrazione: paid_at NULL, residuo già azzerato e perso
+        _invoice(test_db_session, "OLD/1", amount=300.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=c.id)
+
+        r = test_client.get("/api/dashboard/riconciliazione").json()["recuperato"]
+        assert r["certo"]["importo"] == 0.0
+        assert r["storico_stimato"]["importo"] == 300.0
+        assert r["storico_stimato"]["stimato"] is True
+        assert "stima" in r["storico_stimato"]["nota"].lower()
+
+    def test_certo_e_stimato_non_si_sovrappongono(self, test_client, test_db_session):
+        """Una fattura sta in UNO dei due secchielli, mai in entrambi."""
+        c = _customer(test_db_session, "Misto")
+        azione = RecoveryAction(
+            customer_id=c.id, action_type="first_contact",
+            created_at=datetime.utcnow() - timedelta(days=10),
+            completed_at=datetime.utcnow() - timedelta(days=10),
+        )
+        test_db_session.add(azione)
+        test_db_session.commit()
+
+        _invoice(test_db_session, "NEW/1", amount=500.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=c.id,
+                 paid_at=datetime.utcnow(), amount_due_at_paid=200.0)
+        _invoice(test_db_session, "OLD/1", amount=300.0, amount_due=0.0,
+                 status="paid", days_overdue=0, customer_id=c.id)
+
+        r = test_client.get("/api/dashboard/riconciliazione").json()["recuperato"]
+        assert r["certo"]["fatture"] == 1
+        assert r["storico_stimato"]["fatture"] == 1
+        assert r["certo"]["importo"] == 200.0
+        assert r["storico_stimato"]["importo"] == 300.0

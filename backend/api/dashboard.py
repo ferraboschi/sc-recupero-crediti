@@ -652,6 +652,196 @@ async def get_attivita(session: Session = Depends(get_session)):
         raise
 
 
+@router.get("/riconciliazione")
+async def get_riconciliazione(session: Session = Depends(get_session)):
+    """La cascata che spiega il numero di testa, scalino per scalino.
+
+    Nasce da una segnalazione precisa: "vedo da pagare 674.378, poi sotto
+    460.932, e 197.033 recuperato: i conti non tornano". Non tornavano per
+    costruzione — erano tre risposte a tre domande diverse, su tre
+    popolazioni diverse, in due colonne diverse, su due pagine diverse.
+
+    Qui c'è UNA popolazione (l'universo dello scaduto) divisa in categorie
+    MUTUAMENTE ESCLUSIVE, e vale l'identità:
+
+        scaduto_totale == non_abbinati + esclusi + contestati + lavorabile
+
+    L'esclusività è strutturale, non aritmetica: un CASE SQL (bucket_expr)
+    assegna ogni riga a un solo ramo. Le condizioni si sovrappongono nella
+    realtà — una fattura può essere orfana E contestata, un cliente escluso
+    può avere fatture contestate — e sommare secchielli sovrapposti avrebbe
+    ricostruito esattamente il bug che questo endpoint cura.
+
+    Un credito escluso o contestato ESISTE ancora: non lo si insegue, ma
+    resta tracciato e la cascata lo chiude.
+    """
+    try:
+        # ── La cascata: UNA query, un CASE, nessuna somma sovrapposta ──
+        rows = (
+            session.query(
+                bucket_expr().label("bucket"),
+                func.count(Invoice.id).label("fatture"),
+                func.sum(Invoice.amount_due).label("importo"),
+            )
+            .outerjoin(Customer, Invoice.customer_id == Customer.id)
+            .filter(overdue_clause())
+            .group_by(bucket_expr())
+            .all()
+        )
+        per_bucket = {
+            b: {"fatture": 0, "importo": 0.0} for b in OVERDUE_BUCKETS
+        }
+        for bucket, fatture, importo in rows:
+            per_bucket[bucket] = {
+                "fatture": int(fatture or 0),
+                "importo": float(importo or 0),
+            }
+
+        # ── Il lavorabile per stato pratica (deve chiudere a sua volta) ──
+        stage_rows = (
+            session.query(
+                stage_expr().label("stato"),
+                func.count(Invoice.id).label("fatture"),
+                func.sum(Invoice.amount_due).label("importo"),
+                func.count(func.distinct(Invoice.customer_id)).label("clienti"),
+            )
+            .outerjoin(Customer, Invoice.customer_id == Customer.id)
+            .filter(workable_clause())
+            .group_by(stage_expr())
+            .all()
+        )
+        per_stato = {
+            s: {"fatture": 0, "importo": 0.0, "clienti": 0} for s in CASE_STAGES
+        }
+        for stato, fatture, importo, clienti in stage_rows:
+            per_stato[stato] = {
+                "fatture": int(fatture or 0),
+                "importo": float(importo or 0),
+                "clienti": int(clienti or 0),
+            }
+
+        totale = {
+            "fatture": sum(b["fatture"] for b in per_bucket.values()),
+            "importo": round(sum(b["importo"] for b in per_bucket.values()), 2),
+        }
+
+        cascata = {
+            "scaduto_totale": {
+                **totale,
+                "label": "Scaduto totale",
+                "descrizione": "Tutto il non pagato oltre la scadenza.",
+            },
+            "non_abbinati": {
+                **per_bucket["non_abbinati"],
+                "label": "Non abbinati",
+                "descrizione": "Fatture senza cliente: da abbinare prima di poterle inseguire.",
+            },
+            "esclusi": {
+                **per_bucket["esclusi"],
+                "label": "Esclusi",
+                "descrizione": "Clienti esclusi dal recupero: il credito esiste, non lo si insegue.",
+            },
+            "contestati": {
+                **per_bucket["contestati"],
+                "label": "Contestati",
+                "descrizione": "Fatture contestate: il motore non le sollecita.",
+            },
+            "lavorabile": {
+                **per_bucket["lavorabile"],
+                "label": "Lavorabile",
+                "descrizione": "Lo scaduto che il motore insegue davvero.",
+                "per_stato": per_stato,
+            },
+        }
+
+        return {
+            "cascata": cascata,
+            "recuperato": _recuperato(session),
+            "precedenza": list(OVERDUE_BUCKETS),
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching riconciliazione: {e}", exc_info=True)
+        raise
+
+
+def _recuperato(session: Session) -> dict:
+    """Quanto è rientrato DOPO il primo sollecito.
+
+    Due secchielli che non si toccano mai, divisi da un fatto tecnico
+    onesto: `paid_at` esiste solo dalla migrazione in poi.
+
+    - certo: ha paid_at (data di pagamento vera) e amount_due_at_paid (il
+      residuo fotografato all'atto del pagamento). Numero affidabile.
+    - storico_stimato: righe già 'paid' prima della migrazione. Per loro
+      NON esiste una data di pagamento (updated_at cambia a ogni modifica
+      di riga) NÉ il residuo (amount_due era già stato azzerato). Si stima
+      con quel che c'è — updated_at e l'importo pieno — e si DICHIARA
+      stimato, invece di spacciarlo per certo.
+    """
+    first_action = (
+        session.query(
+            RecoveryAction.customer_id,
+            func.min(RecoveryAction.created_at).label("first_action"),
+        )
+        .filter(RecoveryAction.action_type.in_(["first_contact", "second_contact", "lawyer"]))
+        .group_by(RecoveryAction.customer_id)
+        .subquery()
+    )
+
+    # Certo: paid_at valorizzata, dopo il primo sollecito, somma del RESIDUO.
+    certo = (
+        session.query(
+            func.count(Invoice.id),
+            func.sum(func.coalesce(Invoice.amount_due_at_paid, 0.0)),
+        )
+        .join(first_action, Invoice.customer_id == first_action.c.customer_id)
+        .filter(
+            Invoice.status == "paid",
+            Invoice.paid_at.isnot(None),
+            Invoice.paid_at >= first_action.c.first_action,
+        )
+        .one()
+    )
+
+    # Stimato: SOLO le righe senza paid_at (mai sovrapposto al certo).
+    stimato = (
+        session.query(
+            func.count(Invoice.id),
+            func.sum(func.coalesce(Invoice.amount, 0.0)),
+        )
+        .join(first_action, Invoice.customer_id == first_action.c.customer_id)
+        .filter(
+            Invoice.status == "paid",
+            Invoice.paid_at.is_(None),
+            Invoice.updated_at >= first_action.c.first_action,
+        )
+        .one()
+    )
+
+    return {
+        "certo": {
+            "fatture": int(certo[0] or 0),
+            "importo": round(float(certo[1] or 0), 2),
+            "stimato": False,
+            "label": "Recuperato",
+            "nota": "Pagato dopo il primo sollecito, a residuo: data di pagamento certa.",
+        },
+        "storico_stimato": {
+            "fatture": int(stimato[0] or 0),
+            "importo": round(float(stimato[1] or 0), 2),
+            "stimato": True,
+            "label": "Storico stimato",
+            "nota": (
+                "Stima: fatture pagate prima che il sistema registrasse la data "
+                "di pagamento. La data è dedotta dall'ultima modifica della riga "
+                "e l'importo è quello pieno (il residuo non è più recuperabile). "
+                "Non sommare a 'Recuperato' come se fosse certo."
+            ),
+        },
+    }
+
+
 @router.get("/pipeline")
 async def get_pipeline(session: Session = Depends(get_session)):
     """
