@@ -701,7 +701,18 @@ class FatturaProConnector:
                 return result, complete
 
             PAGE = 100
-            start = PAGE
+            # Si parte da start=0 così TUTTE le pagine condividono
+            # l'ordinamento imposto qui sotto (DESC per data scadenza).
+            # Partendo da PAGE, le prime 100 righe di QUELL'ordinamento — le
+            # scadenze più lontane, cioè le fatture aperte più recenti — non
+            # venivano mai richieste: restavano senza scadenza reale e
+            # 'assumed' (emissione+30) le dava per scadute in anticipo.
+            # Stesso motivo per cui fetch_overdue_invoices e
+            # _paginate_xcrud_list partono da 0.
+            # Il re-ingest delle righe già lette dalla pagina renderizzata è
+            # innocuo: `result` è un dict per doc_key con merge via min(),
+            # `covered` è un set.
+            start = 0
             for _ in range(max_pages):
                 if targets is not None and covered >= targets:
                     complete = True

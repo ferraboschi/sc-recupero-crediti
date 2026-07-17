@@ -175,6 +175,73 @@ class TestScadenzeMap:
         assert posts["n"] == 0               # target già in pagina 1: nessun AJAX
 
 
+def _scad_row(num, due, sosp="10,00"):
+    return (f'<tr><td>{due}</td><td></td><td>{num}</td><td>Cli</td>'
+            f'<td>B</td><td>U</td><td>I</td><td>10</td><td>{sosp}</td><td></td></tr>')
+
+
+class TestScadenzarioPaginationStart:
+    """La paginazione AJAX impone il proprio ordinamento (DESC per data
+    scadenza): deve quindi partire da start=0, altrimenti le prime 100 righe
+    di QUELL'ordinamento — le scadenze più lontane, cioè le fatture aperte
+    più recenti — non vengono mai richieste.
+    """
+
+    def test_first_ajax_page_starts_at_zero(self, monkeypatch):
+        page1 = ('<table><tr><th>Scadenza</th></tr>'
+                 + ''.join(_scad_row(f"{i}/SAK del 01/01/2026", "01/02/2026")
+                           for i in range(10))
+                 + '</table><input name="key" value="k1">'
+                   '<input name="instance" value="scad_9">')
+        empty = '<table><tr><th>Scadenza</th></tr></table>'
+
+        conn = FatturaProConnector()
+        conn._authenticated = True
+        monkeypatch.setattr(conn.client, "get", lambda *a, **kw: _FakeResp(page1))
+        starts = []
+
+        def fake_post(*a, **kw):
+            starts.append(kw["data"]["xcrud[start]"])
+            return _FakeResp(empty)
+
+        monkeypatch.setattr(conn.client, "post", fake_post)
+        # target mai coperto → l'AJAX parte davvero
+        conn.fetch_scadenze_map(target_keys={doc_key("777/SAK")}, patience=3)
+        assert starts, "nessuna richiesta AJAX effettuata"
+        assert starts[0] == "0"
+
+    def test_due_date_in_first_100_desc_rows_is_found(self, monkeypatch):
+        # Il DANNO: 250 rate ordinate DESC per scadenza. La target è la più
+        # lontana nel futuro → riga 0 dell'ordinamento imposto via AJAX.
+        # Partendo da start=100 non veniva mai letta: la fattura restava
+        # senza scadenza reale e 'assumed' (emissione+30) la dava per
+        # scaduta con 60 giorni di anticipo → sollecito indebito.
+        rows = [_scad_row("9999/SAK del 01/11/2026", "01/12/2026")]
+        rows += [_scad_row(f"{i}/OLD del 01/01/2024", f"{(i % 28) + 1:02d}/01/2024")
+                 for i in range(249)]
+        # pagina renderizzata: ordinamento di DEFAULT del sito, righe vecchie
+        rendered = ('<table><tr><th>Scadenza</th></tr>' + ''.join(rows[200:210])
+                    + '</table><input name="key" value="k1">'
+                      '<input name="instance" value="scad_9">')
+
+        conn = FatturaProConnector()
+        conn._authenticated = True
+        monkeypatch.setattr(conn.client, "get", lambda *a, **kw: _FakeResp(rendered))
+
+        def fake_post(*a, **kw):
+            start = int(kw["data"]["xcrud[start]"])
+            window = rows[start:start + 100]
+            return _FakeResp('<table><tr><th>Scadenza</th></tr>'
+                             + ''.join(window) + '</table>')
+
+        monkeypatch.setattr(conn.client, "post", fake_post)
+        smap, complete = conn.fetch_scadenze_map(
+            target_keys={doc_key("9999/SAK")}, patience=3
+        )
+        assert smap.get(doc_key("9999/SAK")) == date(2026, 12, 1)
+        assert complete
+
+
 class TestClientiMap:
     def test_piva_by_name(self, monkeypatch):
         conn = _connector_with_list(monkeypatch, {"clienti.php": CLIENTI_HTML})
