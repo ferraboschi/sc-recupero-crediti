@@ -259,6 +259,97 @@ class TestLifecycleRiapertura:
         assert new_case.inherited_contacts == 2
         assert contact_count(test_db_session, new_case) == 2
 
+    def test_archived_case_is_not_reopened_by_next_sync(self, test_db_session):
+        """Archiviare = 'questo debito non lo inseguo più'. Le fatture scadute
+        restano scadute per definizione: il lifecycle successivo NON deve aprire
+        una pratica nuova sulle STESSE fatture né riportare il cliente a 'idle'.
+
+        Regressione: il pulsante Archivia era un no-op che durava fino al sync
+        successivo, e il debitore inesigibile ricompariva fra i 'da contattare
+        per la prima volta' (dashboard.py:167-183).
+        """
+        cust = make_customer(test_db_session, name="Debitore Cronico SRL")
+        inv = make_invoice(test_db_session, cust, number="OLD-1")
+        update_case_lifecycle(test_db_session)
+        case = get_open_case(test_db_session, cust.id)
+        assert case is not None
+        assert inv.case_id == case.id
+
+        close_case(test_db_session, case, "archived")
+        test_db_session.commit()
+        assert cust.recovery_status == "archived"
+
+        # il sync successivo: nessun pagamento, nessuna azione operatore
+        stats = update_case_lifecycle(test_db_session)
+
+        assert stats["opened"] == 0
+        assert stats["reopened"] == 0
+        assert get_open_case(test_db_session, cust.id) is None
+        test_db_session.refresh(cust)
+        assert cust.recovery_status == "archived"
+        test_db_session.refresh(inv)
+        assert inv.case_id == case.id  # la fattura resta nella pratica archiviata
+
+    def test_archived_debt_partially_paid_stays_archived(self, test_db_session):
+        """Il saldo di UNA fattura del ciclo archiviato non resuscita il resto:
+        l'archiviazione copriva l'intero ciclo, non la singola fattura."""
+        cust = make_customer(test_db_session, name="Debitore Cronico SRL")
+        inv_a = make_invoice(test_db_session, cust, number="ARC-1")
+        make_invoice(test_db_session, cust, number="ARC-2")
+        update_case_lifecycle(test_db_session)
+        case = get_open_case(test_db_session, cust.id)
+        close_case(test_db_session, case, "archived")
+
+        inv_a.status = "paid"
+        inv_a.amount_due = 0
+        inv_a.days_overdue = 0
+        test_db_session.commit()
+
+        update_case_lifecycle(test_db_session)
+
+        assert get_open_case(test_db_session, cust.id) is None
+        test_db_session.refresh(cust)
+        assert cust.recovery_status == "archived"
+
+    def test_new_debt_opens_case_without_resurrecting_archived_debt(self, test_db_session):
+        """Un debito NUOVO merita una pratica nuova — ma il debito archiviato
+        NON la segue: resta nella pratica archiviata. Altrimenti la pratica
+        nuova nascerebbe con dentro una fattura inesigibile e non potrebbe mai
+        chiudersi a saldo.
+
+        Copre il buco di test_case_after_archive_inherits_contacts, che salda
+        la vecchia fattura e quindi non distingue le due politiche.
+        """
+        cust = make_customer(test_db_session, name="Debitore Cronico SRL")
+        old_inv = make_invoice(test_db_session, cust, number="ARC-1")
+        update_case_lifecycle(test_db_session)
+        archived = get_open_case(test_db_session, cust.id)
+        close_case(test_db_session, archived, "archived")
+        test_db_session.commit()
+
+        # arriva debito NUOVO, mentre ARC-1 resta scaduta e non pagata
+        new_inv = make_invoice(test_db_session, cust, number="NEW-1", days_overdue=10)
+        stats = update_case_lifecycle(test_db_session)
+
+        assert stats["opened"] == 1
+        new_case = get_open_case(test_db_session, cust.id)
+        assert new_case is not None and new_case.id != archived.id
+        test_db_session.refresh(old_inv)
+        test_db_session.refresh(new_inv)
+        assert old_inv.case_id == archived.id  # l'inesigibile non risorge
+        assert new_inv.case_id == new_case.id
+
+        # e la pratica nuova può chiudersi a saldo: non trascina ARC-1
+        new_inv.status = "paid"
+        new_inv.amount_due = 0
+        new_inv.days_overdue = 0
+        test_db_session.commit()
+        update_case_lifecycle(test_db_session)
+
+        test_db_session.refresh(new_case)
+        assert new_case.status == "closed"
+        assert new_case.closed_reason == "paid"
+
     def test_reassigned_invoice_detached_from_foreign_case(self, test_db_session):
         """Regola difensiva: fattura riassegnata non resta nella pratica altrui."""
         cust_a = make_customer(test_db_session, name="Cliente A SRL")
