@@ -50,10 +50,16 @@ class TestNormalizeRagioneSociale:
         assert "acme" in result  # May have extra spaces but should contain "acme"
 
     def test_remove_legal_form_spa(self):
-        """Test removal of S.P.A. (Società per Azioni)."""
+        """Test removal of S.P.A. (Società per Azioni).
+
+        Solo la forma PUNTATA: 'spa' nuda è anche un centro benessere, e
+        rimuoverla fa collassare alberghi diversi sulla stessa chiave.
+        Vedi TestAmbiguousNudeSigle.
+        """
         assert normalize_ragione_sociale("ACME S.P.A.") == "acme"
-        assert normalize_ragione_sociale("ACME SPA") == "acme"
         assert normalize_ragione_sociale("ACME s.p.a.") == "acme"
+        # La nuda si CONSERVA: non è distinguibile da una parola del nome.
+        assert normalize_ragione_sociale("ACME SPA") == "acme spa"
 
     def test_remove_legal_form_sas(self):
         """Test removal of S.A.S. (Società in Accomandita Semplice)."""
@@ -157,7 +163,10 @@ class TestNormalizeRagioneSociale:
     def test_only_legal_form(self):
         """Test when input is only a legal form."""
         assert normalize_ragione_sociale("S.R.L.") == ""
-        assert normalize_ragione_sociale("SPA") == ""
+        assert normalize_ragione_sociale("SRL") == ""
+        assert normalize_ragione_sociale("S.P.A.") == ""
+        # 'SPA' nuda NON è più assunta forma legale: resta parola del nome.
+        assert normalize_ragione_sociale("SPA") == "spa"
 
     def test_only_prefix(self):
         """Test when input is only a prefix."""
@@ -409,39 +418,71 @@ class TestPersonAwareSimilarity:
         assert light_similarity_score("YOHO MILANO SRL", "YOHO MILANO") >= 75
 
 
-class TestSpaIsAWord:
-    """'spa' è un centro benessere prima che una forma legale.
+class TestAmbiguousNudeSigle:
+    """Le sigle NUDE ambigue (spa/ong/sapa) non si tolgono MAI.
 
-    Una società ha UNA sola forma legale: se ne abbiamo già trovata una
-    (SRL, SNC, SAS...), allora 'spa' è una parola vera del nome e va
-    conservata — altrimenti due alberghi DIVERSI ('Hotel Spa Milano Srl'
-    e 'Hotel Milano Srl') producono la stessa chiave e una fattura può
-    essere abbinata all'azienda sbagliata.
+    Dalla sola stringa non è distinguibile se 'spa' sia la forma legale o
+    parte del nome ('Hotel Spa Milano' è un centro benessere). La forma
+    PUNTATA ('S.p.A.') è inequivocabile e si rimuove ovunque; quella nuda
+    resta, e il prezzo accettato è che 'Rossi SPA' → 'rossi spa' non
+    coincida più con 'Rossi S.p.A.' → 'rossi': meglio un suggerimento da
+    confermare che un sollecito all'azienda sbagliata.
     """
 
-    def test_spa_word_is_not_stripped_when_another_legal_form_exists(self):
+    def test_nude_sigla_survives_asymmetric_spelling(self):
+        """Il caso vero: le fatture OMETTONO spesso la forma legale, quindi
+        la chiave non può dipendere dalla presenza di 'Srl' nella stringa.
+        """
+        # La fattura senza forma legale trova comunque il suo cliente...
+        assert (
+            normalize_ragione_sociale("Beauty Spa Srl")
+            == normalize_ragione_sociale("Beauty Spa")
+            == "beauty spa"
+        )
+        # ...e resta DIVERSA dall'azienda omonima senza 'spa'.
+        assert normalize_ragione_sociale("Beauty Srl") == "beauty"
+        assert (
+            normalize_ragione_sociale("Beauty Spa")
+            != normalize_ragione_sociale("Beauty Srl")
+        )
+
+    def test_nude_sigla_is_kept_as_a_real_word(self):
         assert normalize_ragione_sociale("HOTEL SPA MILANO SRL") == "hotel spa milano"
         assert normalize_ragione_sociale("HOTEL MILANO SRL") == "hotel milano"
-        assert normalize_ragione_sociale("Beauty Spa Srl") == "beauty spa"
-        assert normalize_ragione_sociale("Beauty Srl") == "beauty"
-        # Le due coppie NON devono collassare sulla stessa chiave.
         assert (
             normalize_ragione_sociale("HOTEL SPA MILANO SRL")
             != normalize_ragione_sociale("HOTEL MILANO SRL")
         )
+        # 'ong' = cognome cinese/vietnamita: i ristoranti asiatici comprano sake.
+        assert normalize_ragione_sociale("Ong Sushi Bar Srl") == "ong sushi bar"
+        assert normalize_ragione_sociale("Sushi Bar Srl") == "sushi bar"
         assert (
-            normalize_ragione_sociale("Beauty Spa Srl")
-            != normalize_ragione_sociale("Beauty Srl")
+            normalize_ragione_sociale("Ong Sushi Bar Srl")
+            != normalize_ragione_sociale("Sushi Bar Srl")
+        )
+        # 'sapa' = Sa Pa (città del Vietnam); e il mosto cotto (enoteche).
+        assert (
+            normalize_ragione_sociale("Ristorante Sapa Milano Srl")
+            == "ristorante sapa milano"
         )
 
-    def test_spa_as_legal_form_is_still_stripped(self):
-        # Puntata: inequivocabile, si rimuove ovunque.
+    def test_dotted_sigla_is_still_stripped_anywhere(self):
+        # Puntata: inequivocabile, si rimuove ovunque nel nome.
         assert normalize_ragione_sociale("Rossi S.p.A.") == "rossi"
         assert normalize_ragione_sociale("Rossi S.P.A. Milano") == "rossi milano"
-        # Nuda a fine nome, nessun'altra forma legale → è la forma legale.
-        assert normalize_ragione_sociale("Rossi SPA") == "rossi"
-        # Le due grafie restano equivalenti.
+        # Il prezzo accettato: la nuda NON è più equiparata alla puntata.
+        assert normalize_ragione_sociale("Rossi SPA") == "rossi spa"
         assert (
             normalize_ragione_sociale("Rossi SPA")
-            == normalize_ragione_sociale("Rossi S.p.A.")
+            != normalize_ragione_sociale("Rossi S.p.A.")
         )
+
+    def test_ambiguous_sigla_never_empties_the_key(self):
+        """Bug gemello, danno opposto: una chiave VUOTA rende il cliente
+        non abbinabile e il credito non viene MAI sollecitato.
+        """
+        assert normalize_ragione_sociale("Ong Srl") == "ong"
+        assert normalize_ragione_sociale("Sapa Srl") == "sapa"
+        assert normalize_ragione_sociale("Spa Srl") == "spa"
+        for name in ("Ong Srl", "Sapa Srl", "Spa Srl"):
+            assert normalize_ragione_sociale(name), f"chiave vuota per {name!r}"
