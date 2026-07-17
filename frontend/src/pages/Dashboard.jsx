@@ -176,13 +176,16 @@ export default function Dashboard() {
       await client.post('/sync/full')
 
       // Polling LIVE ogni ~1.5s (max ~4 min): aggiorna il pannello di
-      // avanzamento e chiude quando il tracker segnala running=false E il
-      // marker 'cases' è cambiato (pipeline arrivata in fondo). L'esito
-      // per-step si legge da collectSyncErrors (order_matching escluso).
+      // avanzamento. I DATI che servono per lavorare (fatture, abbinamenti,
+      // pratiche) sono pronti al passo 6 (marker 'cases' cambiato): a quel
+      // punto mostro subito "Dati aggiornati" e ricarico la vista, SENZA
+      // aspettare l'aggancio ordini (passo 7, enrichment) che continua
+      // visibile nel pannello. Così il pulsante è reattivo (~2 min) invece
+      // di sembrare bloccato per l'intera pipeline.
       const POLL_MS = 1500
       const MAX_POLLS = 160
       let baseline = markerBefore
-      let outcome = { completed: false, errors: [] }
+      let coreDone = false
       for (let i = 0; i < MAX_POLLS; i++) {
         await new Promise(resolve => setTimeout(resolve, POLL_MS))
         let payload
@@ -201,31 +204,38 @@ export default function Dashboard() {
           continue
         }
         const markerChanged = marker && marker !== baseline
-        const stopped = payload?.progress?.running === false
-        if (markerChanged && stopped) {
-          outcome = { completed: true, errors: collectSyncErrors(lastSyncData) }
-          break
+
+        if (markerChanged && !coreDone) {
+          // Passo 6 completato: i dati core sono pronti. Esito dai soli
+          // step core (collectSyncErrors esclude già l'aggancio ordini).
+          coreDone = true
+          const errors = collectSyncErrors(lastSyncData)
+          if (errors.length === 0) {
+            setSyncMessage('Dati aggiornati ✓')
+            const syncNow = new Date()
+            setLastSync(syncNow)
+            localStorage.setItem('lastSyncTime', syncNow.toISOString())
+          } else {
+            setSyncMessage(`Errore nella sincronizzazione: step ${errors.join(', ')} falliti — dati non aggiornati`)
+          }
+          // Ricarica SUBITO la vista coi dati freschi (non attende gli ordini).
+          fetchData()
+          fetchTodos()
+          fetchConnectorStatus()
+          fetchSchedulerInfo()
         }
+
+        // Fine dell'INTERA pipeline (incluso l'aggancio ordini): pannello via.
+        if (payload?.progress?.running === false) break
       }
 
-      if (outcome.completed && outcome.errors.length === 0) {
-        setSyncMessage('Sincronizzazione completata con successo')
-        const syncNow = new Date()
-        setLastSync(syncNow)
-        localStorage.setItem('lastSyncTime', syncNow.toISOString())
-      } else if (outcome.completed) {
-        // La pipeline è arrivata in fondo ma uno o più step sono falliti:
-        // niente messaggio verde né lastSync — i dati NON sono aggiornati.
-        setSyncMessage(`Errore nella sincronizzazione: step ${outcome.errors.join(', ')} falliti — dati non aggiornati`)
-      } else {
+      if (!coreDone) {
+        // Timeout prima ancora del passo 6: sync ancora in corso in background.
         setSyncMessage('Sync ancora in corso in background — i dati mostrati potrebbero non essere definitivi')
+        await fetchData()
+        await fetchTodos()
       }
-      await fetchData()
-      await fetchTodos()
-      await fetchConnectorStatus()
-      await fetchSchedulerInfo()
-      // Il pannello di progresso sparisce dopo qualche secondo (l'esito
-      // resta nel messaggio colorato accanto al pulsante).
+      // Il pannello di progresso e il messaggio spariscono dopo qualche secondo.
       setTimeout(() => { setSyncMessage(''); setSyncProgress(null) }, 8000)
     } catch (err) {
       setSyncMessage('Errore nella sincronizzazione')
