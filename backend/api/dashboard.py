@@ -76,8 +76,8 @@ async def search_dashboard(
         results = (
             session.query(
                 Customer,
-                func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).label("total_overdue"),
-                func.count(case((Invoice.days_overdue > 0, 1), else_=None)).label("overdue_count"),
+                func.sum(case((overdue_clause(), Invoice.amount_due), else_=0)).label("total_overdue"),
+                func.count(case((overdue_clause(), 1), else_=None)).label("overdue_count"),
             )
             .outerjoin(Invoice, (Invoice.customer_id == Customer.id) & (Invoice.status != "paid"))
             .filter(
@@ -88,7 +88,7 @@ async def search_dashboard(
                 )
             )
             .group_by(Customer.id)
-            .order_by(func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).desc())
+            .order_by(func.sum(case((overdue_clause(), Invoice.amount_due), else_=0)).desc())
             .limit(20)
             .all()
         )
@@ -324,8 +324,7 @@ async def get_calendar(
                 func.sum(Invoice.amount_due).label("tot"),
             )
             .filter(
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
+                overdue_clause(),
                 Invoice.customer_id.isnot(None),
             )
             .group_by(Invoice.customer_id)
@@ -454,16 +453,10 @@ async def get_attivita(session: Session = Depends(get_session)):
             session.query(
                 Customer,
                 func.count(func.distinct(
-                    case((
-                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
-                        Invoice.id
-                    ), else_=None)
+                    case((overdue_clause(), Invoice.id), else_=None)
                 )).label("overdue_count"),
                 func.sum(
-                    case((
-                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
-                        Invoice.amount_due
-                    ), else_=0)
+                    case((overdue_clause(), Invoice.amount_due), else_=0)
                 ).label("total_overdue"),
             )
             .outerjoin(Invoice, Invoice.customer_id == Customer.id)
@@ -475,10 +468,7 @@ async def get_attivita(session: Session = Depends(get_session)):
             # Exclude customers with no overdue invoices (nothing to recover)
             .having(
                 func.count(func.distinct(
-                    case((
-                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
-                        Invoice.id
-                    ), else_=None)
+                    case((overdue_clause(), Invoice.id), else_=None)
                 )) > 0
             )
             .order_by(Customer.next_action_date.asc().nullslast())
@@ -607,8 +597,7 @@ async def get_attivita(session: Session = Depends(get_session)):
                 )
                 .filter(
                     Invoice.customer_id.in_(incassati_ids),
-                    Invoice.status != "paid",
-                    Invoice.days_overdue > 0,
+                    overdue_clause(),
                 )
                 .group_by(Invoice.customer_id)
                 .all()
