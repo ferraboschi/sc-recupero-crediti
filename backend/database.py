@@ -209,6 +209,55 @@ class SyncState(Base):
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
 
+class OverdueSnapshot(Base):
+    """Fotografia giornaliera dello scaduto: la storia che la dashboard non ha.
+
+    La dashboard fotografa solo l'ISTANTE presente; qui si persiste la cascata
+    giorno per giorno, così l'evoluzione dello scaduto (totale, lavorabile,
+    recuperato) diventa una serie storica per il grafico.
+
+    Un solo snapshot per giorno (`date` UNIQUE): il sync fa UPSERT sulla riga
+    del giorno lavorativo corrente — due sync nello stesso giorno la
+    aggiornano, non la duplicano. La "data di oggi" è quella del giorno
+    lavorativo italiano (business_day_start), non date.today() UTC.
+
+    Gli importi sono la cascata di /riconciliazione (definizione condivisa in
+    engine/overdue.py): la serie storica non può divergere dal numero live.
+    `recuperato_certo` è CUMULATO — tutto ciò che è rientrato dopo il primo
+    sollecito a quella data.
+
+    Tabella NUOVA: la crea create_all (nessuna migrazione ALTER necessaria —
+    servono solo per colonne su tabelle esistenti). RLS abilitata in
+    _enable_rls come per ogni altra tabella (requisito Supabase).
+    """
+    __tablename__ = "overdue_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Un solo snapshot per giorno. UNIQUE: l'UPSERT del sync aggiorna questa
+    # riga; l'indice impedisce anche una duplicazione da race a livello DB.
+    date = Column(Date, nullable=False, unique=True, index=True)
+
+    # Importi (euro) della cascata dello scaduto
+    scaduto_totale = Column(Float, nullable=False, default=0.0)
+    non_abbinati = Column(Float, nullable=False, default=0.0)
+    esclusi = Column(Float, nullable=False, default=0.0)
+    contestati = Column(Float, nullable=False, default=0.0)
+    lavorabile = Column(Float, nullable=False, default=0.0)
+    # Recuperato certo, CUMULATO (pagato dopo il primo sollecito, a residuo)
+    recuperato_certo = Column(Float, nullable=False, default=0.0)
+
+    # Conteggi fatture per bucket (stessa cascata)
+    scaduto_totale_fatture = Column(Integer, nullable=False, default=0)
+    non_abbinati_fatture = Column(Integer, nullable=False, default=0)
+    esclusi_fatture = Column(Integer, nullable=False, default=0)
+    contestati_fatture = Column(Integer, nullable=False, default=0)
+    lavorabile_fatture = Column(Integer, nullable=False, default=0)
+    recuperato_certo_fatture = Column(Integer, nullable=False, default=0)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
 # Database engine and session
 _engine = None
 
@@ -356,6 +405,7 @@ def _enable_rls(engine):
     tables = [
         "customers", "invoices", "recovery_cases",
         "recovery_actions", "activity_log", "sync_state",
+        "overdue_snapshots",
         # legacy, non più mappate dal codice ma presenti nel DB
         "messages", "conversations",
     ]

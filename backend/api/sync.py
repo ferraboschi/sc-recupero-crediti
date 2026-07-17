@@ -1321,6 +1321,24 @@ def _full_sync_task(include_order_matching: bool = True, manual: bool = False) -
         else:
             logger.info("Full sync completed (order matching skipped: light/hourly run)")
 
+        # Snapshot storico dello scaduto per il grafico di evoluzione. Gira in
+        # coda, dopo che pratiche e pagamenti sono aggiornati. NON deve
+        # rallentare né FAR FALLIRE il sync: se esplode, si logga e si
+        # prosegue — il sync vale più di un punto del grafico. Un solo
+        # snapshot al giorno (UPSERT), quindi il sync orario lo riaggiorna.
+        try:
+            from backend.engine.overdue_history import record_overdue_snapshot
+            snap_session = get_session_direct()
+            try:
+                record_overdue_snapshot(snap_session)
+            finally:
+                snap_session.close()
+        except Exception as e:
+            logger.error(
+                f"Overdue snapshot failed (non-fatal, sync continues): {e}",
+                exc_info=True,
+            )
+
         logger.info(f"Full sync completed: {results}")
         return results
     finally:

@@ -6,11 +6,16 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, extract
 from sqlalchemy.orm import Session, joinedload
 
-from backend.database import get_session, Invoice, Customer, RecoveryAction, RecoveryCase
+from backend.database import (
+    get_session, Invoice, Customer, RecoveryAction, RecoveryCase,
+    OverdueSnapshot,
+)
 from backend.engine.overdue import (
-    overdue_clause, workable_clause, bucket_expr, stage_expr,
+    overdue_clause, workable_clause, stage_expr,
+    compute_overdue_buckets, compute_recuperato_certo,
     OVERDUE_BUCKETS, CASE_STAGES,
 )
+from backend.engine.cases import business_day_start
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -666,25 +671,10 @@ async def get_riconciliazione(session: Session = Depends(get_session)):
     """
     try:
         # ── La cascata: UNA query, un CASE, nessuna somma sovrapposta ──
-        rows = (
-            session.query(
-                bucket_expr().label("bucket"),
-                func.count(Invoice.id).label("fatture"),
-                func.sum(Invoice.amount_due).label("importo"),
-            )
-            .outerjoin(Customer, Invoice.customer_id == Customer.id)
-            .filter(overdue_clause())
-            .group_by(bucket_expr())
-            .all()
-        )
-        per_bucket = {
-            b: {"fatture": 0, "importo": 0.0} for b in OVERDUE_BUCKETS
-        }
-        for bucket, fatture, importo in rows:
-            per_bucket[bucket] = {
-                "fatture": int(fatture or 0),
-                "importo": float(importo or 0),
-            }
+        # compute_overdue_buckets vive in engine/overdue.py e lo condivide con
+        # lo snapshot storico: una definizione sola, non due che divergono.
+        buckets = compute_overdue_buckets(session)
+        per_bucket = {b: buckets[b] for b in OVERDUE_BUCKETS}
 
         # ── Il lavorabile per stato pratica (deve chiudere a sua volta) ──
         stage_rows = (
@@ -709,10 +699,7 @@ async def get_riconciliazione(session: Session = Depends(get_session)):
                 "clienti": int(clienti or 0),
             }
 
-        totale = {
-            "fatture": sum(b["fatture"] for b in per_bucket.values()),
-            "importo": round(sum(b["importo"] for b in per_bucket.values()), 2),
-        }
+        totale = buckets["scaduto_totale"]
 
         cascata = {
             "scaduto_totale": {
@@ -754,6 +741,59 @@ async def get_riconciliazione(session: Session = Depends(get_session)):
         raise
 
 
+@router.get("/evoluzione")
+async def get_evoluzione(
+    giorni: int = 90, session: Session = Depends(get_session)
+):
+    """La serie storica dello scaduto: il grafico dell'evoluzione nel tempo.
+
+    Ogni punto è lo snapshot di un giorno (uno solo per giorno): scaduto
+    totale, i bucket della cascata, il lavorabile e il recuperato certo
+    (cumulato). Ordinata per data CRESCENTE, così il grafico scorre da
+    sinistra a destra.
+
+    `giorni` è la finestra (default 90). Se nessuno snapshot è stato ancora
+    registrato — lo storico parte dal primo sync dopo il rilascio di questa
+    funzione — la serie è VUOTA, non un 500: il grafico mostrerà "nessun
+    dato" invece di rompersi.
+    """
+    try:
+        # Clamp difensivo: niente finestre negative o assurde.
+        giorni = max(1, min(giorni, 3650))
+        cutoff = business_day_start().date() - timedelta(days=giorni)
+        rows = (
+            session.query(OverdueSnapshot)
+            .filter(OverdueSnapshot.date >= cutoff)
+            .order_by(OverdueSnapshot.date.asc())
+            .all()
+        )
+        serie = [
+            {
+                "data": s.date.isoformat(),
+                "scaduto_totale": s.scaduto_totale,
+                "non_abbinati": s.non_abbinati,
+                "esclusi": s.esclusi,
+                "contestati": s.contestati,
+                "lavorabile": s.lavorabile,
+                "recuperato_certo": s.recuperato_certo,
+                "fatture": {
+                    "scaduto_totale": s.scaduto_totale_fatture,
+                    "non_abbinati": s.non_abbinati_fatture,
+                    "esclusi": s.esclusi_fatture,
+                    "contestati": s.contestati_fatture,
+                    "lavorabile": s.lavorabile_fatture,
+                    "recuperato_certo": s.recuperato_certo_fatture,
+                },
+            }
+            for s in rows
+        ]
+        return {"giorni": giorni, "serie": serie}
+
+    except Exception as e:
+        logger.error(f"Error fetching evoluzione: {e}", exc_info=True)
+        raise
+
+
 def _recuperato(session: Session) -> dict:
     """Quanto è rientrato DOPO il primo sollecito.
 
@@ -779,19 +819,9 @@ def _recuperato(session: Session) -> dict:
     )
 
     # Certo: paid_at valorizzata, dopo il primo sollecito, somma del RESIDUO.
-    certo = (
-        session.query(
-            func.count(Invoice.id),
-            func.sum(func.coalesce(Invoice.amount_due_at_paid, 0.0)),
-        )
-        .join(first_action, Invoice.customer_id == first_action.c.customer_id)
-        .filter(
-            Invoice.status == "paid",
-            Invoice.paid_at.isnot(None),
-            Invoice.paid_at >= first_action.c.first_action,
-        )
-        .one()
-    )
+    # Definizione condivisa con lo snapshot storico (engine/overdue.py): il
+    # "recuperato" della serie storica e quello della cascata sono lo stesso.
+    certo_fatture, certo_importo = compute_recuperato_certo(session)
 
     # Stimato: SOLO le righe senza paid_at (mai sovrapposto al certo).
     stimato = (
@@ -810,8 +840,8 @@ def _recuperato(session: Session) -> dict:
 
     return {
         "certo": {
-            "fatture": int(certo[0] or 0),
-            "importo": round(float(certo[1] or 0), 2),
+            "fatture": certo_fatture,
+            "importo": round(certo_importo, 2),
             "stimato": False,
             "label": "Recuperato",
             "nota": "Pagato dopo il primo sollecito, a residuo: data di pagamento certa.",
