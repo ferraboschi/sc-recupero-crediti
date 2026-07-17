@@ -147,6 +147,66 @@ async def list_customers(
         raise
 
 
+@router.get("/suggest")
+async def suggest_customers(
+    q: str = Query(..., min_length=2, description="Testo di ricerca approssimato"),
+    limit: int = Query(6, ge=1, le=20),
+    session: Session = Depends(get_session),
+):
+    """"Forse intendevi": clienti la cui ragione sociale è APPROSSIMABILE al
+    testo cercato — accenti, forme legali (S.r.l./Srl) e punteggiatura
+    ignorati, refusi tollerati. Aiuta a ritrovare un cliente di cui non si
+    ricorda la grafia esatta (es. "Domo Milano" → "Domò Milano", "Sakeya
+    Srl" → "Sakeya S.r.l.").
+
+    Cerca su TUTTI i clienti, indipendentemente dal filtro only_overdue.
+    Definito PRIMA di /{customer_id} così 'suggest' non è letto come id.
+    """
+    from backend.engine.normalizer import rank_similar
+    from sqlalchemy import case
+
+    rows = session.query(
+        Customer.id, Customer.ragione_sociale,
+        Customer.partita_iva, Customer.excluded,
+    ).all()
+    if not rows:
+        return {"query": q, "items": []}
+
+    ranked = rank_similar(q, [r[1] or "" for r in rows], limit=limit)
+    if not ranked:
+        return {"query": q, "items": []}
+
+    ids = [rows[idx][0] for idx, _ in ranked]
+    stats = {}
+    stat_rows = (
+        session.query(
+            Invoice.customer_id,
+            func.sum(case((Invoice.days_overdue > 0, 1), else_=0)).label("overdue_count"),
+            func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).label("total_overdue"),
+        )
+        .filter(Invoice.status != "paid", Invoice.customer_id.in_(ids))
+        .group_by(Invoice.customer_id)
+        .all()
+    )
+    for sr in stat_rows:
+        stats[sr[0]] = {"overdue_count": int(sr[1] or 0), "total_overdue": float(sr[2] or 0)}
+
+    items = []
+    for idx, score in ranked:
+        r = rows[idx]
+        s = stats.get(r[0], {"overdue_count": 0, "total_overdue": 0.0})
+        items.append({
+            "id": r[0],
+            "ragione_sociale": r[1],
+            "partita_iva": r[2],
+            "excluded": bool(r[3]),
+            "score": score,
+            "overdue_count": s["overdue_count"],
+            "total_overdue": s["total_overdue"],
+        })
+    return {"query": q, "items": items}
+
+
 @router.get("/{customer_id}")
 async def get_customer_detail(
     customer_id: int,

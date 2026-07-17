@@ -35,6 +35,7 @@ export default function Customers() {
   const [excludedToggle, setExcludedToggle] = useState({})
   const [summaryTotalOverdue, setSummaryTotalOverdue] = useState(0)
   const [summaryOverdueCustomers, setSummaryOverdueCustomers] = useState(0)
+  const [suggestions, setSuggestions] = useState([])
 
   useEffect(() => {
     const fetchCustomers = async () => {
@@ -63,6 +64,26 @@ export default function Customers() {
     }
     fetchCustomers()
   }, [skip, limit, search, onlyOverdue, sortBy, sortOrder])
+
+  // "Forse intendevi": suggerimenti approssimati (accenti/forme legali/
+  // refusi tollerati). Debounced, su TUTTI i clienti (anche senza scadute).
+  useEffect(() => {
+    const q = search.trim()
+    if (q.length < 2) {
+      setSuggestions([])
+      return
+    }
+    let cancelled = false
+    const t = setTimeout(async () => {
+      try {
+        const res = await client.get('/customers/suggest', { params: { q, limit: 6 } })
+        if (!cancelled) setSuggestions(res.data.items || [])
+      } catch {
+        if (!cancelled) setSuggestions([])
+      }
+    }, 300)
+    return () => { cancelled = true; clearTimeout(t) }
+  }, [search])
 
   const handleToggleExcluded = async (customerId, newValue, e) => {
     e.stopPropagation()
@@ -133,6 +154,42 @@ export default function Customers() {
             </label>
           </div>
         </div>
+
+        {/* "Forse intendevi": suggerimenti approssimati non già in elenco */}
+        {(() => {
+          const shown = new Set(customers.map(c => c.id))
+          const alt = suggestions.filter(s => !shown.has(s.id))
+          if (alt.length === 0) return null
+          return (
+            <div className="mt-4 pt-4 border-t border-dark-border">
+              <p className="text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">
+                Forse intendevi
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {alt.map(s => (
+                  <button
+                    key={s.id}
+                    onClick={() => navigate(`/customers/${s.id}`)}
+                    title={`P.IVA: ${s.partita_iva || '—'} · corrispondenza ${s.score}%`}
+                    className="group flex items-center gap-2 px-3 py-1.5 rounded-lg bg-dark-surface border border-dark-border hover:border-accent-teal/50 hover:bg-dark-cardHover transition-colors"
+                  >
+                    <span className="text-sm font-medium text-txt-primary group-hover:text-accent-teal">
+                      {s.ragione_sociale}
+                    </span>
+                    {s.overdue_count > 0 && (
+                      <span className="sc-badge bg-accent-red/15 text-accent-red">
+                        {s.overdue_count} scadut{s.overdue_count === 1 ? 'a' : 'e'}
+                      </span>
+                    )}
+                    {s.excluded && (
+                      <span className="sc-badge bg-[rgba(148,163,184,0.15)] text-txt-muted">escluso</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )
+        })()}
       </div>
 
       {/* Summary */}
