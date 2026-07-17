@@ -18,15 +18,28 @@ from typing import Optional
 _FOREIGN_RE = re.compile(r"^[A-Z]{2,3}\d{8,15}$")
 _ITALIAN_RE = re.compile(r"^\d{11}$")
 
+# Prefissi paese italiani: 'IT' (ISO alpha-2, lo standard VIES/EU) e 'ITA'
+# (alpha-3, dai campi-paese di molti gestionali). Davanti a sole cifre sono
+# entrambi ridondanti: l'Italia ha solo P.IVA di 11 cifre, quindi se il
+# resto è numerico la P.IVA è italiana — valida o corrotta che sia — e deve
+# passare dal checksum, non da _FOREIGN_RE.
+_IT_PREFIXES = ("ITA", "IT")  # il più lungo per primo
+
 
 def normalize_piva(raw: Optional[str]) -> str:
     """Uppercase, senza spazi né prefisso 'IT' ridondante."""
     if not raw:
         return ""
     piva = re.sub(r"[\s.\-]", "", raw.strip().upper())
-    # 'IT12345678901' e '12345678901' sono la stessa P.IVA italiana
-    if piva.startswith("IT") and _ITALIAN_RE.match(piva[2:]):
-        piva = piva[2:]
+    # 'IT12345678901' e '12345678901' sono la stessa P.IVA italiana.
+    # Il prefisso va tolto ogni volta che il resto è tutto CIFRE, non solo
+    # quando sono esattamente 11: altrimenti una P.IVA italiana corrotta
+    # (10 o 12 cifre) resta 'ITxxx', passa per estera (_FOREIGN_RE) e salta
+    # il checksum.
+    for prefix in _IT_PREFIXES:
+        if piva.startswith(prefix) and piva[len(prefix):].isdigit():
+            piva = piva[len(prefix):]
+            break
     return piva
 
 

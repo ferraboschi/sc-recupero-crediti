@@ -38,9 +38,12 @@ class TestNormalizePiva:
     def test_it_prefix_stripped(self):
         assert normalize_piva(f"IT{VALID_IT}") == VALID_IT
 
-    def test_it_prefix_kept_when_not_italian_shape(self):
-        # ITxxx con meno di 11 cifre non è una P.IVA italiana prefissata
-        assert normalize_piva("IT12345") == "IT12345"
+    def test_it_prefix_kept_when_rest_is_not_numeric(self):
+        # Il prefisso si toglie solo se il resto è tutto cifre. "IT" davanti
+        # a lettere non è un prefisso di P.IVA (es. una ragione sociale
+        # finita per sbaglio nel campo) e va conservato.
+        assert normalize_piva("ITALIA") == "ITALIA"
+        assert normalize_piva("IT") == "IT"
 
 
 class TestValidatePiva:
@@ -81,3 +84,28 @@ class TestValidatePiva:
     def test_is_valid_wrapper(self):
         assert is_valid_piva(VALID_IT) is True
         assert is_valid_piva("badpiva") is False
+
+
+def test_it_prefix_never_bypasses_italian_checksum():
+    """IT + cifre è SEMPRE una P.IVA italiana: deve passare dal checksum.
+
+    Regressione: 'IT1234567890' (10 cifre) veniva accettata come P.IVA
+    ESTERA (_FOREIGN_RE), saltando il checksum, mentre '1234567890' nuda
+    veniva correttamente rifiutata.
+    """
+    assert validate_piva("1234567890") is None
+    assert validate_piva("IT1234567890") is None
+    assert validate_piva("123456789012") is None
+    assert validate_piva("IT123456789012") is None
+    assert validate_piva("IT12345678903") == "12345678903"
+    assert validate_piva("12345678903") == "12345678903"
+    # 'ITA' (ISO alpha-3) è ridondante quanto 'IT': non deve aprire una
+    # scorciatoia verso _FOREIGN_RE aggirando il checksum con UNA lettera.
+    assert validate_piva("ITA1234567890") is None
+    assert validate_piva("ITA12345678903") == "12345678903"
+
+
+def test_foreign_piva_still_valid():
+    """Le P.IVA estere vere non devono essere toccate dal fix."""
+    assert validate_piva("DE123456789") == "DE123456789"
+    assert validate_piva("FR12345678901") == "FR12345678901"
