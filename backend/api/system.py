@@ -431,8 +431,7 @@ async def match_audit(
     include_paid=true copre anche le pagate (che inquinano i totali del
     profilo pur non contando nelle scadute).
     """
-    from backend.engine.normalizer import name_similarity_score
-    from backend.engine.piva import validate_piva
+    from backend.engine.verify import verify_invoice_customer
 
     session = get_session_direct()
     try:
@@ -456,48 +455,10 @@ async def match_audit(
             if not cust:
                 continue
 
-            # Score robusto ai nomi-persona (stesso predicato di matcher e
-            # repair): "MERCURI CHRISTIAN" è concorde con l'insegna
-            # "Dr. Gahe di Mercuri Christian", non un caso 'bad'.
-            name_score = None
-            if inv.customer_name_raw and cust.ragione_sociale:
-                name_score = name_similarity_score(
-                    inv.customer_name_raw, cust.ragione_sociale
-                )
-
-            inv_piva = validate_piva(inv.customer_piva_raw)
-            cust_piva = validate_piva(cust.partita_iva)
-            piva_conflict = bool(inv_piva and cust_piva and inv_piva != cust_piva)
-            piva_match = bool(inv_piva and cust_piva and inv_piva == cust_piva)
-
-            reasons = []
-            if piva_conflict:
-                verdict = "bad"
-                reasons.append("P.IVA fattura diversa da P.IVA cliente")
-            elif piva_match and name_score is not None and name_score < 40:
-                # Replica della guardia anti-poisoning del matcher: se il
-                # vecchio motore ha scritto la P.IVA della fattura sul
-                # cliente SBAGLIATO, l'accordo P.IVA è proprio il sintomo,
-                # non una conferma.
-                verdict = "bad"
-                reasons.append(
-                    f"P.IVA coincidente ma nomi dissimili (score {name_score}): "
-                    f"possibile P.IVA avvelenata sul cliente"
-                )
-            elif name_score is not None and name_score < 40 and not piva_match:
-                verdict = "bad"
-                reasons.append(f"nomi dissimili (score {name_score})")
-            elif name_score is not None and name_score < 75 and not piva_match:
-                verdict = "warn"
-                reasons.append(f"nomi poco simili (score {name_score})")
-            elif inv_piva and not cust_piva:
-                verdict = "warn"
-                reasons.append("P.IVA presente in fattura ma assente sul cliente")
-            elif name_score is None and not piva_match:
-                verdict = "warn"
-                reasons.append("nome fattura assente: verifica impossibile")
-            else:
-                verdict = "ok"
+            # Fonte di verità unica: lo stesso controllo del semaforo sul
+            # profilo cliente (backend/engine/verify.py).
+            v = verify_invoice_customer(inv, cust)
+            verdict = v["verdict"]
 
             counts[verdict] += 1
             if only_problems and verdict == "ok":
@@ -514,9 +475,10 @@ async def match_audit(
                 "customer_piva_raw": inv.customer_piva_raw,
                 "match_method": inv.match_method,
                 "match_score": inv.match_score,
-                "name_score": name_score,
+                "name_score": v["name_score"],
                 "verdict": verdict,
-                "reasons": reasons,
+                "reasons": [v["message"]],
+                "verification": v,
             })
 
         page = results[skip:skip + limit]

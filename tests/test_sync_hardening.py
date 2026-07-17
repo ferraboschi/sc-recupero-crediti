@@ -477,6 +477,7 @@ class TestMatchAuditV2:
         assert len(items) == 1
         assert items[0]["verdict"] == "bad"
         assert "avvelenata" in items[0]["reasons"][0]
+        assert items[0]["verification"]["level"] == "critical"
 
     def test_missing_raw_name_is_warn_not_ok(self, test_client, test_db_session):
         cust = self._customer(test_db_session, "Rooftop SRL")

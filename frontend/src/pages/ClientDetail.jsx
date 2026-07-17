@@ -66,6 +66,81 @@ const OUTCOME_COLORS = {
   no_answer: 'bg-accent-amber/15 text-accent-amber',
 }
 
+// Semaforo di verifica P.IVA + ragione sociale (dati dall'API, campo
+// `verification`). Il verde compare SOLO quando la corrispondenza è
+// davvero garantita (P.IVA uguale + ragione sociale coincidente).
+const VERIFY_STYLE = {
+  verified: { badge: 'bg-accent-green/15 text-accent-green', dot: '✔︎', label: 'Verificato', ring: 'border-accent-green/30 bg-accent-green/5' },
+  warning: { badge: 'bg-accent-amber/15 text-accent-amber', dot: '⚠', label: 'Da controllare', ring: 'border-accent-amber/30 bg-accent-amber/5' },
+  critical: { badge: 'bg-accent-red/15 text-accent-red', dot: '⛔', label: 'Discordante', ring: 'border-accent-red/30 bg-accent-red/5' },
+}
+
+// Badge cliccabile: apre/chiude il pannello di dettaglio della verifica.
+function VerifyBadge({ v, open, onToggle }) {
+  const s = VERIFY_STYLE[v?.level] || VERIFY_STYLE.warning
+  return (
+    <button
+      type="button"
+      onClick={(e) => { e.stopPropagation(); onToggle() }}
+      className={`sc-badge ${s.badge} cursor-pointer hover:brightness-110 whitespace-nowrap`}
+      title="Controllo P.IVA e ragione sociale — clicca per il dettaglio"
+    >
+      {s.dot} {s.label} {open ? '▴' : '▾'}
+    </button>
+  )
+}
+
+// Riga di confronto (valore fattura vs valore cliente) con evidenza.
+function VerifyRow({ label, left, right, ok }) {
+  const mark = ok === true ? '✔︎' : ok === false ? '✗' : ''
+  const color = ok === true ? 'text-accent-green' : ok === false ? 'text-accent-red' : 'text-txt-muted'
+  return (
+    <div className="grid grid-cols-[130px_1fr_1fr] gap-2 py-1 items-start text-sm">
+      <span className="text-xs font-semibold text-txt-label uppercase tracking-wider pt-0.5">{label}</span>
+      <span className="text-txt-primary break-words">{left || <span className="text-txt-muted">—</span>}</span>
+      <span className="text-txt-primary break-words">
+        <span className={`mr-1 ${color}`}>{mark}</span>
+        {right || <span className="text-txt-muted">—</span>}
+      </span>
+    </div>
+  )
+}
+
+// Pannello di dettaglio: messaggio di garanzia/avviso + valori affiancati.
+function VerifyDetail({ v }) {
+  if (!v) return null
+  const s = VERIFY_STYLE[v.level] || VERIFY_STYLE.warning
+  return (
+    <div className={`rounded-lg border ${s.ring} p-3`}>
+      <p className={`text-sm font-medium ${v.level === 'verified' ? 'text-accent-green' : v.level === 'critical' ? 'text-accent-red' : 'text-accent-amber'}`}>
+        {v.message}
+      </p>
+      <div className="mt-2 pt-2 border-t border-dark-border">
+        <div className="grid grid-cols-[130px_1fr_1fr] gap-2 pb-1">
+          <span></span>
+          <span className="text-xs font-semibold text-txt-label uppercase tracking-wider">Sulla fattura</span>
+          <span className="text-xs font-semibold text-txt-label uppercase tracking-wider">Sul cliente</span>
+        </div>
+        <VerifyRow
+          label="P.IVA"
+          left={v.invoice_piva}
+          right={v.customer_piva}
+          ok={v.piva_match ? true : v.piva_conflict ? false : null}
+        />
+        <VerifyRow
+          label="Ragione soc."
+          left={v.invoice_name}
+          right={v.customer_name}
+          ok={v.name_equivalent ? true : (v.name_score != null && v.name_score < 40) ? false : null}
+        />
+        {v.name_score != null && (
+          <p className="text-xs text-txt-muted mt-1">Somiglianza nomi: {v.name_score}%</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function ClientDetail() {
   const { customerId } = useParams()
   const navigate = useNavigate()
@@ -81,6 +156,7 @@ export default function ClientDetail() {
   const [phoneEdit, setPhoneEdit] = useState(null)
   const [updatingInvoice, setUpdatingInvoice] = useState(null)
   const [showAllInvoices, setShowAllInvoices] = useState(false)
+  const [openVerify, setOpenVerify] = useState(() => new Set())
   const [invoiceSortBy, setInvoiceSortBy] = useState('due_date')
   const [invoiceSortOrder, setInvoiceSortOrder] = useState('asc')
   const [neighbors, setNeighbors] = useState({ prev_id: null, next_id: null, position: null, total: null })
@@ -292,6 +368,15 @@ export default function ClientDetail() {
 
   const toggleInvoiceSelection = (id) => {
     setSelectedInvoices(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleVerify = (id) => {
+    setOpenVerify(prev => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
       else next.add(id)
@@ -820,6 +905,13 @@ export default function ClientDetail() {
                     <span className="sc-badge bg-[rgba(148,163,184,0.15)] text-txt-secondary">
                       {sug.suggested_method} {formatScore(sug.suggested_score)}
                     </span>
+                    {sug.verification && (
+                      <VerifyBadge
+                        v={sug.verification}
+                        open={openVerify.has(`sug-${sug.id}`)}
+                        onToggle={() => toggleVerify(`sug-${sug.id}`)}
+                      />
+                    )}
                     {isLowConfidence(sug) && (
                       <span className="sc-badge bg-[rgba(251,191,36,0.15)] text-accent-amber">bassa confidenza</span>
                     )}
@@ -830,6 +922,11 @@ export default function ClientDetail() {
                       <span className="text-xs font-medium text-accent-red">+{sug.days_overdue}gg</span>
                     )}
                   </div>
+                  {sug.verification && openVerify.has(`sug-${sug.id}`) && (
+                    <div className="mt-2">
+                      <VerifyDetail v={sug.verification} />
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex gap-2 shrink-0">
@@ -897,6 +994,7 @@ export default function ClientDetail() {
                 <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleInvoiceSort('invoice_number')}>
                   Fattura{invoiceSortArrow('invoice_number')}
                 </th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Verifica</th>
                 <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Ordine</th>
                 <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Fonte</th>
                 <th className="px-3 py-3 text-right text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleInvoiceSort('amount_due')}>
@@ -914,8 +1012,8 @@ export default function ClientDetail() {
             </thead>
             <tbody className="divide-y divide-dark-border">
               {visibleInvoices.map(inv => (
+                <React.Fragment key={inv.id}>
                 <tr
-                  key={inv.id}
                   className={`
                     ${inv.status === 'paid' ? 'bg-accent-green/5 opacity-60' : ''}
                     ${inv.days_overdue > 0 && inv.status !== 'paid' ? 'bg-accent-red/5' : ''}
@@ -933,6 +1031,17 @@ export default function ClientDetail() {
                     />
                   </td>
                   <td className="px-3 py-3 text-sm font-medium text-txt-primary">{inv.invoice_number}</td>
+                  <td className="px-3 py-3 text-sm">
+                    {inv.verification ? (
+                      <VerifyBadge
+                        v={inv.verification}
+                        open={openVerify.has(inv.id)}
+                        onToggle={() => toggleVerify(inv.id)}
+                      />
+                    ) : (
+                      <span className="text-txt-muted">—</span>
+                    )}
+                  </td>
                   <td className="px-3 py-3 text-sm">
                     {inv.shopify_order_number ? (
                       <span className="badge-paid sc-badge">
@@ -992,6 +1101,14 @@ export default function ClientDetail() {
                     </button>
                   </td>
                 </tr>
+                {openVerify.has(inv.id) && inv.verification && (
+                  <tr key={`${inv.id}-verify`} className="bg-dark-surface/40">
+                    <td colSpan={10} className="px-3 pb-3">
+                      <VerifyDetail v={inv.verification} />
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
               ))}
             </tbody>
           </table>
