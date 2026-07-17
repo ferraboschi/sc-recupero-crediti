@@ -15,8 +15,12 @@ usarla per qualsiasi match.
 import re
 from typing import Optional
 
-_FOREIGN_RE = re.compile(r"^[A-Z]{2,3}\d{8,15}$")
-_ITALIAN_RE = re.compile(r"^\d{11}$")
+# Solo cifre ASCII: `\d` è unicode-aware e int('٣') vale 3, quindi le cifre
+# arabo-indiane/fullwidth passavano il checksum e ottenevano la garanzia
+# forte, pur non potendo MAI combaciare con la gemella ASCII. Usate sempre
+# con fullmatch (il `$` tollera un '\n' finale).
+_FOREIGN_RE = re.compile(r"[A-Z]{2,3}[0-9]{8,15}")
+_ITALIAN_RE = re.compile(r"[0-9]{11}")
 
 # Prefissi paese italiani: 'IT' (ISO alpha-2, lo standard VIES/EU) e 'ITA'
 # (alpha-3, dai campi-paese di molti gestionali). Davanti a sole cifre sono
@@ -66,9 +70,9 @@ def validate_piva(raw: Optional[str]) -> Optional[str]:
     piva = normalize_piva(raw)
     if not piva:
         return None
-    if _ITALIAN_RE.match(piva):
+    if _ITALIAN_RE.fullmatch(piva):
         return piva if _italian_checksum_ok(piva) else None
-    if _FOREIGN_RE.match(piva):
+    if _FOREIGN_RE.fullmatch(piva):
         return piva
     return None
 
@@ -85,4 +89,4 @@ def is_checksum_backed(raw: Optional[str]) -> bool:
     inventata. Per una GARANZIA forte (semaforo verde) serve il checksum.
     """
     piva = validate_piva(raw)
-    return bool(piva and _ITALIAN_RE.match(piva))
+    return bool(piva and _ITALIAN_RE.fullmatch(piva))

@@ -105,6 +105,21 @@ def test_it_prefix_never_bypasses_italian_checksum():
     assert validate_piva("ITA12345678903") == "12345678903"
 
 
+def test_unicode_digits_never_pass_the_checksum():
+    """Le cifre non-ASCII non sono una P.IVA italiana valida.
+
+    Regressione preesistente: `\\d` in Python è unicode-aware e int('٣')==3,
+    quindi il checksum PASSAVA su cifre arabo-indiane/fullwidth/thai e
+    verify.py dava la garanzia forte a una stringa che non potrà mai
+    combaciare con la gemella ASCII (match mancato o cliente duplicato).
+    """
+    assert validate_piva("١٢٣٤٥٦٧٨٩٠٣") is None     # arabo-indiane
+    assert validate_piva("１２３４５６７８９０３") is None     # fullwidth
+    assert validate_piva("1234567890٣") is None     # mista ASCII+unicode
+    # la gemella ASCII resta valida
+    assert validate_piva("12345678903") == "12345678903"
+
+
 def test_foreign_piva_still_valid():
     """Le P.IVA estere vere non devono essere toccate dal fix."""
     assert validate_piva("DE123456789") == "DE123456789"
