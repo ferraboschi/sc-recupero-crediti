@@ -287,6 +287,11 @@ def _sync_invoices_task() -> dict:
                         # Keep status as open if it was paid before but reappeared
                         if existing.status == "paid" and inv.get("balance", 0) > 0:
                             existing.status = "open"
+                            # Non era pagata: la "pagata per assenza" è stata
+                            # smentita dai fatti. Lasciare paid_at la farebbe
+                            # contare per sempre nel recuperato.
+                            existing.paid_at = None
+                            existing.amount_due_at_paid = None
                         existing.updated_at = datetime.utcnow()
                         updated += 1
                     else:
@@ -334,6 +339,12 @@ def _sync_invoices_task() -> dict:
                                 # su fetch completi.
                                 streak = (known_inv.missing_streak or 0) + 1
                                 if streak >= PAID_ABSENCE_STREAK:
+                                    # Il residuo va fotografato PRIMA di
+                                    # azzerarlo: è l'importo davvero
+                                    # rientrato, e fra un istante non
+                                    # esisterà più.
+                                    known_inv.amount_due_at_paid = known_inv.amount_due
+                                    known_inv.paid_at = datetime.utcnow()
                                     known_inv.status = "paid"
                                     known_inv.amount_due = 0
                                     known_inv.missing_streak = 0
@@ -1364,6 +1375,9 @@ async def cleanup_stale_f24():
 
         count = 0
         for inv in stale:
+            # Residuo fotografato prima dell'azzeramento (vedi paid_at).
+            inv.amount_due_at_paid = inv.amount_due
+            inv.paid_at = datetime.utcnow()
             inv.status = "paid"
             inv.amount_due = 0
             inv.days_overdue = 0

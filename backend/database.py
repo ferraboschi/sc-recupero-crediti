@@ -95,6 +95,18 @@ class Invoice(Base):
     # abbinamento dubbio/critico e lo considera ok. Valorizzato = esce dai
     # problemi dell'audit (a meno di include_reviewed).
     audit_reviewed_at = Column(DateTime, nullable=True)
+    # Data di pagamento VERA: scritta nel momento in cui il sync marca la
+    # fattura 'paid', azzerata se la fattura riapre. Da non confondere con
+    # updated_at (onupdate: cambia a ogni modifica di riga, non è una data
+    # di pagamento). NULL sulle righe già pagate prima della migrazione:
+    # per quelle una data di pagamento vera non esiste e non va inventata —
+    # il KPI le tiene separate come "storico stimato".
+    paid_at = Column(DateTime, nullable=True)
+    # Residuo fotografato all'atto del pagamento. Serve perché i punti che
+    # marcano 'paid' azzerano amount_due: senza questo scatto, sommare il
+    # residuo delle pagate darebbe sempre 0. È il valore da sommare per il
+    # "recuperato" (l'importo PIENO sovrastima i pagamenti parziali).
+    amount_due_at_paid = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -287,6 +299,13 @@ def _run_migrations(engine):
         "UPDATE invoices SET missing_streak = 0 WHERE missing_streak IS NULL",
         # Audit abbinamenti: "Segna verificato" per le fatture già controllate
         "ALTER TABLE invoices ADD COLUMN audit_reviewed_at TIMESTAMP",
+        # Riconciliazione: data di pagamento vera + residuo all'atto del
+        # pagamento. NESSUN backfill: le righe già 'paid' non hanno una data
+        # di pagamento vera (updated_at non lo è) né un residuo recuperabile
+        # (amount_due è già stato azzerato). Restano NULL e il KPI le
+        # dichiara "storico stimato" invece di spacciarle per certe.
+        "ALTER TABLE invoices ADD COLUMN paid_at TIMESTAMP",
+        "ALTER TABLE invoices ADD COLUMN amount_due_at_paid DOUBLE PRECISION",
     ]
     try:
         raw = engine.raw_connection()
