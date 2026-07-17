@@ -219,12 +219,24 @@ def _sync_invoices_task() -> dict:
                         if due:
                             inv["due_date"] = due
                             inv["due_from_ledger"] = True
-                    cust = clienti_map.get((inv.get("customer_name") or "").strip().lower())
-                    if cust:
-                        if cust.get("piva"):
-                            inv["customer_piva"] = cust["piva"]
-                        inv["customer_phone"] = cust.get("phone")
-                        inv["customer_email"] = cust.get("email")
+                    # SOLO su anagrafica COMPLETA. Il guard degli omonimi vive
+                    # in fetch_clienti_map: quando due righe condividono il
+                    # nome e le P.IVA divergono, l'entry viene RIMOSSA dalla
+                    # mappa (fatturapro.py:818-823), così .get() non serve più
+                    # nulla per quel nome. Ma quel confronto vede solo le righe
+                    # SCARICATE: con un fetch parziale l'omonimo mai letto non
+                    # innesca la rimozione, la mappa sembra univoca e la P.IVA
+                    # finisce sull'azienda sbagliata — dove il matching per
+                    # P.IVA la aggancia in AUTOMATICO, non in quarantena.
+                    # Stessa disciplina di scad_ok (sopra) e del repair, che
+                    # salta il ciclo quando anagrafica_ok è False.
+                    if cli_ok:
+                        cust = clienti_map.get((inv.get("customer_name") or "").strip().lower())
+                        if cust:
+                            if cust.get("piva"):
+                                inv["customer_piva"] = cust["piva"]
+                            inv["customer_phone"] = cust.get("phone")
+                            inv["customer_email"] = cust.get("email")
 
                 # Build set of invoice numbers currently overdue in FatturaPro
                 fetched_invoice_numbers = set()
