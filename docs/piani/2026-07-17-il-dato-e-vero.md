@@ -53,7 +53,35 @@ perdere: ognuno merita una valutazione a sé.
    (audit nella scheda cliente): serve un esito `piva_malformata` distinto da
    `piva_contradiction`.
 
-3. **`normalize_piva` esplode su input non-stringa** (`piva.py:26`, `raw.strip()`).
+3. **`ragione_sociale_normalized` è una colonna decorativa** (`database.py:26`). Scritta in 5
+   punti (`sync.py:588,609,757`, `positions.py:462`, `customers.py:606`), **letta da zero**:
+   `matching.py:142-148` ricalcola la chiave fresca su entrambi i lati a ogni confronto.
+   Prova che è morta: `customers.py:602` ci scrive da sempre uno schema di normalizzazione
+   COMPLETAMENTE diverso (`re.sub(r'[^a-z0-9]','',lower)` → `'acmesrl'`, forme legali
+   incluse) e nessuno se n'è mai accorto — la colonna contiene già oggi formati mutuamente
+   incompatibili. **Conseguenza utile:** cambiare il normalizzatore non richiede backfill.
+   **Conseguenza da decidere:** o si elimina la colonna, o le si dà un writer unico e un
+   lettore. Oggi è solo un invito a sbagliare.
+
+4. **Sigle nude ambigue di secondo livello** (`normalizer.py`). Chiuse `SPA`/`ONG`/`SAPA`.
+   Restano, a rischio minore: `SAS` (articolo sardo — "Ristorante Sas Benas Srl" →
+   `ristorante benas`; ma `SAS` è una forma legale comune e reale, il rimedio costa più del
+   danno) e la **cascata trailing** `SA`+`P.A.` ("Ristorante Sa Pa Srl" → `ristorante`, due
+   voci trailing che si concatenano su "Sa Pa", città del Vietnam). Rimedio per la cascata:
+   una sola rimozione trailing per nome.
+
+5. **S.p.A. reale con sigla nuda NON finale** (`normalizer.py`). `"CAMPARI SPA MILANO"` →
+   `campari spa milano` ma `"Campari S.p.A. Milano"` → `campari milano`: le due grafie della
+   stessa società divergono. Verificato che il danno è contenuto (le fatture già abbinate
+   NON vengono staccate dal repair; le nuove degradano a quarantena, direzione sicura) e che
+   in FatturaPro/Shopify la sigla sta quasi sempre in coda. Mitigabile ancorando la variante
+   nuda a fine nome *o* seguita da soli token di forma legale.
+
+6. **Il confine `\w` non copre trattino e apostrofo** (`normalizer.py`).
+   `Sapa-Bistrot Srl` → `-bistrot`, `L'Ong Srl` → `l`. Chiavi storpiate (non collisioni):
+   priorità bassa, ma `l` è sotto `MIN_DISTINCTIVE_NAME_LEN` → cliente non abbinabile.
+
+7. **`normalize_piva` esplode su input non-stringa** (`piva.py:26`, `raw.strip()`).
    `normalize_piva(12345678903)` → `AttributeError`; `b"IT..."` → `TypeError`. Oggi **non
    raggiungibile** — verificato tracciando ogni writer: `fatturapro.py:795` e
    `shopify.py:219` fanno `.strip()`, l'import CSV usa `csv.DictReader` (stringhe, non
