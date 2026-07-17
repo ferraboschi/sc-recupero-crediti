@@ -25,7 +25,7 @@ import client from '../api/client'
  * Colori = significato (un colore, un senso):
  *   rosso  = scaduto/urgente        → Scaduto totale
  *   ambra  = lavorabile/da inseguire → Lavorabile
- *   verde  = incassato/confermato    → Recuperato certo
+ *   verde  = incasso presunto        → Presunto incassato
  *   muto   = tolto dalla lavorazione → Non abbinati / Esclusi / Contestati
  */
 
@@ -60,7 +60,7 @@ const GIORNI_OPTIONS = [30, 90, 180]
 const CHART_SERIES = [
   { key: 'scaduto_totale', label: 'Scaduto totale', color: '#f87171' }, // accent-red
   { key: 'lavorabile', label: 'Lavorabile', color: '#fbbf24' }, // accent-amber
-  { key: 'recuperato_certo', label: 'Recuperato', color: '#4ade80' }, // accent-green
+  { key: 'recuperato_certo', label: 'Presunto incassato', color: '#4ade80' }, // accent-green
 ]
 
 export default function RiconciliazioneCascata({ formatCurrency }) {
@@ -270,25 +270,34 @@ function Cascata({ recon, loading, error, onRetry, formatCurrency }) {
         </div>
       </div>
 
-      {/* Il recuperato — verde solo qui: è l'unico vero incasso confermato */}
+      {/* Il presunto incassato — verde: sparito dalla lista da incassare dopo
+          il sollecito. È dedotto per assenza (FatturaPro), non un pagamento
+          osservato: l'etichetta e la nota lo dicono senza spacciarlo per certo. */}
       {certo && (
         <div className="mt-4 pt-4 border-t border-dark-border">
           <div className="flex items-baseline justify-between gap-3">
             <div className="min-w-0">
               <p className="text-sm font-semibold text-accent-green">
-                {certo.label || 'Recuperato'}
+                {certo.label || 'Presunto incassato'}
                 <span className="ml-2 text-[10px] font-normal text-txt-muted uppercase tracking-wide">
-                  certo
+                  presunto
                 </span>
               </p>
               <p className="text-xs text-txt-muted">
-                {certo.fatture ?? 0} fatture · pagato dopo il sollecito
+                {certo.fatture ?? 0} fatture · sparite dalla lista dopo il sollecito
               </p>
             </div>
             <p className="text-lg sm:text-xl font-bold text-accent-green whitespace-nowrap tabular-nums">
               {formatCurrency(certo.importo || 0)}
             </p>
           </div>
+
+          {/* La nota onesta: dedotto per assenza, non verificato */}
+          {certo.nota && (
+            <p className="mt-1.5 text-[11px] leading-snug text-txt-muted">
+              {certo.nota}
+            </p>
+          )}
 
           {/* Lo storico stimato — MAI sommato al certo, con la sua nota onesta */}
           {stimato && (stimato.fatture || 0) > 0 && (
@@ -456,7 +465,7 @@ function EvoluzioneChart({ serie, formatCurrency }) {
         <Line
           type="monotone"
           dataKey="recuperato_certo"
-          name="Recuperato"
+          name="Presunto incassato"
           stroke="#4ade80"
           strokeWidth={2}
           dot={false}
