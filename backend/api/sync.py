@@ -69,6 +69,42 @@ _sync_status = {
 
 _sync_loaded = False
 
+# Tracker di PROGRESSO live del full sync (solo in memoria: una sola istanza
+# Render). Lo legge GET /sync/status → la Dashboard mostra il passo corrente
+# sotto il pulsante Sincronizza, così l'operatore non resta minuti davanti a
+# un messaggio statico che sembra rotto. Non viene persistito: a un riavvio si
+# riparte da running=False e va benissimo (nessun sync è in corso).
+_sync_progress = {
+    "running": False,
+    "step_key": None,
+    "step_label": None,
+    "step_index": 0,
+    "total_steps": 0,
+    "started_at": None,
+    "updated_at": None,
+    "manual": False,
+    "include_order_matching": True,
+}
+
+
+def _set_progress(step_key: str, label: str, index: int, total: int):
+    """Segna il passo CORRENTE del full sync (prima di eseguirlo)."""
+    _sync_progress["step_key"] = step_key
+    _sync_progress["step_label"] = label
+    _sync_progress["step_index"] = index
+    _sync_progress["total_steps"] = total
+    _sync_progress["updated_at"] = datetime.utcnow().isoformat()
+
+
+def _clear_progress():
+    """Chiude il progresso: running=False. Chiamato SEMPRE nel finally del
+    full sync — anche se un passo esplode a metà — così la Dashboard smette
+    di attendere e mostra l'esito invece di restare bloccata."""
+    _sync_progress["running"] = False
+    _sync_progress["step_key"] = None
+    _sync_progress["step_label"] = None
+    _sync_progress["updated_at"] = datetime.utcnow().isoformat()
+
 
 def _load_sync_state():
     """Load persisted sync state from DB on first access."""
@@ -1113,16 +1149,25 @@ async def sync_cases(background_tasks: BackgroundTasks):
     }
 
 
-def _full_sync_task() -> dict:
+def _full_sync_task(include_order_matching: bool = True, manual: bool = False) -> dict:
     """Run full sync sequentially:
-    invoices → customers → matching → auto-create → cases → order matching.
+    invoices → customers → [repair] → matching → auto-create → cases →
+    order matching.
 
     L'aggancio ordini è l'ULTIMO passo e il più lento (interroga Shopify):
     non serve per vedere/lavorare gli insoluti (attacca solo il numero
     d'ordine alla fattura). Sta DOPO 'cases' apposta — il marker che la
     Dashboard attende (cases.last_sync) scatta a ~2 min, così l'operatore
-    non aspetta i minuti dell'aggancio ordini, che prosegue in background.
-    Il fetch di fatture e clienti NUOVI resta invariato (passi 1-4).
+    non aspetta i minuti dell'aggancio ordini. Il fetch di fatture e clienti
+    NUOVI resta invariato (passi 1-4).
+
+    include_order_matching=False → SALTA l'aggancio ordini Shopify: è la
+    modalità del sync ORARIO automatico (leggera, non rate-limited). Fatture,
+    clienti, abbinamenti e pratiche vengono comunque aggiornati; l'aggancio
+    ordini gira solo nel sync giornaliero e allo startup (una volta al giorno).
+
+    Il tracker _sync_progress viene popolato all'inizio di ogni passo così la
+    Dashboard può mostrare l'avanzamento live (running=True fino al finally).
 
     Uses a mutex to prevent concurrent full syncs from corrupting data.
     """
@@ -1130,11 +1175,28 @@ def _full_sync_task() -> dict:
         logger.warning("Full sync already in progress, skipping")
         return {"error": "Sync already in progress"}
 
+    # 7 passi col full sync, 6 senza l'aggancio ordini finale.
+    total_steps = 7 if include_order_matching else 6
+    now_iso = datetime.utcnow().isoformat()
+    _sync_progress["running"] = True
+    _sync_progress["manual"] = manual
+    _sync_progress["include_order_matching"] = include_order_matching
+    _sync_progress["total_steps"] = total_steps
+    _sync_progress["step_index"] = 0
+    _sync_progress["step_key"] = None
+    _sync_progress["step_label"] = None
+    _sync_progress["started_at"] = now_iso
+    _sync_progress["updated_at"] = now_iso
+
     try:
-        logger.info("Starting full sync (sequential)...")
+        logger.info(
+            "Starting full sync (sequential, include_order_matching=%s)...",
+            include_order_matching,
+        )
         results = {}
 
         # Step 1: Sync invoices first (gets latest data from platforms)
+        _set_progress("invoices", "Fatture (FatturaPro)", 1, total_steps)
         try:
             results["invoices"] = _sync_invoices_task()
         except Exception as e:
@@ -1142,13 +1204,14 @@ def _full_sync_task() -> dict:
             results["invoices"] = {"error": str(e)}
 
         # Step 2: Sync customers from Shopify
+        _set_progress("customers", "Clienti (Shopify)", 2, total_steps)
         try:
             results["customers"] = _sync_customers_task()
         except Exception as e:
             logger.error(f"Customer sync failed: {e}", exc_info=True)
             results["customers"] = {"error": str(e)}
 
-        # Step 2.5: Repair RICORRENTE degli abbinamenti. Gira QUI, dopo che
+        # Step 3: Repair RICORRENTE degli abbinamenti. Gira QUI, dopo che
         # il sync fatture ha popolato le P.IVA reali dall'anagrafica: le
         # contraddizioni P.IVA sono visibili e i casi legacy tipo
         # QOQA→Rooftop vengono separati. Il lock è già del full sync,
@@ -1156,6 +1219,7 @@ def _full_sync_task() -> dict:
         # SOLO su enrichment COMPLETO: la P.IVA che il repair legge viene
         # dall'ANAGRAFICA — con fetch parziali un detach potrebbe basarsi su
         # dati incompleti; si salta il ciclo e si ritenta al successivo.
+        _set_progress("repair", "Riparazione abbinamenti", 3, total_steps)
         inv_res = results.get("invoices", {})
         fp_res = inv_res.get("fatturapro", {}) if isinstance(inv_res, dict) else {}
         enrichment_complete = (
@@ -1181,25 +1245,28 @@ def _full_sync_task() -> dict:
                 fp_res.get("partial"), fp_res.get("anagrafica_ok"),
             )
 
-        # Step 3: Matching (abbinamenti sicuri + quarantena suggerimenti)
+        # Step 4: Matching (abbinamenti sicuri + quarantena suggerimenti)
+        _set_progress("matching", "Abbinamento fatture", 4, total_steps)
         try:
             results["matching"] = _run_matching_task()
         except Exception as e:
             logger.error(f"Matching failed: {e}", exc_info=True)
             results["matching"] = {"error": str(e)}
 
-        # Step 4: Auto-create clienti SOLO per fatture senza alcun candidato
+        # Step 5: Auto-create clienti SOLO per fatture senza alcun candidato
         # (deve girare DOPO il matching, mai prima)
+        _set_progress("auto_create", "Creazione clienti mancanti", 5, total_steps)
         try:
             results["auto_create"] = _auto_create_task()
         except Exception as e:
             logger.error(f"Auto-create failed: {e}", exc_info=True)
             results["auto_create"] = {"error": str(e)}
 
-        # Step 5: Case lifecycle. Con fetch fatture PARZIALE la payment
+        # Step 6: Case lifecycle. Con fetch fatture PARZIALE la payment
         # detection non è affidabile → niente chiusure (solo aperture).
         # È l'ULTIMO passo "interattivo": il suo marker (cases.last_sync)
         # segnala alla Dashboard che i dati che servono sono pronti.
+        _set_progress("cases", "Pratiche di recupero", 6, total_steps)
         try:
             invoices_result = results.get("invoices", {})
             fp = invoices_result.get("fatturapro", {}) if isinstance(invoices_result, dict) else {}
@@ -1209,31 +1276,39 @@ def _full_sync_task() -> dict:
             logger.error(f"Case lifecycle failed: {e}", exc_info=True)
             results["cases"] = {"error": str(e)}
 
-        logger.info("Interactive sync complete; order matching (enrichment) follows")
-
-        # Step 6 (background enrichment): aggancio ordini Shopify. Ultimo e
-        # più lento — la Dashboard ha già smesso di attendere (marker cases).
+        # Step 7 (enrichment finale): aggancio ordini Shopify. Ultimo e più
+        # lento — la Dashboard ha già smesso di attendere (marker cases).
         # Attacca solo shopify_order_id/number a fatture già presenti: non
-        # crea clienti né fatture, quindi ritardarlo non perde nulla di nuovo.
-        try:
-            results["order_matching"] = _match_orders_task()
-        except Exception as e:
-            logger.error(
-                f"Order matching failed: {e}", exc_info=True
-            )
-            results["order_matching"] = {"error": str(e)}
+        # crea clienti né fatture, quindi ritardarlo (o saltarlo nel sync
+        # orario) non perde nulla di nuovo.
+        if include_order_matching:
+            logger.info("Interactive sync complete; order matching (enrichment) follows")
+            _set_progress("order_matching", "Aggancio ordini Shopify", 7, total_steps)
+            try:
+                results["order_matching"] = _match_orders_task()
+            except Exception as e:
+                logger.error(
+                    f"Order matching failed: {e}", exc_info=True
+                )
+                results["order_matching"] = {"error": str(e)}
+        else:
+            logger.info("Full sync completed (order matching skipped: light/hourly run)")
 
         logger.info(f"Full sync completed: {results}")
         return results
     finally:
+        _clear_progress()
         _sync_lock.release()
 
 
 @router.post("/full")
 async def sync_full(background_tasks: BackgroundTasks):
     """Trigger full sync (sequential):
-    invoices → customers → matching → auto-create → order matching → cases."""
-    background_tasks.add_task(_full_sync_task)
+    invoices → customers → matching → auto-create → cases → order matching.
+
+    Trigger MANUALE dalla Dashboard → sync COMPLETO (con aggancio ordini) e
+    manual=True nel tracker di progresso."""
+    background_tasks.add_task(_full_sync_task, include_order_matching=True, manual=True)
 
     return {
         "status": "sync_started",
@@ -1243,10 +1318,17 @@ async def sync_full(background_tasks: BackgroundTasks):
 
 @router.get("/status")
 async def get_sync_status():
-    """Get the last sync timestamps and results."""
+    """Get the last sync timestamps and results.
+
+    - last_sync: esito per-step persistito (marker cases = fine pipeline)
+    - progress: avanzamento LIVE del full sync in corso (running/step_index/
+      total_steps/step_label) — la Dashboard lo mostra sotto il pulsante
+    - scheduler: stato dello scheduler (cron giornaliero + orario)
+    """
     _load_sync_state()
     return {
         "last_sync": _sync_status,
+        "progress": dict(_sync_progress),
         "scheduler": get_scheduler_status(),
     }
 
