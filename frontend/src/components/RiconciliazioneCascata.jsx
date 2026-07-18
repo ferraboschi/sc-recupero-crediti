@@ -263,7 +263,11 @@ function Cascata({ recon, loading, error, onRetry, formatCurrency }) {
               >
                 {isSconosciuto && <span aria-hidden="true">⚠</span>}
                 {STATO_LABELS[stato] || stato}
+                {/* L'unità è esplicita: i chip contano FATTURE, la KPI
+                    "Clienti da Gestire" conta aziende — senza "fatt." i due
+                    numeri sembravano lo stesso dato in disaccordo. */}
                 <span className="font-bold">{s.fatture}</span>
+                <span className="text-[10px] text-txt-muted">fatt.</span>
               </span>
             )
           })}

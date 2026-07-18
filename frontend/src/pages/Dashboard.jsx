@@ -404,7 +404,10 @@ export default function Dashboard() {
         <StatsWidget label="Totale Scaduto" value={formatCurrency(data.total_scaduto || 0)} color="red" />
         <StatsWidget label="Fatture Scadute" value={data.total_fatture_scadute || 0} subtitle="numero fatture" color="orange" />
         <StatsWidget label="Clienti con Scaduto" value={data.total_clienti_scaduti || 0} subtitle="numero aziende" color="purple" />
-        <StatsWidget label="Da Gestire" value={todos.length || 0} color="blue" />
+        {/* "Clienti da Gestire", non "Da Gestire": il chip omonimo della
+            cascata conta FATTURE, questo conta AZIENDE — stessa etichetta
+            con numeri diversi si leggeva come un bug. */}
+        <StatsWidget label="Clienti da Gestire" value={todos.length || 0} subtitle="numero aziende" color="blue" />
       </div>
 
       {/* Clienti Da Fare - with filters and sorting */}
