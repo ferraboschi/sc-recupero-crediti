@@ -423,6 +423,40 @@ class TestAssignNamePreviewHonesty:
         assert not cust.ragione_sociale_locked
 
 
+# ── Unlock: la via di ritorno dal rinomino sbagliato (S4) ────────────
+
+class TestUnlockName:
+    def test_unlock_clears_lock_and_logs(self, test_client, test_db_session):
+        cust = _mk_customer(test_db_session, ragione_sociale_locked=True)
+        # La scheda cliente dichiara il lock (serve alla UI per il bottone).
+        detail = test_client.get(f"/api/customers/{cust.id}").json()
+        assert detail["ragione_sociale_locked"] is True
+
+        r = test_client.post(f"/api/customers/{cust.id}/unlock-name")
+        assert r.status_code == 200
+        test_db_session.refresh(cust)
+        assert cust.ragione_sociale_locked is False
+
+        log = test_db_session.query(ActivityLog).filter_by(
+            action="audit_unlock_name"
+        ).one()
+        assert log.entity_type == "customer"
+        assert log.entity_id == cust.id
+        assert log.details["ragione_sociale"] == OLD_NAME
+
+        detail = test_client.get(f"/api/customers/{cust.id}").json()
+        assert detail["ragione_sociale_locked"] is False
+
+    def test_unlock_400_when_not_locked(self, test_client, test_db_session):
+        cust = _mk_customer(test_db_session)
+        r = test_client.post(f"/api/customers/{cust.id}/unlock-name")
+        assert r.status_code == 400
+
+    def test_unlock_404_when_customer_missing(self, test_client):
+        r = test_client.post("/api/customers/99999/unlock-name")
+        assert r.status_code == 404
+
+
 # ── Il sync Shopify rispetta il lock ─────────────────────────────────
 
 SHOPIFY_ID = "gid://shopify/Customer/777"
@@ -486,6 +520,29 @@ class TestSyncRespectsNameLock:
         result = self._run_sync(monkeypatch, test_db_session)
         assert result["success"] is True
 
+        row = test_db_session.query(Customer).filter_by(
+            shopify_id=SHOPIFY_ID
+        ).one()
+        assert row.ragione_sociale == OLD_NAME
+        assert row.ragione_sociale_normalized == normalize_ragione_sociale(OLD_NAME)
+
+    def test_unlock_then_sync_governs_name_again(
+        self, test_client, monkeypatch, test_db_session
+    ):
+        """S4, la via di ritorno completa: dopo lo sblocco il sync torna a
+        governare il nome al giro successivo (nessun limbo permanente)."""
+        cust = _mk_customer(
+            test_db_session, name=NEW_NAME,
+            shopify_id=SHOPIFY_ID, source="shopify",
+            ragione_sociale_locked=True,
+        )
+        r = test_client.post(f"/api/customers/{cust.id}/unlock-name")
+        assert r.status_code == 200
+
+        result = self._run_sync(monkeypatch, test_db_session)
+        assert result["success"] is True
+
+        # re-query: il task chiude la sessione e stacca le istanze
         row = test_db_session.query(Customer).filter_by(
             shopify_id=SHOPIFY_ID
         ).one()

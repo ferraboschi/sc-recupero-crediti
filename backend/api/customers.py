@@ -490,6 +490,9 @@ async def get_customer_detail(
             "phones": customer.phones_json or [],
             "email": customer.email,
             "excluded": customer.excluded,
+            # Nome bloccato dalla bonifica manuale (assign-name-to-customer):
+            # la UI mostra il badge + "Sblocca nome" solo quando è True.
+            "ragione_sociale_locked": bool(customer.ragione_sociale_locked),
             "source": customer.source,
             "phone_validated": customer.phone_validated,
             "shopify_id": customer.shopify_id,
@@ -732,6 +735,59 @@ async def toggle_customer_exclusion(
         raise
     except Exception as e:
         logger.error(f"Error updating customer exclusion: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.post("/{customer_id}/unlock-name")
+async def unlock_customer_name(
+    customer_id: int,
+    session: Session = Depends(get_session),
+):
+    """Sblocca la ragione sociale bonificata a mano (rename amministrativo).
+
+    Via di ritorno da un rinomino sbagliato (assign-name-to-customer): senza
+    questo endpoint un cliente con una sola fattura resterebbe nel limbo per
+    sempre — il lock ferma il sync, nessuna fattura porta il vecchio nome,
+    nessun endpoint modifica il nome. Rimosso il lock, il sync Shopify torna
+    a governare il nome dal giro successivo.
+    """
+    try:
+        customer = session.query(Customer).filter(
+            Customer.id == customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        if not customer.ragione_sociale_locked:
+            raise HTTPException(
+                status_code=400,
+                detail="Il nome di questo cliente non è bloccato",
+            )
+
+        customer.ragione_sociale_locked = False
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_unlock_name",
+            entity_type="customer",
+            entity_id=customer_id,
+            details={
+                "ragione_sociale": customer.ragione_sociale,
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"Nome del cliente {customer_id} "
+            f"('{customer.ragione_sociale}') sbloccato: il sync torna a "
+            f"governarlo"
+        )
+        return {"ok": True, "customer_id": customer.id, "locked": False}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error unlocking customer name: {e}", exc_info=True)
         session.rollback()
         raise
 
