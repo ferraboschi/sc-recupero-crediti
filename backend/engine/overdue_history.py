@@ -108,10 +108,19 @@ def backfill_overdue_history(session, days: int = HISTORY_BACKFILL_DAYS) -> dict
     aveva al giorno D usando i dati fattura di OGGI:
 
     - una fattura era "aperta e scaduta" al giorno D se `due_date <= D` e
-      non era ancora pagata a quella data. "Pagata al giorno D": `paid_at <=
-      D` se paid_at esiste; per le `status='paid'` SENZA paid_at (storico
-      pre-migrazione) si usa `updated_at` come data-pagamento stimata — la
-      stessa convenzione dello "storico stimato" di /riconciliazione.
+      non era ancora pagata a quella data. "Pagata al giorno D": `paid_at
+      <= D`. Le `status='paid'` SENZA paid_at (storico pre-migrazione) sono
+      ESCLUSE dalla serie — trattate come già pagate a tutte le date della
+      finestra. Datarle con updated_at sembrava naturale, ma updated_at
+      viene bumpata dai sync (_recalculate_days_overdue azzera il
+      days_overdue delle paid, il repair, assign-piva): misurato in
+      condizioni realistiche produceva un gradino permanente del +51% alla
+      giunzione stima→vero (la promozione tocca solo la riga di oggi, mai
+      il passato). L'esclusione rende la giunzione continua PER COSTRUZIONE
+      — le pagate non compaiono nemmeno nel punto vero — al costo di una
+      SOTTOSTIMA del passato remoto, onesta e nella direzione sicura.
+      NB: lo "storico stimato" di /riconciliazione mantiene la SUA
+      convenzione updated_at — è un'altra metrica, già etichettata.
     - LIMITE ONESTO sugli importi: per le pagate il residuo storico non
       esiste più (amount_due è stato azzerato al pagamento), quindi si usa
       l'importo PIENO (`amount`); per le ancora aperte si usa `amount_due`
@@ -129,9 +138,12 @@ def backfill_overdue_history(session, days: int = HISTORY_BACKFILL_DAYS) -> dict
 
     Scrive righe `OverdueSnapshot(estimated=True)` SOLO per le date senza
     alcuno snapshot: le righe VERE non si toccano mai, e nemmeno le stime
-    già scritte (idempotente per costruzione). Non fa commit: flush soltanto
-    — il chiamante decide il confine transazionale (il marker one-shot viene
-    scritto nello STESSO commit).
+    già scritte (idempotente per costruzione). La stima è CONGELATA al
+    primo avvio: il marker one-shot non riesegue, quindi import retroattivi
+    correggono solo i punti veri futuri, mai il tratteggio — la curva
+    stimata non cambia sotto gli occhi dell'utente. Non fa commit: flush
+    soltanto — il chiamante decide il confine transazionale (il marker
+    viene scritto nello STESSO commit).
     """
     today = business_day_start().date()
     start = today - timedelta(days=days)
@@ -152,7 +164,6 @@ def backfill_overdue_history(session, days: int = HISTORY_BACKFILL_DAYS) -> dict
             Invoice.due_date,
             Invoice.status,
             Invoice.paid_at,
-            Invoice.updated_at,
             Invoice.amount,
             Invoice.amount_due,
         )
@@ -161,19 +172,19 @@ def backfill_overdue_history(session, days: int = HISTORY_BACKFILL_DAYS) -> dict
         .all()
     )
 
-    # Pre-digest: (bucket, due_date, data-pagamento stimata | None, importo).
+    # Pre-digest: (bucket, due_date, data-pagamento | None, importo).
     universe = []
-    for bucket, due, status, paid_at, updated_at, amount, amount_due in invoice_rows:
+    for bucket, due, status, paid_at, amount, amount_due in invoice_rows:
         if paid_at is not None:
             paid_on = paid_at.date()
         elif status == "paid":
-            # Storico pre-migrazione: updated_at come data-pagamento stimata.
-            # Senza nemmeno updated_at non c'è NULLA che dati il pagamento:
-            # la riga si tratta come pagata da sempre (mai nella serie) —
-            # meglio ometterla che inventarle una permanenza nello scaduto.
-            if updated_at is None:
-                continue
-            paid_on = updated_at.date()
+            # Paid SENZA paid_at (pre-migrazione): ESCLUSA dalla serie,
+            # come già pagata a ogni data della finestra. updated_at NON è
+            # un proxy della data di pagamento — i sync la bumpano di
+            # continuo e la fattura resterebbe "aperta" in tutto il
+            # tratteggio, creando il gradino alla giunzione col punto vero
+            # (che le pagate non le conta affatto). Vedi docstring.
+            continue
         else:
             paid_on = None  # mai pagata: aperta ancora oggi
         importo = float(amount or 0) if status == "paid" else float(amount_due or 0)

@@ -18,7 +18,11 @@ Copertura:
 
 Backfill STIMATO dello storico (sezioni D-G):
 - la stima a un giorno D ricostruita dalle date fattura (aperte /
-  pagate-con-paid_at / pagate-senza, che usano updated_at)
+  pagate-con-paid_at / pagate-SENZA-paid_at, ESCLUSE dalla serie: updated_at
+  viene bumpata dai sync e datarci il pagamento creava un gradino permanente
+  alla giunzione stima→vero)
+- lo scenario del cliff misurato: paid pre-migrazione toccate dal sync NON
+  producono nessun gradino — stimato(ieri) == vero(oggi) per costruzione
 - la classificazione di OGGI proiettata indietro (esclusi/contestati/orfane)
 - il backfill NON sovrascrive mai righe esistenti (vere O stimate)
 - lo snapshot vero (record_overdue_snapshot) RIMPIAZZA la stima sulla stessa
@@ -316,13 +320,15 @@ class TestSyncWiring:
 class TestBackfillStimato:
     def test_stima_a_un_giorno_con_mix(self, test_db_session):
         """La stima a un giorno D con il mix completo: aperta, pagata con
-        paid_at, pagata SENZA paid_at (storico pre-migrazione → updated_at).
+        paid_at, pagata SENZA paid_at (storico pre-migrazione).
 
         - A (aperta, cliente):    due=today-40, amount_due=100 → scaduta da D>=due
         - B (pagata, paid_at=−10gg, cliente): due=today-40, amount=200 pieno
           → scaduta per D in [today-40, paid_at), poi sparisce
-        - C (pagata SENZA paid_at, updated_at=−20gg, ORFANA): due=today-50,
-          amount=300 pieno → scaduta per D in [today-50, updated_at)
+        - C (pagata SENZA paid_at, ORFANA): ESCLUSA dalla serie a ogni data.
+          Non ha una data di pagamento vera e updated_at NON è un proxy
+          affidabile (i sync la bumpano di continuo): datarci il pagamento
+          creava un gradino permanente alla giunzione stima→vero.
         """
         today = _business_today()
         now = datetime.utcnow()
@@ -354,20 +360,21 @@ class TestBackfillStimato:
         assert stats["created"] == 60
         assert all(s.estimated for s in rows.values())
 
-        # D=today-45: solo C è già scaduta (A e B scadono a today-40)
+        # D=today-45: A e B non ancora scadute (due=today-40), C esclusa
+        # dalla serie (paid senza paid_at) → il punto è a zero
         s45 = rows[today - timedelta(days=45)]
-        assert s45.scaduto_totale == 300.0
-        assert s45.non_abbinati == 300.0  # C è orfana
+        assert s45.scaduto_totale == 0.0
+        assert s45.non_abbinati == 0.0
 
-        # D=today-30: A(100) + B(200, non ancora pagata) + C(300, idem)
+        # D=today-30: A(100) + B(200, non ancora pagata); C mai contata
         s30 = rows[today - timedelta(days=30)]
-        assert s30.scaduto_totale == 600.0
+        assert s30.scaduto_totale == 300.0
         assert s30.lavorabile == 300.0        # A + B (cliente normale)
-        assert s30.non_abbinati == 300.0      # C
-        assert s30.scaduto_totale_fatture == 3
+        assert s30.non_abbinati == 0.0        # C esclusa, non "orfana aperta"
+        assert s30.scaduto_totale_fatture == 2
         assert s30.lavorabile_fatture == 2
 
-        # D=today-15: C ormai "pagata" (updated_at −20gg) → restano A + B
+        # D=today-15: B ancora in circolo (paid_at −10gg) → A + B
         s15 = rows[today - timedelta(days=15)]
         assert s15.scaduto_totale == 300.0
         assert s15.non_abbinati == 0.0
@@ -377,6 +384,76 @@ class TestBackfillStimato:
         assert s5.scaduto_totale == 100.0
         assert s5.lavorabile == 100.0
         assert s5.scaduto_totale_fatture == 1
+
+    def test_paid_con_paid_at_esce_alla_sua_data(self, test_db_session):
+        """Le pagate CON paid_at (data di pagamento vera) continuano a
+        uscire dallo scaduto stimato alla loro data: l'esclusione riguarda
+        SOLO le paid senza paid_at."""
+        today = _business_today()
+        now = datetime.utcnow()
+        _invoice(test_db_session, "PAY/1", amount=400.0, amount_due=0.0,
+                 status="paid", days_overdue=0,
+                 due_date=today - timedelta(days=25),
+                 issue_date=today - timedelta(days=55),
+                 paid_at=now - timedelta(days=10))
+
+        backfill_overdue_history(test_db_session, days=30)
+        test_db_session.commit()
+
+        rows = {s.date: s for s in test_db_session.query(OverdueSnapshot).all()}
+        assert rows[today - timedelta(days=15)].scaduto_totale == 400.0, \
+            "ancora in circolo prima del pagamento"
+        assert rows[today - timedelta(days=5)].scaduto_totale == 0.0, \
+            "uscita dallo scaduto alla sua data di pagamento"
+
+    def test_niente_gradino_alla_giunzione(self, test_db_session):
+        """LO SCENARIO DEL CLIFF (misurato dal controagente): 150 paid
+        pre-migrazione (senza paid_at) con updated_at bumpata OGGI da un
+        sync — trigger plausibili in prod: _recalculate_days_overdue,
+        repair, assign-piva.
+
+        Con la convenzione updated_at la serie stimata le contava aperte
+        per tutta la finestra: stimato(ieri) 1.097.681 € contro il punto
+        vero di oggi 725.206 € — un gradino permanente del +51,4% alla
+        giunzione (la promozione tocca solo la riga di oggi, mai il
+        passato). ESCLUSE dalla stima, la giunzione è continua PER
+        COSTRUZIONE: le pagate non compaiono né nella stima né nel vero.
+        """
+        today = _business_today()
+        now = datetime.utcnow()
+        c = _customer(test_db_session, "Grosso Cliente SRL")
+
+        # Lo scaduto vero di oggi: 725.206 € su 3 fatture aperte
+        for i, (ago, imp) in enumerate(
+            [(60, 300000.0), (45, 300000.0), (30, 125206.0)]
+        ):
+            _invoice(test_db_session, f"OPN/{i}", amount_due=imp,
+                     due_date=today - timedelta(days=ago),
+                     issue_date=today - timedelta(days=ago + 30),
+                     days_overdue=ago, customer_id=c.id)
+
+        # 150 paid pre-migrazione (372.475,50 € pieni), toccate oggi dal sync
+        for i in range(150):
+            _invoice(test_db_session, f"OLD/{i}", amount=2483.17,
+                     amount_due=0.0, status="paid", days_overdue=0,
+                     due_date=today - timedelta(days=50 + (i % 30)),
+                     issue_date=today - timedelta(days=90 + (i % 30)),
+                     customer_id=c.id, updated_at=now)
+
+        backfill_overdue_history(test_db_session, days=30)
+        test_db_session.commit()
+        vero_oggi = record_overdue_snapshot(test_db_session)
+
+        ieri = (test_db_session.query(OverdueSnapshot)
+                .filter(OverdueSnapshot.date == today - timedelta(days=1))
+                .one())
+        assert ieri.estimated is True
+        assert vero_oggi.estimated is False
+        # Nessun gradino: stimato(ieri) == vero(oggi), non 1.097.681 vs 725.206
+        assert ieri.scaduto_totale == 725206.0
+        assert vero_oggi.scaduto_totale == 725206.0
+        assert ieri.scaduto_totale_fatture == 3
+        assert vero_oggi.scaduto_totale_fatture == 3
 
     def test_classificazione_di_oggi_proiettata_indietro(self, test_db_session):
         """Esclusi e contestati di OGGI restano tali anche nella stima:
