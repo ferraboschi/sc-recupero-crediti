@@ -1,7 +1,7 @@
 """Customers API endpoints."""
 
 import logging
-from typing import Optional
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import or_, func
@@ -457,6 +457,104 @@ async def bonifica_suggestions(session: Session = Depends(get_session)):
 
     items.sort(key=lambda i: (-i["confidence"], -i["total_overdue"], i["customer_id"]))
     return {"total": len(items), "items": items}
+
+
+class BonificaBulkRequest(BaseModel):
+    customer_ids: List[int]
+
+
+@router.post("/bonifica-piva/bulk")
+async def bonifica_piva_bulk(
+    body: BonificaBulkRequest,
+    session: Session = Depends(get_session),
+):
+    """Applica la bonifica P.IVA a PIÙ clienti in un colpo (dalla lista di
+    revisione). Per ogni id RI-VALIDA server-side il criterio (non ci si fida
+    del client) e poi assegna la P.IVA al cliente — stessa logica di
+    assign-piva-to-customer (customer.partita_iva = P.IVA valida). La cascade è
+    automatica: verify è calcolato dal vivo, quindi assegnata la P.IVA tutte le
+    fatture del cliente (presenti e future) con quella P.IVA diventano verdi.
+
+    Esito per-id:
+    - applied          — P.IVA assegnata;
+    - skipped_conflict — nel frattempo le fatture portano P.IVA diverse;
+    - skipped_has_piva — il cliente ha già una P.IVA valida (idempotenza:
+                         ri-eseguire su un bonificato NON è un errore);
+    - skipped_no_piva  — nessuna P.IVA valida da assegnare (dati cambiati);
+    - not_found        — cliente inesistente.
+
+    Definito PRIMA di /{customer_id} (path a due segmenti, ma per coerenza sta
+    con l'altra rotta di bonifica). Efficiente anche qui: i clienti e le loro
+    fatture non-pagate si caricano in DUE query, non una per id.
+    """
+    try:
+        # Dedup preservando l'ordine ricevuto (l'esito segue l'ordine input).
+        ids = list(dict.fromkeys(body.customer_ids or []))
+        if not ids:
+            return {"applied": 0, "results": []}
+
+        customers = {
+            c.id: c
+            for c in session.query(Customer).filter(Customer.id.in_(ids)).all()
+        }
+        inv_by_customer = {}
+        for inv in session.query(Invoice).filter(
+            Invoice.customer_id.in_(ids),
+            Invoice.status != "paid",
+        ).all():
+            inv_by_customer.setdefault(inv.customer_id, []).append(inv)
+
+        results = []
+        applied = 0
+        for cid in ids:
+            cust = customers.get(cid)
+            if cust is None:
+                results.append({"customer_id": cid, "result": "not_found"})
+                continue
+            # Idempotenza + guardia: se ha già una P.IVA valida, niente da fare.
+            if validate_piva(cust.partita_iva) is not None:
+                results.append({"customer_id": cid, "result": "skipped_has_piva"})
+                continue
+            outcome = _single_shared_piva(cust, inv_by_customer.get(cid, []))
+            if outcome and outcome[0] == "single":
+                _, the_piva, carrier_ids, confidence = outcome
+                # Stessa scrittura di assign-piva-to-customer: solo la P.IVA
+                # (ragione_sociale_normalized resta invariato).
+                cust.partita_iva = the_piva
+                session.add(ActivityLog(
+                    action="audit_assign_piva",
+                    entity_type="customer",
+                    entity_id=cid,
+                    details={
+                        "customer_id": cid,
+                        "piva": the_piva,
+                        "invoice_count": len(carrier_ids),
+                        "confidence": confidence,
+                        "bulk": True,
+                    },
+                ))
+                applied += 1
+                results.append({
+                    "customer_id": cid, "result": "applied", "piva": the_piva,
+                })
+            elif outcome and outcome[0] == "conflict":
+                results.append({
+                    "customer_id": cid, "result": "skipped_conflict",
+                    "pivas": outcome[1],
+                })
+            else:
+                results.append({"customer_id": cid, "result": "skipped_no_piva"})
+
+        session.commit()
+        logger.info(
+            f"Bonifica P.IVA in blocco: {applied}/{len(ids)} clienti bonificati"
+        )
+        return {"applied": applied, "results": results}
+
+    except Exception as e:
+        logger.error(f"Error in bulk P.IVA bonifica: {e}", exc_info=True)
+        session.rollback()
+        raise
 
 
 @router.get("/{customer_id}")

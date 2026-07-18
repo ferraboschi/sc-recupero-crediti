@@ -221,3 +221,84 @@ class TestBonificaSuggestionsEfficiency:
             f"query cresciute col n. clienti: {n_small} → {n_big} (N+1)"
         )
         assert n_small <= 2, f"attesa UNA passata aggregata, non {n_small} SELECT"
+
+
+# ── D) POST /customers/bonifica-piva/bulk ────────────────────────────
+
+def _bulk(test_client, ids):
+    return test_client.post(
+        "/api/customers/bonifica-piva/bulk", json={"customer_ids": ids}
+    ).json()
+
+
+class TestBonificaBulkApply:
+    def test_applies_and_cascades(self, test_client, test_db_session):
+        c = _customer(test_db_session, CAVO)
+        _invoice(test_db_session, "C1/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        _invoice(test_db_session, "C2/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        out = _bulk(test_client, [c.id])
+        assert out["applied"] == 1
+        assert out["results"] == [{"customer_id": c.id, "result": "applied", "piva": PIVA_CAVO}]
+        # La P.IVA è sul cliente e la CASCADE rende verdi tutte le fatture.
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        assert detail["partita_iva"] == PIVA_CAVO
+        for it in detail["invoices"]["items"]:
+            assert it["verification"]["level"] == "verified"
+        # Loggato in ActivityLog.
+        assert test_db_session.query(ActivityLog).filter_by(
+            action="audit_assign_piva", entity_id=c.id
+        ).count() == 1
+
+    def test_skips_has_piva_and_is_idempotent(self, test_client, test_db_session):
+        # Già valorizzata → skipped_has_piva; e ri-eseguire un bonificato NON
+        # è un errore (idempotenza), è di nuovo skipped_has_piva.
+        c = _customer(test_db_session, CAVO)
+        _invoice(test_db_session, "C1/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        first = _bulk(test_client, [c.id])
+        assert first["results"][0]["result"] == "applied"
+        second = _bulk(test_client, [c.id])
+        assert second["applied"] == 0
+        assert second["results"][0]["result"] == "skipped_has_piva"
+
+    def test_revalidates_conflict_server_side(self, test_client, test_db_session):
+        # Il client crede sia bonificabile ma le fatture portano P.IVA DIVERSE:
+        # il server RI-VALIDA e salta (non si fida del client).
+        c = _customer(test_db_session, "Doppio SRL")
+        _invoice(test_db_session, "D1/2026", customer_id=c.id,
+                 customer_name_raw="Doppio SRL", customer_piva_raw=PIVA_A)
+        _invoice(test_db_session, "D2/2026", customer_id=c.id,
+                 customer_name_raw="Doppio SRL", customer_piva_raw=PIVA_B)
+        out = _bulk(test_client, [c.id])
+        assert out["applied"] == 0
+        assert out["results"][0]["result"] == "skipped_conflict"
+        assert out["results"][0]["pivas"] == sorted([PIVA_A, PIVA_B])
+        # Nessuna P.IVA scritta.
+        assert test_db_session.query(Customer).filter_by(id=c.id).first().partita_iva is None
+
+    def test_not_found_for_unknown_id(self, test_client, test_db_session):
+        out = _bulk(test_client, [999999])
+        assert out["results"][0]["result"] == "not_found"
+
+    def test_no_piva_when_nothing_to_assign(self, test_client, test_db_session):
+        # Cliente senza P.IVA sulle fatture (caso Tier 2): niente da assegnare.
+        c = _customer(test_db_session, "Ferramenta Bianchi")
+        _invoice(test_db_session, "NP/2026", customer_id=c.id, customer_name_raw="Sushi Kyoto")
+        out = _bulk(test_client, [c.id])
+        assert out["results"][0]["result"] == "skipped_no_piva"
+
+    def test_mixed_batch_partitions_outcomes(self, test_client, test_db_session):
+        ok = _customer(test_db_session, CAVO)
+        _invoice(test_db_session, "OK/2026", customer_id=ok.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        has = _customer(test_db_session, "Rossi SRL", partita_iva=PIVA_A)
+        _invoice(test_db_session, "H/2026", customer_id=has.id,
+                 customer_name_raw="Rossi SRL", customer_piva_raw=PIVA_A)
+        out = _bulk(test_client, [ok.id, has.id, 424242])
+        by_id = {r["customer_id"]: r["result"] for r in out["results"]}
+        assert out["applied"] == 1
+        assert by_id[ok.id] == "applied"
+        assert by_id[has.id] == "skipped_has_piva"
+        assert by_id[424242] == "not_found"
