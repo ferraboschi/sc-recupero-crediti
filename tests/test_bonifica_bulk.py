@@ -108,3 +108,116 @@ class TestBonificaPivaConfidence:
         assert low < 100
         assert data["bonifica_piva"]["invoice_count"] == 2
         assert data["bonifica_piva"]["confidence"] == low  # il minimo, non 100
+
+
+# ── B) GET /customers/bonifica-suggestions ───────────────────────────
+
+class TestBonificaSuggestionsList:
+    def test_includes_only_valid_candidates(self, test_client, test_db_session):
+        # Candidato: senza P.IVA, fatture con UNA P.IVA valida concorde.
+        cand = _customer(test_db_session, CAVO)
+        _invoice(test_db_session, "C1/2026", customer_id=cand.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO, amount_due=500.0)
+        # Escluso: ha già una P.IVA valida.
+        has_piva = _customer(test_db_session, "Rossi SRL", partita_iva=PIVA_A)
+        _invoice(test_db_session, "H/2026", customer_id=has_piva.id,
+                 customer_name_raw="Rossi SRL", customer_piva_raw=PIVA_A)
+        # Escluso: fatture con P.IVA DIVERSE (conflitto → forse due clienti).
+        conflict = _customer(test_db_session, "Doppio SRL")
+        _invoice(test_db_session, "D1/2026", customer_id=conflict.id,
+                 customer_name_raw="Doppio SRL", customer_piva_raw=PIVA_A)
+        _invoice(test_db_session, "D2/2026", customer_id=conflict.id,
+                 customer_name_raw="Doppio SRL", customer_piva_raw=PIVA_B)
+        # Escluso: nessuna P.IVA valida da assegnare (caso Tier 2).
+        no_piva = _customer(test_db_session, "Ferramenta Bianchi")
+        _invoice(test_db_session, "NP/2026", customer_id=no_piva.id,
+                 customer_name_raw="Sushi Kyoto")
+
+        data = test_client.get("/api/customers/bonifica-suggestions").json()
+        ids = [i["customer_id"] for i in data["items"]]
+        assert ids == [cand.id]
+        assert data["total"] == 1
+        item = data["items"][0]
+        assert item["ragione_sociale"] == CAVO
+        assert item["piva_suggerita"] == PIVA_CAVO
+        assert item["invoice_count"] == 1
+        assert item["confidence"] == 100
+        assert item["total_overdue"] == 500.0
+
+    def test_paid_invoice_piva_not_counted(self, test_client, test_db_session):
+        # Una fattura PAGATA non deve rendere bonificabile un cliente (la lista
+        # guarda le non-pagate, come lo scaduto).
+        c = _customer(test_db_session, CAVO)
+        _invoice(test_db_session, "P/2026", customer_id=c.id, status="paid",
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        data = test_client.get("/api/customers/bonifica-suggestions").json()
+        assert c.id not in [i["customer_id"] for i in data["items"]]
+
+    def test_reviewed_invoice_excluded_like_audit(self, test_client, test_db_session):
+        # Coerenza con bonifica_piva: una fattura "Segnata verificata" non porta
+        # più il suo P.IVA nella bonifica.
+        c = _customer(test_db_session, CAVO)
+        inv = _invoice(test_db_session, "R/2026", customer_id=c.id,
+                       customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        assert c.id in [i["customer_id"] for i in
+                        test_client.get("/api/customers/bonifica-suggestions").json()["items"]]
+        test_client.post(f"/api/positions/{inv.id}/mark-reviewed")
+        assert c.id not in [i["customer_id"] for i in
+                            test_client.get("/api/customers/bonifica-suggestions").json()["items"]]
+
+    def test_ordered_by_confidence_then_overdue(self, test_client, test_db_session):
+        # Certezza alta prima; a parità di certezza, scaduto più alto prima.
+        high = _customer(test_db_session, CAVO)  # nome identico → 100
+        _invoice(test_db_session, "HI/2026", customer_id=high.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO, amount_due=100.0)
+        low = _customer(test_db_session, "Trattoria Del Sole SRL")
+        _invoice(test_db_session, "LO/2026", customer_id=low.id,
+                 customer_name_raw="Officina Meccanica Verdi", customer_piva_raw=PIVA_A,
+                 amount_due=9999.0)  # scaduto enorme ma confidence bassa
+        data = test_client.get("/api/customers/bonifica-suggestions").json()
+        ids = [i["customer_id"] for i in data["items"]]
+        # confidence vince sul totale scaduto.
+        assert ids.index(high.id) < ids.index(low.id)
+
+    def test_tiebreak_by_overdue_when_same_confidence(self, test_client, test_db_session):
+        # Stessa confidence (nome identico → 100): vince lo scaduto più alto.
+        big = _customer(test_db_session, "Alpha Beverage SRL")
+        _invoice(test_db_session, "BIG/2026", customer_id=big.id,
+                 customer_name_raw="Alpha Beverage SRL", customer_piva_raw=PIVA_A,
+                 amount_due=8000.0)
+        small = _customer(test_db_session, "Beta Beverage SRL")
+        _invoice(test_db_session, "SML/2026", customer_id=small.id,
+                 customer_name_raw="Beta Beverage SRL", customer_piva_raw=PIVA_B,
+                 amount_due=10.0)
+        data = test_client.get("/api/customers/bonifica-suggestions").json()
+        ids = [i["customer_id"] for i in data["items"]]
+        assert ids.index(big.id) < ids.index(small.id)
+
+
+# ── C) efficienza: conteggio query costante ──────────────────────────
+
+class TestBonificaSuggestionsEfficiency:
+    def test_query_count_constant_vs_customer_count(self, test_client, test_db_session):
+        # La lista NON deve fare una query per cliente (niente N+1 su 115+):
+        # il numero di SELECT è COSTANTE al crescere dei clienti.
+        def make(start, n):
+            for i in range(start, start + n):
+                c = _customer(test_db_session, f"Cliente {i} Beverage SRL")
+                _invoice(test_db_session, f"I{i}/2026", customer_id=c.id,
+                         customer_name_raw=f"Cliente {i} Beverage SRL",
+                         customer_piva_raw=PIVA_CAVO)
+
+        make(0, 3)
+        n_small = _count_selects(
+            test_db_session,
+            lambda: test_client.get("/api/customers/bonifica-suggestions"),
+        )
+        make(1000, 30)  # 10× i clienti candidati
+        n_big = _count_selects(
+            test_db_session,
+            lambda: test_client.get("/api/customers/bonifica-suggestions"),
+        )
+        assert n_small == n_big, (
+            f"query cresciute col n. clienti: {n_small} → {n_big} (N+1)"
+        )
+        assert n_small <= 2, f"attesa UNA passata aggregata, non {n_small} SELECT"

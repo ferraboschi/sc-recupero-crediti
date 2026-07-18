@@ -75,6 +75,52 @@ def _audit_customer_ids(session, include_paid: bool = False) -> set:
     return ids
 
 
+def _single_shared_piva(customer, invoices):
+    """Criterio della bonifica_piva a livello cliente, in UNA definizione sola
+    condivisa da lista e bulk (così non possono divergere dall'audit).
+
+    Dato un cliente e le sue fatture NON pagate, ritorna:
+    - ("single", piva, [carrier_ids], confidence) se il cliente NON ha una
+      P.IVA valida e le sue fatture non-verificate che portano una P.IVA valida
+      ne condividono UNA SOLA;
+    - ("conflict", [piva distinte]) se ne portano di DIVERSE (forse due clienti);
+    - None se il cliente ha già una P.IVA valida, o nessuna fattura porta una
+      P.IVA valida da assegnare.
+
+    confidence = somiglianza nome MINIMA (caso peggiore) fra la ragione sociale
+    del cliente e le intestazioni grezze delle fatture che portano quella P.IVA
+    — lo STESSO scorer di verify (name_similarity_score, il "Somiglianza nomi").
+
+    Per costruzione una fattura con P.IVA valida verso un cliente SENZA P.IVA
+    valida non è MAI 'ok' nel verify (è sempre warn/bad): raccogliere i carrier
+    con P.IVA valida equivale quindi a raccogliere i "problemi con P.IVA" di
+    bonifica_piva, SENZA chiamare verify — che leggerebbe accepted_names dal
+    vivo (una lazy-load per cliente = N+1 sulla lista da 115+).
+    """
+    if validate_piva(customer.partita_iva) is not None:
+        return None
+    carriers = []  # (invoice_id, piva, confidence)
+    for inv in invoices:
+        # Le già "Segnate verificate" escono dai problemi (come in bonifica_piva).
+        if inv.audit_reviewed_at is not None:
+            continue
+        ip = validate_piva(inv.customer_piva_raw)
+        if ip is None:
+            continue
+        conf = name_similarity_score(
+            inv.customer_name_raw or "", customer.ragione_sociale or ""
+        )
+        carriers.append((inv.id, ip, conf))
+    if not carriers:
+        return None
+    distinct = sorted({p for _, p, _ in carriers})
+    if len(distinct) > 1:
+        return ("conflict", distinct)
+    the_piva = distinct[0]
+    group = [(iid, conf) for iid, p, conf in carriers if p == the_piva]
+    return ("single", the_piva, [iid for iid, _ in group], min(conf for _, conf in group))
+
+
 @router.get("")
 async def list_customers(
     session: Session = Depends(get_session),
@@ -356,6 +402,61 @@ async def customers_audit_summary(
     """
     ids = _audit_customer_ids(session, include_paid=include_paid)
     return {"to_sanitize_count": len(ids), "customer_ids": sorted(ids)}
+
+
+@router.get("/bonifica-suggestions")
+async def bonifica_suggestions(session: Session = Depends(get_session)):
+    """Lista di revisione della bonifica P.IVA in blocco: TUTTI i clienti
+    bonificabili in un colpo (l'owner ne ha ~115).
+
+    Un cliente entra col criterio IDENTICO a bonifica_piva dell'audit: SENZA
+    P.IVA valida sul profilo + le sue fatture non-pagate che portano una P.IVA
+    valida ne condividono UNA SOLA. I clienti con P.IVA DIVERSE sulle fatture
+    (conflict = "forse due clienti") NON entrano — sono un caso a parte.
+
+    Ordinati per confidence desc, poi total_overdue desc (i più certi e più
+    pesanti in cima), con l'id come tiebreaker stabile.
+
+    EFFICIENZA: UNA sola query aggregata (Invoice ⋈ Customer delle non-pagate),
+    poi raggruppamento in Python. NIENTE query-per-cliente → nessun N+1 su
+    115+. Definito PRIMA di /{customer_id} così 'bonifica-suggestions' non è
+    letto come id.
+    """
+    rows = (
+        session.query(Invoice, Customer)
+        .join(Customer, Invoice.customer_id == Customer.id)
+        .filter(Invoice.status != "paid")
+        .all()
+    )
+    by_customer = {}  # customer_id → {"customer": Customer, "invoices": [Invoice]}
+    for inv, cust in rows:
+        entry = by_customer.setdefault(cust.id, {"customer": cust, "invoices": []})
+        entry["invoices"].append(inv)
+
+    items = []
+    for cid, entry in by_customer.items():
+        cust = entry["customer"]
+        outcome = _single_shared_piva(cust, entry["invoices"])
+        if not outcome or outcome[0] != "single":
+            # Esclusi: già con P.IVA, senza P.IVA da assegnare, o CONFLITTO.
+            continue
+        _, the_piva, carrier_ids, confidence = outcome
+        # Scaduto = universo overdue_clause (status != paid & days_overdue > 0);
+        # le fatture qui sono già non-pagate, resta il solo giorni>0.
+        total_overdue = sum(
+            inv.amount_due for inv in entry["invoices"] if (inv.days_overdue or 0) > 0
+        )
+        items.append({
+            "customer_id": cid,
+            "ragione_sociale": cust.ragione_sociale,
+            "piva_suggerita": the_piva,
+            "invoice_count": len(carrier_ids),
+            "confidence": confidence,
+            "total_overdue": round(float(total_overdue), 2),
+        })
+
+    items.sort(key=lambda i: (-i["confidence"], -i["total_overdue"], i["customer_id"]))
+    return {"total": len(items), "items": items}
 
 
 @router.get("/{customer_id}")
