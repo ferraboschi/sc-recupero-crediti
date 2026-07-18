@@ -145,6 +145,32 @@ def main():
         customer_name_raw="BATTIATO LORIS",
     ))
 
+    # 5. Cavo Luigi Beverage Solutions srl — BONIFICABILE IN BLOCCO: cliente
+    #    SENZA P.IVA sul profilo, ma 2 fatture con la STESSA P.IVA valida e
+    #    nome identico → compare nella lista di revisione (certezza 100%).
+    cavo = Customer(
+        ragione_sociale="Cavo Luigi Beverage Solutions srl",
+        partita_iva=None,
+        phone="+393337778899",
+        source="fatturapro",
+    )
+    session.add(cavo)
+    session.flush()
+    cavo_piva = _valid_piva("0257244099")
+    for num, days in (("FT-2026-201", 20), ("FT-2026-202", 6)):
+        session.add(Invoice(
+            invoice_number=num,
+            amount=1200.00, amount_due=1200.00,
+            issue_date=today - timedelta(days=days + 30),
+            due_date=today - timedelta(days=days),
+            due_date_source="real",
+            days_overdue=days, status="open",
+            customer_id=cavo.id, source_platform="fatturapro",
+            match_method="name_exact",
+            customer_name_raw="Cavo Luigi Beverage Solutions srl",
+            customer_piva_raw=cavo_piva,
+        ))
+
     session.commit()
     session.close()
     print("Seed E2E completato: data/e2e.db")
