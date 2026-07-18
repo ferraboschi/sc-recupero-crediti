@@ -339,6 +339,77 @@ class TestClearPiva:
         assert c.id in ids
 
 
+class TestClearPivaUnlinksForeignInvoices:
+    """FIX 2 — clear-piva è una reversibilità COMPLETA: dopo aver assegnato una
+    P.IVA per errore, una fattura FUTURA di un'ALTRA azienda con quella P.IVA si
+    aggancia in automatico (match_method='piva'). clear-piva deve SCOLLEGARE
+    quelle entrate SOLO grazie alla P.IVA (match_method='piva' + somiglianza
+    nome col cliente < PIVA_NAME_MISMATCH_THRESHOLD), lasciando le proprie
+    (name_exact / nome concorde) al loro posto.
+    """
+
+    def test_unlinks_piva_rider_keeps_own_and_concordant(self, test_client, test_db_session):
+        from backend.engine.matching import run_matching, PIVA_NAME_MISMATCH_THRESHOLD
+        from backend.database import ActivityLog as _AL
+
+        # Cliente con P.IVA X assegnata PER ERRORE (X appartiene ad altri).
+        c = _customer(test_db_session, "Ferramenta Bianchi",
+                      ragione_sociale_normalized="ferramentabianchi",
+                      partita_iva=PIVA_CAVO)
+        # 2 fatture PROPRIE, agganciate per nome (name_exact): non si toccano.
+        own1 = _invoice(test_db_session, "OWN1", customer_id=c.id,
+                        customer_name_raw="Ferramenta Bianchi", match_method="name_exact")
+        own2 = _invoice(test_db_session, "OWN2", customer_id=c.id,
+                        customer_name_raw="Ferramenta Bianchi", match_method="name_exact")
+        # Estranea SENZA nome che cavalca la P.IVA: run_matching la aggancia
+        # come 'piva' (l'anti-poisoning guard NON scatta senza nome).
+        rider = _invoice(test_db_session, "RIDER", customer_id=None,
+                         customer_name_raw=None, customer_piva_raw=PIVA_CAVO)
+        # Estranea con nome CONCORDE che cavalca la P.IVA (score >= soglia):
+        # ambigua, resta agganciata (potrebbe essere davvero del cliente).
+        conc = _invoice(test_db_session, "CONC", customer_id=None,
+                        customer_name_raw="Ferramenta Bianchi Grossisti",
+                        customer_piva_raw=PIVA_CAVO)
+
+        run_matching(test_db_session)
+        for inv in (rider, conc):
+            test_db_session.refresh(inv)
+        # Premessa: entrambe agganciate per 'piva' — rider score < soglia,
+        # conc score >= soglia.
+        assert rider.customer_id == c.id and rider.match_method == "piva"
+        assert conc.customer_id == c.id and conc.match_method == "piva"
+        assert name_similarity_score(rider.customer_name_raw or "", c.ragione_sociale) < PIVA_NAME_MISMATCH_THRESHOLD
+        assert name_similarity_score(conc.customer_name_raw or "", c.ragione_sociale) >= PIVA_NAME_MISMATCH_THRESHOLD
+
+        # clear-piva.
+        r = test_client.post(f"/api/customers/{c.id}/clear-piva")
+        assert r.status_code == 200
+
+        for inv in (own1, own2, rider, conc):
+            test_db_session.refresh(inv)
+        # L'estranea nome-discordante è SCOLLEGATA.
+        assert rider.customer_id is None
+        # Le proprie (name_exact) e la concorde restano agganciate.
+        assert own1.customer_id == c.id
+        assert own2.customer_id == c.id
+        assert conc.customer_id == c.id
+        # ActivityLog dello scollegamento.
+        assert test_db_session.query(_AL).filter_by(
+            action="audit_unlink_foreign_invoice", entity_id=rider.id
+        ).count() == 1
+
+    def test_clear_without_riders_touches_nothing(self, test_client, test_db_session):
+        # clear-piva senza fatture-rider: nessuno scollegamento (le proprie
+        # restano), come prima del fix.
+        c = _customer(test_db_session, CAVO, partita_iva=PIVA_CAVO)
+        own = _invoice(test_db_session, "O/2026", customer_id=c.id,
+                       customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO,
+                       match_method="name_exact")
+        assert test_client.post(f"/api/customers/{c.id}/clear-piva").status_code == 200
+        test_db_session.refresh(own)
+        assert own.customer_id == c.id
+
+
 # ── F) un cliente bonificato ESCE dalla lista al giro dopo ────────────
 
 class TestBonifiedExitsList:

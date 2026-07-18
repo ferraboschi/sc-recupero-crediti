@@ -15,6 +15,7 @@ from backend.database import (
 from backend.engine.cases import get_open_case, contact_count, business_day_start
 from backend.engine.verify import verify_invoice_customer
 from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
+from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
 from backend.engine.overdue import overdue_clause, RECOVERY_ACTION_TYPES
 from backend.engine.piva import validate_piva
 
@@ -1073,6 +1074,18 @@ async def clear_customer_piva(
     loro esito naturale (verify dal vivo). Reversibilità dichiarata come nota #4
     dell'analisi.
 
+    Reversibilità COMPLETA: azzerare la sola P.IVA non basta. Finché era sul
+    cliente, una fattura FUTURA di un'ALTRA azienda con quella P.IVA si è
+    agganciata in automatico (match_method='piva'); resterebbe attaccata al
+    cliente sbagliato (importi e solleciti inclusi). Perciò, dopo l'azzeramento,
+    si SCOLLEGANO le fatture entrate SOLO grazie alla P.IVA: quelle con
+    match_method='piva' la cui somiglianza-nome col cliente è sotto soglia
+    (< PIVA_NAME_MISMATCH_THRESHOLD, lo stesso scorer del matching). Le fatture
+    PROPRIE del cliente (agganciate per nome — name_exact/manual/… — o con nome
+    concorde, somiglianza >= soglia) NON si toccano: l'anti-poisoning guard del
+    matching lascia entrare per sola P.IVA solo le estranee senza nome (o con
+    nome discordante-nullo), ed è esattamente quel residuo che qui si scollega.
+
     NB sul sync: azzerare qui è sicuro. Il sync scrive customer.partita_iva
     SOLO da Shopify (_sync_customers_task) e SOLO se Shopify riporta una P.IVA
     checksum-valida; un cliente bonificato senza P.IVA su Shopify non viene
@@ -1097,6 +1110,25 @@ async def clear_customer_piva(
             )
 
         customer.partita_iva = None
+
+        # Scollega le fatture estranee che avevano cavalcato la P.IVA: entrate
+        # per sola P.IVA (match_method='piva') e con nome sotto soglia rispetto
+        # al cliente — le PROPRIE (name_exact/… o nome concorde) restano.
+        piva_matched = session.query(Invoice).filter(
+            Invoice.customer_id == customer_id,
+            Invoice.match_method == "piva",
+        ).all()
+        unlinked_ids = []
+        for inv in piva_matched:
+            score = name_similarity_score(
+                inv.customer_name_raw or "", customer.ragione_sociale or ""
+            )
+            if score < PIVA_NAME_MISMATCH_THRESHOLD:
+                inv.customer_id = None
+                inv.match_method = None
+                inv.match_score = None
+                unlinked_ids.append(inv.id)
+
         session.commit()
 
         session.add(ActivityLog(
@@ -1106,15 +1138,35 @@ async def clear_customer_piva(
             details={
                 "ragione_sociale": customer.ragione_sociale,
                 "removed_piva": old_piva,
+                "unlinked_invoice_ids": unlinked_ids,
             },
         ))
+        # Un log per fattura scollegata: tracciabilità per singola riga (la
+        # scheda cliente e l'audit possono citare l'azione).
+        for iid in unlinked_ids:
+            session.add(ActivityLog(
+                action="audit_unlink_foreign_invoice",
+                entity_type="invoice",
+                entity_id=iid,
+                details={
+                    "customer_id": customer_id,
+                    "reason": "piva_cleared",
+                    "removed_piva": old_piva,
+                },
+            ))
         session.commit()
 
         logger.info(
             f"P.IVA '{old_piva}' rimossa dal cliente {customer_id} "
-            f"('{customer.ragione_sociale}')"
+            f"('{customer.ragione_sociale}'); "
+            f"{len(unlinked_ids)} fattura/e estranea/e scollegata/e"
         )
-        return {"ok": True, "customer_id": customer.id, "partita_iva": None}
+        return {
+            "ok": True,
+            "customer_id": customer.id,
+            "partita_iva": None,
+            "unlinked_invoice_ids": unlinked_ids,
+        }
 
     except HTTPException:
         raise
