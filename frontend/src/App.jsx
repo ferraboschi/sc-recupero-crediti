@@ -7,7 +7,7 @@ import ClientDetail from './pages/ClientDetail'
 import Attivita from './pages/Attivita'
 import System from './pages/System'
 import Login from './pages/Login'
-import SyncButton from './components/SyncButton'
+import SyncStatus from './components/SyncStatus'
 
 /* ── SVG icon components ─────────────────────────────────────────── */
 function IconDashboard() {
@@ -174,7 +174,7 @@ export default function App() {
             )}
           </div>
           <div className="flex items-center gap-4">
-            <SyncButton />
+            <SyncStatus />
             <div className="flex items-center gap-2 text-xs text-txt-muted">
               <div className="w-1.5 h-1.5 bg-accent-green rounded-full pulse-glow"></div>
               Attivo
