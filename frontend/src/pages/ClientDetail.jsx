@@ -373,7 +373,10 @@ export default function ClientDetail() {
     if (!window.confirm(
       `Completa anagrafica di "${data?.ragione_sociale}": assegnare la P.IVA ${b.piva}?\n\n`
       + `È presente su ${b.invoice_count} fattur${b.invoice_count === 1 ? 'a' : 'e'} ma manca sul cliente. `
-      + 'Assegnandola, tutte le fatture con quella P.IVA — presenti e future — diventano verificate (verde garantito).'
+      + 'Assegni l\'identità al cliente: da ora QUALSIASI fattura, anche FUTURA, con quella '
+      + 'P.IVA si aggancia da sola a questo cliente e risulta verificata.\n\n'
+      + 'La certezza è la somiglianza del NOME, non una verifica della P.IVA: se la P.IVA '
+      + 'fosse un refuso, il verde comparirebbe comunque. Reversibile con "Rimuovi P.IVA".'
     )) return
     runAuditAction(b.invoice_id, () => client.post(`/positions/${b.invoice_id}/assign-piva-to-customer`))
   }
@@ -1295,6 +1298,11 @@ export default function ClientDetail() {
                   Assegna la P.IVA <span className="font-mono text-txt-primary">{auditData.bonifica_piva.piva}</span>{' '}
                   — presente su {auditData.bonifica_piva.invoice_count} fattur{auditData.bonifica_piva.invoice_count === 1 ? 'a' : 'e'},
                   assente sul cliente → tutte, presenti e future, diventano verificate.
+                </p>
+                <p className="text-xs text-txt-muted">
+                  Assegna l&apos;identità al cliente: anche una fattura FUTURA con questa P.IVA
+                  si aggancerà da sola. La certezza è la somiglianza del nome, non una verifica
+                  della P.IVA. Reversibile con &laquo;Rimuovi P.IVA&raquo;.
                 </p>
                 <button
                   onClick={handleBonificaPiva}

@@ -69,9 +69,11 @@ export default function BonificaAnagrafica() {
     if (ids.length === 0) return
     if (!window.confirm(
       `Assegno la P.IVA a ${ids.length} cliente${ids.length === 1 ? '' : 'i'}.\n\n`
-      + 'Tutte le loro fatture, presenti e future, con quella P.IVA diventeranno '
-      + 'verificate (verde garantito). L\'operazione è reversibile per singolo '
-      + 'cliente (Rimuovi P.IVA sulla scheda).'
+      + 'Assegni l\'identità al cliente: da ora QUALSIASI fattura, anche FUTURA, '
+      + 'con quella P.IVA si aggancia da sola a questo cliente e risulta verificata.\n\n'
+      + 'La certezza mostrata è la somiglianza del NOME, non una verifica della '
+      + 'P.IVA: se la P.IVA fosse errata (un refuso), il verde comparirebbe lo stesso.\n\n'
+      + 'Reversibile per singolo cliente (Rimuovi P.IVA sulla scheda).'
     )) return
     try {
       setApplying(true)
@@ -218,7 +220,7 @@ export default function BonificaAnagrafica() {
                       <td className="px-4 py-3 text-center">
                         <span
                           className={`sc-badge ${confidenceStyle(item.confidence)}`}
-                          title="Somiglianza fra la ragione sociale e l'intestazione delle fatture (minimo del gruppo)"
+                          title="Somiglianza del NOME fra la ragione sociale e l'intestazione delle fatture (minimo del gruppo). NON è una verifica della P.IVA."
                         >
                           {item.confidence}%
                         </span>
