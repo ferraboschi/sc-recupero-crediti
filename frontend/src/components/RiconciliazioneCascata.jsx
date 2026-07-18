@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useMemo } from 'react'
 import {
   ResponsiveContainer,
   ComposedChart,
@@ -62,6 +62,29 @@ const CHART_SERIES = [
   { key: 'lavorabile', label: 'Lavorabile', color: '#fbbf24' }, // accent-amber
   { key: 'recuperato_certo', label: 'Presunto incassato', color: '#4ade80' }, // accent-green
 ]
+
+// Tratteggio dei segmenti STIMATI (storico ricostruito dalle date fattura).
+const STIMA_DASH = '6 4'
+
+/*
+ * Ogni serie logica si sdoppia in due chiavi: `<key>_stima` (tratteggiata)
+ * e `<key>_vero` (piena). Un punto vero ADIACENTE a un punto stimato entra
+ * anche nella serie stimata: è il PONTE che fa toccare tratteggio e linea
+ * piena senza buchi visivi alla transizione stima→vero (e attorno a un
+ * eventuale giorno stimato in mezzo a punti veri, se un sync è saltato).
+ */
+function buildChartData(serie) {
+  return serie.map((p, i) => {
+    const inStima =
+      p.stimato || serie[i - 1]?.stimato || serie[i + 1]?.stimato
+    const out = { ...p }
+    for (const s of CHART_SERIES) {
+      out[`${s.key}_stima`] = inStima ? p[s.key] : null
+      out[`${s.key}_vero`] = p.stimato ? null : p[s.key]
+    }
+    return out
+  })
+}
 
 export default function RiconciliazioneCascata({ formatCurrency }) {
   const [recon, setRecon] = useState(null)
@@ -337,6 +360,11 @@ function Cascata({ recon, loading, error, onRetry, formatCurrency }) {
 
 function Evoluzione({ serie, loading, error, giorni, setGiorni, onRetry, formatCurrency }) {
   const hasData = Array.isArray(serie) && serie.length > 0
+  const hasStima = hasData && serie.some((p) => p.stimato)
+  const chartData = useMemo(
+    () => (hasData ? buildChartData(serie) : []),
+    [serie, hasData]
+  )
 
   return (
     <div className="sc-card p-5 flex flex-col">
@@ -384,7 +412,7 @@ function Evoluzione({ serie, loading, error, giorni, setGiorni, onRetry, formatC
             </p>
           </div>
         ) : (
-          <EvoluzioneChart serie={serie} formatCurrency={formatCurrency} />
+          <EvoluzioneChart data={chartData} formatCurrency={formatCurrency} />
         )}
       </div>
 
@@ -402,11 +430,22 @@ function Evoluzione({ serie, loading, error, giorni, setGiorni, onRetry, formatC
           ))}
         </div>
       )}
+
+      {/* La nota onesta della stima: c'è solo se il tratteggio c'è */}
+      {hasStima && (
+        <p className="mt-1.5 inline-flex items-center gap-1.5 text-[11px] leading-snug text-txt-muted">
+          <span
+            aria-hidden="true"
+            className="w-4 shrink-0 border-t-2 border-dashed border-txt-muted"
+          />
+          tratteggio = storico stimato dalle date fattura
+        </p>
+      )}
     </div>
   )
 }
 
-function EvoluzioneChart({ serie, formatCurrency }) {
+function EvoluzioneChart({ data, formatCurrency }) {
   // Asse Y compatto (in migliaia): l'importo pieno vive nel tooltip.
   const formatAxis = (v) => {
     if (v == null) return ''
@@ -422,9 +461,15 @@ function EvoluzioneChart({ serie, formatCurrency }) {
     return dt.toLocaleDateString('it-IT', { day: '2-digit', month: 'short' })
   }
 
+  /*
+   * Ogni serie logica è DUE elementi: la variante `_stima` (tratteggiata,
+   * riempimento più tenue) e la variante `_vero` (piena). I null spezzano
+   * l'elemento dove l'altra variante prende il testimone; il punto-ponte
+   * (buildChartData) fa combaciare i due tratti senza buchi.
+   */
   return (
     <ResponsiveContainer width="100%" height={260}>
-      <ComposedChart data={serie} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+      <ComposedChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
         <defs>
           <linearGradient id="gradScaduto" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#f87171" stopOpacity={0.35} />
@@ -432,6 +477,14 @@ function EvoluzioneChart({ serie, formatCurrency }) {
           </linearGradient>
           <linearGradient id="gradLavorabile" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#fbbf24" stopOpacity={0.3} />
+            <stop offset="100%" stopColor="#fbbf24" stopOpacity={0.02} />
+          </linearGradient>
+          <linearGradient id="gradScadutoStima" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#f87171" stopOpacity={0.16} />
+            <stop offset="100%" stopColor="#f87171" stopOpacity={0.02} />
+          </linearGradient>
+          <linearGradient id="gradLavorabileStima" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#fbbf24" stopOpacity={0.14} />
             <stop offset="100%" stopColor="#fbbf24" stopOpacity={0.02} />
           </linearGradient>
         </defs>
@@ -452,7 +505,16 @@ function EvoluzioneChart({ serie, formatCurrency }) {
         <Tooltip content={<ChartTooltip formatCurrency={formatCurrency} formatTick={formatTick} />} />
         <Area
           type="monotone"
-          dataKey="scaduto_totale"
+          dataKey="scaduto_totale_stima"
+          name="Scaduto totale (stima)"
+          stroke="#f87171"
+          strokeWidth={2}
+          strokeDasharray={STIMA_DASH}
+          fill="url(#gradScadutoStima)"
+        />
+        <Area
+          type="monotone"
+          dataKey="scaduto_totale_vero"
           name="Scaduto totale"
           stroke="#f87171"
           strokeWidth={2}
@@ -460,7 +522,16 @@ function EvoluzioneChart({ serie, formatCurrency }) {
         />
         <Area
           type="monotone"
-          dataKey="lavorabile"
+          dataKey="lavorabile_stima"
+          name="Lavorabile (stima)"
+          stroke="#fbbf24"
+          strokeWidth={2}
+          strokeDasharray={STIMA_DASH}
+          fill="url(#gradLavorabileStima)"
+        />
+        <Area
+          type="monotone"
+          dataKey="lavorabile_vero"
           name="Lavorabile"
           stroke="#fbbf24"
           strokeWidth={2}
@@ -468,7 +539,16 @@ function EvoluzioneChart({ serie, formatCurrency }) {
         />
         <Line
           type="monotone"
-          dataKey="recuperato_certo"
+          dataKey="recuperato_certo_stima"
+          name="Presunto incassato (stima)"
+          stroke="#4ade80"
+          strokeWidth={2}
+          strokeDasharray={STIMA_DASH}
+          dot={false}
+        />
+        <Line
+          type="monotone"
+          dataKey="recuperato_certo_vero"
           name="Presunto incassato"
           stroke="#4ade80"
           strokeWidth={2}
@@ -481,20 +561,30 @@ function EvoluzioneChart({ serie, formatCurrency }) {
 
 function ChartTooltip({ active, payload, label, formatCurrency, formatTick }) {
   if (!active || !payload || payload.length === 0) return null
+  // Le serie sdoppiate (stima/vero) duplicherebbero le righe: si legge il
+  // PUNTO intero e si mostrano le tre serie logiche, una volta sola.
+  const punto = payload[0]?.payload || {}
   return (
     <div className="bg-dark-card border border-dark-border rounded-lg px-3 py-2 shadow-lg">
-      <p className="text-xs font-semibold text-txt-primary mb-1">{formatTick(label)}</p>
-      {payload.map((entry) => (
-        <div key={entry.dataKey} className="flex items-center justify-between gap-4 text-xs">
+      <p className="text-xs font-semibold text-txt-primary mb-1">
+        {formatTick(label)}
+        {punto.stimato && (
+          <span className="ml-2 text-[10px] font-normal text-txt-muted uppercase tracking-wide">
+            stima
+          </span>
+        )}
+      </p>
+      {CHART_SERIES.map((s) => (
+        <div key={s.key} className="flex items-center justify-between gap-4 text-xs">
           <span className="inline-flex items-center gap-1.5 text-txt-secondary">
             <span
               className="w-2 h-2 rounded-sm shrink-0"
-              style={{ backgroundColor: entry.color }}
+              style={{ backgroundColor: s.color }}
             />
-            {entry.name}
+            {s.label}
           </span>
           <span className="font-medium text-txt-primary tabular-nums">
-            {formatCurrency(entry.value || 0)}
+            {formatCurrency(punto[s.key] || 0)}
           </span>
         </div>
       ))}
