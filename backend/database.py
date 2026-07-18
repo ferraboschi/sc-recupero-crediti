@@ -24,6 +24,11 @@ class Customer(Base):
     shopify_id = Column(String, unique=True, nullable=True)
     ragione_sociale = Column(String, nullable=False)
     ragione_sociale_normalized = Column(String, nullable=True, index=True)
+    # Bonifica nomi (assign-name-to-customer): l'operatore ha aggiornato la
+    # ragione sociale dal documento — il sync clienti Shopify NON deve più
+    # sovrascriverla, altrimenti il sync orario annulla la bonifica entro
+    # un'ora (quel ramo riscrive i nomi a ogni giro).
+    ragione_sociale_locked = Column(Boolean, default=False)
     partita_iva = Column(String, nullable=True, index=True)
     codice_fiscale = Column(String, nullable=True)
     codice_sdi = Column(String, nullable=True)
@@ -357,6 +362,11 @@ def _run_migrations(engine):
         # dichiara "storico stimato" invece di spacciarle per certe.
         "ALTER TABLE invoices ADD COLUMN paid_at TIMESTAMP",
         "ALTER TABLE invoices ADD COLUMN amount_due_at_paid DOUBLE PRECISION",
+        # Bonifica nomi: lock anti-sync sulla ragione sociale corretta a mano
+        # (assign-name-to-customer). NULL→FALSE come gli altri BOOLEAN via ALTER.
+        "ALTER TABLE customers ADD COLUMN ragione_sociale_locked BOOLEAN DEFAULT FALSE",
+        "UPDATE customers SET ragione_sociale_locked = FALSE "
+        "WHERE ragione_sociale_locked IS NULL",
     ]
     try:
         raw = engine.raw_connection()

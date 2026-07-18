@@ -608,9 +608,17 @@ def _sync_customers_task() -> dict:
                         # Mai sovrascrivere un nome buono con uno vuoto (un
                         # profilo Shopify senza company produce ""), e per i
                         # clienti ADOTTATI tenere il nome derivato dalle
-                        # fatture: è quello su cui lavora il matching.
+                        # fatture: è quello su cui lavora il matching. Il
+                        # nome BONIFICATO a mano (ragione_sociale_locked,
+                        # via assign-name-to-customer) non si tocca MAI:
+                        # senza il lock questo ramo annullerebbe la
+                        # bonifica al primo sync orario.
                         parsed_name = (cust.get("ragione_sociale") or "").strip()
-                        if parsed_name and not (was_adopted and existing.ragione_sociale):
+                        if (
+                            parsed_name
+                            and not (was_adopted and existing.ragione_sociale)
+                            and not existing.ragione_sociale_locked
+                        ):
                             existing.ragione_sociale = parsed_name
                             existing.ragione_sociale_normalized = normalize_ragione_sociale(
                                 parsed_name

@@ -665,6 +665,179 @@ async def assign_piva_to_customer(position_id: int, session: Session = Depends(g
         raise
 
 
+@router.post("/{position_id}/assign-name-to-customer")
+async def assign_name_to_customer(
+    position_id: int,
+    confirm: bool = Query(False, description="Senza confirm: solo anteprima d'impatto, nessuna modifica"),
+    session: Session = Depends(get_session),
+):
+    """Copia la ragione sociale della FATTURA sul CLIENTE abbinato.
+
+    Via ② del menu "Risolvi" sulla riga discordante: stessa azienda, ma il
+    profilo ha il nome vecchio (es. cambio ragione sociale mai recepito in
+    anagrafica). Si aggiorna il CLIENTE dal documento — MAI il contrario:
+    customer_name_raw è la prova documentale, toccarlo renderebbe la
+    verifica circolare.
+
+    Guardie (simmetriche ad assign-piva-to-customer):
+    - 404 se la fattura o il cliente non esistono;
+    - 400 se la fattura non è abbinata o non ha un nome destinatario;
+    - 409 se le P.IVA confliggono (entrambe checksum-valide e diverse =
+      entità diverse: il rinomino nasconderebbe un mis-abbinamento — la via
+      giusta è Riassegna);
+    - no-op 200 se il nome è già identico (nessun lock inutile).
+
+    Flusso preview→confirm: la prima chiamata (confirm=false) NON applica e
+    ritorna l'impatto — quante ALTRE fatture di questo cliente diventerebbero
+    discordanti col nuovo nome (verify ricalcolato su un cliente simulato).
+    Con confirm=true applica: nome + normalized ricalcolata col normalizzatore
+    canonico + ragione_sociale_locked=True (il sync Shopify non deve poter
+    annullare la bonifica al giro successivo).
+    """
+    from types import SimpleNamespace
+    from backend.engine.matching import piva_contradiction
+    from backend.engine.normalizer import normalize_ragione_sociale
+    from backend.engine.verify import verify_invoice_customer
+
+    try:
+        position = session.query(Invoice).filter(Invoice.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+        if not position.customer_id:
+            raise HTTPException(
+                status_code=400,
+                detail="La fattura non è abbinata a nessun cliente",
+            )
+
+        customer = session.query(Customer).filter(
+            Customer.id == position.customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Cliente non trovato")
+
+        new_name = (position.customer_name_raw or "").strip()
+        if not new_name:
+            raise HTTPException(
+                status_code=400,
+                detail="La fattura non riporta un nome destinatario da assegnare",
+            )
+
+        # P.IVA in contraddizione (entrambe checksum-valide e diverse) =
+        # entità diverse: rinominare il cliente nasconderebbe il vero
+        # problema (fattura abbinata al cliente sbagliato).
+        if piva_contradiction(position, customer):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"La P.IVA della fattura ('{position.customer_piva_raw}') e "
+                    f"quella del cliente '{customer.ragione_sociale}' "
+                    f"('{customer.partita_iva}') sono entrambe valide e DIVERSE: "
+                    f"sono entità diverse, rinominare il profilo nasconderebbe un "
+                    f"abbinamento sbagliato. Usa 'È di un altro cliente' per "
+                    f"riassegnare la fattura."
+                ),
+            )
+
+        old_name = (customer.ragione_sociale or "").strip()
+        if new_name == old_name:
+            # Già allineati: niente da fare, e nessun lock inutile.
+            return {
+                "ok": True,
+                "applied": False,
+                "already_aligned": True,
+                "customer_id": customer.id,
+                "old_name": old_name,
+                "new_name": new_name,
+                "impact": {"would_become_discordant": 0, "invoices": []},
+            }
+
+        # ── Impatto: quante ALTRE fatture (non pagate) di questo cliente
+        # DIVENTEREBBERO discordanti col nuovo nome. Si ricalcola verify su
+        # un cliente "simulato" col nuovo nome (stessa P.IVA): contano solo
+        # i passaggi a 'bad' — le già discordanti non sono un peggioramento.
+        simulated = SimpleNamespace(
+            ragione_sociale=new_name,
+            partita_iva=customer.partita_iva,
+        )
+        siblings = (
+            session.query(Invoice)
+            .filter(
+                Invoice.customer_id == customer.id,
+                Invoice.id != position.id,
+                Invoice.status != "paid",
+            )
+            .all()
+        )
+        impacted = []
+        for sib in siblings:
+            before = verify_invoice_customer(sib, customer)["verdict"]
+            after = verify_invoice_customer(sib, simulated)["verdict"]
+            if after == "bad" and before != "bad":
+                impacted.append({
+                    "invoice_id": sib.id,
+                    "invoice_number": sib.invoice_number,
+                    "amount_due": float(sib.amount_due),
+                })
+
+        impact = {
+            "would_become_discordant": len(impacted),
+            "invoices": impacted,
+        }
+
+        if not confirm:
+            # Anteprima: NESSUNA modifica.
+            return {
+                "ok": True,
+                "applied": False,
+                "customer_id": customer.id,
+                "old_name": old_name,
+                "new_name": new_name,
+                "impact": impact,
+            }
+
+        customer.ragione_sociale = new_name
+        customer.ragione_sociale_normalized = normalize_ragione_sociale(new_name)
+        customer.ragione_sociale_locked = True
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_assign_name",
+            entity_type="customer",
+            entity_id=customer.id,
+            details={
+                "invoice_id": position.id,
+                "invoice_number": position.invoice_number,
+                "customer_id": customer.id,
+                "old_name": old_name,
+                "new_name": new_name,
+                "would_become_discordant": len(impacted),
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"Ragione sociale del cliente {customer.id} aggiornata da "
+            f"'{old_name}' a '{new_name}' dalla fattura "
+            f"{position.invoice_number} (lock anti-sync attivo)"
+        )
+        return {
+            "ok": True,
+            "applied": True,
+            "customer_id": customer.id,
+            "old_name": old_name,
+            "new_name": new_name,
+            "locked": True,
+            "impact": impact,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error assigning name to customer: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
 @router.post("/{position_id}/mark-reviewed")
 async def mark_reviewed(position_id: int, session: Session = Depends(get_session)):
     """Segna la fattura come 'verificata a mano' nell'audit abbinamenti.
