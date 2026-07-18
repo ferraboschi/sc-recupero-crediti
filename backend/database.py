@@ -51,6 +51,57 @@ class Customer(Base):
     invoices = relationship("Invoice", back_populates="customer", foreign_keys="Invoice.customer_id")
     recovery_actions = relationship("RecoveryAction", back_populates="customer", order_by="RecoveryAction.created_at.desc()")
     recovery_cases = relationship("RecoveryCase", back_populates="customer", order_by="RecoveryCase.opened_at.desc()")
+    # Intestazioni accettate (bonifica durevole): grafie che l'operatore ha
+    # dichiarato appartenere a questo cliente. verify_invoice_customer le
+    # consulta DAL VIVO — vale per le fatture presenti e future per costruzione.
+    accepted_names = relationship(
+        "CustomerAcceptedName",
+        back_populates="customer",
+        cascade="all, delete-orphan",
+        order_by="CustomerAcceptedName.created_at.desc()",
+    )
+
+
+class CustomerAcceptedName(Base):
+    """Intestazione accettata di un cliente: un tratto d'IDENTITÀ durevole.
+
+    Il verificatore (verify_invoice_customer) consulta questa lista DAL VIVO:
+    quando l'intestazione grezza di una fattura, normalizzata, è tra le
+    accettate del cliente, la fattura esce dai problemi dell'audit e il
+    semaforo diventa verde — per costruzione vale anche per le fatture FUTURE
+    con la stessa intestazione (nessuna scrittura per-fattura, a differenza di
+    audit_reviewed_at che vive sulla singola fattura).
+
+    Non è una garanzia checksum (guaranteed=False sul verify): è una conferma
+    UMANA, onesta e distinta. Reversibile (DELETE) e idempotente sull'UNIQUE.
+
+    Tabella NUOVA: la crea create_all (nessuna migrazione ALTER necessaria).
+    RLS abilitata in _enable_rls come per ogni altra tabella (Supabase).
+    """
+    __tablename__ = "customer_accepted_names"
+    __table_args__ = (
+        # Una sola riga per (cliente, intestazione normalizzata): l'add è
+        # idempotente per costruzione, no-op se la grafia è già accettata.
+        Index(
+            "uq_customer_accepted_name",
+            "customer_id", "name_normalized",
+            unique=True,
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(
+        Integer, ForeignKey("customers.id"), nullable=False, index=True
+    )
+    # La CHIAVE del confronto: normalize_ragione_sociale dell'intestazione
+    # grezza accettata (stessa normalizzazione del matching/verify).
+    name_normalized = Column(String, nullable=False)
+    # L'originale grezzo accettato (per la UI: mostra la grafia umana).
+    note = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    # Relationships
+    customer = relationship("Customer", back_populates="accepted_names")
 
 
 class Invoice(Base):
@@ -428,7 +479,7 @@ def _enable_rls(engine):
     tables = [
         "customers", "invoices", "recovery_cases",
         "recovery_actions", "activity_log", "sync_state",
-        "overdue_snapshots",
+        "overdue_snapshots", "customer_accepted_names",
         # legacy, non più mappate dal codice ma presenti nel DB
         "messages", "conversations",
     ]
