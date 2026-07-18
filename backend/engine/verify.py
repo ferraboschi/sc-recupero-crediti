@@ -137,8 +137,13 @@ def verify_invoice_customer(
     # da questo caso l'accepted-name smarca regolarmente (fattura senza P.IVA
     # valida, o cliente che la P.IVA ce l'ha già).
     #
-    # `getattr` difensivo: i chiamanti che passano un customer "simulato"
-    # (SimpleNamespace, niente relationship) non devono esplodere.
+    # Lettura difensiva di accepted_names: copre SIA il customer "simulato"
+    # (SimpleNamespace senza la relationship → AttributeError) SIA l'ORM
+    # STACCATO dalla sessione (la lazy-load su un detached solleva
+    # DetachedInstanceError, che un semplice getattr NON cattura). In entrambi
+    # i casi trattiamo l'assenza-di-accepted-names invece di propagare un 500 —
+    # nessun chiamante attuale passa un ORM detached (verificato), ma la lettura
+    # deve restare robusta se un futuro chiamante lo facesse.
     piva_assignable = inv_piva is not None and cust_piva is None
     manual_confirmed = False
     if (
@@ -150,7 +155,12 @@ def verify_invoice_customer(
     ):
         inv_norm = normalize_ragione_sociale(inv_name_src)
         if inv_norm:
-            for an in (getattr(customer, "accepted_names", None) or []):
+            try:
+                accepted = getattr(customer, "accepted_names", None) or []
+                accepted = list(accepted)
+            except Exception:
+                accepted = []
+            for an in accepted:
                 if getattr(an, "name_normalized", None) == inv_norm:
                     manual_confirmed = True
                     break

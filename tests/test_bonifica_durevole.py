@@ -250,6 +250,44 @@ class TestAcceptedNameBulkCascade:
         assert by_num["FUT/2026"]["verification"]["level"] == "verified"
 
 
+class TestVerifyRobustToDetachedCustomer:
+    """FIX 3 — la lettura di accepted_names deve reggere anche a un ORM
+    STACCATO dalla sessione: la lazy-load su un detached solleva
+    DetachedInstanceError, che il getattr difensivo NON cattura (copre solo
+    AttributeError). verify non deve andare in 500 — deve trattarlo come
+    assenza di intestazioni accettate."""
+
+    def test_detached_customer_does_not_raise(self, test_db_session):
+        from backend.engine.verify import verify_invoice_customer
+
+        c = _customer(test_db_session, "Ferramenta Bianchi")
+        test_db_session.add(CustomerAcceptedName(
+            customer_id=c.id,
+            name_normalized=normalize_ragione_sociale("Sushi Kyoto"),
+        ))
+        test_db_session.commit()
+        # Scalari caricati (il caso normale: verify legge ragione_sociale/P.IVA
+        # dal cliente già in mano), MA la relationship accepted_names mai
+        # caricata; poi stacco dalla sessione. Così l'unico accesso che farebbe
+        # partire una lazy-load su detached — e andrebbe in 500 — è quello a
+        # accepted_names, esattamente il ramo del fix.
+        test_db_session.refresh(c)
+        test_db_session.expunge(c)
+
+        # Sanity: l'accesso diretto alla relationship solleva DetachedInstanceError.
+        from sqlalchemy.orm.exc import DetachedInstanceError
+        with pytest.raises(DetachedInstanceError):
+            _ = list(c.accepted_names)
+
+        class _Inv:
+            customer_piva_raw = None
+            customer_name_raw = "Sushi Kyoto"
+
+        # verify non esplode e degrada a "nessuna intestazione accettata".
+        v = verify_invoice_customer(_Inv(), c)
+        assert v["manual_confirmed"] is False
+
+
 class TestAcceptedNameExitsAudit:
     def test_accepted_customer_leaves_da_sanificare(self, test_client, test_db_session):
         # Punto 5: un cliente le cui uniche fatture problematiche sono su
