@@ -53,23 +53,56 @@ export default function Customers() {
   const [suggestions, setSuggestions] = useState([])
   const [sanitizeCount, setSanitizeCount] = useState(null)
 
+  // Parametri correnti della lista (un solo punto di verità, usato anche
+  // dalla richiesta dedicata al riepilogo).
+  const buildListParams = () => {
+    const params = { skip, limit, only_overdue: onlyOverdue, sort_by: sortBy, sort_order: sortOrder }
+    if (search) params.search = search
+    if (toSanitize) params.to_sanitize = true
+    if (noPhone) params.no_phone = true
+    if (recoveryStatus) params.recovery_status = recoveryStatus
+    if (excludedFilter === 'hide') params.excluded = false
+    if (excludedFilter === 'only') params.excluded = true
+    return params
+  }
+
+  // Il riepilogo dice "fuori dai totali": DEVE escludere gli esclusi anche
+  // quando il filtro li MOSTRA in lista. Richiesta dedicata con
+  // excluded=false (limit minimo: servono solo i summary_* del backend).
+  const fetchSummary = async () => {
+    try {
+      const params = { ...buildListParams(), excluded: false, skip: 0, limit: 1 }
+      const res = await client.get('/customers', { params })
+      setSummaryTotalOverdue(res.data.summary_total_overdue || 0)
+      setSummaryOverdueCustomers(res.data.summary_overdue_customers || 0)
+    } catch (err) {
+      console.error('Errore aggiornamento riepilogo:', err)
+    }
+  }
+
   useEffect(() => {
+    let cancelled = false
     const fetchCustomers = async () => {
       try {
         setLoading(true)
-        const params = { skip, limit, only_overdue: onlyOverdue, sort_by: sortBy, sort_order: sortOrder }
-        if (search) params.search = search
-        if (toSanitize) params.to_sanitize = true
-        if (noPhone) params.no_phone = true
-        if (recoveryStatus) params.recovery_status = recoveryStatus
-        if (excludedFilter === 'hide') params.excluded = false
-        if (excludedFilter === 'only') params.excluded = true
+        const params = buildListParams()
 
-        const response = await client.get('/customers', { params })
+        // In modalità 'nascondi' la lista è già excluded=false: i suoi
+        // summary_* sono giusti. Negli altri casi il riepilogo arriva da
+        // una richiesta parallela che esclude gli esclusi.
+        const needsSummaryRequest = excludedFilter !== 'hide'
+        const [response, summaryRes] = await Promise.all([
+          client.get('/customers', { params }),
+          needsSummaryRequest
+            ? client.get('/customers', { params: { ...params, excluded: false, skip: 0, limit: 1 } })
+            : null,
+        ])
+        if (cancelled) return
         setCustomers(response.data.items)
         setTotal(response.data.total)
-        setSummaryTotalOverdue(response.data.summary_total_overdue || 0)
-        setSummaryOverdueCustomers(response.data.summary_overdue_customers || 0)
+        const summarySource = summaryRes ? summaryRes.data : response.data
+        setSummaryTotalOverdue(summarySource.summary_total_overdue || 0)
+        setSummaryOverdueCustomers(summarySource.summary_overdue_customers || 0)
 
         const toggleState = {}
         response.data.items.forEach(c => {
@@ -77,13 +110,15 @@ export default function Customers() {
         })
         setExcludedToggle(toggleState)
       } catch (err) {
+        if (cancelled) return
         setError('Errore nel caricamento dei clienti')
         console.error(err)
       } finally {
-        setLoading(false)
+        if (!cancelled) setLoading(false)
       }
     }
     fetchCustomers()
+    return () => { cancelled = true }
   }, [skip, limit, search, onlyOverdue, toSanitize, noPhone, recoveryStatus, excludedFilter, sortBy, sortOrder])
 
   // Conteggio globale "da sanificare" (audit): un solo giro, indipendente
@@ -129,6 +164,9 @@ export default function Customers() {
         ...excludedToggle,
         [customerId]: newValue,
       })
+      // Il riepilogo cambia in ENTRAMBE le direzioni (escluso ↔ riportato
+      // nel recupero): si riallinea subito, senza aspettare un reload.
+      fetchSummary()
     } catch (err) {
       console.error(err)
     }
@@ -381,22 +419,26 @@ export default function Customers() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-dark-border">
-                  {customers.map(customer => (
+                  {customers.map(customer => {
+                    // Un solo punto di verità per riga: il toggle locale
+                    // (inizializzato dal server) — così escludere E
+                    // ri-includere si riflettono subito, simmetricamente.
+                    const isExcluded = excludedToggle[customer.id] ?? customer.excluded
+                    const displayName = customer.ragione_sociale || customer.email || `Cliente #${customer.id}`
+                    return (
                     <tr
                       key={customer.id}
-                      className={`sc-table-row cursor-pointer ${
-                        customer.excluded || excludedToggle[customer.id] ? 'opacity-50' : ''
-                      }`}
+                      className={`sc-table-row cursor-pointer ${isExcluded ? 'opacity-50' : ''}`}
                       onClick={() => navigate(`/customers/${customer.id}`)}
                     >
                       <td className="px-4 py-3">
                         <div className="text-sm font-medium text-accent-teal hover:text-accent-cyan">
-                          {customer.ragione_sociale || customer.email || `Cliente #${customer.id}`}
+                          {displayName}
                         </div>
                         {!customer.ragione_sociale && (
                           <span className="text-xs text-txt-muted">(nome mancante)</span>
                         )}
-                        {(customer.excluded || excludedToggle[customer.id]) && (
+                        {isExcluded && (
                           <span
                             className="mt-1 inline-block sc-badge bg-[rgba(148,163,184,0.15)] text-txt-muted"
                             title="Cliente escluso: non conteggiato nei totali della cascata di riconciliazione"
@@ -476,18 +518,27 @@ export default function Customers() {
                       </td>
                       <td className="px-4 py-3 text-center" onClick={(e) => e.stopPropagation()}>
                         <button
-                          onClick={(e) => handleToggleExcluded(customer.id, !excludedToggle[customer.id], e)}
+                          onClick={(e) => handleToggleExcluded(customer.id, !isExcluded, e)}
+                          role="switch"
+                          aria-checked={isExcluded}
+                          aria-label={isExcluded
+                            ? `Riporta ${displayName} nel recupero`
+                            : `Escludi ${displayName} dal recupero`}
+                          title={isExcluded
+                            ? `Riporta ${displayName} nel recupero`
+                            : `Escludi ${displayName} dal recupero`}
                           className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
-                            excludedToggle[customer.id] ? 'bg-accent-red' : 'bg-accent-green'
+                            isExcluded ? 'bg-accent-red' : 'bg-accent-green'
                           }`}
                         >
                           <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                            excludedToggle[customer.id] ? 'translate-x-4.5' : 'translate-x-0.5'
+                            isExcluded ? 'translate-x-4.5' : 'translate-x-0.5'
                           }`} />
                         </button>
                       </td>
                     </tr>
-                  ))}
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
