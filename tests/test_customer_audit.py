@@ -476,3 +476,31 @@ class TestStableOrdering:
         assert data["next_id"] == c.id
         assert data["position"] == 2
         assert data["total"] == 3
+
+
+class TestReviewedExposedOnDetail:
+    def test_customer_detail_exposes_reviewed_flag(self, test_client, test_db_session):
+        """Il dettaglio cliente espone `reviewed` per fattura.
+
+        Senza questo campo lo stato "verificata a mano" (audit_reviewed_at,
+        settato da mark-reviewed) viveva solo nella sessione del browser: un
+        hard-reload faceva ricomparire il ⚠ su una fattura già controllata
+        dall'operatore.
+        """
+        import datetime as _dt
+        c = _customer(test_db_session, "Rooftop SRL", partita_iva=PIVA_A)
+        inv_ok = _invoice(
+            test_db_session, "100/2026", customer_id=c.id,
+            customer_name_raw="Rooftop SRL",
+        )
+        inv_rev = _invoice(
+            test_db_session, "101/2026", customer_id=c.id,
+            customer_name_raw="Rooftop SRL",
+        )
+        inv_rev.audit_reviewed_at = _dt.datetime.utcnow()
+        test_db_session.commit()
+
+        data = test_client.get(f"/api/customers/{c.id}").json()
+        by_number = {i["invoice_number"]: i for i in data["invoices"]["items"]}
+        assert by_number["100/2026"]["reviewed"] is False
+        assert by_number["101/2026"]["reviewed"] is True

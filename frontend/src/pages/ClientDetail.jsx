@@ -193,9 +193,9 @@ export default function ClientDetail() {
   const [auditError, setAuditError] = useState(null)
   const [auditActingId, setAuditActingId] = useState(null)
   const [includeReviewedAudit, setIncludeReviewedAudit] = useState(false)
-  // Verifiche manuali sul semaforo per-riga. Il backend le registra
-  // (audit_reviewed_at via mark-reviewed) ma /customers/{id} non le espone:
-  // lo stato vive qui, seminato dall'audit quando include le già verificate.
+  // Verifiche manuali sul semaforo per-riga (audit_reviewed_at via
+  // mark-reviewed). Seminato da /customers/{id} (campo `reviewed` per
+  // fattura), così lo stato sopravvive all'hard-reload.
   const [reviewedRows, setReviewedRows] = useState(() => new Set())
   const [rowReviewActingId, setRowReviewActingId] = useState(null)
 
@@ -204,10 +204,14 @@ export default function ClientDetail() {
       setLoading(true)
       const response = await client.get(`/customers/${customerId}`)
       setData(response.data)
-      const overdueIds = (response.data.invoices?.items || [])
+      const items = response.data.invoices?.items || []
+      const overdueIds = items
         .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid')
         .map(inv => inv.id)
       setSelectedInvoices(new Set(overdueIds))
+      // Semina le "verificate a mano" dal backend: senza, un hard-reload
+      // farebbe ricomparire il ⚠ su fatture già controllate dall'operatore.
+      setReviewedRows(new Set(items.filter(inv => inv.reviewed).map(inv => inv.id)))
     } catch (err) {
       setError('Errore nel caricamento del cliente')
       console.error(err)

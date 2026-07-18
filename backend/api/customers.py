@@ -380,6 +380,11 @@ async def get_customer_detail(
                 # Controllo puntuale P.IVA + ragione sociale (istantaneo:
                 # confronta dati già in DB, nessun sync). Semaforo per-riga.
                 "verification": verify_invoice_customer(inv, customer),
+                # "Verificata a mano" (Segna verificato): senza questo campo
+                # lo stato vive solo nella sessione del browser e un
+                # hard-reload fa ricomparire il ⚠ su una fattura già
+                # controllata dall'operatore.
+                "reviewed": inv.audit_reviewed_at is not None,
             }
             for inv in invoices
         ]
