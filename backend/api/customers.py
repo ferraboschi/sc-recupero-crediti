@@ -8,14 +8,28 @@ from sqlalchemy import or_, func
 from sqlalchemy.orm import Session
 from datetime import datetime
 
-from backend.database import get_session, Customer, Invoice, ActivityLog, RecoveryAction
+from backend.database import (
+    get_session, Customer, Invoice, ActivityLog, RecoveryAction,
+    CustomerAcceptedName,
+)
 from backend.engine.cases import get_open_case, contact_count, business_day_start
 from backend.engine.verify import verify_invoice_customer
+from backend.engine.normalizer import normalize_ragione_sociale
 from backend.engine.overdue import overdue_clause, RECOVERY_ACTION_TYPES
 from backend.engine.piva import validate_piva
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _accepted_name_dict(an: CustomerAcceptedName) -> dict:
+    """Serializzazione di un'intestazione accettata per l'API/UI."""
+    return {
+        "id": an.id,
+        "name_normalized": an.name_normalized,
+        "note": an.note,
+        "created_at": an.created_at.isoformat() if an.created_at else None,
+    }
 
 
 def _audit_customer_ids(session, include_paid: bool = False) -> set:
@@ -512,6 +526,11 @@ async def get_customer_detail(
             "recovery_actions": action_list,
             "contact_action_count": contact_action_count,
             "case": case_block,
+            # Intestazioni accettate (bonifica durevole): il tratto d'identità
+            # che rende verdi le fatture con quella grafia, presenti e future.
+            "accepted_names": [
+                _accepted_name_dict(an) for an in customer.accepted_names
+            ],
         }
 
     except HTTPException:
@@ -788,6 +807,198 @@ async def unlock_customer_name(
         raise
     except Exception as e:
         logger.error(f"Error unlocking customer name: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+class AcceptedNameRequest(BaseModel):
+    # Una delle due: il nome grezzo da accettare, oppure la fattura da cui
+    # prenderlo (customer_name_raw). invoice_id ha la precedenza.
+    name: Optional[str] = None
+    invoice_id: Optional[int] = None
+
+
+@router.post("/{customer_id}/accepted-names")
+async def add_accepted_name(
+    customer_id: int,
+    body: AcceptedNameRequest,
+    session: Session = Depends(get_session),
+):
+    """Conferma d'identità DUREVOLE: aggiunge un'intestazione accettata al
+    cliente (tratto letto dal vivo da verify_invoice_customer).
+
+    A differenza di mark-reviewed (per-fattura, one-off), questa conferma vale
+    per TUTTE le fatture del cliente con quella intestazione — presenti e
+    future — in un colpo, senza scritture per-fattura. Idempotente
+    sull'UNIQUE (no-op se la grafia è già accettata) + ActivityLog.
+
+    Guardie:
+    - 404 se il cliente o la fattura non esistono;
+    - 400 se manca sia name sia invoice_id, o l'intestazione è vuota / non
+      normalizzabile.
+    """
+    try:
+        customer = session.query(Customer).filter(
+            Customer.id == customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        raw = None
+        source_invoice_id = None
+        if body.invoice_id is not None:
+            inv = session.query(Invoice).filter(
+                Invoice.id == body.invoice_id
+            ).first()
+            if not inv:
+                raise HTTPException(status_code=404, detail="Fattura non trovata")
+            raw = (inv.customer_name_raw or "").strip()
+            source_invoice_id = inv.id
+        elif body.name is not None:
+            raw = body.name.strip()
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Serve 'name' o 'invoice_id' da cui prendere l'intestazione",
+            )
+
+        if not raw:
+            raise HTTPException(
+                status_code=400,
+                detail="L'intestazione da accettare è vuota",
+            )
+        norm = normalize_ragione_sociale(raw)
+        if not norm:
+            raise HTTPException(
+                status_code=400,
+                detail="L'intestazione da accettare non è normalizzabile",
+            )
+
+        # Idempotente: no-op se la grafia (normalizzata) è già accettata.
+        existing = session.query(CustomerAcceptedName).filter(
+            CustomerAcceptedName.customer_id == customer_id,
+            CustomerAcceptedName.name_normalized == norm,
+        ).first()
+        if existing:
+            return {
+                "ok": True,
+                "already_present": True,
+                "accepted_name": _accepted_name_dict(existing),
+                "accepted_names": [
+                    _accepted_name_dict(a) for a in customer.accepted_names
+                ],
+            }
+
+        an = CustomerAcceptedName(
+            customer_id=customer_id, name_normalized=norm, note=raw,
+        )
+        session.add(an)
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_accept_name",
+            entity_type="customer",
+            entity_id=customer_id,
+            details={
+                "ragione_sociale": customer.ragione_sociale,
+                "accepted_raw": raw,
+                "name_normalized": norm,
+                "invoice_id": source_invoice_id,
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"Intestazione '{raw}' (norm '{norm}') accettata per il cliente "
+            f"{customer_id} ('{customer.ragione_sociale}')"
+        )
+        session.refresh(customer)
+        return {
+            "ok": True,
+            "already_present": False,
+            "accepted_name": _accepted_name_dict(an),
+            "accepted_names": [
+                _accepted_name_dict(a) for a in customer.accepted_names
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding accepted name: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.delete("/{customer_id}/accepted-names/{name_or_id}")
+async def remove_accepted_name(
+    customer_id: int,
+    name_or_id: str,
+    session: Session = Depends(get_session),
+):
+    """Rimuove un'intestazione accettata (reversibilità della conferma).
+
+    `name_or_id` può essere l'id della riga o l'intestazione normalizzata.
+    Rimosso l'ultimo appiglio, le fatture con quella grafia tornano al loro
+    esito naturale (warning/discordante) — il tratto d'identità è reversibile.
+    """
+    try:
+        customer = session.query(Customer).filter(
+            Customer.id == customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        base = session.query(CustomerAcceptedName).filter(
+            CustomerAcceptedName.customer_id == customer_id
+        )
+        row = None
+        if name_or_id.isdigit():
+            row = base.filter(CustomerAcceptedName.id == int(name_or_id)).first()
+        if row is None:
+            norm = normalize_ragione_sociale(name_or_id)
+            if norm:
+                row = base.filter(
+                    CustomerAcceptedName.name_normalized == norm
+                ).first()
+        if not row:
+            raise HTTPException(
+                status_code=404, detail="Intestazione accettata non trovata"
+            )
+
+        removed = _accepted_name_dict(row)
+        session.delete(row)
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_unaccept_name",
+            entity_type="customer",
+            entity_id=customer_id,
+            details={
+                "ragione_sociale": customer.ragione_sociale,
+                "name_normalized": removed["name_normalized"],
+                "note": removed["note"],
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"Intestazione accettata '{removed['name_normalized']}' rimossa "
+            f"dal cliente {customer_id}"
+        )
+        session.refresh(customer)
+        return {
+            "ok": True,
+            "removed": removed,
+            "accepted_names": [
+                _accepted_name_dict(a) for a in customer.accepted_names
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing accepted name: {e}", exc_info=True)
         session.rollback()
         raise
 
