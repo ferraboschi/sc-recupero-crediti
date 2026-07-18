@@ -184,7 +184,23 @@ perdere: ognuno merita una valutazione a sé.
     avuto un sollecito e la fattura era emessa prima, quell'operazione manuale le conta come
     recupero con data = adesso. Endpoint di manutenzione una-tantum, sorgente legacy.
 
-22. **`normalize_piva` esplode su input non-stringa** (`piva.py:26`, `raw.strip()`).
+22. **L'audit globale in `System.jsx` è ora duplicato** dall'audit per-cliente + contatore "da
+    sanificare", ed è l'unico rimasto col difetto `.all()` su tutte le fatture
+    (`system.py:458`). Da rimuovere in un task dedicato, sostituendo il conteggio con un
+    rimando alla lista Clienti filtrata.
+
+23. **`suggested_score` mostrato può differire dal seed** (visto dal vivo: "fuzzy 100" su un
+    suggerimento seminato a 82). Probabile ricalcolo su nome normalizzato a valle; da
+    verificare che sia voluto e che la UI mostri lo score della decisione, non uno ricalcolato.
+
+24. **Etichetta "Scadenza più vicina" in desc** mette i NULL/più lontani in cima finché non si
+    inverte: controintuitivo rispetto all'etichetta. Cosmetico.
+
+25. **`unlink`/`reassign` non sono scoped al cliente aperto** (`positions.py`): via API diretta
+    si può scollegare la fattura di qualsiasi cliente. Autenticato e loggato in ActivityLog;
+    se si vuole lo scoping UI-server, va imposto lato backend. Minore.
+
+26. **`normalize_piva` esplode su input non-stringa** (`piva.py:26`, `raw.strip()`).
    `normalize_piva(12345678903)` → `AttributeError`; `b"IT..."` → `TypeError`. Oggi **non
    raggiungibile** — verificato tracciando ogni writer: `fatturapro.py:795` e
    `shopify.py:219` fanno `.strip()`, l'import CSV usa `csv.DictReader` (stringhe, non
