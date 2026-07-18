@@ -275,3 +275,89 @@ class TestAcceptedNameExitsAudit:
             "/api/customers?to_sanitize=true&only_overdue=false"
         ).json()["items"]]
         assert c.id not in ids
+
+
+# ── TIER 1: bonifica_piva a livello cliente + cascade P.IVA ───────────
+
+# Caso reale dell'owner: cliente senza P.IVA, fatture tutte con la stessa
+# P.IVA valida e nome identico → il giallo nasce SOLO dalla P.IVA mancante.
+CAVO = "Cavo Luigi Beverage Solutions srl"
+
+
+class TestBonificaPivaCascade:
+    def test_assign_piva_greens_all_present_and_future(self, test_client, test_db_session):
+        # La CASCADE dell'endpoint esistente: appena il cliente ha la P.IVA,
+        # tutte le sue fatture con quella P.IVA + le future diventano verified
+        # (verde vero, checksum) — verify è calcolato dal vivo.
+        c = _customer(test_db_session, CAVO)  # nessuna P.IVA
+        i1 = _invoice(test_db_session, "C1/2026", customer_id=c.id,
+                      customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        _invoice(test_db_session, "C2/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        # Prima: tutte "Da controllare" (warning), il giallo è solo la P.IVA
+        # mancante sul cliente.
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        for it in detail["invoices"]["items"]:
+            assert it["verification"]["level"] == "warning"
+        # Assegno la P.IVA al cliente da UNA qualsiasi delle fatture.
+        r = test_client.post(f"/api/positions/{i1.id}/assign-piva-to-customer")
+        assert r.status_code == 200
+        # Ora tutte verde-garanzia (checksum), guaranteed True.
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        assert detail["partita_iva"] == PIVA_CAVO
+        for it in detail["invoices"]["items"]:
+            assert it["verification"]["level"] == "verified"
+            assert it["verification"]["guaranteed"] is True
+        # Fattura FUTURA con la stessa P.IVA: verde anche lei, nessun'azione.
+        _invoice(test_db_session, "CFUT/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        by_num = {it["invoice_number"]: it for it in detail["invoices"]["items"]}
+        assert by_num["CFUT/2026"]["verification"]["level"] == "verified"
+
+
+class TestBonificaPivaAudit:
+    def test_offered_when_single_shared_piva(self, test_client, test_db_session):
+        # Caso Cavo Luigi: cliente senza P.IVA, 3 fatture warning con la STESSA
+        # P.IVA valida → l'audit offre bonifica_piva a livello cliente.
+        c = _customer(test_db_session, CAVO)
+        ids = []
+        for n in ("V1/2026", "V2/2026", "V3/2026"):
+            inv = _invoice(test_db_session, n, customer_id=c.id,
+                           customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+            ids.append(inv.id)
+        data = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert data["bonifica_piva"] is not None
+        assert data["bonifica_piva"]["piva"] == PIVA_CAVO
+        assert data["bonifica_piva"]["invoice_count"] == 3
+        assert data["bonifica_piva"]["invoice_id"] in ids
+        assert data["bonifica_piva_conflict"] is None
+
+    def test_not_offered_when_customer_has_piva(self, test_client, test_db_session):
+        # Se il cliente ha già una P.IVA valida non c'è nulla da completare.
+        c = _customer(test_db_session, CAVO, partita_iva=PIVA_A)
+        _invoice(test_db_session, "H/2026", customer_id=c.id,
+                 customer_name_raw="Qualcosa Di Diverso", customer_piva_raw=PIVA_A)
+        data = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert data["bonifica_piva"] is None
+        assert data["bonifica_piva_conflict"] is None
+
+    def test_conflict_when_different_pivas(self, test_client, test_db_session):
+        # GUARDRAIL P.IVA-diverse: le fatture problematiche portano P.IVA
+        # DIVERSE → NON offrire (cliente mis-raggruppato), esponi la lista.
+        c = _customer(test_db_session, CAVO)  # nessuna P.IVA
+        _invoice(test_db_session, "D1/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_A)
+        _invoice(test_db_session, "D2/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_B)
+        data = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert data["bonifica_piva"] is None
+        assert data["bonifica_piva_conflict"] == sorted([PIVA_A, PIVA_B])
+
+    def test_not_offered_when_no_valid_piva_on_invoices(self, test_client, test_db_session):
+        # Problemi ma nessuna P.IVA valida da assegnare (caso Tier 2, non Tier 1).
+        c = _customer(test_db_session, CUST_NAME)
+        _invoice(test_db_session, "NP/2026", customer_id=c.id, customer_name_raw=HEADING)
+        data = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert data["bonifica_piva"] is None
+        assert data["bonifica_piva_conflict"] is None

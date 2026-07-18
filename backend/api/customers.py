@@ -580,6 +580,13 @@ async def audit_customer(
     items = []
     reviewed_count = 0
     worst = "ok"
+    # TIER 1 — "Completa anagrafica" a livello CLIENTE: fra i problemi mostrati
+    # raccolgo le P.IVA VALIDE portate dalle fatture. Se il cliente non ha
+    # P.IVA e i problemi ne condividono UNA SOLA → si offre la bonifica a
+    # livello cliente (l'assegnazione CASCADE su tutte, presenti e future).
+    # Se ne portano di DIVERSE è segnale di cliente mis-raggruppato: niente
+    # offerta, si espone la lista delle P.IVA distinte.
+    piva_carriers = []  # (invoice_id, validated_piva)
     for inv in invoices:
         v = verify_invoice_customer(inv, customer)
         verdict = v["verdict"]
@@ -596,6 +603,9 @@ async def audit_customer(
             worst = "bad"
         elif worst != "bad":
             worst = "warn"
+        inv_piva = validate_piva(inv.customer_piva_raw)
+        if inv_piva:
+            piva_carriers.append((inv.id, inv_piva))
         items.append({
             "invoice_id": inv.id,
             "invoice_number": inv.invoice_number,
@@ -640,6 +650,26 @@ async def audit_customer(
         for p in pending
     ]
 
+    # TIER 1 — bonifica_piva a livello cliente. Solo se il cliente NON ha una
+    # P.IVA valida: se ce l'ha, non c'è anagrafica da completare.
+    bonifica_piva = None
+    bonifica_piva_conflict = None
+    if validate_piva(customer.partita_iva) is None and piva_carriers:
+        distinct = sorted({p for _, p in piva_carriers})
+        if len(distinct) == 1:
+            the_piva = distinct[0]
+            carriers = [iid for iid, p in piva_carriers if p == the_piva]
+            bonifica_piva = {
+                "piva": the_piva,
+                "invoice_count": len(carriers),
+                # Una qualsiasi delle fatture del gruppo: l'endpoint
+                # assign-piva-to-customer copia la P.IVA sul cliente (CASCADE).
+                "invoice_id": carriers[0],
+            }
+        else:
+            # P.IVA diverse fra le fatture: forse due clienti fusi per errore.
+            bonifica_piva_conflict = distinct
+
     total_problems = counts["warn"] + counts["bad"]
     return {
         "customer_id": customer.id,
@@ -654,6 +684,11 @@ async def audit_customer(
         "worst_verdict": worst if items else ("warn" if pending_suggestions else "ok"),
         "items": items,
         "pending_suggestions": pending_suggestions,
+        # TIER 1: presente SOLO quando c'è una singola P.IVA da assegnare al
+        # cliente (altrimenti null); conflict = lista P.IVA distinte se le
+        # fatture ne portano di diverse (avviso "forse due clienti").
+        "bonifica_piva": bonifica_piva,
+        "bonifica_piva_conflict": bonifica_piva_conflict,
     }
 
 
