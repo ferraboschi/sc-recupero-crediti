@@ -748,6 +748,10 @@ async def get_evoluzione(
     registrato — lo storico parte dal primo sync dopo il rilascio di questa
     funzione — la serie è VUOTA, non un 500: il grafico mostrerà "nessun
     dato" invece di rompersi.
+
+    Ogni punto espone `stimato`: True per le righe ricostruite dal backfill
+    storico (proiezione dalle date fattura), False per gli snapshot veri.
+    Il grafico tratteggia le stime; i punti veri le sostituiscono man mano.
     """
     try:
         # Clamp difensivo: niente finestre negative o assurde.
@@ -768,6 +772,8 @@ async def get_evoluzione(
                 "contestati": s.contestati,
                 "lavorabile": s.lavorabile,
                 "recuperato_certo": s.recuperato_certo,
+                # bool() copre i NULL delle righe pre-ALTER sul DB live
+                "stimato": bool(s.estimated),
                 "fatture": {
                     "scaduto_totale": s.scaduto_totale_fatture,
                     "non_abbinati": s.non_abbinati_fatture,

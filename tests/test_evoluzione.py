@@ -15,12 +15,35 @@ Copertura:
 - storico vuoto → serie vuota, mai un 500
 - il full sync scrive lo snapshot, ma se la scrittura esplode NON fa fallire
   il sync (si logga e si prosegue)
+
+Backfill STIMATO dello storico (sezioni D-G):
+- la stima a un giorno D ricostruita dalle date fattura (aperte /
+  pagate-con-paid_at / pagate-senza, che usano updated_at)
+- la classificazione di OGGI proiettata indietro (esclusi/contestati/orfane)
+- il backfill NON sovrascrive mai righe esistenti (vere O stimate)
+- lo snapshot vero (record_overdue_snapshot) RIMPIAZZA la stima sulla stessa
+  data (estimated torna False, valori ricalcolati)
+- marker one-shot in sync_state: secondo giro = skipped; scritto solo a
+  successo (un fallimento riprova al prossimo avvio)
+- GET /evoluzione espone `stimato` per punto
 """
 
 from datetime import date, datetime, timedelta
 
-from backend.database import Invoice, Customer, RecoveryAction, OverdueSnapshot
-from backend.engine.overdue_history import record_overdue_snapshot
+from backend.database import (
+    Invoice, Customer, RecoveryAction, OverdueSnapshot, SyncState,
+)
+from backend.engine.cases import business_day_start
+from backend.engine.overdue_history import (
+    record_overdue_snapshot,
+    backfill_overdue_history,
+    backfill_overdue_history_if_needed,
+)
+
+
+def _business_today():
+    """La stessa àncora di data usata da snapshot e backfill."""
+    return business_day_start().date()
 
 
 # ── Helper ───────────────────────────────────────────────────────────
@@ -56,13 +79,14 @@ def _invoice(session, number, amount_due=100.0, status="open",
 
 
 def _snapshot_row(session, d, scaduto_totale=0.0, lavorabile=0.0,
-                  recuperato_certo=0.0):
+                  recuperato_certo=0.0, estimated=False):
     """Inserisce direttamente una riga di storico (per i test dell'endpoint)."""
     snap = OverdueSnapshot(
         date=d,
         scaduto_totale=scaduto_totale,
         lavorabile=lavorabile,
         recuperato_certo=recuperato_certo,
+        estimated=estimated,
     )
     session.add(snap)
     session.commit()
@@ -285,3 +309,250 @@ class TestSyncWiring:
                      "cases"):
             assert step in results
         assert sync_mod._sync_progress["running"] is False
+
+
+# ── D. Il backfill stimato dello storico ─────────────────────────────
+
+class TestBackfillStimato:
+    def test_stima_a_un_giorno_con_mix(self, test_db_session):
+        """La stima a un giorno D con il mix completo: aperta, pagata con
+        paid_at, pagata SENZA paid_at (storico pre-migrazione → updated_at).
+
+        - A (aperta, cliente):    due=today-40, amount_due=100 → scaduta da D>=due
+        - B (pagata, paid_at=−10gg, cliente): due=today-40, amount=200 pieno
+          → scaduta per D in [today-40, paid_at), poi sparisce
+        - C (pagata SENZA paid_at, updated_at=−20gg, ORFANA): due=today-50,
+          amount=300 pieno → scaduta per D in [today-50, updated_at)
+        """
+        today = _business_today()
+        now = datetime.utcnow()
+        c = _customer(test_db_session, "Normale SRL")
+
+        _invoice(test_db_session, "A/1", amount_due=100.0,
+                 due_date=today - timedelta(days=40),
+                 issue_date=today - timedelta(days=70),
+                 customer_id=c.id)
+        _invoice(test_db_session, "B/1", amount=200.0, amount_due=0.0,
+                 status="paid", days_overdue=0,
+                 due_date=today - timedelta(days=40),
+                 issue_date=today - timedelta(days=70),
+                 customer_id=c.id,
+                 paid_at=now - timedelta(days=10))
+        _invoice(test_db_session, "C/1", amount=300.0, amount_due=0.0,
+                 status="paid", days_overdue=0,
+                 due_date=today - timedelta(days=50),
+                 issue_date=today - timedelta(days=80),
+                 customer_id=None,
+                 updated_at=now - timedelta(days=20))
+
+        stats = backfill_overdue_history(test_db_session, days=60)
+        test_db_session.commit()
+
+        rows = {s.date: s for s in test_db_session.query(OverdueSnapshot).all()}
+        # 60 giorni: da today-60 a ieri, tutti stimati
+        assert len(rows) == 60
+        assert stats["created"] == 60
+        assert all(s.estimated for s in rows.values())
+
+        # D=today-45: solo C è già scaduta (A e B scadono a today-40)
+        s45 = rows[today - timedelta(days=45)]
+        assert s45.scaduto_totale == 300.0
+        assert s45.non_abbinati == 300.0  # C è orfana
+
+        # D=today-30: A(100) + B(200, non ancora pagata) + C(300, idem)
+        s30 = rows[today - timedelta(days=30)]
+        assert s30.scaduto_totale == 600.0
+        assert s30.lavorabile == 300.0        # A + B (cliente normale)
+        assert s30.non_abbinati == 300.0      # C
+        assert s30.scaduto_totale_fatture == 3
+        assert s30.lavorabile_fatture == 2
+
+        # D=today-15: C ormai "pagata" (updated_at −20gg) → restano A + B
+        s15 = rows[today - timedelta(days=15)]
+        assert s15.scaduto_totale == 300.0
+        assert s15.non_abbinati == 0.0
+
+        # D=today-5: anche B pagata (paid_at −10gg) → resta solo A
+        s5 = rows[today - timedelta(days=5)]
+        assert s5.scaduto_totale == 100.0
+        assert s5.lavorabile == 100.0
+        assert s5.scaduto_totale_fatture == 1
+
+    def test_classificazione_di_oggi_proiettata_indietro(self, test_db_session):
+        """Esclusi e contestati di OGGI restano tali anche nella stima:
+        la composizione è la classificazione attuale proiettata indietro."""
+        today = _business_today()
+        escluso = _customer(test_db_session, "Escluso SRL", excluded=True)
+
+        _invoice(test_db_session, "ESC/1", amount_due=80.0,
+                 due_date=today - timedelta(days=30),
+                 customer_id=escluso.id)
+        _invoice(test_db_session, "CON/1", amount_due=55.0,
+                 status="disputed",
+                 due_date=today - timedelta(days=30),
+                 customer_id=None)
+
+        backfill_overdue_history(test_db_session, days=20)
+        test_db_session.commit()
+
+        s10 = (test_db_session.query(OverdueSnapshot)
+               .filter(OverdueSnapshot.date == today - timedelta(days=10))
+               .one())
+        assert s10.esclusi == 80.0
+        # CON/1 è orfana E contestata: la gerarchia di bucket_expr() la
+        # mette in non_abbinati (senza cliente la domanda "è esclusa?"
+        # non ha risposta) — identica alla cascata live.
+        assert s10.non_abbinati == 55.0
+        assert s10.contestati == 0.0
+        assert s10.lavorabile == 0.0
+        assert s10.scaduto_totale == 135.0
+
+    def test_recuperato_certo_storico_cumulato(self, test_db_session):
+        """recuperato_certo(D) cumula le pagate con paid_at <= D che
+        rispettano recovered_invoice_clause (stessi helper del live)."""
+        today = _business_today()
+        now = datetime.utcnow()
+        c = _customer(test_db_session, "Pagante SRL")
+        test_db_session.add(RecoveryAction(
+            customer_id=c.id, action_type="first_contact",
+            created_at=now - timedelta(days=30),
+            completed_at=now - timedelta(days=30),
+        ))
+        test_db_session.commit()
+
+        _invoice(test_db_session, "P/1", amount=300.0, amount_due=0.0,
+                 status="paid", days_overdue=0,
+                 issue_date=today - timedelta(days=60),
+                 due_date=today - timedelta(days=40),
+                 customer_id=c.id,
+                 paid_at=now - timedelta(days=10),
+                 amount_due_at_paid=150.0)
+
+        backfill_overdue_history(test_db_session, days=30)
+        test_db_session.commit()
+
+        rows = {s.date: s for s in test_db_session.query(OverdueSnapshot).all()}
+        # Prima del pagamento: nulla di recuperato
+        assert rows[today - timedelta(days=15)].recuperato_certo == 0.0
+        assert rows[today - timedelta(days=15)].recuperato_certo_fatture == 0
+        # Dopo il pagamento: cumulato a residuo (amount_due_at_paid)
+        assert rows[today - timedelta(days=5)].recuperato_certo == 150.0
+        assert rows[today - timedelta(days=5)].recuperato_certo_fatture == 1
+
+    def test_non_sovrascrive_righe_esistenti(self, test_db_session):
+        """Le righe già presenti — VERE o stimate — non si toccano mai."""
+        today = _business_today()
+        _snapshot_row(test_db_session, today - timedelta(days=10),
+                      scaduto_totale=42.0, estimated=False)
+        _snapshot_row(test_db_session, today - timedelta(days=20),
+                      scaduto_totale=777.0, estimated=True)
+        _invoice(test_db_session, "O/1", amount_due=100.0,
+                 due_date=today - timedelta(days=40))
+
+        stats = backfill_overdue_history(test_db_session, days=30)
+        test_db_session.commit()
+
+        rows = {s.date: s for s in test_db_session.query(OverdueSnapshot).all()}
+        assert len(rows) == 30
+        assert stats["created"] == 28
+        assert stats["skipped_existing"] == 2
+        # La riga VERA è intatta
+        vera = rows[today - timedelta(days=10)]
+        assert vera.scaduto_totale == 42.0
+        assert vera.estimated is False
+        # Anche la stima già scritta non viene riscritta (idempotenza)
+        stima = rows[today - timedelta(days=20)]
+        assert stima.scaduto_totale == 777.0
+        # Le date nuove sono state stimate davvero
+        nuova = rows[today - timedelta(days=5)]
+        assert nuova.scaduto_totale == 100.0
+        assert nuova.estimated is True
+
+
+# ── E. Lo snapshot vero rimpiazza la stima ───────────────────────────
+
+class TestSnapshotVeroSostituisceStima:
+    def test_upsert_vero_su_riga_stimata(self, test_db_session):
+        """record_overdue_snapshot su una data con riga stimata: la riga
+        diventa VERA (estimated=False) e i valori sono ricalcolati."""
+        today = _business_today()
+        _snapshot_row(test_db_session, today, scaduto_totale=999.0,
+                      estimated=True)
+        _invoice(test_db_session, "O/1", amount_due=100.0,
+                 due_date=today - timedelta(days=30))
+
+        record_overdue_snapshot(test_db_session)
+
+        rows = (test_db_session.query(OverdueSnapshot)
+                .filter(OverdueSnapshot.date == today).all())
+        assert len(rows) == 1, "stessa riga, non un doppione"
+        assert rows[0].estimated is False, "la stima è stata promossa a vera"
+        assert rows[0].scaduto_totale == 100.0, "valori ricalcolati, non 999"
+
+
+# ── F. Il trigger one-shot (marker in sync_state) ────────────────────
+
+class TestTriggerOneShot:
+    def test_marker_idempotente(self, test_db_session):
+        """Primo giro: backfill + marker. Secondo giro: skipped, nessuna
+        riga in più."""
+        today = _business_today()
+        _invoice(test_db_session, "O/1", amount_due=100.0,
+                 due_date=today - timedelta(days=40))
+
+        r1 = backfill_overdue_history_if_needed(test_db_session, days=30)
+        assert r1.get("created") == 30
+        marker = (test_db_session.query(SyncState)
+                  .filter_by(key="overdue_history_backfill").first())
+        assert marker is not None
+        assert (marker.result or {}).get("done") is True
+
+        r2 = backfill_overdue_history_if_needed(test_db_session, days=30)
+        assert r2 == {"skipped": True}
+        assert test_db_session.query(OverdueSnapshot).count() == 30
+
+    def test_marker_scritto_solo_a_successo(self, monkeypatch, test_db_session):
+        """Se il backfill esplode il marker NON viene scritto: al prossimo
+        avvio si riprova (stesso pattern di cases.run_backfill_if_needed)."""
+        import backend.engine.overdue_history as oh
+        import backend.database as db_mod
+
+        monkeypatch.setattr(db_mod, "get_session_direct",
+                            lambda: test_db_session)
+
+        def boom(session, days=90):
+            raise RuntimeError("boom backfill")
+
+        with monkeypatch.context() as m:
+            m.setattr(oh, "backfill_overdue_history", boom)
+            assert oh.run_history_backfill_if_needed() is None
+
+        marker = (test_db_session.query(SyncState)
+                  .filter_by(key="overdue_history_backfill").first())
+        assert marker is None or not (marker.result or {}).get("done")
+
+        # Il retry (senza l'esplosione) va a buon fine e scrive il marker
+        result = oh.run_history_backfill_if_needed()
+        assert result is not None and result.get("created", 0) >= 0
+        marker = (test_db_session.query(SyncState)
+                  .filter_by(key="overdue_history_backfill").first())
+        assert (marker.result or {}).get("done") is True
+
+
+# ── G. /evoluzione espone `stimato` ──────────────────────────────────
+
+class TestEvoluzioneStimato:
+    def test_espone_stimato_per_punto(self, test_client, test_db_session):
+        """Ogni punto dice se è una stima o uno snapshot vero: è ciò che
+        permette al grafico di tratteggiare lo storico ricostruito."""
+        today = date.today()
+        _snapshot_row(test_db_session, today - timedelta(days=2),
+                      scaduto_totale=10.0, estimated=True)
+        _snapshot_row(test_db_session, today - timedelta(days=1),
+                      scaduto_totale=20.0, estimated=False)
+
+        serie = test_client.get("/api/dashboard/evoluzione").json()["serie"]
+
+        assert len(serie) == 2
+        assert serie[0]["stimato"] is True
+        assert serie[1]["stimato"] is False

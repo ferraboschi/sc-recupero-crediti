@@ -259,6 +259,13 @@ class OverdueSnapshot(Base):
     lavorabile_fatture = Column(Integer, nullable=False, default=0)
     recuperato_certo_fatture = Column(Integer, nullable=False, default=0)
 
+    # STIMA vs realtà: le righe ricostruite dal backfill storico (proiezione
+    # dalle date fattura, engine/overdue_history.backfill_overdue_history)
+    # sono marcate estimated=True e il grafico le tratteggia. Lo snapshot
+    # VERO del sync sulla stessa data le promuove (estimated=False, valori
+    # ricalcolati). Le righe vere non vengono MAI sovrascritte dal backfill.
+    estimated = Column(Boolean, default=False)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -367,6 +374,12 @@ def _run_migrations(engine):
         "ALTER TABLE customers ADD COLUMN ragione_sociale_locked BOOLEAN DEFAULT FALSE",
         "UPDATE customers SET ragione_sociale_locked = FALSE "
         "WHERE ragione_sociale_locked IS NULL",
+        # Storico stimato del grafico evoluzione: colonna additiva perché
+        # overdue_snapshots può già esistere in prod (creata da create_all
+        # nel deploy della PR). NULL→FALSE come gli altri BOOLEAN via ALTER.
+        "ALTER TABLE overdue_snapshots ADD COLUMN estimated BOOLEAN DEFAULT FALSE",
+        "UPDATE overdue_snapshots SET estimated = FALSE "
+        "WHERE estimated IS NULL",
     ]
     try:
         raw = engine.raw_connection()
