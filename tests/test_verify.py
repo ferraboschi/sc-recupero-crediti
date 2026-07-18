@@ -210,6 +210,65 @@ class TestAcceptedNames:
         assert v["manual_confirmed"] is False
 
 
+PIVA_CAVO = "02572440994"
+CAVO = "Cavo Luigi Beverage Solutions srl"
+
+
+class TestAcceptedNameDoesNotOverrideAssignablePiva:
+    """FIX 1 — l'upgrade via accepted_names NON deve scattare quando la fattura
+    porta una P.IVA valida CHE IL CLIENTE NON HA: lì la strada giusta è
+    ASSEGNARE la P.IVA (azione più forte), quindi la riga resta al suo esito
+    naturale (warning) e l'audit continua a offrire bonifica_piva. L'accepted-
+    name smarca SOLO i casi senza P.IVA assegnabile."""
+
+    def test_assignable_piva_blocks_accepted_name_upgrade(self):
+        # Cliente senza P.IVA + fattura con P.IVA valida X + intestazione
+        # ACCETTATA (identica) → resta warning, NON verified: la P.IVA è
+        # assegnabile, l'accepted-name non deve spegnere quell'offerta.
+        v = verify_invoice_customer(
+            _Inv(PIVA_CAVO, CAVO),
+            _CustAccepted(None, CAVO, accepted=[CAVO]),
+        )
+        assert v["level"] == "warning"
+        assert v["verdict"] == "warn"
+        assert v["manual_confirmed"] is False
+
+    def test_no_assignable_piva_still_upgrades_from_critical(self):
+        # Cliente senza P.IVA + fattura SENZA P.IVA valida + intestazione
+        # accettata → verified: è il caso d'uso reale dell'accepted-name, resta
+        # funzionante (nessuna P.IVA da assegnare).
+        v = verify_invoice_customer(
+            _Inv(None, "Sushi Kyoto"),
+            _CustAccepted(None, "Ferramenta Bianchi", accepted=["Sushi Kyoto"]),
+        )
+        assert v["level"] == "verified"
+        assert v["verdict"] == "ok"
+        assert v["manual_confirmed"] is True
+
+    def test_customer_already_has_piva_still_upgrades(self):
+        # Cliente CON P.IVA + fattura senza P.IVA valida + intestazione accettata
+        # → verified: nessuna P.IVA assegnabile (il cliente ce l'ha già) →
+        # l'upgrade è lecito.
+        v = verify_invoice_customer(
+            _Inv(None, "Sushi Kyoto"),
+            _CustAccepted(PIVA_A, "Ferramenta Bianchi", accepted=["Sushi Kyoto"]),
+        )
+        assert v["level"] == "verified"
+        assert v["verdict"] == "ok"
+        assert v["manual_confirmed"] is True
+
+    def test_both_pivas_valid_and_different_stays_critical(self):
+        # La valvola preesistente resta: P.IVA fattura e cliente entrambe valide
+        # e DIVERSE → critical, l'accepted-name non zittisce la contraddizione.
+        v = verify_invoice_customer(
+            _Inv(PIVA_A, "Sushi Kyoto"),
+            _CustAccepted(PIVA_B, "Ferramenta Bianchi", accepted=["Sushi Kyoto"]),
+        )
+        assert v["level"] == "critical"
+        assert v["verdict"] == "bad"
+        assert v["manual_confirmed"] is False
+
+
 class TestAuditVerdictUnchanged:
     """Il verdict (audit) resta più permissivo del level (semaforo):
     P.IVA uguale con nome decente = ok, ma non necessariamente verified."""

@@ -361,3 +361,56 @@ class TestBonificaPivaAudit:
         data = test_client.get(f"/api/customers/{c.id}/audit").json()
         assert data["bonifica_piva"] is None
         assert data["bonifica_piva_conflict"] is None
+
+
+class TestFix1AcceptedNameDoesNotHideAssignablePiva:
+    """FIX 1 (non-regressione della divergenza lista/audit) — quando una
+    fattura porta una P.IVA valida che il cliente NON ha, aver accettato la sua
+    intestazione NON deve smarcarla: la P.IVA resta assegnabile e i TRE insiemi
+    dell'audit (audit-summary / to_sanitize / bonifica-suggestions) CONCORDANO.
+    """
+
+    def test_three_sets_concord_when_piva_is_assignable(self, test_client, test_db_session):
+        # Cliente senza P.IVA + fattura con P.IVA valida + intestazione ACCETTATA.
+        c = _customer(test_db_session, CAVO)  # nessuna P.IVA
+        _invoice(test_db_session, "AC/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        # Accetto l'intestazione (che nel bug la renderebbe "pulita").
+        r = test_client.post(
+            f"/api/customers/{c.id}/accepted-names", json={"name": CAVO}
+        )
+        assert r.status_code == 200
+
+        # verify per-riga: warning, NON verified (la P.IVA è assegnabile).
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        assert len(detail["invoices"]["items"]) == 1
+        ver = detail["invoices"]["items"][0]["verification"]
+        assert ver["level"] == "warning"
+        assert ver["manual_confirmed"] is False
+
+        # /{id}/audit: continua a offrire bonifica_piva.
+        aud = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert aud["bonifica_piva"] is not None
+        assert aud["bonifica_piva"]["piva"] == PIVA_CAVO
+        assert aud["problem_count"] == 1
+        assert aud["worst_verdict"] != "ok"
+
+        # I TRE insiemi concordano: audit-summary, to_sanitize, bonifica-suggestions.
+        summary_ids = test_client.get(
+            "/api/customers/audit-summary"
+        ).json()["customer_ids"]
+        assert c.id in summary_ids
+
+        to_sanitize_ids = [
+            i["id"] for i in test_client.get(
+                "/api/customers?to_sanitize=true&only_overdue=false"
+            ).json()["items"]
+        ]
+        assert c.id in to_sanitize_ids
+
+        bonifica_ids = [
+            i["customer_id"] for i in test_client.get(
+                "/api/customers/bonifica-suggestions"
+            ).json()["items"]
+        ]
+        assert c.id in bonifica_ids

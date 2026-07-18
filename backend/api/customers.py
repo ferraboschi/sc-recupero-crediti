@@ -91,11 +91,16 @@ def _single_shared_piva(customer, invoices):
     del cliente e le intestazioni grezze delle fatture che portano quella P.IVA
     — lo STESSO scorer di verify (name_similarity_score, il "Somiglianza nomi").
 
-    Per costruzione una fattura con P.IVA valida verso un cliente SENZA P.IVA
-    valida non è MAI 'ok' nel verify (è sempre warn/bad): raccogliere i carrier
-    con P.IVA valida equivale quindi a raccogliere i "problemi con P.IVA" di
-    bonifica_piva, SENZA chiamare verify — che leggerebbe accepted_names dal
-    vivo (una lazy-load per cliente = N+1 sulla lista da 115+).
+    INVARIANTE (e perché regge): una fattura con P.IVA valida verso un cliente
+    SENZA P.IVA valida non è MAI 'ok' nel verify — è sempre warn/bad. Regge
+    perché verify GATE-a l'upgrade via accepted_names esattamente su questo
+    caso (piva_assignable): un'intestazione accettata NON smarca una fattura la
+    cui P.IVA è ancora assegnabile al cliente (la strada giusta è assegnarla).
+    Senza quel gate l'invariante sarebbe FALSA e questo shortcut divergerebbe
+    dall'audit. Data l'invariante, raccogliere i carrier con P.IVA valida
+    equivale a raccogliere i "problemi con P.IVA" di bonifica_piva SENZA
+    chiamare verify — che leggerebbe accepted_names dal vivo (una lazy-load per
+    cliente = N+1 sulla lista da 115+).
     """
     if validate_piva(customer.partita_iva) is not None:
         return None

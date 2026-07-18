@@ -119,15 +119,32 @@ def verify_invoice_customer(
     # umana, non una garanzia checksum. Vale per costruzione anche per le
     # fatture FUTURE con la stessa intestazione (nessuna scrittura per-fattura).
     #
-    # VALVOLA DI SICUREZZA OBBLIGATORIA: l'upgrade NON avviene se piva_conflict
-    # è True (P.IVA fattura e cliente entrambe valide e diverse). Una conferma
-    # d'intestazione non deve MAI zittire una P.IVA in contraddizione: resta
-    # critical. `getattr` difensivo: i chiamanti che passano un customer
-    # "simulato" (SimpleNamespace, niente relationship) non devono esplodere.
+    # VALVOLA DI SICUREZZA OBBLIGATORIA #1: l'upgrade NON avviene se
+    # piva_conflict è True (P.IVA fattura e cliente entrambe valide e diverse).
+    # Una conferma d'intestazione non deve MAI zittire una P.IVA in
+    # contraddizione: resta critical.
+    #
+    # VALVOLA DI SICUREZZA OBBLIGATORIA #2 (piva_assignable): l'upgrade NON
+    # avviene se la fattura porta una P.IVA valida CHE IL CLIENTE NON HA
+    # (inv_piva valido e cust_piva assente). Lì la strada giusta è ASSEGNARE
+    # la P.IVA al cliente (azione più forte, verde da checksum e cascade sulle
+    # future), non smarcare la riga: accettare il nome spegnerebbe l'offerta
+    # "Assegna P.IVA" e — poiché l'audit passa da verify — nasconderebbe il
+    # cliente dagli insiemi "da sanificare" mentre bonifica-suggestions lo
+    # tiene (divergenza lista/audit). La riga resta quindi al suo esito
+    # naturale (warning) e l'audit continua a offrire bonifica_piva. È anche
+    # ciò che rende VERA l'invariante verify-free di _single_shared_piva. Fuori
+    # da questo caso l'accepted-name smarca regolarmente (fattura senza P.IVA
+    # valida, o cliente che la P.IVA ce l'ha già).
+    #
+    # `getattr` difensivo: i chiamanti che passano un customer "simulato"
+    # (SimpleNamespace, niente relationship) non devono esplodere.
+    piva_assignable = inv_piva is not None and cust_piva is None
     manual_confirmed = False
     if (
         customer is not None
         and not piva_conflict
+        and not piva_assignable
         and level != "verified"
         and inv_name_src
     ):
