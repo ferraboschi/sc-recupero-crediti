@@ -198,6 +198,15 @@ export default function ClientDetail() {
   // fattura), così lo stato sopravvive all'hard-reload.
   const [reviewedRows, setReviewedRows] = useState(() => new Set())
   const [rowReviewActingId, setRowReviewActingId] = useState(null)
+  // Menu guidato "Risolvi" sulle righe discordanti dell'audit: 3 vie.
+  // ① picker riassegnazione (ricerca fuzzy /customers/suggest)
+  const [resolveReassignId, setResolveReassignId] = useState(null)
+  const [resolveQuery, setResolveQuery] = useState('')
+  const [resolveResults, setResolveResults] = useState([])
+  const [resolveSearching, setResolveSearching] = useState(false)
+  // ② anteprima d'impatto del rinomino (assign-name-to-customer senza confirm)
+  const [renamePreview, setRenamePreview] = useState(null)
+  const [renameLoadingId, setRenameLoadingId] = useState(null)
 
   const fetchData = useCallback(async () => {
     try {
@@ -265,7 +274,35 @@ export default function ClientDetail() {
   // Cambiando cliente lo stato locale delle verifiche manuali riparte pulito.
   useEffect(() => {
     setReviewedRows(new Set())
+    setResolveReassignId(null)
+    setResolveQuery('')
+    setResolveResults([])
+    setRenamePreview(null)
   }, [customerId])
+
+  // Picker "È di un altro cliente": ricerca approssimata debounced sugli
+  // stessi suggerimenti fuzzy della lista Clienti (/customers/suggest).
+  useEffect(() => {
+    if (resolveReassignId == null) return undefined
+    const q = resolveQuery.trim()
+    if (q.length < 2) {
+      setResolveResults([])
+      return undefined
+    }
+    let cancelled = false
+    setResolveSearching(true)
+    const t = setTimeout(async () => {
+      try {
+        const res = await client.get('/customers/suggest', { params: { q, limit: 6 } })
+        if (!cancelled) setResolveResults(res.data.items || [])
+      } catch {
+        if (!cancelled) setResolveResults([])
+      } finally {
+        if (!cancelled) setResolveSearching(false)
+      }
+    }, 300)
+    return () => { cancelled = true; clearTimeout(t) }
+  }, [resolveQuery, resolveReassignId])
 
   useEffect(() => {
     fetchAudit()
@@ -316,6 +353,77 @@ export default function ClientDetail() {
         else next.add(item.invoice_id)
         return next
       })
+    })
+  }
+
+  // ── Menu guidato "Risolvi" (riga discordante) ──────────────────────
+
+  // ① "È di un altro cliente": apre il picker inline, pre-compilato col
+  // destinatario della fattura — nel caso tipico (BASARA su COLONIALE) la
+  // prima ricerca è già quella giusta.
+  const handleResolveOpenReassign = (item) => {
+    setRenamePreview(null)
+    if (resolveReassignId === item.invoice_id) {
+      setResolveReassignId(null)
+      setResolveQuery('')
+      setResolveResults([])
+      return
+    }
+    setResolveReassignId(item.invoice_id)
+    setResolveQuery(item.verification?.invoice_name || '')
+    setResolveResults([])
+  }
+
+  const handleResolveReassign = (item, target) => {
+    if (!window.confirm(
+      `Riassegnare la fattura ${item.invoice_number} da "${data?.ragione_sociale}" `
+      + `a "${target.ragione_sociale}"?\n\n`
+      + 'La fattura passa al nuovo cliente con abbinamento manuale.'
+    )) return
+    runAuditAction(item.invoice_id, async () => {
+      await client.put(`/positions/${item.invoice_id}/reassign`, null, {
+        params: { new_customer_id: target.id },
+      })
+      setResolveReassignId(null)
+      setResolveQuery('')
+      setResolveResults([])
+    })
+  }
+
+  // ② "Il profilo ha il nome vecchio": prima chiamata SENZA confirm =
+  // anteprima d'impatto (quante altre fatture diventerebbero discordanti),
+  // il pannello con Conferma/Annulla è la conferma esplicita.
+  const handleResolveRenamePreview = async (item) => {
+    setResolveReassignId(null)
+    setResolveQuery('')
+    setResolveResults([])
+    if (renamePreview?.invoiceId === item.invoice_id) {
+      setRenamePreview(null)
+      return
+    }
+    try {
+      setRenameLoadingId(item.invoice_id)
+      setAuditError(null)
+      const res = await client.post(`/positions/${item.invoice_id}/assign-name-to-customer`)
+      if (res.data.already_aligned) {
+        setAuditError('Il nome del cliente è già identico a quello sulla fattura: niente da rinominare.')
+        return
+      }
+      setRenamePreview({ invoiceId: item.invoice_id, ...res.data })
+    } catch (err) {
+      console.error('Rename preview error:', err)
+      setAuditError(err.response?.data?.detail || 'Errore durante l\'anteprima del rinomino')
+    } finally {
+      setRenameLoadingId(null)
+    }
+  }
+
+  const handleResolveRenameConfirm = (item) => {
+    runAuditAction(item.invoice_id, async () => {
+      await client.post(`/positions/${item.invoice_id}/assign-name-to-customer`, null, {
+        params: { confirm: true },
+      })
+      setRenamePreview(null)
     })
   }
 
@@ -1129,36 +1237,198 @@ export default function ClientDetail() {
                       {/* Il perché + confronto P.IVA/ragione sociale affiancato */}
                       <VerifyDetail v={item.verification} />
 
-                      {/* Azioni: endpoint esistenti. Distruttive con conferma. */}
-                      <div className="flex flex-wrap items-center gap-2">
-                        <button
-                          onClick={() => handleAuditUnlink(item)}
-                          disabled={busy}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-red/15 text-accent-red hover:bg-accent-red/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
-                        >
-                          {busy ? '…' : 'Scollega'}
-                        </button>
-                        {item.can_assign_piva && (
+                      {/* Riga DISCORDANTE non ancora verificata: menu guidato
+                          "Risolvi" a 3 vie — la verità è una di queste.
+                          ① in testa: nel caso tipico (fattura BASARA sul
+                          cliente COLONIALE) l'errore è l'abbinamento. */}
+                      {isBad && !item.reviewed ? (
+                        <div className="space-y-2">
+                          <p className="text-xs font-semibold text-txt-label uppercase tracking-wider">
+                            Risolvi — qual è la verità?
+                          </p>
+
+                          {/* ① È di un altro cliente → riassegna */}
                           <button
-                            onClick={() => handleAuditAssignPiva(item)}
+                            onClick={() => handleResolveOpenReassign(item)}
                             disabled={busy}
-                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-teal/15 text-accent-teal hover:bg-accent-teal/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            className={`w-full text-left px-3 py-2 rounded-lg border transition-colors ${
+                              resolveReassignId === item.invoice_id
+                                ? 'border-accent-teal/60 bg-accent-teal/10'
+                                : 'border-dark-border bg-dark-surface hover:border-accent-teal/40'
+                            } ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
                           >
-                            Assegna P.IVA al cliente
+                            <span className="text-sm font-semibold text-txt-primary">① È di un altro cliente</span>
+                            <span className="block text-xs text-txt-muted mt-0.5">
+                              La fattura è attaccata al cliente sbagliato: cerca quello giusto e riassegnala.
+                            </span>
                           </button>
-                        )}
-                        <button
-                          onClick={() => handleAuditToggleReviewed(item)}
-                          disabled={busy}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''} ${
-                            item.reviewed
-                              ? 'bg-dark-surface text-txt-muted hover:text-txt-secondary'
-                              : 'bg-accent-green/15 text-accent-green hover:bg-accent-green/25'
-                          }`}
-                        >
-                          {item.reviewed ? 'Annulla verifica' : 'Segna verificato'}
-                        </button>
-                      </div>
+                          {resolveReassignId === item.invoice_id && (
+                            <div className="ml-4 space-y-2">
+                              <input
+                                type="text"
+                                autoFocus
+                                value={resolveQuery}
+                                onChange={(e) => setResolveQuery(e.target.value)}
+                                placeholder="Cerca il cliente giusto (nome anche approssimato)…"
+                                className="sc-input w-full"
+                              />
+                              {resolveSearching && (
+                                <p className="text-xs text-txt-muted">Ricerca…</p>
+                              )}
+                              {!resolveSearching && resolveQuery.trim().length >= 2 && resolveResults.length === 0 && (
+                                <p className="text-xs text-txt-muted">
+                                  Nessun cliente somigliante. Prova con meno parole.
+                                </p>
+                              )}
+                              {resolveResults.length > 0 && (
+                                <div className="flex flex-wrap gap-2">
+                                  {resolveResults
+                                    .filter(c => c.id !== Number(customerId))
+                                    .map(c => (
+                                      <button
+                                        key={c.id}
+                                        onClick={() => handleResolveReassign(item, c)}
+                                        disabled={busy}
+                                        className={`px-3 py-1.5 rounded-lg text-xs font-medium bg-accent-teal/10 text-accent-teal border border-accent-teal/30 hover:bg-accent-teal/20 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                        title="Clicca per riassegnare la fattura a questo cliente (con conferma)"
+                                      >
+                                        {c.ragione_sociale}
+                                        {c.partita_iva && (
+                                          <span className="text-txt-muted"> · {c.partita_iva}</span>
+                                        )}
+                                        {c.excluded && (
+                                          <span className="text-txt-muted"> (escluso)</span>
+                                        )}
+                                      </button>
+                                    ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* ② Stessa azienda, profilo col nome vecchio →
+                              aggiorna il nome dal documento (preview→confirm) */}
+                          <button
+                            onClick={() => handleResolveRenamePreview(item)}
+                            disabled={busy || renameLoadingId === item.invoice_id}
+                            className={`w-full text-left px-3 py-2 rounded-lg border transition-colors ${
+                              renamePreview?.invoiceId === item.invoice_id
+                                ? 'border-accent-amber/60 bg-accent-amber/10'
+                                : 'border-dark-border bg-dark-surface hover:border-accent-amber/40'
+                            } ${(busy || renameLoadingId === item.invoice_id) ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          >
+                            <span className="text-sm font-semibold text-txt-primary">
+                              ② Stessa azienda, il profilo ha il nome vecchio
+                              {renameLoadingId === item.invoice_id && ' …'}
+                            </span>
+                            <span className="block text-xs text-txt-muted mt-0.5">
+                              Aggiorna il nome del cliente dal documento (prima ti mostro l&apos;impatto).
+                            </span>
+                          </button>
+                          {renamePreview?.invoiceId === item.invoice_id && (
+                            <div className="ml-4 p-3 rounded-lg border border-accent-amber/30 bg-accent-amber/5 space-y-2">
+                              <p className="text-sm text-txt-primary">
+                                Rinominare &ldquo;<span className="font-semibold">{renamePreview.old_name}</span>&rdquo; in
+                                {' '}&ldquo;<span className="font-semibold">{renamePreview.new_name}</span>&rdquo;
+                                {renamePreview.impact?.would_become_discordant > 0 ? (
+                                  <>
+                                    {' '}renderà discordant{renamePreview.impact.would_become_discordant === 1 ? 'e' : 'i'}{' '}
+                                    <span className="font-semibold text-accent-amber">
+                                      {renamePreview.impact.would_become_discordant === 1
+                                        ? '1 altra fattura'
+                                        : `${renamePreview.impact.would_become_discordant} altre fatture`}
+                                    </span>{' '}di questo cliente — confermi?
+                                  </>
+                                ) : (
+                                  <> non renderà discordante nessun&apos;altra fattura di questo cliente — confermi?</>
+                                )}
+                              </p>
+                              {renamePreview.impact?.invoices?.length > 0 && (
+                                <p className="text-xs text-txt-muted font-mono">
+                                  {renamePreview.impact.invoices.map(i => i.invoice_number).join(' · ')}
+                                </p>
+                              )}
+                              <div className="flex items-center gap-2">
+                                <button
+                                  onClick={() => handleResolveRenameConfirm(item)}
+                                  disabled={busy}
+                                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-amber/15 text-accent-amber hover:bg-accent-amber/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                >
+                                  {busy ? '…' : 'Conferma rinomina'}
+                                </button>
+                                <button
+                                  onClick={() => setRenamePreview(null)}
+                                  disabled={busy}
+                                  className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-dark-surface text-txt-muted hover:text-txt-secondary transition-colors"
+                                >
+                                  Annulla
+                                </button>
+                              </div>
+                              <p className="text-xs text-txt-muted">
+                                Il nome resterà bloccato: il sync Shopify non potrà più sovrascriverlo. La fattura non viene toccata.
+                              </p>
+                            </div>
+                          )}
+
+                          {/* ③ Stessa azienda, solo grafia diversa →
+                              Segna verificato (endpoint esistente) */}
+                          <button
+                            onClick={() => handleAuditToggleReviewed(item)}
+                            disabled={busy}
+                            className={`w-full text-left px-3 py-2 rounded-lg border border-dark-border bg-dark-surface hover:border-accent-green/40 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          >
+                            <span className="text-sm font-semibold text-txt-primary">③ Stessa azienda, solo grafia diversa</span>
+                            <span className="block text-xs text-txt-muted mt-0.5">
+                              L&apos;abbinamento è giusto: segna verificato e silenzia l&apos;avviso.
+                            </span>
+                          </button>
+
+                          {/* Via d'uscita fuori menu: non sai di chi è. */}
+                          <div className="flex items-center gap-2 pt-1">
+                            <span className="text-xs text-txt-muted">Nessuna delle tre?</span>
+                            <button
+                              onClick={() => handleAuditUnlink(item)}
+                              disabled={busy}
+                              className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-red/15 text-accent-red hover:bg-accent-red/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            >
+                              {busy ? '…' : 'Scollega senza riabbinare'}
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        /* Righe warn (o bad già verificate): azioni piatte
+                           esistenti — endpoint invariati, distruttive con
+                           conferma. */
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            onClick={() => handleAuditUnlink(item)}
+                            disabled={busy}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-red/15 text-accent-red hover:bg-accent-red/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          >
+                            {busy ? '…' : 'Scollega'}
+                          </button>
+                          {item.can_assign_piva && (
+                            <button
+                              onClick={() => handleAuditAssignPiva(item)}
+                              disabled={busy}
+                              className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-teal/15 text-accent-teal hover:bg-accent-teal/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            >
+                              Assegna P.IVA al cliente
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleAuditToggleReviewed(item)}
+                            disabled={busy}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''} ${
+                              item.reviewed
+                                ? 'bg-dark-surface text-txt-muted hover:text-txt-secondary'
+                                : 'bg-accent-green/15 text-accent-green hover:bg-accent-green/25'
+                            }`}
+                          >
+                            {item.reviewed ? 'Annulla verifica' : 'Segna verificato'}
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )
                 })}
