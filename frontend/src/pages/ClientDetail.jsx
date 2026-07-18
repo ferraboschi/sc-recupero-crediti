@@ -421,10 +421,31 @@ export default function ClientDetail() {
   const handleResolveRenameConfirm = (item) => {
     runAuditAction(item.invoice_id, async () => {
       await client.post(`/positions/${item.invoice_id}/assign-name-to-customer`, null, {
-        params: { confirm: true },
+        // expected_customer_id = il cliente VISTO in anteprima: se un
+        // reassign concorrente ha spostato la fattura, il backend fa 409
+        // invece di rinominare (e lockare) la vittima sbagliata.
+        params: { confirm: true, expected_customer_id: renamePreview?.customer_id },
       })
       setRenamePreview(null)
     })
+  }
+
+  // Sblocco amministrativo del nome (via di ritorno da un rinomino
+  // sbagliato): rimosso il lock, il sync Shopify torna a governare la
+  // ragione sociale dal giro successivo.
+  const handleUnlockName = async () => {
+    if (!window.confirm(
+      `Sbloccare il nome "${data?.ragione_sociale}"?\n\n`
+      + 'Il sync Shopify tornerà a governare la ragione sociale dal prossimo '
+      + 'giro: serve per rimediare a un rinomino sbagliato.'
+    )) return
+    try {
+      await client.post(`/customers/${customerId}/unlock-name`)
+      await fetchData()
+    } catch (err) {
+      console.error('Errore sblocco nome:', err)
+      alert(err.response?.data?.detail || 'Errore durante lo sblocco del nome')
+    }
   }
 
   // "Segna verificato" dal pannello del semaforo per-riga: stesso endpoint
@@ -1055,6 +1076,25 @@ export default function ClientDetail() {
                 )}
               </div>
               {data.source && <p>Fonte: <span className="capitalize text-txt-primary">{data.source}</span></p>}
+              {/* Nome bonificato a mano: il sync non lo sovrascrive. Lo
+                  sblocco è la via di ritorno da un rinomino sbagliato. */}
+              {data.ragione_sociale_locked && (
+                <p className="flex items-center gap-2 flex-wrap">
+                  <span
+                    className="sc-badge text-xs bg-[rgba(148,163,184,0.15)] text-txt-muted"
+                    title="Ragione sociale corretta a mano dalla bonifica: il sync Shopify non la sovrascrive"
+                  >
+                    Nome bloccato (bonifica manuale)
+                  </span>
+                  <button
+                    onClick={handleUnlockName}
+                    className="text-xs text-accent-teal hover:text-accent-cyan font-medium transition-colors"
+                    title="Rimuovi il blocco: il sync Shopify tornerà a governare il nome dal prossimo giro"
+                  >
+                    Sblocca nome
+                  </button>
+                </p>
+              )}
             </div>
           </div>
           <div className="flex flex-col items-end gap-3">
@@ -1327,46 +1367,104 @@ export default function ClientDetail() {
                           </button>
                           {renamePreview?.invoiceId === item.invoice_id && (
                             <div className="ml-4 p-3 rounded-lg border border-accent-amber/30 bg-accent-amber/5 space-y-2">
-                              <p className="text-sm text-txt-primary">
-                                Rinominare &ldquo;<span className="font-semibold">{renamePreview.old_name}</span>&rdquo; in
-                                {' '}&ldquo;<span className="font-semibold">{renamePreview.new_name}</span>&rdquo;
-                                {renamePreview.impact?.would_become_discordant > 0 ? (
-                                  <>
-                                    {' '}renderà discordant{renamePreview.impact.would_become_discordant === 1 ? 'e' : 'i'}{' '}
-                                    <span className="font-semibold text-accent-amber">
-                                      {renamePreview.impact.would_become_discordant === 1
-                                        ? '1 altra fattura'
-                                        : `${renamePreview.impact.would_become_discordant} altre fatture`}
-                                    </span>{' '}di questo cliente — confermi?
-                                  </>
-                                ) : (
-                                  <> non renderà discordante nessun&apos;altra fattura di questo cliente — confermi?</>
-                                )}
-                              </p>
-                              {renamePreview.impact?.invoices?.length > 0 && (
-                                <p className="text-xs text-txt-muted font-mono">
-                                  {renamePreview.impact.invoices.map(i => i.invoice_number).join(' · ')}
-                                </p>
+                              {/* Omonimo: il vero destinatario esiste già in
+                                  anagrafica — il confirm farebbe comunque 409,
+                                  quindi niente bottone Conferma: si indirizza
+                                  alla via ① Riassegna. */}
+                              {renamePreview.homonym ? (
+                                <>
+                                  <p className="text-sm font-medium text-accent-red">
+                                    Esiste già il cliente &ldquo;<span className="font-semibold">{renamePreview.homonym.ragione_sociale}</span>&rdquo;
+                                    {renamePreview.homonym.partita_iva && ` (P.IVA ${renamePreview.homonym.partita_iva})`}:
+                                    questa fattura è probabilmente sua.
+                                  </p>
+                                  <p className="text-xs text-txt-muted">
+                                    Rinominare questo profilo creerebbe due clienti con lo stesso nome (prossime fatture in quarantena).
+                                    Usa <span className="font-semibold text-txt-secondary">① &ldquo;È di un altro cliente&rdquo;</span> per riassegnarla.
+                                  </p>
+                                  <button
+                                    onClick={() => setRenamePreview(null)}
+                                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-dark-surface text-txt-muted hover:text-txt-secondary transition-colors"
+                                  >
+                                    Chiudi
+                                  </button>
+                                </>
+                              ) : (
+                                <>
+                                  <p className="text-sm text-txt-primary">
+                                    Rinominare &ldquo;<span className="font-semibold">{renamePreview.old_name}</span>&rdquo; in
+                                    {' '}&ldquo;<span className="font-semibold">{renamePreview.new_name}</span>&rdquo;
+                                    {renamePreview.impact?.would_become_discordant > 0 ? (
+                                      <>
+                                        {' '}renderà discordant{renamePreview.impact.would_become_discordant === 1 ? 'e' : 'i'}{' '}
+                                        <span className="font-semibold text-accent-amber">
+                                          {renamePreview.impact.would_become_discordant === 1
+                                            ? '1 altra fattura'
+                                            : `${renamePreview.impact.would_become_discordant} altre fatture`}
+                                        </span>{' '}di questo cliente — confermi?
+                                      </>
+                                    ) : (
+                                      <> non renderà discordante nessun&apos;altra fattura aperta di questo cliente — confermi?</>
+                                    )}
+                                  </p>
+                                  {renamePreview.impact?.invoices?.length > 0 && (
+                                    <p className="text-xs text-txt-muted font-mono">
+                                      {renamePreview.impact.invoices.map(i => i.invoice_number).join(' · ')}
+                                    </p>
+                                  )}
+                                  {renamePreview.impact?.would_become_warning > 0 && (
+                                    <p className="text-xs text-accent-amber">
+                                      {renamePreview.impact.would_become_warning === 1
+                                        ? '1 altra fattura passerà a "Da controllare"'
+                                        : `${renamePreview.impact.would_become_warning} altre fatture passeranno a "Da controllare"`}
+                                      {renamePreview.impact.warning_invoices?.length > 0 && (
+                                        <span className="font-mono"> ({renamePreview.impact.warning_invoices.map(i => i.invoice_number).join(' · ')})</span>
+                                      )}
+                                    </p>
+                                  )}
+                                  {/* Le PAGATE non compaiono nell'audit di default:
+                                      senza questa voce il caso più pericoloso
+                                      (1 aperta + N pagate col vecchio nome)
+                                      sembrava innocuo. */}
+                                  {renamePreview.impact?.paid_would_become_discordant > 0 && (
+                                    <p className="text-xs text-accent-amber">
+                                      {renamePreview.impact.paid_would_become_discordant === 1
+                                        ? '1 fattura PAGATA resterà intestata al vecchio nome su questo profilo'
+                                        : `${renamePreview.impact.paid_would_become_discordant} fatture PAGATE resteranno intestate al vecchio nome su questo profilo`}
+                                      {renamePreview.impact.paid_invoices?.length > 0 && (
+                                        <span className="font-mono"> ({renamePreview.impact.paid_invoices.map(i => i.invoice_number).join(' · ')})</span>
+                                      )}
+                                    </p>
+                                  )}
+                                  {renamePreview.similarity != null && (
+                                    <p className={`text-xs ${renamePreview.similarity < 40 ? 'text-accent-red' : 'text-txt-muted'}`}>
+                                      Somiglianza tra i due nomi: {renamePreview.similarity}%
+                                      {renamePreview.similarity < 40 && (
+                                        <> — nomi molto diversi: se non sei certo che sia la stessa azienda, meglio ① Riassegna.</>
+                                      )}
+                                    </p>
+                                  )}
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      onClick={() => handleResolveRenameConfirm(item)}
+                                      disabled={busy}
+                                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-amber/15 text-accent-amber hover:bg-accent-amber/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                    >
+                                      {busy ? '…' : 'Conferma rinomina'}
+                                    </button>
+                                    <button
+                                      onClick={() => setRenamePreview(null)}
+                                      disabled={busy}
+                                      className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-dark-surface text-txt-muted hover:text-txt-secondary transition-colors"
+                                    >
+                                      Annulla
+                                    </button>
+                                  </div>
+                                  <p className="text-xs text-txt-muted">
+                                    Il nome resterà bloccato: il sync Shopify non potrà più sovrascriverlo (Sblocca nome in testa alla scheda per tornare indietro). La fattura non viene toccata.
+                                  </p>
+                                </>
                               )}
-                              <div className="flex items-center gap-2">
-                                <button
-                                  onClick={() => handleResolveRenameConfirm(item)}
-                                  disabled={busy}
-                                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-amber/15 text-accent-amber hover:bg-accent-amber/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
-                                >
-                                  {busy ? '…' : 'Conferma rinomina'}
-                                </button>
-                                <button
-                                  onClick={() => setRenamePreview(null)}
-                                  disabled={busy}
-                                  className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-dark-surface text-txt-muted hover:text-txt-secondary transition-colors"
-                                >
-                                  Annulla
-                                </button>
-                              </div>
-                              <p className="text-xs text-txt-muted">
-                                Il nome resterà bloccato: il sync Shopify non potrà più sovrascriverlo. La fattura non viene toccata.
-                              </p>
                             </div>
                           )}
 
