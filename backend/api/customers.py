@@ -41,19 +41,23 @@ def _audit_customer_ids(session, include_paid: bool = False) -> set:
         if verify_invoice_customer(inv, cust)["verdict"] in ("warn", "bad"):
             ids.add(cust.id)
 
-    # Suggerimenti pendenti verso un cliente: puro SQL, nessun verify.
+    # Suggerimenti pendenti verso un cliente ESISTENTE: puro SQL, nessun
+    # verify. Le PAGATE sono INCLUSE, in parità con la scheda cliente e con
+    # /{id}/audit (che non filtrano per status): una quarantenata pagata
+    # resta visibile sul profilo finché non viene abbinata (caso Belfiore,
+    # docs/verifica-segnalazioni-20260716.md — inquina i totali storici),
+    # quindi badge e filtro "da sanificare" devono contarla, o la lista
+    # nasconde ciò che la scheda segnala. Il join su Customer scarta i
+    # suggerimenti ORFANI (cliente cancellato da un merge): senza, il badge
+    # conterebbe un id fantasma che la lista non sa mostrare.
     pend = (
         session.query(Invoice.suggested_customer_id)
-        .filter(
-            Invoice.customer_id.is_(None),
-            Invoice.suggested_customer_id.isnot(None),
-            Invoice.status != "paid",
-        )
+        .join(Customer, Customer.id == Invoice.suggested_customer_id)
+        .filter(Invoice.customer_id.is_(None))
         .distinct()
     )
     for (cid,) in pend:
-        if cid:
-            ids.add(cid)
+        ids.add(cid)
     return ids
 
 
@@ -133,8 +137,13 @@ async def list_customers(
         # il filtro è attivo — è la parte costosa (verify Python-level).
         sanitize_ids = _audit_customer_ids(session) if to_sanitize else None
 
-        # Step 2: Query customers with basic filters
-        query = session.query(Customer)
+        # Step 2: Query customers with basic filters.
+        # ORDER BY id: senza, l'ordine di ritorno è garantito solo per caso
+        # (SQLite = rowid) ma NON su Postgres/Supabase — i pari-merito dei
+        # sort seguenti si sposterebbero fra richieste e la paginazione
+        # salterebbe/ripeterebbe righe (stessa classe di bug già corretta su
+        # fatture e positions).
+        query = session.query(Customer).order_by(Customer.id)
 
         if search:
             search_pattern = f"%{search}%"
@@ -182,29 +191,40 @@ async def list_customers(
         summary_total_overdue = sum(e["total_overdue"] for e in enriched)
         summary_overdue_customers = sum(1 for e in enriched if e["overdue_count"] > 0)
 
-        # Step 5: Sort
+        # Step 5: Sort. Ogni chiave ha l'id come tiebreaker FINALE, sempre
+        # CRESCENTE (in desc si nega, così reverse=True lo riporta
+        # crescente): i pari-merito hanno un ordine totale, identico fra
+        # richieste e coerente con /neighbors (ORDER BY … DESC, id ASC).
+        desc = sort_order == "desc"
+
+        def _id_tie(e):
+            cid = e["customer"].id
+            return -cid if desc else cid
+
         if sort_by == "total_overdue":
-            enriched.sort(key=lambda e: e["total_overdue"], reverse=(sort_order == "desc"))
+            enriched.sort(key=lambda e: (e["total_overdue"], _id_tie(e)), reverse=desc)
         elif sort_by == "overdue_count":
-            enriched.sort(key=lambda e: e["overdue_count"], reverse=(sort_order == "desc"))
+            enriched.sort(key=lambda e: (e["overdue_count"], _id_tie(e)), reverse=desc)
         elif sort_by == "days_overdue":
-            enriched.sort(key=lambda e: e["max_days_overdue"], reverse=(sort_order == "desc"))
+            enriched.sort(key=lambda e: (e["max_days_overdue"], _id_tie(e)), reverse=desc)
         elif sort_by == "last_action":
             from datetime import datetime as _dt
             far_past = _dt.min
             enriched.sort(
-                key=lambda e: e.get("last_action") or far_past,
-                reverse=(sort_order == "desc"),
+                key=lambda e: (e.get("last_action") or far_past, _id_tie(e)),
+                reverse=desc,
             )
         elif sort_by == "earliest_due_date":
             from datetime import date as date_type
             far_future = date_type(9999, 12, 31)
             enriched.sort(
-                key=lambda e: e.get("earliest_due_date") or far_future,
-                reverse=(sort_order == "desc"),
+                key=lambda e: (e.get("earliest_due_date") or far_future, _id_tie(e)),
+                reverse=desc,
             )
         else:
-            enriched.sort(key=lambda e: (e["customer"].ragione_sociale or "").lower())
+            enriched.sort(
+                key=lambda e: ((e["customer"].ragione_sociale or "").lower(), e["customer"].id)
+            )
 
         # Step 6: Paginate
         page = enriched[skip:skip + limit]
@@ -523,6 +543,12 @@ async def audit_customer(
         q = q.filter(Invoice.status != "paid")
     invoices = q.order_by(Invoice.due_date.desc()).all()
 
+    # counts conta i problemi AZIONABILI: warn/bad già "Segnati verificati"
+    # NON entrano (salvo include_reviewed=true) — restano in reviewed_count.
+    # Così counts/total_problems/worst_verdict descrivono sempre ciò che
+    # items mostra: senza questo, un cliente col suo unico problema già
+    # verificato dichiarava total_problems=1 e tile rossa accanto al badge
+    # "In ordine ✓" (il frontend affianca counts e problem_count).
     counts = {"ok": 0, "warn": 0, "bad": 0}
     items = []
     reviewed_count = 0
@@ -530,14 +556,15 @@ async def audit_customer(
     for inv in invoices:
         v = verify_invoice_customer(inv, customer)
         verdict = v["verdict"]
-        counts[verdict] += 1
         if verdict == "ok":
+            counts[verdict] += 1
             continue
         is_reviewed = inv.audit_reviewed_at is not None
         if is_reviewed:
             reviewed_count += 1
             if not include_reviewed:
                 continue
+        counts[verdict] += 1
         if verdict == "bad":
             worst = "bad"
         elif worst != "bad":
@@ -627,7 +654,12 @@ async def get_customer_neighbors(
             )
             .group_by(Customer.id)
             .having(func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)) > 0)
-            .order_by(func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).desc())
+            # Tiebreaker id: senza, i pari-merito su total_overdue rendono
+            # prev/next non deterministici (riproducibile perfino su SQLite).
+            .order_by(
+                func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).desc(),
+                Customer.id,
+            )
             .all()
         )
 
