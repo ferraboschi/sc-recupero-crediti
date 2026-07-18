@@ -527,6 +527,14 @@ export default function System() {
                   {String(scheduler.scheduler_hour).padStart(2, '0')}:{String(scheduler.scheduler_minute).padStart(2, '0')} ({scheduler.timezone})
                 </span>
               </div>
+              <div className="flex justify-between">
+                <span className="text-xs text-txt-muted">Prossimo sync orario</span>
+                <span className="text-xs text-txt-secondary">
+                  {scheduler.next_run_times?.hourly_sync_job
+                    ? new Date(scheduler.next_run_times.hourly_sync_job).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })
+                    : '—'}
+                </span>
+              </div>
             </div>
           </div>
         </div>
