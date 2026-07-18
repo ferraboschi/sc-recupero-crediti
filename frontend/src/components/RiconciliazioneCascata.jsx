@@ -438,7 +438,7 @@ function Evoluzione({ serie, loading, error, giorni, setGiorni, onRetry, formatC
             aria-hidden="true"
             className="w-4 shrink-0 border-t-2 border-dashed border-txt-muted"
           />
-          tratteggio = storico stimato dalle date fattura
+          tratteggio = storico stimato dalle date fattura, con la classificazione di oggi
         </p>
       )}
     </div>
