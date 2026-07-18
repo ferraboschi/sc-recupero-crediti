@@ -1056,6 +1056,69 @@ async def unlock_customer_name(
         raise
 
 
+@router.post("/{customer_id}/clear-piva")
+async def clear_customer_piva(
+    customer_id: int,
+    session: Session = Depends(get_session),
+):
+    """Rimuove la P.IVA assegnata per errore: via di ritorno dalla bonifica.
+
+    Simmetrico ad assign-piva-to-customer / bonifica-piva/bulk: se una P.IVA è
+    stata copiata sul cliente sbagliato, la si azzera e le fatture tornano al
+    loro esito naturale (verify dal vivo). Reversibilità dichiarata come nota #4
+    dell'analisi.
+
+    NB sul sync: azzerare qui è sicuro. Il sync scrive customer.partita_iva
+    SOLO da Shopify (_sync_customers_task) e SOLO se Shopify riporta una P.IVA
+    checksum-valida; un cliente bonificato senza P.IVA su Shopify non viene
+    ri-toccato. (Il sync fatture FatturaPro non scrive mai la P.IVA sul cliente,
+    solo su customer_piva_raw della fattura.)
+
+    Guardie:
+    - 404 se il cliente non esiste;
+    - 400 se il cliente non ha una P.IVA da rimuovere (niente da azzerare).
+    """
+    try:
+        customer = session.query(Customer).filter(
+            Customer.id == customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        old_piva = (customer.partita_iva or "").strip()
+        if not old_piva:
+            raise HTTPException(
+                status_code=400,
+                detail="Il cliente non ha una P.IVA da rimuovere",
+            )
+
+        customer.partita_iva = None
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_clear_piva",
+            entity_type="customer",
+            entity_id=customer_id,
+            details={
+                "ragione_sociale": customer.ragione_sociale,
+                "removed_piva": old_piva,
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"P.IVA '{old_piva}' rimossa dal cliente {customer_id} "
+            f"('{customer.ragione_sociale}')"
+        )
+        return {"ok": True, "customer_id": customer.id, "partita_iva": None}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error clearing customer P.IVA: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
 class AcceptedNameRequest(BaseModel):
     # Una delle due: il nome grezzo da accettare, oppure la fattura da cui
     # prenderlo (customer_name_raw). invoice_id ha la precedenza.

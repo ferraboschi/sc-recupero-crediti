@@ -302,3 +302,55 @@ class TestBonificaBulkApply:
         assert by_id[ok.id] == "applied"
         assert by_id[has.id] == "skipped_has_piva"
         assert by_id[424242] == "not_found"
+
+
+# ── E) POST /customers/{id}/clear-piva — reversibilità ───────────────
+
+class TestClearPiva:
+    def test_clear_removes_piva_and_logs(self, test_client, test_db_session):
+        c = _customer(test_db_session, CAVO, partita_iva=PIVA_CAVO)
+        r = test_client.post(f"/api/customers/{c.id}/clear-piva")
+        assert r.status_code == 200
+        assert r.json()["partita_iva"] is None
+        assert test_db_session.query(Customer).filter_by(id=c.id).first().partita_iva is None
+        assert test_db_session.query(ActivityLog).filter_by(
+            action="audit_clear_piva", entity_id=c.id
+        ).count() == 1
+
+    def test_clear_400_when_no_piva(self, test_client, test_db_session):
+        c = _customer(test_db_session, CAVO)  # nessuna P.IVA
+        assert test_client.post(f"/api/customers/{c.id}/clear-piva").status_code == 400
+
+    def test_clear_404_missing_customer(self, test_client):
+        assert test_client.post("/api/customers/999999/clear-piva").status_code == 404
+
+    def test_bonifica_is_reversible(self, test_client, test_db_session):
+        # Bonifica per errore → clear → il cliente torna bonificabile (reversibile).
+        c = _customer(test_db_session, CAVO)
+        _invoice(test_db_session, "C1/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        _bulk(test_client, [c.id])
+        assert test_db_session.query(Customer).filter_by(id=c.id).first().partita_iva == PIVA_CAVO
+        # Sbaglio: la tolgo.
+        assert test_client.post(f"/api/customers/{c.id}/clear-piva").status_code == 200
+        # Ricompare nella lista di revisione: la bonifica è completamente reversibile.
+        ids = [i["customer_id"] for i in
+               test_client.get("/api/customers/bonifica-suggestions").json()["items"]]
+        assert c.id in ids
+
+
+# ── F) un cliente bonificato ESCE dalla lista al giro dopo ────────────
+
+class TestBonifiedExitsList:
+    def test_bonified_customer_leaves_suggestions(self, test_client, test_db_session):
+        c = _customer(test_db_session, CAVO)
+        _invoice(test_db_session, "C1/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        # Prima: nella lista.
+        assert c.id in [i["customer_id"] for i in
+                        test_client.get("/api/customers/bonifica-suggestions").json()["items"]]
+        # Bonifico.
+        assert _bulk(test_client, [c.id])["applied"] == 1
+        # Dopo (il giro seguente): sparito dalla lista.
+        after = test_client.get("/api/customers/bonifica-suggestions").json()
+        assert c.id not in [i["customer_id"] for i in after["items"]]
