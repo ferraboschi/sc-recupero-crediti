@@ -75,9 +75,13 @@ const VERIFY_STYLE = {
   critical: { badge: 'bg-accent-red/15 text-accent-red', dot: '⛔', label: 'Discordante', ring: 'border-accent-red/30 bg-accent-red/5' },
 }
 
+// Stato "verificata a mano": la stessa convenzione muta dell'audit
+// (grigio = tolto dalla lavorazione, MAI verde: il verde resta una garanzia).
+const REVIEWED_STYLE = { badge: 'bg-[rgba(148,163,184,0.15)] text-txt-muted', dot: '✔︎', label: 'Verificata a mano' }
+
 // Badge cliccabile: apre/chiude il pannello di dettaglio della verifica.
-function VerifyBadge({ v, open, onToggle }) {
-  const s = VERIFY_STYLE[v?.level] || VERIFY_STYLE.warning
+function VerifyBadge({ v, open, onToggle, reviewed }) {
+  const s = reviewed ? REVIEWED_STYLE : (VERIFY_STYLE[v?.level] || VERIFY_STYLE.warning)
   return (
     <button
       type="button"
@@ -189,6 +193,11 @@ export default function ClientDetail() {
   const [auditError, setAuditError] = useState(null)
   const [auditActingId, setAuditActingId] = useState(null)
   const [includeReviewedAudit, setIncludeReviewedAudit] = useState(false)
+  // Verifiche manuali sul semaforo per-riga. Il backend le registra
+  // (audit_reviewed_at via mark-reviewed) ma /customers/{id} non le espone:
+  // lo stato vive qui, seminato dall'audit quando include le già verificate.
+  const [reviewedRows, setReviewedRows] = useState(() => new Set())
+  const [rowReviewActingId, setRowReviewActingId] = useState(null)
 
   const fetchData = useCallback(async () => {
     try {
@@ -226,6 +235,16 @@ export default function ClientDetail() {
         params: { include_reviewed: includeReviewedAudit },
       })
       setAuditData(res.data)
+      // Semina lo stato "verificata a mano" del semaforo per-riga con ciò
+      // che l'audit sa (le già verificate compaiono con include_reviewed).
+      const seededIds = (res.data.items || []).filter(i => i.reviewed).map(i => i.invoice_id)
+      if (seededIds.length > 0) {
+        setReviewedRows(prev => {
+          const next = new Set(prev)
+          seededIds.forEach(id => next.add(id))
+          return next
+        })
+      }
     } catch (err) {
       console.error('Error fetching audit:', err)
       setAuditError('Impossibile eseguire l\'audit degli abbinamenti')
@@ -238,6 +257,11 @@ export default function ClientDetail() {
     fetchData()
     fetchNeighbors()
   }, [fetchData, fetchNeighbors])
+
+  // Cambiando cliente lo stato locale delle verifiche manuali riparte pulito.
+  useEffect(() => {
+    setReviewedRows(new Set())
+  }, [customerId])
 
   useEffect(() => {
     fetchAudit()
@@ -279,7 +303,40 @@ export default function ClientDetail() {
 
   const handleAuditToggleReviewed = (item) => {
     const path = item.reviewed ? 'unmark-reviewed' : 'mark-reviewed'
-    runAuditAction(item.invoice_id, () => client.post(`/positions/${item.invoice_id}/${path}`))
+    runAuditAction(item.invoice_id, async () => {
+      await client.post(`/positions/${item.invoice_id}/${path}`)
+      // Tiene allineato anche il semaforo per-riga della tabella fatture.
+      setReviewedRows(prev => {
+        const next = new Set(prev)
+        if (item.reviewed) next.delete(item.invoice_id)
+        else next.add(item.invoice_id)
+        return next
+      })
+    })
+  }
+
+  // "Segna verificato" dal pannello del semaforo per-riga: stesso endpoint
+  // dell'audit (mark-reviewed). Dopo l'azione si ricarica l'audit, così i
+  // conteggi ("N da sistemare", "già verificate") restano coerenti.
+  const handleRowToggleReviewed = async (inv) => {
+    const isReviewed = reviewedRows.has(inv.id)
+    const path = isReviewed ? 'unmark-reviewed' : 'mark-reviewed'
+    try {
+      setRowReviewActingId(inv.id)
+      await client.post(`/positions/${inv.id}/${path}`)
+      setReviewedRows(prev => {
+        const next = new Set(prev)
+        if (isReviewed) next.delete(inv.id)
+        else next.add(inv.id)
+        return next
+      })
+      await fetchAudit()
+    } catch (err) {
+      console.error('Errore verifica manuale:', err)
+      alert(err.response?.data?.detail || 'Errore durante la registrazione della verifica manuale')
+    } finally {
+      setRowReviewActingId(null)
+    }
   }
 
   const formatCurrency = (value) =>
@@ -686,6 +743,17 @@ export default function ClientDetail() {
   const totalPaid = paidInvoices.reduce((sum, inv) => sum + inv.amount, 0)
   const whatsappNumber = getWhatsAppNumber() || null
 
+  // Righe GIALLE del semaforo che l'audit NON conta come problemi (verdict
+  // ok ma livello warning: garanzia impossibile, non errore di abbinamento).
+  // L'header le dichiara, così "in ordine" e le ⚠ in tabella non si
+  // contraddicono; escluse le già verificate a mano.
+  const manualCheckCount = (data.invoices?.items || []).filter(inv =>
+    inv.status !== 'paid'
+    && inv.verification?.verdict === 'ok'
+    && inv.verification?.level === 'warning'
+    && !reviewedRows.has(inv.id)
+  ).length
+
   let visibleInvoices = showAllInvoices
     ? (data.invoices?.items || [])
     : overdueInvoices
@@ -949,8 +1017,18 @@ export default function ClientDetail() {
                   {auditData.problem_count} da sistemare
                 </span>
               ) : (
-                <span className="sc-badge bg-accent-green/15 text-accent-green">In ordine ✓</span>
+                <span className="sc-badge bg-accent-green/15 text-accent-green">Abbinamenti in ordine ✓</span>
               )
+            )}
+            {/* Le ⚠ del semaforo non sono problemi di abbinamento: qui si
+                dichiarano, in tono muto, per non contraddire la tabella. */}
+            {!auditLoading && auditData && manualCheckCount > 0 && (
+              <span
+                className="text-xs text-txt-muted"
+                title="Righe col semaforo giallo nella tabella fatture: non sono errori di abbinamento, chiedono solo un controllo manuale. Apri la ⚠ sulla riga e usa Segna verificato."
+              >
+                · {manualCheckCount} da verificare a mano
+              </span>
             )}
           </div>
           <button
@@ -1006,6 +1084,14 @@ export default function ClientDetail() {
                     ? 'Nessun abbinamento da controllare ✓'
                     : 'Gli abbinamenti di questo cliente risultano in ordine ✓'}
                 </p>
+                {manualCheckCount > 0 && (
+                  <p className="text-xs text-txt-muted mt-1">
+                    Nella tabella fatture {manualCheckCount === 1
+                      ? 'resta 1 riga gialla (⚠)'
+                      : `restano ${manualCheckCount} righe gialle (⚠)`}: non {manualCheckCount === 1 ? 'è un errore' : 'sono errori'} di abbinamento,
+                    {manualCheckCount === 1 ? ' chiede' : ' chiedono'} solo una verifica manuale — apri la ⚠ e usa &ldquo;Segna verificato&rdquo;.
+                  </p>
+                )}
                 {auditData.pending_count > 0 && (
                   <p className="text-xs text-txt-muted mt-1">
                     Restano {auditData.pending_count} fattur{auditData.pending_count === 1 ? 'a' : 'e'} in attesa di conferma (sezione qui sotto).
@@ -1268,6 +1354,7 @@ export default function ClientDetail() {
                         v={inv.verification}
                         open={openVerify.has(inv.id)}
                         onToggle={() => toggleVerify(inv.id)}
+                        reviewed={reviewedRows.has(inv.id)}
                       />
                     ) : (
                       <span className="text-txt-muted">—</span>
@@ -1336,6 +1423,33 @@ export default function ClientDetail() {
                   <tr key={`${inv.id}-verify`} className="bg-dark-surface/40">
                     <td colSpan={10} className="px-3 pb-3">
                       <VerifyDetail v={inv.verification} />
+                      {/* Via d'uscita dal giallo: l'operatore che ha
+                          controllato a mano lo registra qui (stesso
+                          endpoint mark-reviewed dell'audit). */}
+                      {inv.verification.level !== 'verified' && (
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          <button
+                            onClick={() => handleRowToggleReviewed(inv)}
+                            disabled={rowReviewActingId === inv.id}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                              rowReviewActingId === inv.id ? 'opacity-50 cursor-not-allowed' : ''
+                            } ${
+                              reviewedRows.has(inv.id)
+                                ? 'bg-dark-surface text-txt-muted hover:text-txt-secondary'
+                                : 'bg-accent-green/15 text-accent-green hover:bg-accent-green/25'
+                            }`}
+                          >
+                            {rowReviewActingId === inv.id
+                              ? '…'
+                              : reviewedRows.has(inv.id) ? 'Annulla verifica' : 'Segna verificato'}
+                          </button>
+                          <span className="text-xs text-txt-muted">
+                            {reviewedRows.has(inv.id)
+                              ? 'Verificata a mano: l\'avviso è silenziato.'
+                              : 'Hai controllato a mano che la fattura è del cliente giusto? Segnala verificata.'}
+                          </span>
+                        </div>
+                      )}
                     </td>
                   </tr>
                 )}
