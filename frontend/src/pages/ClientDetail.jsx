@@ -94,14 +94,19 @@ function VerifyBadge({ v, open, onToggle }) {
 function VerifyRow({ label, left, right, ok }) {
   const mark = ok === true ? '✔︎' : ok === false ? '✗' : ''
   const color = ok === true ? 'text-accent-green' : ok === false ? 'text-accent-red' : 'text-txt-muted'
+  // Mobile (<sm): label sopra, poi fattura|cliente in 2 colonne. sm+: la riga
+  // torna a 3 colonne (label | fattura | cliente) grazie a sm:contents sul
+  // wrapper interno. Nessuna colonna fissa che sfori il layout stretto.
   return (
-    <div className="grid grid-cols-[130px_1fr_1fr] gap-2 py-1 items-start text-sm">
-      <span className="text-xs font-semibold text-txt-label uppercase tracking-wider pt-0.5">{label}</span>
-      <span className="text-txt-primary break-words">{left || <span className="text-txt-muted">—</span>}</span>
-      <span className="text-txt-primary break-words">
-        <span className={`mr-1 ${color}`}>{mark}</span>
-        {right || <span className="text-txt-muted">—</span>}
-      </span>
+    <div className="py-1 text-sm sm:grid sm:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)] sm:gap-2 sm:items-start">
+      <span className="block mb-0.5 sm:mb-0 sm:pt-0.5 text-xs font-semibold text-txt-label uppercase tracking-wider">{label}</span>
+      <div className="grid grid-cols-2 gap-2 sm:contents">
+        <span className="min-w-0 text-txt-primary break-words">{left || <span className="text-txt-muted">—</span>}</span>
+        <span className="min-w-0 text-txt-primary break-words">
+          <span className={`mr-1 ${color}`}>{mark}</span>
+          {right || <span className="text-txt-muted">—</span>}
+        </span>
+      </div>
     </div>
   )
 }
@@ -112,14 +117,16 @@ function VerifyDetail({ v }) {
   const s = VERIFY_STYLE[v.level] || VERIFY_STYLE.warning
   return (
     <div className={`rounded-lg border ${s.ring} p-3`}>
-      <p className={`text-sm font-medium ${v.level === 'verified' ? 'text-accent-green' : v.level === 'critical' ? 'text-accent-red' : 'text-accent-amber'}`}>
+      <p className={`text-sm font-medium break-words ${v.level === 'verified' ? 'text-accent-green' : v.level === 'critical' ? 'text-accent-red' : 'text-accent-amber'}`}>
         {v.message}
       </p>
       <div className="mt-2 pt-2 border-t border-dark-border">
-        <div className="grid grid-cols-[130px_1fr_1fr] gap-2 pb-1">
-          <span></span>
-          <span className="text-xs font-semibold text-txt-label uppercase tracking-wider">Sulla fattura</span>
-          <span className="text-xs font-semibold text-txt-label uppercase tracking-wider">Sul cliente</span>
+        <div className="pb-1 sm:grid sm:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)] sm:gap-2">
+          <span className="hidden sm:block"></span>
+          <div className="grid grid-cols-2 gap-2 sm:contents">
+            <span className="text-xs font-semibold text-txt-label uppercase tracking-wider">Sulla fattura</span>
+            <span className="text-xs font-semibold text-txt-label uppercase tracking-wider">Sul cliente</span>
+          </div>
         </div>
         <VerifyRow
           label="P.IVA"
@@ -176,6 +183,12 @@ export default function ClientDetail() {
   // Fatture in quarantena suggerite a questo cliente ("In attesa di conferma")
   const [suggestionActingId, setSuggestionActingId] = useState(null)
   const [suggestionError, setSuggestionError] = useState(null)
+  // Audit abbinamenti del cliente aperto (azionabile): esito verify per-fattura
+  const [auditData, setAuditData] = useState(null)
+  const [auditLoading, setAuditLoading] = useState(true)
+  const [auditError, setAuditError] = useState(null)
+  const [auditActingId, setAuditActingId] = useState(null)
+  const [includeReviewedAudit, setIncludeReviewedAudit] = useState(false)
 
   const fetchData = useCallback(async () => {
     try {
@@ -203,10 +216,71 @@ export default function ClientDetail() {
     }
   }, [customerId])
 
+  // Audit abbinamenti del cliente aperto: scoped alle SUE fatture (nessuna
+  // scansione globale). Il client axios ritenta da solo i cold-start 502/503.
+  const fetchAudit = useCallback(async () => {
+    try {
+      setAuditLoading(true)
+      setAuditError(null)
+      const res = await client.get(`/customers/${customerId}/audit`, {
+        params: { include_reviewed: includeReviewedAudit },
+      })
+      setAuditData(res.data)
+    } catch (err) {
+      console.error('Error fetching audit:', err)
+      setAuditError('Impossibile eseguire l\'audit degli abbinamenti')
+    } finally {
+      setAuditLoading(false)
+    }
+  }, [customerId, includeReviewedAudit])
+
   useEffect(() => {
     fetchData()
     fetchNeighbors()
   }, [fetchData, fetchNeighbors])
+
+  useEffect(() => {
+    fetchAudit()
+  }, [fetchAudit])
+
+  // Azioni dell'audit: gli endpoint sono quelli ESISTENTI di positions.py.
+  // Dopo ogni azione si ricaricano scheda + audit (unlink cambia totali).
+  const runAuditAction = async (invoiceId, request) => {
+    try {
+      setAuditActingId(invoiceId)
+      setAuditError(null)
+      await request()
+      await Promise.all([fetchData(), fetchAudit()])
+    } catch (err) {
+      console.error('Audit action error:', err)
+      setAuditError(err.response?.data?.detail || 'Errore durante l\'operazione')
+    } finally {
+      setAuditActingId(null)
+    }
+  }
+
+  const handleAuditUnlink = (item) => {
+    if (!window.confirm(
+      `Scollegare la fattura ${item.invoice_number} da "${data?.ragione_sociale}"?\n\n`
+      + 'La fattura tornerà senza cliente e non sarà più riabbinata in automatico.'
+    )) return
+    runAuditAction(item.invoice_id, () => client.post(`/positions/${item.invoice_id}/unlink`))
+  }
+
+  const handleAuditAssignPiva = (item) => {
+    const piva = item.verification?.invoice_piva
+    if (!window.confirm(
+      `Assegnare la P.IVA ${piva} (dalla fattura ${item.invoice_number}) al cliente "${data?.ragione_sociale}"?\n\n`
+      + 'Serve quando la fattura ha una P.IVA valida ma il cliente non ne ha una: '
+      + 'i prossimi abbinamenti diventeranno garantiti per P.IVA.'
+    )) return
+    runAuditAction(item.invoice_id, () => client.post(`/positions/${item.invoice_id}/assign-piva-to-customer`))
+  }
+
+  const handleAuditToggleReviewed = (item) => {
+    const path = item.reviewed ? 'unmark-reviewed' : 'mark-reviewed'
+    runAuditAction(item.invoice_id, () => client.post(`/positions/${item.invoice_id}/${path}`))
+  }
 
   const formatCurrency = (value) =>
     new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(value)
@@ -547,7 +621,7 @@ export default function ClientDetail() {
       setSuggestionActingId(sug.id)
       setSuggestionError(null)
       await client.post(`/positions/${sug.id}/confirm-suggestion`)
-      await fetchData()
+      await Promise.all([fetchData(), fetchAudit()])
     } catch (err) {
       setSuggestionError(err.response?.data?.detail || 'Errore durante la conferma del suggerimento')
       console.error(err)
@@ -562,7 +636,7 @@ export default function ClientDetail() {
       setSuggestionActingId(sug.id)
       setSuggestionError(null)
       await client.post(`/positions/${sug.id}/reject-suggestion`)
-      await fetchData()
+      await Promise.all([fetchData(), fetchAudit()])
     } catch (err) {
       setSuggestionError(err.response?.data?.detail || 'Errore durante il rifiuto del suggerimento')
       console.error(err)
@@ -855,6 +929,163 @@ export default function ClientDetail() {
             <p className="text-xl font-bold text-txt-primary">{data.invoices?.count || 0}</p>
           </div>
         </div>
+      </div>
+
+      {/* VERIFICA ABBINAMENTI: audit del cliente aperto, AZIONABILE. Chiama
+          /customers/{id}/audit (scoped alle sue fatture) e mette a portata di
+          click Scollega / Assegna P.IVA / Segna verificato: si sanifica il
+          cliente senza passare dalla pagina Sistema. */}
+      <div className="sc-card overflow-hidden">
+        <div className="sc-card-header flex-wrap gap-2">
+          <div className="flex items-center gap-3 flex-wrap">
+            <h2 className="text-base font-bold text-txt-primary">Verifica abbinamenti</h2>
+            {!auditLoading && auditData && (
+              auditData.problem_count > 0 ? (
+                <span className={`sc-badge ${
+                  auditData.worst_verdict === 'bad'
+                    ? 'bg-accent-red/15 text-accent-red'
+                    : 'bg-accent-amber/15 text-accent-amber'
+                }`}>
+                  {auditData.problem_count} da sistemare
+                </span>
+              ) : (
+                <span className="sc-badge bg-accent-green/15 text-accent-green">In ordine ✓</span>
+              )
+            )}
+          </div>
+          <button
+            onClick={fetchAudit}
+            disabled={auditLoading}
+            className="text-sm text-accent-teal hover:text-accent-cyan font-medium transition-colors disabled:opacity-50"
+          >
+            {auditLoading ? 'Analisi…' : 'Ri-analizza'}
+          </button>
+        </div>
+
+        {auditError && (
+          <div className="px-5 py-3 text-sm text-accent-red border-b border-dark-border flex items-center justify-between gap-3">
+            <span>{auditError}</span>
+            <button onClick={fetchAudit} className="sc-btn-secondary text-xs shrink-0">Riprova</button>
+          </div>
+        )}
+
+        {auditLoading && !auditData ? (
+          <div className="p-6 flex items-center gap-3 text-txt-muted text-sm">
+            <svg className="animate-spin w-5 h-5 text-accent-teal shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+            <span>Analisi degli abbinamenti in corso… (al primo avvio il server può metterci qualche secondo).</span>
+          </div>
+        ) : auditData ? (
+          <div className="p-5 space-y-4">
+            {/* Conteggi per fattura */}
+            <div className="grid grid-cols-3 gap-3 text-center">
+              <div>
+                <p className="text-2xl font-bold text-accent-green">{auditData.counts?.ok ?? 0}</p>
+                <p className="text-xs text-txt-muted mt-0.5">OK</p>
+              </div>
+              <div>
+                <p className="text-2xl font-bold text-accent-amber">{auditData.counts?.warn ?? 0}</p>
+                <p className="text-xs text-txt-muted mt-0.5">Da controllare</p>
+              </div>
+              <div>
+                <p className="text-2xl font-bold text-accent-red">{auditData.counts?.bad ?? 0}</p>
+                <p className="text-xs text-txt-muted mt-0.5">Discordanti</p>
+              </div>
+            </div>
+            <p className="text-xs text-txt-muted text-center">
+              Analizzate {auditData.total_invoices} fattur{auditData.total_invoices === 1 ? 'a' : 'e'}
+              {' · '}{auditData.reviewed_count ?? 0} già verificate
+              {auditData.pending_count > 0 && ` · ${auditData.pending_count} in attesa di conferma`}
+            </p>
+
+            {auditData.problem_count === 0 ? (
+              <div className="bg-accent-green/10 border border-accent-green/20 rounded-xl p-4 text-center">
+                <p className="text-accent-green font-medium">
+                  {includeReviewedAudit
+                    ? 'Nessun abbinamento da controllare ✓'
+                    : 'Gli abbinamenti di questo cliente risultano in ordine ✓'}
+                </p>
+                {auditData.pending_count > 0 && (
+                  <p className="text-xs text-txt-muted mt-1">
+                    Restano {auditData.pending_count} fattur{auditData.pending_count === 1 ? 'a' : 'e'} in attesa di conferma (sezione qui sotto).
+                  </p>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {auditData.items.map(item => {
+                  const busy = auditActingId === item.invoice_id
+                  const isBad = item.verdict === 'bad'
+                  return (
+                    <div key={item.invoice_id} className={`rounded-lg border p-4 space-y-3 ${
+                      isBad ? 'border-accent-red/30 bg-accent-red/5' : 'border-accent-amber/30 bg-accent-amber/5'
+                    }`}>
+                      <div className="flex items-center justify-between gap-3 flex-wrap">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-sm font-mono font-medium text-txt-primary">{item.invoice_number}</span>
+                          <span className={`sc-badge ${
+                            isBad ? 'bg-accent-red/15 text-accent-red' : 'bg-accent-amber/15 text-accent-amber'
+                          }`}>
+                            {isBad ? '⛔ Discordante' : '⚠ Da controllare'}
+                          </span>
+                          {item.reviewed && (
+                            <span className="sc-badge bg-[rgba(148,163,184,0.15)] text-txt-muted">già verificata</span>
+                          )}
+                        </div>
+                        <span className="text-sm font-mono text-txt-secondary whitespace-nowrap">{formatCurrency(item.amount_due)}</span>
+                      </div>
+
+                      {/* Il perché + confronto P.IVA/ragione sociale affiancato */}
+                      <VerifyDetail v={item.verification} />
+
+                      {/* Azioni: endpoint esistenti. Distruttive con conferma. */}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          onClick={() => handleAuditUnlink(item)}
+                          disabled={busy}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-red/15 text-accent-red hover:bg-accent-red/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        >
+                          {busy ? '…' : 'Scollega'}
+                        </button>
+                        {item.can_assign_piva && (
+                          <button
+                            onClick={() => handleAuditAssignPiva(item)}
+                            disabled={busy}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-teal/15 text-accent-teal hover:bg-accent-teal/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          >
+                            Assegna P.IVA al cliente
+                          </button>
+                        )}
+                        <button
+                          onClick={() => handleAuditToggleReviewed(item)}
+                          disabled={busy}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''} ${
+                            item.reviewed
+                              ? 'bg-dark-surface text-txt-muted hover:text-txt-secondary'
+                              : 'bg-accent-green/15 text-accent-green hover:bg-accent-green/25'
+                          }`}
+                        >
+                          {item.reviewed ? 'Annulla verifica' : 'Segna verificato'}
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
+            <label className="flex items-center justify-center gap-2 text-xs text-txt-secondary cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeReviewedAudit}
+                onChange={(e) => setIncludeReviewedAudit(e.target.checked)}
+                className="accent-accent-teal"
+              />
+              Mostra anche le fatture già verificate a mano
+            </label>
+          </div>
+        ) : null}
       </div>
 
       {/* FATTURE IN QUARANTENA SUGGERITE A QUESTO CLIENTE: senza questa
