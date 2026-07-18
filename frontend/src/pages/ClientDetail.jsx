@@ -75,9 +75,13 @@ const VERIFY_STYLE = {
   critical: { badge: 'bg-accent-red/15 text-accent-red', dot: '⛔', label: 'Discordante', ring: 'border-accent-red/30 bg-accent-red/5' },
 }
 
+// Stato "verificata a mano": la stessa convenzione muta dell'audit
+// (grigio = tolto dalla lavorazione, MAI verde: il verde resta una garanzia).
+const REVIEWED_STYLE = { badge: 'bg-[rgba(148,163,184,0.15)] text-txt-muted', dot: '✔︎', label: 'Verificata a mano' }
+
 // Badge cliccabile: apre/chiude il pannello di dettaglio della verifica.
-function VerifyBadge({ v, open, onToggle }) {
-  const s = VERIFY_STYLE[v?.level] || VERIFY_STYLE.warning
+function VerifyBadge({ v, open, onToggle, reviewed }) {
+  const s = reviewed ? REVIEWED_STYLE : (VERIFY_STYLE[v?.level] || VERIFY_STYLE.warning)
   return (
     <button
       type="button"
@@ -94,14 +98,19 @@ function VerifyBadge({ v, open, onToggle }) {
 function VerifyRow({ label, left, right, ok }) {
   const mark = ok === true ? '✔︎' : ok === false ? '✗' : ''
   const color = ok === true ? 'text-accent-green' : ok === false ? 'text-accent-red' : 'text-txt-muted'
+  // Mobile (<sm): label sopra, poi fattura|cliente in 2 colonne. sm+: la riga
+  // torna a 3 colonne (label | fattura | cliente) grazie a sm:contents sul
+  // wrapper interno. Nessuna colonna fissa che sfori il layout stretto.
   return (
-    <div className="grid grid-cols-[130px_1fr_1fr] gap-2 py-1 items-start text-sm">
-      <span className="text-xs font-semibold text-txt-label uppercase tracking-wider pt-0.5">{label}</span>
-      <span className="text-txt-primary break-words">{left || <span className="text-txt-muted">—</span>}</span>
-      <span className="text-txt-primary break-words">
-        <span className={`mr-1 ${color}`}>{mark}</span>
-        {right || <span className="text-txt-muted">—</span>}
-      </span>
+    <div className="py-1 text-sm sm:grid sm:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)] sm:gap-2 sm:items-start">
+      <span className="block mb-0.5 sm:mb-0 sm:pt-0.5 text-xs font-semibold text-txt-label uppercase tracking-wider">{label}</span>
+      <div className="grid grid-cols-2 gap-2 sm:contents">
+        <span className="min-w-0 text-txt-primary break-words">{left || <span className="text-txt-muted">—</span>}</span>
+        <span className="min-w-0 text-txt-primary break-words">
+          <span className={`mr-1 ${color}`}>{mark}</span>
+          {right || <span className="text-txt-muted">—</span>}
+        </span>
+      </div>
     </div>
   )
 }
@@ -112,14 +121,16 @@ function VerifyDetail({ v }) {
   const s = VERIFY_STYLE[v.level] || VERIFY_STYLE.warning
   return (
     <div className={`rounded-lg border ${s.ring} p-3`}>
-      <p className={`text-sm font-medium ${v.level === 'verified' ? 'text-accent-green' : v.level === 'critical' ? 'text-accent-red' : 'text-accent-amber'}`}>
+      <p className={`text-sm font-medium break-words ${v.level === 'verified' ? 'text-accent-green' : v.level === 'critical' ? 'text-accent-red' : 'text-accent-amber'}`}>
         {v.message}
       </p>
       <div className="mt-2 pt-2 border-t border-dark-border">
-        <div className="grid grid-cols-[130px_1fr_1fr] gap-2 pb-1">
-          <span></span>
-          <span className="text-xs font-semibold text-txt-label uppercase tracking-wider">Sulla fattura</span>
-          <span className="text-xs font-semibold text-txt-label uppercase tracking-wider">Sul cliente</span>
+        <div className="pb-1 sm:grid sm:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)] sm:gap-2">
+          <span className="hidden sm:block"></span>
+          <div className="grid grid-cols-2 gap-2 sm:contents">
+            <span className="text-xs font-semibold text-txt-label uppercase tracking-wider">Sulla fattura</span>
+            <span className="text-xs font-semibold text-txt-label uppercase tracking-wider">Sul cliente</span>
+          </div>
         </div>
         <VerifyRow
           label="P.IVA"
@@ -176,16 +187,40 @@ export default function ClientDetail() {
   // Fatture in quarantena suggerite a questo cliente ("In attesa di conferma")
   const [suggestionActingId, setSuggestionActingId] = useState(null)
   const [suggestionError, setSuggestionError] = useState(null)
+  // Audit abbinamenti del cliente aperto (azionabile): esito verify per-fattura
+  const [auditData, setAuditData] = useState(null)
+  const [auditLoading, setAuditLoading] = useState(true)
+  const [auditError, setAuditError] = useState(null)
+  const [auditActingId, setAuditActingId] = useState(null)
+  const [includeReviewedAudit, setIncludeReviewedAudit] = useState(false)
+  // Verifiche manuali sul semaforo per-riga (audit_reviewed_at via
+  // mark-reviewed). Seminato da /customers/{id} (campo `reviewed` per
+  // fattura), così lo stato sopravvive all'hard-reload.
+  const [reviewedRows, setReviewedRows] = useState(() => new Set())
+  const [rowReviewActingId, setRowReviewActingId] = useState(null)
+  // Menu guidato "Risolvi" sulle righe discordanti dell'audit: 3 vie.
+  // ① picker riassegnazione (ricerca fuzzy /customers/suggest)
+  const [resolveReassignId, setResolveReassignId] = useState(null)
+  const [resolveQuery, setResolveQuery] = useState('')
+  const [resolveResults, setResolveResults] = useState([])
+  const [resolveSearching, setResolveSearching] = useState(false)
+  // ② anteprima d'impatto del rinomino (assign-name-to-customer senza confirm)
+  const [renamePreview, setRenamePreview] = useState(null)
+  const [renameLoadingId, setRenameLoadingId] = useState(null)
 
   const fetchData = useCallback(async () => {
     try {
       setLoading(true)
       const response = await client.get(`/customers/${customerId}`)
       setData(response.data)
-      const overdueIds = (response.data.invoices?.items || [])
+      const items = response.data.invoices?.items || []
+      const overdueIds = items
         .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid')
         .map(inv => inv.id)
       setSelectedInvoices(new Set(overdueIds))
+      // Semina le "verificate a mano" dal backend: senza, un hard-reload
+      // farebbe ricomparire il ⚠ su fatture già controllate dall'operatore.
+      setReviewedRows(new Set(items.filter(inv => inv.reviewed).map(inv => inv.id)))
     } catch (err) {
       setError('Errore nel caricamento del cliente')
       console.error(err)
@@ -203,10 +238,239 @@ export default function ClientDetail() {
     }
   }, [customerId])
 
+  // Audit abbinamenti del cliente aperto: scoped alle SUE fatture (nessuna
+  // scansione globale). Il client axios ritenta da solo i cold-start 502/503.
+  const fetchAudit = useCallback(async () => {
+    try {
+      setAuditLoading(true)
+      setAuditError(null)
+      const res = await client.get(`/customers/${customerId}/audit`, {
+        params: { include_reviewed: includeReviewedAudit },
+      })
+      setAuditData(res.data)
+      // Semina lo stato "verificata a mano" del semaforo per-riga con ciò
+      // che l'audit sa (le già verificate compaiono con include_reviewed).
+      const seededIds = (res.data.items || []).filter(i => i.reviewed).map(i => i.invoice_id)
+      if (seededIds.length > 0) {
+        setReviewedRows(prev => {
+          const next = new Set(prev)
+          seededIds.forEach(id => next.add(id))
+          return next
+        })
+      }
+    } catch (err) {
+      console.error('Error fetching audit:', err)
+      setAuditError('Impossibile eseguire l\'audit degli abbinamenti')
+    } finally {
+      setAuditLoading(false)
+    }
+  }, [customerId, includeReviewedAudit])
+
   useEffect(() => {
     fetchData()
     fetchNeighbors()
   }, [fetchData, fetchNeighbors])
+
+  // Cambiando cliente lo stato locale delle verifiche manuali riparte pulito.
+  useEffect(() => {
+    setReviewedRows(new Set())
+    setResolveReassignId(null)
+    setResolveQuery('')
+    setResolveResults([])
+    setRenamePreview(null)
+  }, [customerId])
+
+  // Picker "È di un altro cliente": ricerca approssimata debounced sugli
+  // stessi suggerimenti fuzzy della lista Clienti (/customers/suggest).
+  useEffect(() => {
+    if (resolveReassignId == null) return undefined
+    const q = resolveQuery.trim()
+    if (q.length < 2) {
+      setResolveResults([])
+      return undefined
+    }
+    let cancelled = false
+    setResolveSearching(true)
+    const t = setTimeout(async () => {
+      try {
+        const res = await client.get('/customers/suggest', { params: { q, limit: 6 } })
+        if (!cancelled) setResolveResults(res.data.items || [])
+      } catch {
+        if (!cancelled) setResolveResults([])
+      } finally {
+        if (!cancelled) setResolveSearching(false)
+      }
+    }, 300)
+    return () => { cancelled = true; clearTimeout(t) }
+  }, [resolveQuery, resolveReassignId])
+
+  useEffect(() => {
+    fetchAudit()
+  }, [fetchAudit])
+
+  // Azioni dell'audit: gli endpoint sono quelli ESISTENTI di positions.py.
+  // Dopo ogni azione si ricaricano scheda + audit (unlink cambia totali).
+  const runAuditAction = async (invoiceId, request) => {
+    try {
+      setAuditActingId(invoiceId)
+      setAuditError(null)
+      await request()
+      await Promise.all([fetchData(), fetchAudit()])
+    } catch (err) {
+      console.error('Audit action error:', err)
+      setAuditError(err.response?.data?.detail || 'Errore durante l\'operazione')
+    } finally {
+      setAuditActingId(null)
+    }
+  }
+
+  const handleAuditUnlink = (item) => {
+    if (!window.confirm(
+      `Scollegare la fattura ${item.invoice_number} da "${data?.ragione_sociale}"?\n\n`
+      + 'La fattura tornerà senza cliente e non sarà più riabbinata in automatico.'
+    )) return
+    runAuditAction(item.invoice_id, () => client.post(`/positions/${item.invoice_id}/unlink`))
+  }
+
+  const handleAuditAssignPiva = (item) => {
+    const piva = item.verification?.invoice_piva
+    if (!window.confirm(
+      `Assegnare la P.IVA ${piva} (dalla fattura ${item.invoice_number}) al cliente "${data?.ragione_sociale}"?\n\n`
+      + 'Serve quando la fattura ha una P.IVA valida ma il cliente non ne ha una: '
+      + 'i prossimi abbinamenti diventeranno garantiti per P.IVA.'
+    )) return
+    runAuditAction(item.invoice_id, () => client.post(`/positions/${item.invoice_id}/assign-piva-to-customer`))
+  }
+
+  const handleAuditToggleReviewed = (item) => {
+    const path = item.reviewed ? 'unmark-reviewed' : 'mark-reviewed'
+    runAuditAction(item.invoice_id, async () => {
+      await client.post(`/positions/${item.invoice_id}/${path}`)
+      // Tiene allineato anche il semaforo per-riga della tabella fatture.
+      setReviewedRows(prev => {
+        const next = new Set(prev)
+        if (item.reviewed) next.delete(item.invoice_id)
+        else next.add(item.invoice_id)
+        return next
+      })
+    })
+  }
+
+  // ── Menu guidato "Risolvi" (riga discordante) ──────────────────────
+
+  // ① "È di un altro cliente": apre il picker inline, pre-compilato col
+  // destinatario della fattura — nel caso tipico (BASARA su COLONIALE) la
+  // prima ricerca è già quella giusta.
+  const handleResolveOpenReassign = (item) => {
+    setRenamePreview(null)
+    if (resolveReassignId === item.invoice_id) {
+      setResolveReassignId(null)
+      setResolveQuery('')
+      setResolveResults([])
+      return
+    }
+    setResolveReassignId(item.invoice_id)
+    setResolveQuery(item.verification?.invoice_name || '')
+    setResolveResults([])
+  }
+
+  const handleResolveReassign = (item, target) => {
+    if (!window.confirm(
+      `Riassegnare la fattura ${item.invoice_number} da "${data?.ragione_sociale}" `
+      + `a "${target.ragione_sociale}"?\n\n`
+      + 'La fattura passa al nuovo cliente con abbinamento manuale.'
+    )) return
+    runAuditAction(item.invoice_id, async () => {
+      await client.put(`/positions/${item.invoice_id}/reassign`, null, {
+        params: { new_customer_id: target.id },
+      })
+      setResolveReassignId(null)
+      setResolveQuery('')
+      setResolveResults([])
+    })
+  }
+
+  // ② "Il profilo ha il nome vecchio": prima chiamata SENZA confirm =
+  // anteprima d'impatto (quante altre fatture diventerebbero discordanti),
+  // il pannello con Conferma/Annulla è la conferma esplicita.
+  const handleResolveRenamePreview = async (item) => {
+    setResolveReassignId(null)
+    setResolveQuery('')
+    setResolveResults([])
+    if (renamePreview?.invoiceId === item.invoice_id) {
+      setRenamePreview(null)
+      return
+    }
+    try {
+      setRenameLoadingId(item.invoice_id)
+      setAuditError(null)
+      const res = await client.post(`/positions/${item.invoice_id}/assign-name-to-customer`)
+      if (res.data.already_aligned) {
+        setAuditError('Il nome del cliente è già identico a quello sulla fattura: niente da rinominare.')
+        return
+      }
+      setRenamePreview({ invoiceId: item.invoice_id, ...res.data })
+    } catch (err) {
+      console.error('Rename preview error:', err)
+      setAuditError(err.response?.data?.detail || 'Errore durante l\'anteprima del rinomino')
+    } finally {
+      setRenameLoadingId(null)
+    }
+  }
+
+  const handleResolveRenameConfirm = (item) => {
+    runAuditAction(item.invoice_id, async () => {
+      await client.post(`/positions/${item.invoice_id}/assign-name-to-customer`, null, {
+        // expected_customer_id = il cliente VISTO in anteprima: se un
+        // reassign concorrente ha spostato la fattura, il backend fa 409
+        // invece di rinominare (e lockare) la vittima sbagliata.
+        params: { confirm: true, expected_customer_id: renamePreview?.customer_id },
+      })
+      setRenamePreview(null)
+    })
+  }
+
+  // Sblocco amministrativo del nome (via di ritorno da un rinomino
+  // sbagliato): rimosso il lock, il sync Shopify torna a governare la
+  // ragione sociale dal giro successivo.
+  const handleUnlockName = async () => {
+    if (!window.confirm(
+      `Sbloccare il nome "${data?.ragione_sociale}"?\n\n`
+      + 'Il sync Shopify tornerà a governare la ragione sociale dal prossimo '
+      + 'giro: serve per rimediare a un rinomino sbagliato.'
+    )) return
+    try {
+      await client.post(`/customers/${customerId}/unlock-name`)
+      await fetchData()
+    } catch (err) {
+      console.error('Errore sblocco nome:', err)
+      alert(err.response?.data?.detail || 'Errore durante lo sblocco del nome')
+    }
+  }
+
+  // "Segna verificato" dal pannello del semaforo per-riga: stesso endpoint
+  // dell'audit (mark-reviewed). Dopo l'azione si ricarica l'audit, così i
+  // conteggi ("N da sistemare", "già verificate") restano coerenti.
+  const handleRowToggleReviewed = async (inv) => {
+    const isReviewed = reviewedRows.has(inv.id)
+    const path = isReviewed ? 'unmark-reviewed' : 'mark-reviewed'
+    try {
+      setRowReviewActingId(inv.id)
+      await client.post(`/positions/${inv.id}/${path}`)
+      setReviewedRows(prev => {
+        const next = new Set(prev)
+        if (isReviewed) next.delete(inv.id)
+        else next.add(inv.id)
+        return next
+      })
+      await fetchAudit()
+    } catch (err) {
+      console.error('Errore verifica manuale:', err)
+      alert(err.response?.data?.detail || 'Errore durante la registrazione della verifica manuale')
+    } finally {
+      setRowReviewActingId(null)
+    }
+  }
 
   const formatCurrency = (value) =>
     new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(value)
@@ -547,7 +811,7 @@ export default function ClientDetail() {
       setSuggestionActingId(sug.id)
       setSuggestionError(null)
       await client.post(`/positions/${sug.id}/confirm-suggestion`)
-      await fetchData()
+      await Promise.all([fetchData(), fetchAudit()])
     } catch (err) {
       setSuggestionError(err.response?.data?.detail || 'Errore durante la conferma del suggerimento')
       console.error(err)
@@ -562,7 +826,7 @@ export default function ClientDetail() {
       setSuggestionActingId(sug.id)
       setSuggestionError(null)
       await client.post(`/positions/${sug.id}/reject-suggestion`)
-      await fetchData()
+      await Promise.all([fetchData(), fetchAudit()])
     } catch (err) {
       setSuggestionError(err.response?.data?.detail || 'Errore durante il rifiuto del suggerimento')
       console.error(err)
@@ -611,6 +875,17 @@ export default function ClientDetail() {
   const paidInvoices = data.invoices?.items?.filter(inv => inv.status === 'paid') || []
   const totalPaid = paidInvoices.reduce((sum, inv) => sum + inv.amount, 0)
   const whatsappNumber = getWhatsAppNumber() || null
+
+  // Righe GIALLE del semaforo che l'audit NON conta come problemi (verdict
+  // ok ma livello warning: garanzia impossibile, non errore di abbinamento).
+  // L'header le dichiara, così "in ordine" e le ⚠ in tabella non si
+  // contraddicono; escluse le già verificate a mano.
+  const manualCheckCount = (data.invoices?.items || []).filter(inv =>
+    inv.status !== 'paid'
+    && inv.verification?.verdict === 'ok'
+    && inv.verification?.level === 'warning'
+    && !reviewedRows.has(inv.id)
+  ).length
 
   let visibleInvoices = showAllInvoices
     ? (data.invoices?.items || [])
@@ -801,6 +1076,25 @@ export default function ClientDetail() {
                 )}
               </div>
               {data.source && <p>Fonte: <span className="capitalize text-txt-primary">{data.source}</span></p>}
+              {/* Nome bonificato a mano: il sync non lo sovrascrive. Lo
+                  sblocco è la via di ritorno da un rinomino sbagliato. */}
+              {data.ragione_sociale_locked && (
+                <p className="flex items-center gap-2 flex-wrap">
+                  <span
+                    className="sc-badge text-xs bg-[rgba(148,163,184,0.15)] text-txt-muted"
+                    title="Ragione sociale corretta a mano dalla bonifica: il sync Shopify non la sovrascrive"
+                  >
+                    Nome bloccato (bonifica manuale)
+                  </span>
+                  <button
+                    onClick={handleUnlockName}
+                    className="text-xs text-accent-teal hover:text-accent-cyan font-medium transition-colors"
+                    title="Rimuovi il blocco: il sync Shopify tornerà a governare il nome dal prossimo giro"
+                  >
+                    Sblocca nome
+                  </button>
+                </p>
+              )}
             </div>
           </div>
           <div className="flex flex-col items-end gap-3">
@@ -855,6 +1149,401 @@ export default function ClientDetail() {
             <p className="text-xl font-bold text-txt-primary">{data.invoices?.count || 0}</p>
           </div>
         </div>
+      </div>
+
+      {/* VERIFICA ABBINAMENTI: audit del cliente aperto, AZIONABILE. Chiama
+          /customers/{id}/audit (scoped alle sue fatture) e mette a portata di
+          click Scollega / Assegna P.IVA / Segna verificato: si sanifica il
+          cliente senza passare dalla pagina Sistema. */}
+      <div className="sc-card overflow-hidden">
+        <div className="sc-card-header flex-wrap gap-2">
+          <div className="flex items-center gap-3 flex-wrap">
+            <h2 className="text-base font-bold text-txt-primary">Verifica abbinamenti</h2>
+            {!auditLoading && auditData && (
+              auditData.problem_count > 0 ? (
+                <span className={`sc-badge ${
+                  auditData.worst_verdict === 'bad'
+                    ? 'bg-accent-red/15 text-accent-red'
+                    : 'bg-accent-amber/15 text-accent-amber'
+                }`}>
+                  {auditData.problem_count} da sistemare
+                </span>
+              ) : (
+                <span className="sc-badge bg-accent-green/15 text-accent-green">Abbinamenti in ordine ✓</span>
+              )
+            )}
+            {/* Le ⚠ del semaforo non sono problemi di abbinamento: qui si
+                dichiarano, in tono muto, per non contraddire la tabella. */}
+            {!auditLoading && auditData && manualCheckCount > 0 && (
+              <span
+                className="text-xs text-txt-muted"
+                title="Righe col semaforo giallo nella tabella fatture: non sono errori di abbinamento, chiedono solo un controllo manuale. Apri la ⚠ sulla riga e usa Segna verificato."
+              >
+                · {manualCheckCount} da verificare a mano
+              </span>
+            )}
+          </div>
+          <button
+            onClick={fetchAudit}
+            disabled={auditLoading}
+            className="text-sm text-accent-teal hover:text-accent-cyan font-medium transition-colors disabled:opacity-50"
+          >
+            {auditLoading ? 'Analisi…' : 'Ri-analizza'}
+          </button>
+        </div>
+
+        {auditError && (
+          <div className="px-5 py-3 text-sm text-accent-red border-b border-dark-border flex items-center justify-between gap-3">
+            <span>{auditError}</span>
+            <button onClick={fetchAudit} className="sc-btn-secondary text-xs shrink-0">Riprova</button>
+          </div>
+        )}
+
+        {auditLoading && !auditData ? (
+          <div className="p-6 flex items-center gap-3 text-txt-muted text-sm">
+            <svg className="animate-spin w-5 h-5 text-accent-teal shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+            <span>Analisi degli abbinamenti in corso… (al primo avvio il server può metterci qualche secondo).</span>
+          </div>
+        ) : auditData ? (
+          <div className="p-5 space-y-4">
+            {/* Conteggi per fattura */}
+            <div className="grid grid-cols-3 gap-3 text-center">
+              <div>
+                <p className="text-2xl font-bold text-accent-green">{auditData.counts?.ok ?? 0}</p>
+                <p className="text-xs text-txt-muted mt-0.5">OK</p>
+              </div>
+              <div>
+                <p className="text-2xl font-bold text-accent-amber">{auditData.counts?.warn ?? 0}</p>
+                <p className="text-xs text-txt-muted mt-0.5">Da controllare</p>
+              </div>
+              <div>
+                <p className="text-2xl font-bold text-accent-red">{auditData.counts?.bad ?? 0}</p>
+                <p className="text-xs text-txt-muted mt-0.5">Discordanti</p>
+              </div>
+            </div>
+            <p className="text-xs text-txt-muted text-center">
+              Analizzate {auditData.total_invoices} fattur{auditData.total_invoices === 1 ? 'a' : 'e'}
+              {' · '}{auditData.reviewed_count ?? 0} già verificate
+              {auditData.pending_count > 0 && ` · ${auditData.pending_count} in attesa di conferma`}
+            </p>
+
+            {auditData.problem_count === 0 ? (
+              <div className="bg-accent-green/10 border border-accent-green/20 rounded-xl p-4 text-center">
+                <p className="text-accent-green font-medium">
+                  {includeReviewedAudit
+                    ? 'Nessun abbinamento da controllare ✓'
+                    : 'Gli abbinamenti di questo cliente risultano in ordine ✓'}
+                </p>
+                {manualCheckCount > 0 && (
+                  <p className="text-xs text-txt-muted mt-1">
+                    Nella tabella fatture {manualCheckCount === 1
+                      ? 'resta 1 riga gialla (⚠)'
+                      : `restano ${manualCheckCount} righe gialle (⚠)`}: non {manualCheckCount === 1 ? 'è un errore' : 'sono errori'} di abbinamento,
+                    {manualCheckCount === 1 ? ' chiede' : ' chiedono'} solo una verifica manuale — apri la ⚠ e usa &ldquo;Segna verificato&rdquo;.
+                  </p>
+                )}
+                {auditData.pending_count > 0 && (
+                  <p className="text-xs text-txt-muted mt-1">
+                    Restano {auditData.pending_count} fattur{auditData.pending_count === 1 ? 'a' : 'e'} in attesa di conferma (sezione qui sotto).
+                  </p>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {auditData.items.map(item => {
+                  const busy = auditActingId === item.invoice_id
+                  const isBad = item.verdict === 'bad'
+                  return (
+                    <div key={item.invoice_id} className={`rounded-lg border p-4 space-y-3 ${
+                      isBad ? 'border-accent-red/30 bg-accent-red/5' : 'border-accent-amber/30 bg-accent-amber/5'
+                    }`}>
+                      <div className="flex items-center justify-between gap-3 flex-wrap">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-sm font-mono font-medium text-txt-primary">{item.invoice_number}</span>
+                          <span className={`sc-badge ${
+                            isBad ? 'bg-accent-red/15 text-accent-red' : 'bg-accent-amber/15 text-accent-amber'
+                          }`}>
+                            {isBad ? '⛔ Discordante' : '⚠ Da controllare'}
+                          </span>
+                          {item.reviewed && (
+                            <span className="sc-badge bg-[rgba(148,163,184,0.15)] text-txt-muted">già verificata</span>
+                          )}
+                        </div>
+                        <span className="text-sm font-mono text-txt-secondary whitespace-nowrap">{formatCurrency(item.amount_due)}</span>
+                      </div>
+
+                      {/* Il perché + confronto P.IVA/ragione sociale affiancato */}
+                      <VerifyDetail v={item.verification} />
+
+                      {/* Riga DISCORDANTE non ancora verificata: menu guidato
+                          "Risolvi" a 3 vie — la verità è una di queste.
+                          ① in testa: nel caso tipico (fattura BASARA sul
+                          cliente COLONIALE) l'errore è l'abbinamento. */}
+                      {isBad && !item.reviewed ? (
+                        <div className="space-y-2">
+                          <p className="text-xs font-semibold text-txt-label uppercase tracking-wider">
+                            Risolvi — qual è la verità?
+                          </p>
+
+                          {/* ① È di un altro cliente → riassegna */}
+                          <button
+                            onClick={() => handleResolveOpenReassign(item)}
+                            disabled={busy}
+                            className={`w-full text-left px-3 py-2 rounded-lg border transition-colors ${
+                              resolveReassignId === item.invoice_id
+                                ? 'border-accent-teal/60 bg-accent-teal/10'
+                                : 'border-dark-border bg-dark-surface hover:border-accent-teal/40'
+                            } ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          >
+                            <span className="text-sm font-semibold text-txt-primary">① È di un altro cliente</span>
+                            <span className="block text-xs text-txt-muted mt-0.5">
+                              La fattura è attaccata al cliente sbagliato: cerca quello giusto e riassegnala.
+                            </span>
+                          </button>
+                          {resolveReassignId === item.invoice_id && (
+                            <div className="ml-4 space-y-2">
+                              <input
+                                type="text"
+                                autoFocus
+                                value={resolveQuery}
+                                onChange={(e) => setResolveQuery(e.target.value)}
+                                placeholder="Cerca il cliente giusto (nome anche approssimato)…"
+                                className="sc-input w-full"
+                              />
+                              {resolveSearching && (
+                                <p className="text-xs text-txt-muted">Ricerca…</p>
+                              )}
+                              {!resolveSearching && resolveQuery.trim().length >= 2 && resolveResults.length === 0 && (
+                                <p className="text-xs text-txt-muted">
+                                  Nessun cliente somigliante. Prova con meno parole.
+                                </p>
+                              )}
+                              {resolveResults.length > 0 && (
+                                <div className="flex flex-wrap gap-2">
+                                  {resolveResults
+                                    .filter(c => c.id !== Number(customerId))
+                                    .map(c => (
+                                      <button
+                                        key={c.id}
+                                        onClick={() => handleResolveReassign(item, c)}
+                                        disabled={busy}
+                                        className={`px-3 py-1.5 rounded-lg text-xs font-medium bg-accent-teal/10 text-accent-teal border border-accent-teal/30 hover:bg-accent-teal/20 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                        title="Clicca per riassegnare la fattura a questo cliente (con conferma)"
+                                      >
+                                        {c.ragione_sociale}
+                                        {c.partita_iva && (
+                                          <span className="text-txt-muted"> · {c.partita_iva}</span>
+                                        )}
+                                        {c.excluded && (
+                                          <span className="text-txt-muted"> (escluso)</span>
+                                        )}
+                                      </button>
+                                    ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* ② Stessa azienda, profilo col nome vecchio →
+                              aggiorna il nome dal documento (preview→confirm) */}
+                          <button
+                            onClick={() => handleResolveRenamePreview(item)}
+                            disabled={busy || renameLoadingId === item.invoice_id}
+                            className={`w-full text-left px-3 py-2 rounded-lg border transition-colors ${
+                              renamePreview?.invoiceId === item.invoice_id
+                                ? 'border-accent-amber/60 bg-accent-amber/10'
+                                : 'border-dark-border bg-dark-surface hover:border-accent-amber/40'
+                            } ${(busy || renameLoadingId === item.invoice_id) ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          >
+                            <span className="text-sm font-semibold text-txt-primary">
+                              ② Stessa azienda, il profilo ha il nome vecchio
+                              {renameLoadingId === item.invoice_id && ' …'}
+                            </span>
+                            <span className="block text-xs text-txt-muted mt-0.5">
+                              Aggiorna il nome del cliente dal documento (prima ti mostro l&apos;impatto).
+                            </span>
+                          </button>
+                          {renamePreview?.invoiceId === item.invoice_id && (
+                            <div className="ml-4 p-3 rounded-lg border border-accent-amber/30 bg-accent-amber/5 space-y-2">
+                              {/* Omonimo: il vero destinatario esiste già in
+                                  anagrafica — il confirm farebbe comunque 409,
+                                  quindi niente bottone Conferma: si indirizza
+                                  alla via ① Riassegna. */}
+                              {renamePreview.homonym ? (
+                                <>
+                                  <p className="text-sm font-medium text-accent-red">
+                                    Esiste già il cliente &ldquo;<span className="font-semibold">{renamePreview.homonym.ragione_sociale}</span>&rdquo;
+                                    {renamePreview.homonym.partita_iva && ` (P.IVA ${renamePreview.homonym.partita_iva})`}:
+                                    questa fattura è probabilmente sua.
+                                  </p>
+                                  <p className="text-xs text-txt-muted">
+                                    Rinominare questo profilo creerebbe due clienti con lo stesso nome (prossime fatture in quarantena).
+                                    Usa <span className="font-semibold text-txt-secondary">① &ldquo;È di un altro cliente&rdquo;</span> per riassegnarla.
+                                  </p>
+                                  <button
+                                    onClick={() => setRenamePreview(null)}
+                                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-dark-surface text-txt-muted hover:text-txt-secondary transition-colors"
+                                  >
+                                    Chiudi
+                                  </button>
+                                </>
+                              ) : (
+                                <>
+                                  <p className="text-sm text-txt-primary">
+                                    Rinominare &ldquo;<span className="font-semibold">{renamePreview.old_name}</span>&rdquo; in
+                                    {' '}&ldquo;<span className="font-semibold">{renamePreview.new_name}</span>&rdquo;
+                                    {renamePreview.impact?.would_become_discordant > 0 ? (
+                                      <>
+                                        {' '}renderà discordant{renamePreview.impact.would_become_discordant === 1 ? 'e' : 'i'}{' '}
+                                        <span className="font-semibold text-accent-amber">
+                                          {renamePreview.impact.would_become_discordant === 1
+                                            ? '1 altra fattura'
+                                            : `${renamePreview.impact.would_become_discordant} altre fatture`}
+                                        </span>{' '}di questo cliente — confermi?
+                                      </>
+                                    ) : (
+                                      <> non renderà discordante nessun&apos;altra fattura aperta di questo cliente — confermi?</>
+                                    )}
+                                  </p>
+                                  {renamePreview.impact?.invoices?.length > 0 && (
+                                    <p className="text-xs text-txt-muted font-mono">
+                                      {renamePreview.impact.invoices.map(i => i.invoice_number).join(' · ')}
+                                    </p>
+                                  )}
+                                  {renamePreview.impact?.would_become_warning > 0 && (
+                                    <p className="text-xs text-accent-amber">
+                                      {renamePreview.impact.would_become_warning === 1
+                                        ? '1 altra fattura passerà a "Da controllare"'
+                                        : `${renamePreview.impact.would_become_warning} altre fatture passeranno a "Da controllare"`}
+                                      {renamePreview.impact.warning_invoices?.length > 0 && (
+                                        <span className="font-mono"> ({renamePreview.impact.warning_invoices.map(i => i.invoice_number).join(' · ')})</span>
+                                      )}
+                                    </p>
+                                  )}
+                                  {/* Le PAGATE non compaiono nell'audit di default:
+                                      senza questa voce il caso più pericoloso
+                                      (1 aperta + N pagate col vecchio nome)
+                                      sembrava innocuo. */}
+                                  {renamePreview.impact?.paid_would_become_discordant > 0 && (
+                                    <p className="text-xs text-accent-amber">
+                                      {renamePreview.impact.paid_would_become_discordant === 1
+                                        ? '1 fattura PAGATA resterà intestata al vecchio nome su questo profilo'
+                                        : `${renamePreview.impact.paid_would_become_discordant} fatture PAGATE resteranno intestate al vecchio nome su questo profilo`}
+                                      {renamePreview.impact.paid_invoices?.length > 0 && (
+                                        <span className="font-mono"> ({renamePreview.impact.paid_invoices.map(i => i.invoice_number).join(' · ')})</span>
+                                      )}
+                                    </p>
+                                  )}
+                                  {renamePreview.similarity != null && (
+                                    <p className={`text-xs ${renamePreview.similarity < 40 ? 'text-accent-red' : 'text-txt-muted'}`}>
+                                      Somiglianza tra i due nomi: {renamePreview.similarity}%
+                                      {renamePreview.similarity < 40 && (
+                                        <> — nomi molto diversi: se non sei certo che sia la stessa azienda, meglio ① Riassegna.</>
+                                      )}
+                                    </p>
+                                  )}
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      onClick={() => handleResolveRenameConfirm(item)}
+                                      disabled={busy}
+                                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-amber/15 text-accent-amber hover:bg-accent-amber/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                    >
+                                      {busy ? '…' : 'Conferma rinomina'}
+                                    </button>
+                                    <button
+                                      onClick={() => setRenamePreview(null)}
+                                      disabled={busy}
+                                      className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-dark-surface text-txt-muted hover:text-txt-secondary transition-colors"
+                                    >
+                                      Annulla
+                                    </button>
+                                  </div>
+                                  <p className="text-xs text-txt-muted">
+                                    Il nome resterà bloccato: il sync Shopify non potrà più sovrascriverlo (Sblocca nome in testa alla scheda per tornare indietro). La fattura non viene toccata.
+                                  </p>
+                                </>
+                              )}
+                            </div>
+                          )}
+
+                          {/* ③ Stessa azienda, solo grafia diversa →
+                              Segna verificato (endpoint esistente) */}
+                          <button
+                            onClick={() => handleAuditToggleReviewed(item)}
+                            disabled={busy}
+                            className={`w-full text-left px-3 py-2 rounded-lg border border-dark-border bg-dark-surface hover:border-accent-green/40 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          >
+                            <span className="text-sm font-semibold text-txt-primary">③ Stessa azienda, solo grafia diversa</span>
+                            <span className="block text-xs text-txt-muted mt-0.5">
+                              L&apos;abbinamento è giusto: segna verificato e silenzia l&apos;avviso.
+                            </span>
+                          </button>
+
+                          {/* Via d'uscita fuori menu: non sai di chi è. */}
+                          <div className="flex items-center gap-2 pt-1">
+                            <span className="text-xs text-txt-muted">Nessuna delle tre?</span>
+                            <button
+                              onClick={() => handleAuditUnlink(item)}
+                              disabled={busy}
+                              className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-red/15 text-accent-red hover:bg-accent-red/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            >
+                              {busy ? '…' : 'Scollega senza riabbinare'}
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        /* Righe warn (o bad già verificate): azioni piatte
+                           esistenti — endpoint invariati, distruttive con
+                           conferma. */
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            onClick={() => handleAuditUnlink(item)}
+                            disabled={busy}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-red/15 text-accent-red hover:bg-accent-red/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          >
+                            {busy ? '…' : 'Scollega'}
+                          </button>
+                          {item.can_assign_piva && (
+                            <button
+                              onClick={() => handleAuditAssignPiva(item)}
+                              disabled={busy}
+                              className={`px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-teal/15 text-accent-teal hover:bg-accent-teal/25 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            >
+                              Assegna P.IVA al cliente
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleAuditToggleReviewed(item)}
+                            disabled={busy}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''} ${
+                              item.reviewed
+                                ? 'bg-dark-surface text-txt-muted hover:text-txt-secondary'
+                                : 'bg-accent-green/15 text-accent-green hover:bg-accent-green/25'
+                            }`}
+                          >
+                            {item.reviewed ? 'Annulla verifica' : 'Segna verificato'}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
+            <label className="flex items-center justify-center gap-2 text-xs text-txt-secondary cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeReviewedAudit}
+                onChange={(e) => setIncludeReviewedAudit(e.target.checked)}
+                className="accent-accent-teal"
+              />
+              Mostra anche le fatture già verificate a mano
+            </label>
+          </div>
+        ) : null}
       </div>
 
       {/* FATTURE IN QUARANTENA SUGGERITE A QUESTO CLIENTE: senza questa
@@ -1037,6 +1726,7 @@ export default function ClientDetail() {
                         v={inv.verification}
                         open={openVerify.has(inv.id)}
                         onToggle={() => toggleVerify(inv.id)}
+                        reviewed={reviewedRows.has(inv.id)}
                       />
                     ) : (
                       <span className="text-txt-muted">—</span>
@@ -1105,6 +1795,33 @@ export default function ClientDetail() {
                   <tr key={`${inv.id}-verify`} className="bg-dark-surface/40">
                     <td colSpan={10} className="px-3 pb-3">
                       <VerifyDetail v={inv.verification} />
+                      {/* Via d'uscita dal giallo: l'operatore che ha
+                          controllato a mano lo registra qui (stesso
+                          endpoint mark-reviewed dell'audit). */}
+                      {inv.verification.level !== 'verified' && (
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          <button
+                            onClick={() => handleRowToggleReviewed(inv)}
+                            disabled={rowReviewActingId === inv.id}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                              rowReviewActingId === inv.id ? 'opacity-50 cursor-not-allowed' : ''
+                            } ${
+                              reviewedRows.has(inv.id)
+                                ? 'bg-dark-surface text-txt-muted hover:text-txt-secondary'
+                                : 'bg-accent-green/15 text-accent-green hover:bg-accent-green/25'
+                            }`}
+                          >
+                            {rowReviewActingId === inv.id
+                              ? '…'
+                              : reviewedRows.has(inv.id) ? 'Annulla verifica' : 'Segna verificato'}
+                          </button>
+                          <span className="text-xs text-txt-muted">
+                            {reviewedRows.has(inv.id)
+                              ? 'Verificata a mano: l\'avviso è silenziato.'
+                              : 'Hai controllato a mano che la fattura è del cliente giusto? Segnala verificata.'}
+                          </span>
+                        </div>
+                      )}
                     </td>
                   </tr>
                 )}

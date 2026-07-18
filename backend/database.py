@@ -24,6 +24,11 @@ class Customer(Base):
     shopify_id = Column(String, unique=True, nullable=True)
     ragione_sociale = Column(String, nullable=False)
     ragione_sociale_normalized = Column(String, nullable=True, index=True)
+    # Bonifica nomi (assign-name-to-customer): l'operatore ha aggiornato la
+    # ragione sociale dal documento — il sync clienti Shopify NON deve più
+    # sovrascriverla, altrimenti il sync orario annulla la bonifica entro
+    # un'ora (quel ramo riscrive i nomi a ogni giro).
+    ragione_sociale_locked = Column(Boolean, default=False)
     partita_iva = Column(String, nullable=True, index=True)
     codice_fiscale = Column(String, nullable=True)
     codice_sdi = Column(String, nullable=True)
@@ -79,7 +84,9 @@ class Invoice(Base):
     # Suggerimento in quarantena (fuzzy/P.IVA ambigua): richiede conferma manuale.
     suggested_customer_id = Column(Integer, nullable=True)
     suggested_score = Column(Integer, nullable=True)
-    # fuzzy / piva_ambiguous / piva_name_mismatch / name_ambiguous;
+    # fuzzy / piva_ambiguous / piva_name_mismatch / name_ambiguous /
+    # name_exact_piva_unverified / legal_form_conflict (stessa insegna ma
+    # ditta individuale vs società: entità giuridiche diverse);
     # per fatture 'unlinked' anche piva / name_exact (il match sarebbe stato
     # automatico, ma lo scollegamento manuale lo declassa a suggerimento)
     suggested_method = Column(String, nullable=True)
@@ -95,6 +102,18 @@ class Invoice(Base):
     # abbinamento dubbio/critico e lo considera ok. Valorizzato = esce dai
     # problemi dell'audit (a meno di include_reviewed).
     audit_reviewed_at = Column(DateTime, nullable=True)
+    # Data di pagamento VERA: scritta nel momento in cui il sync marca la
+    # fattura 'paid', azzerata se la fattura riapre. Da non confondere con
+    # updated_at (onupdate: cambia a ogni modifica di riga, non è una data
+    # di pagamento). NULL sulle righe già pagate prima della migrazione:
+    # per quelle una data di pagamento vera non esiste e non va inventata —
+    # il KPI le tiene separate come "storico stimato".
+    paid_at = Column(DateTime, nullable=True)
+    # Residuo fotografato all'atto del pagamento. Serve perché i punti che
+    # marcano 'paid' azzerano amount_due: senza questo scatto, sommare il
+    # residuo delle pagate darebbe sempre 0. È il valore da sommare per il
+    # "recuperato" (l'importo PIENO sovrastima i pagamenti parziali).
+    amount_due_at_paid = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -195,6 +214,62 @@ class SyncState(Base):
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
 
+class OverdueSnapshot(Base):
+    """Fotografia giornaliera dello scaduto: la storia che la dashboard non ha.
+
+    La dashboard fotografa solo l'ISTANTE presente; qui si persiste la cascata
+    giorno per giorno, così l'evoluzione dello scaduto (totale, lavorabile,
+    recuperato) diventa una serie storica per il grafico.
+
+    Un solo snapshot per giorno (`date` UNIQUE): il sync fa UPSERT sulla riga
+    del giorno lavorativo corrente — due sync nello stesso giorno la
+    aggiornano, non la duplicano. La "data di oggi" è quella del giorno
+    lavorativo italiano (business_day_start), non date.today() UTC.
+
+    Gli importi sono la cascata di /riconciliazione (definizione condivisa in
+    engine/overdue.py): la serie storica non può divergere dal numero live.
+    `recuperato_certo` è CUMULATO — tutto ciò che è rientrato dopo il primo
+    sollecito a quella data.
+
+    Tabella NUOVA: la crea create_all (nessuna migrazione ALTER necessaria —
+    servono solo per colonne su tabelle esistenti). RLS abilitata in
+    _enable_rls come per ogni altra tabella (requisito Supabase).
+    """
+    __tablename__ = "overdue_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Un solo snapshot per giorno. UNIQUE: l'UPSERT del sync aggiorna questa
+    # riga; l'indice impedisce anche una duplicazione da race a livello DB.
+    date = Column(Date, nullable=False, unique=True, index=True)
+
+    # Importi (euro) della cascata dello scaduto
+    scaduto_totale = Column(Float, nullable=False, default=0.0)
+    non_abbinati = Column(Float, nullable=False, default=0.0)
+    esclusi = Column(Float, nullable=False, default=0.0)
+    contestati = Column(Float, nullable=False, default=0.0)
+    lavorabile = Column(Float, nullable=False, default=0.0)
+    # Recuperato certo, CUMULATO (pagato dopo il primo sollecito, a residuo)
+    recuperato_certo = Column(Float, nullable=False, default=0.0)
+
+    # Conteggi fatture per bucket (stessa cascata)
+    scaduto_totale_fatture = Column(Integer, nullable=False, default=0)
+    non_abbinati_fatture = Column(Integer, nullable=False, default=0)
+    esclusi_fatture = Column(Integer, nullable=False, default=0)
+    contestati_fatture = Column(Integer, nullable=False, default=0)
+    lavorabile_fatture = Column(Integer, nullable=False, default=0)
+    recuperato_certo_fatture = Column(Integer, nullable=False, default=0)
+
+    # STIMA vs realtà: le righe ricostruite dal backfill storico (proiezione
+    # dalle date fattura, engine/overdue_history.backfill_overdue_history)
+    # sono marcate estimated=True e il grafico le tratteggia. Lo snapshot
+    # VERO del sync sulla stessa data le promuove (estimated=False, valori
+    # ricalcolati). Le righe vere non vengono MAI sovrascritte dal backfill.
+    estimated = Column(Boolean, default=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
 # Database engine and session
 _engine = None
 
@@ -287,6 +362,24 @@ def _run_migrations(engine):
         "UPDATE invoices SET missing_streak = 0 WHERE missing_streak IS NULL",
         # Audit abbinamenti: "Segna verificato" per le fatture già controllate
         "ALTER TABLE invoices ADD COLUMN audit_reviewed_at TIMESTAMP",
+        # Riconciliazione: data di pagamento vera + residuo all'atto del
+        # pagamento. NESSUN backfill: le righe già 'paid' non hanno una data
+        # di pagamento vera (updated_at non lo è) né un residuo recuperabile
+        # (amount_due è già stato azzerato). Restano NULL e il KPI le
+        # dichiara "storico stimato" invece di spacciarle per certe.
+        "ALTER TABLE invoices ADD COLUMN paid_at TIMESTAMP",
+        "ALTER TABLE invoices ADD COLUMN amount_due_at_paid DOUBLE PRECISION",
+        # Bonifica nomi: lock anti-sync sulla ragione sociale corretta a mano
+        # (assign-name-to-customer). NULL→FALSE come gli altri BOOLEAN via ALTER.
+        "ALTER TABLE customers ADD COLUMN ragione_sociale_locked BOOLEAN DEFAULT FALSE",
+        "UPDATE customers SET ragione_sociale_locked = FALSE "
+        "WHERE ragione_sociale_locked IS NULL",
+        # Storico stimato del grafico evoluzione: colonna additiva perché
+        # overdue_snapshots può già esistere in prod (creata da create_all
+        # nel deploy della PR). NULL→FALSE come gli altri BOOLEAN via ALTER.
+        "ALTER TABLE overdue_snapshots ADD COLUMN estimated BOOLEAN DEFAULT FALSE",
+        "UPDATE overdue_snapshots SET estimated = FALSE "
+        "WHERE estimated IS NULL",
     ]
     try:
         raw = engine.raw_connection()
@@ -335,6 +428,7 @@ def _enable_rls(engine):
     tables = [
         "customers", "invoices", "recovery_cases",
         "recovery_actions", "activity_log", "sync_state",
+        "overdue_snapshots",
         # legacy, non più mappate dal codice ma presenti nel DB
         "messages", "conversations",
     ]

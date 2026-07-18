@@ -528,3 +528,271 @@ class TestPersonNameMatching:
         test_db_session.refresh(invoice)
         assert invoice.customer_id is None
         assert invoice.suggested_customer_id is None
+
+
+class TestNameExactCollapse:
+    """Il normalizzatore è aggressivo: due insegne diverse possono
+    collassare sulla stessa chiave. name_exact non deve abbinarle."""
+
+    def test_name_exact_requires_light_similarity(self, test_db_session):
+        """Due insegne diverse che collassano sulla stessa chiave NON si
+        abbinano in automatico: vanno in quarantena.
+
+        'Osteria di Mario Rossi' e 'Osteria di Luigi Bianchi' normalizzano
+        entrambe a 'osteria' (il normalizzatore taglia 'di Nome Cognome');
+        con un solo cliente a sistema la fattura di Bianchi veniva abbinata
+        a Rossi con score 100. Le due insegne portano persone DIVERSE:
+        contraddizione, nessun subset → light_similarity_score vale 65.
+        """
+        customer = make_customer(test_db_session, "Osteria di Mario Rossi", None)
+
+        invoice = make_invoice(
+            test_db_session, name="OSTERIA DI LUIGI BIANCHI", piva=None
+        )
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is None
+        assert result.method is None
+        assert result.suggested_customer is not None
+        assert result.suggested_customer.id == customer.id
+        assert result.suggested_method == "name_ambiguous"
+
+    def test_name_exact_still_matches_the_same_business(self, test_db_session):
+        """Il caso legittimo continua a funzionare: stessa insegna, grafie
+        diverse (la forma legale non conta)."""
+        customer = make_customer(test_db_session, "Trattoria Da Gino S.R.L.", None)
+
+        invoice = make_invoice(
+            test_db_session, name="TRATTORIA DA GINO SRL", piva=None
+        )
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is not None
+        assert result.customer.id == customer.id
+        assert result.method == "name_exact"
+
+    def test_monolateral_person_matches_but_bilateral_different_does_not(
+        self, test_db_session
+    ):
+        """La distinzione che regge tutto il fix, congelata.
+
+        Precondizione: le chiavi normalizzate sono già uguali.
+        - persona su UN lato (la fattura omette 'di Nome Cognome') = assenza
+          d'informazione -> auto-match legittimo
+        - persone su ENTRAMBI i lati e diverse = contraddizione -> quarantena
+        Se qualcuno "uniforma" gli scorer di matching e repair, questo test cade.
+        """
+        # Monolaterale: il cliente porta la persona, la fattura no.
+        mono_cust = make_customer(
+            test_db_session, "SHU&SHU di Shu Kei S.A.S.", None
+        )
+        mono_inv = make_invoice(
+            test_db_session, name="SHU&SHU S.A.S.", piva=None, number="MONO1"
+        )
+
+        mono = match_invoice_to_customer(mono_inv, [mono_cust], test_db_session)
+        assert mono.customer is not None, (
+            "assenza della persona su un lato non è contraddizione: "
+            "deve restare un auto-match"
+        )
+        assert mono.customer.id == mono_cust.id
+        assert mono.method == "name_exact"
+
+        # Bilaterale con persone DIVERSE: stessa chiave, ma contraddizione.
+        bi_cust = make_customer(test_db_session, "Osteria di Mario Rossi", None)
+        bi_inv = make_invoice(
+            test_db_session, name="Osteria di Luigi Bianchi", piva=None,
+            number="BI1",
+        )
+
+        bi = match_invoice_to_customer(bi_inv, [bi_cust], test_db_session)
+        assert bi.customer is None, (
+            "persone diverse sui due lati sono una contraddizione: "
+            "mai un auto-match"
+        )
+        assert bi.suggested_customer is not None
+        assert bi.suggested_method == "name_ambiguous"
+
+
+class TestOwnerConcordance:
+    """Quando ENTRAMBI i lati portano un titolare, è il TITOLARE a dover
+    concordare — non il nome intero.
+
+    Questi test sono scritti per FALSIFICARE la guardia, non per
+    confermarla: la versione precedente del fix (confronto light sul nome
+    intero, soglia 75) passava i casi facili e cadeva su questi.
+    """
+
+    # Stesse due persone DIVERSE, insegna condivisa di lunghezza crescente.
+    # Col confronto sul nome intero lo score saliva con l'insegna (65 -> 86)
+    # e sopra ~15 caratteri la guardia non esisteva più. Confrontando le
+    # persone la valutazione è INVARIANTE alla lunghezza dell'insegna.
+    @pytest.mark.parametrize("insegna", [
+        "Osteria",                                   # 7  (prima: 65, ok)
+        "Trattoria Bella",                           # 15 (prima: 75, BUCO)
+        "Ristorante Sakura",                         # 17 (prima: 76, BUCO)
+        "Antica Osteria del Borgo",                  # 24 (prima: 81, BUCO)
+        "Antica Osteria del Borgo Antico al Mare",   # 39 (prima: 86, BUCO)
+    ])
+    def test_different_owners_quarantined_at_any_insegna_length(
+        self, test_db_session, insegna
+    ):
+        """La curva di lunghezza deve essere PIATTA: la contraddizione fra
+        i titolari non si diluisce nell'insegna condivisa."""
+        customer = make_customer(
+            test_db_session, f"{insegna} di Mario Rossi", None
+        )
+        invoice = make_invoice(
+            test_db_session, name=f"{insegna.upper()} DI LUIGI BIANCHI",
+            piva=None,
+        )
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is None, (
+            f"insegna di {len(insegna)} caratteri: titolari diversi "
+            f"(Rossi/Bianchi) non devono MAI auto-abbinare"
+        )
+        assert result.suggested_method == "name_ambiguous"
+
+    # Traslitterazione cinese/vietnamita: i token di un nome sono
+    # sottoinsieme dell'altro. Col token_set il subset-bonus dava 100 e
+    # auto-abbinava — e i ristoranti asiatici sono il cuore dei clienti.
+    @pytest.mark.parametrize("cust_name,inv_name", [
+        ("Sakura di Wang Li", "SAKURA DI WANG LI HUA"),
+        ("Pho Viet di Nguyen Thi Lan", "PHO VIET DI NGUYEN THI LAN ANH"),
+        ("Ramen Ichiban di Sato Kenji", "RAMEN ICHIBAN DI SUZUKI TARO"),
+    ])
+    def test_nested_owner_names_quarantined(
+        self, test_db_session, cust_name, inv_name
+    ):
+        """Un titolare ANNIDATO nell'altro non è lo stesso titolare."""
+        customer = make_customer(test_db_session, cust_name, None)
+        invoice = make_invoice(test_db_session, name=inv_name, piva=None)
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is None, (
+            f"'{cust_name}' e '{inv_name}' hanno titolari diversi"
+        )
+        assert result.suggested_method == "name_ambiguous"
+
+    def test_extra_partner_quarantined(self, test_db_session):
+        """Il suffisso 'di ...' non è sempre UNA persona: un socio in più
+        è un'entità diversa (snc vs ditta individuale, P.IVA diverse)."""
+        customer = make_customer(test_db_session, "Osteria di Rossi Mario", None)
+        invoice = make_invoice(
+            test_db_session, name="OSTERIA DI ROSSI MARIO E BIANCHI LUIGI",
+            piva=None,
+        )
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is None
+        assert result.suggested_method == "name_ambiguous"
+
+    # Il rovescio: la guardia non deve essere isterica.
+    @pytest.mark.parametrize("cust_name,inv_name,perche", [
+        ("Osteria di Mario Rossi", "OSTERIA DI ROSSI MARIO",
+         "ordine invertito: stesso titolare"),
+        ("Dr. Gahe di Mercuri Christian", "DR. GAHE DI MERCURI CRISTIAN",
+         "refuso nel nome: stesso titolare"),
+    ])
+    def test_same_owner_still_auto_matches(
+        self, test_db_session, cust_name, inv_name, perche
+    ):
+        """token_sort tollera ordine e refusi: questi restano auto-match."""
+        customer = make_customer(test_db_session, cust_name, None)
+        invoice = make_invoice(test_db_session, name=inv_name, piva=None)
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is not None, perche
+        assert result.customer.id == customer.id
+        assert result.method == "name_exact"
+
+
+class TestDittaIndividualeVsSocieta:
+    """La chiave normalizzata butta via la forma legale: 'Gaijin di Fois
+    Stefano' e 'Gaijin Srl' collassano entrambi su 'gaijin'.
+
+    Segnalazione del proprietario (17/07): i due profili sono stati uniti
+    "nonostante abbiano dati societari differenti e l'unica somiglianza sia
+    nella ragione sociale". Una ditta individuale e una Srl sono soggetti
+    giuridici diversi con P.IVA diverse SEMPRE: non è una somiglianza da
+    pesare, è una contraddizione.
+    """
+
+    def test_sollecito_della_srl_non_finisce_alla_ditta_individuale(
+        self, test_db_session
+    ):
+        """IL DANNO: la fattura di 'Gaijin Srl' si abbinava da sola al
+        profilo di 'Gaijin di Fois Stefano' — il sollecito partiva verso
+        una persona che quella fattura non l'ha mai emessa."""
+        customer = make_customer(test_db_session, "Gaijin di Fois Stefano", None)
+        invoice = make_invoice(test_db_session, name="Gaijin Srl", piva=None)
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is None
+        assert result.method is None
+        assert result.suggested_method == "legal_form_conflict"
+        assert result.suggested_customer.id == customer.id
+
+    def test_e_viceversa(self, test_db_session):
+        """Simmetrico: il difetto non dipende da quale lato porta il titolare."""
+        customer = make_customer(test_db_session, "Gaijin Srl", None)
+        invoice = make_invoice(
+            test_db_session, name="Gaijin di Fois Stefano", piva=None
+        )
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is None
+        assert result.suggested_method == "legal_form_conflict"
+
+    def test_se_il_profilo_giusto_esiste_la_fattura_ci_va_da_sola(
+        self, test_db_session
+    ):
+        """Con ENTRAMBI i profili a sistema non serve l'operatore: la forma
+        legale disambigua, e la fattura della Srl va sulla Srl."""
+        ditta = make_customer(test_db_session, "Gaijin di Fois Stefano", None)
+        srl = make_customer(test_db_session, "Gaijin Srl", None)
+
+        invoice = make_invoice(test_db_session, name="GAIJIN S.R.L.", piva=None)
+
+        result = match_invoice_to_customer(
+            invoice, [ditta, srl], test_db_session
+        )
+        assert result.customer is not None
+        assert result.customer.id == srl.id
+        assert result.method == "name_exact"
+
+    # ── Il rovescio: la guardia NON deve essere isterica ──────────────
+    @pytest.mark.parametrize("cust_name,inv_name,perche", [
+        # Il caso del test :176 — una S.A.S. DEVE portare il socio nella
+        # ragione sociale: col titolare E la forma non è una ditta individuale.
+        ("SHU&SHU S.A.S.", "SHU&SHU DI SHU KEI S.A.S.",
+         "societa' di persone: la fattura omette il socio, stessa S.A.S."),
+        # Profili duplicati della stessa azienda (uno privo di dati).
+        ("Fronte Mare di Cecchini Francesca", "Fronte Mare",
+         "duplicato senza dati: nessuna forma legale afferma il contrario"),
+        ("Osteria del Borgo di Mario Rossi", "Osteria del Borgo",
+         "nessuna forma legale su nessuno dei due lati"),
+        # LA CONTROPROVA che affonda il discriminante ingenuo
+        # ("forme diverse -> entita' diverse"): il record cliente che omette
+        # la forma legale e' normalissimo, e non afferma di essere una
+        # ditta individuale.
+        ("Fronte Mare", "Fronte Mare Srl",
+         "forma OMESSA sul cliente: assenza d'informazione, non ditta indiv."),
+        ("SHU&SHU", "SHU&SHU S.A.S.",
+         "idem: la forma omessa non rende il cliente una ditta individuale"),
+        # Due societa': la trasformazione SNC->Srl CONSERVA la P.IVA
+        # (art. 2498 c.c.), quindi le forme fra societa' non si confrontano.
+        ("Trattoria Da Gino SNC", "Trattoria Da Gino Srl",
+         "societa' vs societa': trasformazione a P.IVA invariata"),
+    ])
+    def test_i_casi_legittimi_restano_auto_match(
+        self, test_db_session, cust_name, inv_name, perche
+    ):
+        customer = make_customer(test_db_session, cust_name, None)
+        invoice = make_invoice(test_db_session, name=inv_name, piva=None)
+
+        result = match_invoice_to_customer(invoice, [customer], test_db_session)
+        assert result.customer is not None, perche
+        assert result.customer.id == customer.id
+        assert result.method == "name_exact"

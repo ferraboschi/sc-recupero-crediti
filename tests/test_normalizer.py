@@ -5,6 +5,10 @@ from backend.engine.normalizer import (
     normalize_ragione_sociale,
     are_similar,
     remove_accents,
+    legal_forms_of,
+    is_ditta_individuale,
+    LEGAL_FORMS,
+    TRAILING_LEGAL_FORMS,
 )
 
 
@@ -50,10 +54,16 @@ class TestNormalizeRagioneSociale:
         assert "acme" in result  # May have extra spaces but should contain "acme"
 
     def test_remove_legal_form_spa(self):
-        """Test removal of S.P.A. (Società per Azioni)."""
+        """Test removal of S.P.A. (Società per Azioni).
+
+        Solo la forma PUNTATA: 'spa' nuda è anche un centro benessere, e
+        rimuoverla fa collassare alberghi diversi sulla stessa chiave.
+        Vedi TestAmbiguousNudeSigle.
+        """
         assert normalize_ragione_sociale("ACME S.P.A.") == "acme"
-        assert normalize_ragione_sociale("ACME SPA") == "acme"
         assert normalize_ragione_sociale("ACME s.p.a.") == "acme"
+        # La nuda si CONSERVA: non è distinguibile da una parola del nome.
+        assert normalize_ragione_sociale("ACME SPA") == "acme spa"
 
     def test_remove_legal_form_sas(self):
         """Test removal of S.A.S. (Società in Accomandita Semplice)."""
@@ -157,7 +167,10 @@ class TestNormalizeRagioneSociale:
     def test_only_legal_form(self):
         """Test when input is only a legal form."""
         assert normalize_ragione_sociale("S.R.L.") == ""
-        assert normalize_ragione_sociale("SPA") == ""
+        assert normalize_ragione_sociale("SRL") == ""
+        assert normalize_ragione_sociale("S.P.A.") == ""
+        # 'SPA' nuda NON è più assunta forma legale: resta parola del nome.
+        assert normalize_ragione_sociale("SPA") == "spa"
 
     def test_only_prefix(self):
         """Test when input is only a prefix."""
@@ -407,3 +420,139 @@ class TestPersonAwareSimilarity:
             "Osteria di Luigi Bianchi", "Osteria di Mario Rossi"
         ) < 75
         assert light_similarity_score("YOHO MILANO SRL", "YOHO MILANO") >= 75
+
+
+class TestAmbiguousNudeSigle:
+    """Le sigle NUDE ambigue (spa/ong/sapa) non si tolgono MAI.
+
+    Dalla sola stringa non è distinguibile se 'spa' sia la forma legale o
+    parte del nome ('Hotel Spa Milano' è un centro benessere). La forma
+    PUNTATA ('S.p.A.') è inequivocabile e si rimuove ovunque; quella nuda
+    resta, e il prezzo accettato è che 'Rossi SPA' → 'rossi spa' non
+    coincida più con 'Rossi S.p.A.' → 'rossi': meglio un suggerimento da
+    confermare che un sollecito all'azienda sbagliata.
+    """
+
+    def test_nude_sigla_survives_asymmetric_spelling(self):
+        """Il caso vero: le fatture OMETTONO spesso la forma legale, quindi
+        la chiave non può dipendere dalla presenza di 'Srl' nella stringa.
+        """
+        # La fattura senza forma legale trova comunque il suo cliente...
+        assert (
+            normalize_ragione_sociale("Beauty Spa Srl")
+            == normalize_ragione_sociale("Beauty Spa")
+            == "beauty spa"
+        )
+        # ...e resta DIVERSA dall'azienda omonima senza 'spa'.
+        assert normalize_ragione_sociale("Beauty Srl") == "beauty"
+        assert (
+            normalize_ragione_sociale("Beauty Spa")
+            != normalize_ragione_sociale("Beauty Srl")
+        )
+
+    def test_nude_sigla_is_kept_as_a_real_word(self):
+        assert normalize_ragione_sociale("HOTEL SPA MILANO SRL") == "hotel spa milano"
+        assert normalize_ragione_sociale("HOTEL MILANO SRL") == "hotel milano"
+        assert (
+            normalize_ragione_sociale("HOTEL SPA MILANO SRL")
+            != normalize_ragione_sociale("HOTEL MILANO SRL")
+        )
+        # 'ong' = cognome cinese/vietnamita: i ristoranti asiatici comprano sake.
+        assert normalize_ragione_sociale("Ong Sushi Bar Srl") == "ong sushi bar"
+        assert normalize_ragione_sociale("Sushi Bar Srl") == "sushi bar"
+        assert (
+            normalize_ragione_sociale("Ong Sushi Bar Srl")
+            != normalize_ragione_sociale("Sushi Bar Srl")
+        )
+        # 'sapa' = Sa Pa (città del Vietnam); e il mosto cotto (enoteche).
+        assert (
+            normalize_ragione_sociale("Ristorante Sapa Milano Srl")
+            == "ristorante sapa milano"
+        )
+
+    def test_dotted_sigla_is_still_stripped_anywhere(self):
+        # Puntata: inequivocabile, si rimuove ovunque nel nome.
+        assert normalize_ragione_sociale("Rossi S.p.A.") == "rossi"
+        assert normalize_ragione_sociale("Rossi S.P.A. Milano") == "rossi milano"
+        # Il prezzo accettato: la nuda NON è più equiparata alla puntata.
+        assert normalize_ragione_sociale("Rossi SPA") == "rossi spa"
+        assert (
+            normalize_ragione_sociale("Rossi SPA")
+            != normalize_ragione_sociale("Rossi S.p.A.")
+        )
+
+    def test_ambiguous_sigla_never_empties_the_key(self):
+        """Bug gemello, danno opposto: una chiave VUOTA rende il cliente
+        non abbinabile e il credito non viene MAI sollecitato.
+        """
+        assert normalize_ragione_sociale("Ong Srl") == "ong"
+        assert normalize_ragione_sociale("Sapa Srl") == "sapa"
+        assert normalize_ragione_sociale("Spa Srl") == "spa"
+        for name in ("Ong Srl", "Sapa Srl", "Spa Srl"):
+            assert normalize_ragione_sociale(name), f"chiave vuota per {name!r}"
+
+
+class TestLegalFormsOf:
+    """legal_forms_of: l'operazione INVERSA della normalizzazione, che le
+    forme legali le butta via in silenzio."""
+
+    @pytest.mark.parametrize("name,expected", [
+        ("Gaijin Srl", {"SRL"}),
+        ("Gaijin S.R.L.", {"SRL"}),          # puntata e nuda: stessa forma
+        ("SHU&SHU DI SHU KEI S.A.S.", {"SAS"}),
+        ("Trattoria Da Gino SNC", {"SNC"}),
+        ("Belfiore SRLS", {"SRLS"}),         # non deve degradare a SRL
+        ("Gaijin di Fois Stefano", set()),
+        ("Fronte Mare", set()),
+    ])
+    def test_estrae_la_forma(self, name, expected):
+        assert set(legal_forms_of(name)) == expected
+
+    @pytest.mark.parametrize("name", [
+        "Hotel Spa",        # centro benessere, non S.p.A.
+        "Ristorante Ong",   # cognome
+        "Bar Sapa",         # Sa Pa / mosto cotto
+    ])
+    def test_le_sigle_nude_ambigue_non_sono_forme_legali(self, name):
+        """Dopo i fix del 17/07 SPA/ONG/SAPA nude non sono forme legali: se
+        legal_forms_of le riconoscesse, 'Hotel Spa' diventerebbe una societa'
+        e non si abbinerebbe piu' a 'Hotel Spa di Mario Rossi'."""
+        assert set(legal_forms_of(name)) == set()
+
+    def test_rispecchiamento_totale(self):
+        """LA GUARDIA STRUTTURALE: per OGNI sigla nota, legal_forms_of deve
+        vederla esattamente quando la chiave normalizzata la butta via.
+
+        È il rispecchiamento che a _DI_PERSON è mancato (piano 17/07, voce
+        13): se qualcuno aggiunge una sigla a LEGAL_FORMS e le due
+        operazioni divergono, la guardia sulle entità sviluppa un buco
+        silenzioso — la fattura torna ad auto-abbinarsi al profilo sbagliato.
+        Questo test fallisce PRIMA che accada.
+        """
+        for form in LEGAL_FORMS + TRAILING_LEGAL_FORMS:
+            name = f"Bersaglio {form}"
+            forms = legal_forms_of(name)
+            key = normalize_ragione_sociale(name)
+            # La sigla è stata TOLTA dalla chiave...
+            assert key == "bersaglio", f"{form}: chiave={key!r}"
+            # ...quindi legal_forms_of DEVE saperlo dire.
+            assert forms, f"{form}: tolta dalla chiave ma non rilevata"
+
+
+class TestIsDittaIndividuale:
+    """La FIRMA della ditta individuale: titolare + nessuna forma legale.
+    Non basta l'assenza di forma (i record la omettono di continuo)."""
+
+    @pytest.mark.parametrize("name,expected,perche", [
+        ("Gaijin di Fois Stefano", True, "titolare, nessuna forma"),
+        ("Osteria del Borgo di Mario Rossi", True, "idem"),
+        ("SHU&SHU DI SHU KEI S.A.S.", False,
+         "societa' di persone: il socio nella ragione sociale e' un obbligo"),
+        ("Gaijin Srl", False, "nessun titolare"),
+        ("Fronte Mare", False,
+         "forma OMESSA, non assente: non afferma di essere una ditta indiv."),
+        ("Osteria di Mare", False,
+         "'di' + una parola sola = parte del nome, non un titolare"),
+    ])
+    def test_firma(self, name, expected, perche):
+        assert is_ditta_individuale(name) is expected, perche

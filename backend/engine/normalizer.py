@@ -4,7 +4,7 @@ import re
 import functools
 import logging
 import unicodedata
-from typing import List, Tuple
+from typing import FrozenSet, List, Optional, Tuple
 
 from rapidfuzz import fuzz, process
 
@@ -17,7 +17,7 @@ LEGAL_FORMS = [
     # Società a Responsabilità Limitata (e varianti)
     "S.R.L.S.", "SRLS",  # Semplificata — molto comune per società nuove
     "S.R.L.", "SRL",
-    "S.P.A.", "SPA",
+    "S.P.A.",
     "S.A.S.", "SAS",
     "S.N.C.", "SNC",
     "S.C.A.R.L.", "SCARL",
@@ -25,17 +25,27 @@ LEGAL_FORMS = [
     "S.C.R.L.", "SCRL",  # Cooperativa a Resp. Limitata
     "S.R.C.", "SRC",
     "S.R.S.", "SRS",
-    "S.A.P.A.", "SAPA",
+    "S.A.P.A.",
     "S.T.P.", "STP",  # Società tra Professionisti
     "A.S.D.", "ASD",
     "A.P.S.", "APS",
-    "O.N.G.", "ONG",
+    "O.N.G.",
     "E.T.S.", "ETS",
     "ONLUS",
     "UNIPERSONALE",
     # Forme legali estere (per clienti stranieri fatturati in Italia)
     "LLC", "LTD", "GMBH", "SARL",
 ]
+
+# Sigle la cui variante SENZA punti è una parola vera o un cognome: la
+# forma PUNTATA è inequivocabile e si rimuove ovunque, quella NUDA non si
+# rimuove MAI — dalla sola stringa non è distinguibile se sia la forma
+# legale o parte del nome, e un match sbagliato manda il sollecito
+# all'azienda sbagliata (meglio un suggerimento da confermare).
+#   spa  = centro benessere (alberghi/ristoranti, il nostro target)
+#   ong  = cognome cinese/vietnamita (i ristoranti asiatici comprano sake)
+#   sapa = Sa Pa, città del Vietnam; e il mosto cotto (enoteche)
+NODOTS_ANYWHERE_UNSAFE = {"S.P.A.", "O.N.G.", "S.A.P.A."}
 
 # Sigle CORTE e ambigue (2 lettere, o parole reali come "sa"): rimosse SOLO
 # a fine nome, altrimenti mangiano pezzi veri della ragione sociale
@@ -61,6 +71,122 @@ def remove_accents(text: str) -> str:
     return "".join([c for c in nfkd_form if not unicodedata.combining(c)])
 
 
+# Il suffisso "di Nome Cognome". SEDE UNICA: la usano sia la
+# normalizzazione (che lo TOGLIE dalla chiave) sia person_part_of (che lo
+# RIESTRAE). Finché è la stessa costante, le due operazioni non possono
+# divergere e la guardia sui titolari resta totale — il buco silenzioso
+# che nasceva dalla copia in matching.py (piano 17/07, voce 13).
+# 2+ parole dopo "di": una sola è di solito parte del nome vero
+# ("Osteria di Mare") e toglierla collasserebbe aziende diverse.
+_DI_PERSON = re.compile(r"\s+di\s+(\w+(?:\s+\w+)+)\s*$")
+
+
+def _canonical_form(form: str) -> str:
+    """'S.R.L.' e 'SRL' sono la STESSA forma legale: una sola etichetta."""
+    return form.replace(".", "").upper()
+
+
+def _strip_legal_forms(text: str) -> Tuple[str, FrozenSet[str]]:
+    """Toglie le forme legali e dice QUALI ha tolto.
+
+    Sede UNICA della rimozione: `legal_forms_of` non ha una regex propria,
+    passa di qui. Il rispecchiamento è quindi PER COSTRUZIONE, non per
+    disciplina: aggiungere una sigla a LEGAL_FORMS aggiorna insieme la
+    chiave normalizzata e le forme rilevate, e non può aprire il divario
+    che ha reso fragile _DI_PERSON.
+
+    `text` è già senza accenti e minuscolo (vedi _normalize_impl).
+    """
+    found = set()
+
+    # Sigle sicure ovunque nel nome (multi-lettera, non ambigue).
+    for form in LEGAL_FORMS:
+        escaped = re.escape(form.lower())
+        # Dot-flexible: "s.r.l." matcha "s.r.l." e "s.r.l"
+        text, n = re.subn(rf"(?<!\w){escaped}\.?(?!\w)", "", text)
+        if n:
+            found.add(_canonical_form(form))
+        # Variante senza punti ("srl"), salvo quelle ambigue con parole vere
+        nodots = form.replace(".", "").lower()
+        if nodots != form.lower() and form not in NODOTS_ANYWHERE_UNSAFE:
+            text, n = re.subn(rf"(?<!\w){re.escape(nodots)}(?!\w)", "", text)
+            if n:
+                found.add(_canonical_form(form))
+
+    # Sigle corte/ambigue: solo a fine nome.
+    for form in TRAILING_LEGAL_FORMS:
+        escaped = re.escape(form.lower())
+        text, n = re.subn(rf"(?<!\w){escaped}\.?\s*$", "", text)
+        if n:
+            found.add(_canonical_form(form))
+        nodots = form.replace(".", "").lower()
+        if nodots != form.lower():
+            text, n = re.subn(rf"(?<!\w){re.escape(nodots)}\s*$", "", text)
+            if n:
+                found.add(_canonical_form(form))
+
+    return text, frozenset(found)
+
+
+@functools.lru_cache(maxsize=8192)
+def legal_forms_of(name: str) -> FrozenSet[str]:
+    """Le forme legali presenti nel nome, canonicalizzate ('SRL', 'SAS'…).
+
+    Operazione INVERSA di quella che normalize_ragione_sociale compie in
+    silenzio: la chiave butta via la forma legale, qui la si recupera per
+    decidere se due nomi che collassano sulla stessa chiave siano davvero
+    la stessa entità giuridica.
+
+    Insieme VUOTO = "nessuna forma riconosciuta", che NON significa "ditta
+    individuale": un record può semplicemente ometterla ('Fronte Mare' per
+    'Fronte Mare Srl'). Vedi is_ditta_individuale.
+
+    >>> sorted(legal_forms_of("SHU&SHU DI SHU KEI S.A.S."))
+    ['SAS']
+    >>> sorted(legal_forms_of("Gaijin Srl"))
+    ['SRL']
+    >>> sorted(legal_forms_of("Gaijin di Fois Stefano"))
+    []
+    """
+    if not name:
+        return frozenset()
+    return _strip_legal_forms(remove_accents(name).lower())[1]
+
+
+@functools.lru_cache(maxsize=8192)
+def person_part_of(name: str) -> Optional[str]:
+    """Il titolare 'di Nome Cognome' di una ragione sociale, se c'è.
+
+    >>> person_part_of("Gaijin di Fois Stefano")
+    'fois stefano'
+    >>> person_part_of("Gaijin Srl") is None
+    True
+    """
+    m = _DI_PERSON.search(normalize_ragione_sociale_light(name or ""))
+    return m.group(1) if m else None
+
+
+def is_ditta_individuale(name: str) -> bool:
+    """True se il nome porta la FIRMA della ditta individuale: titolare
+    esplicito ('X di Mario Rossi') E nessuna forma legale.
+
+    Non è l'assenza di forma a qualificare — un record la omette di
+    continuo ('Fronte Mare' sta per 'Fronte Mare Srl') — ed è per questo
+    che serve la COMPRESENZA delle due condizioni: una società di persone
+    che porta il socio nella ragione sociale DEVE dichiarare la forma
+    ('SHU&SHU DI SHU KEI S.A.S.'). Titolare + nessuna forma resta quindi
+    la ditta individuale, e questa è INFORMAZIONE POSITIVA, non assenza.
+
+    >>> is_ditta_individuale("Gaijin di Fois Stefano")
+    True
+    >>> is_ditta_individuale("SHU&SHU DI SHU KEI S.A.S.")
+    False
+    >>> is_ditta_individuale("Fronte Mare")
+    False
+    """
+    return bool(person_part_of(name) and not legal_forms_of(name))
+
+
 @functools.lru_cache(maxsize=8192)
 def _normalize_impl(name: str, strip_person: bool) -> str:
     """Implementazione condivisa della normalizzazione.
@@ -83,25 +209,10 @@ def _normalize_impl(name: str, strip_person: bool) -> str:
     # Convert to lowercase
     normalized = normalized.lower()
 
-    # Remove legal forms (must handle both with and without dots)
-    # First, build patterns that handle dots flexibly (e.g., S.R.L. or SRL or S.r.l)
-    for form in LEGAL_FORMS:
-        # Create pattern that matches with or without dots and trailing dot
-        escaped = re.escape(form.lower())
-        # Also create a dot-flexible version: "s.r.l." matches "s.r.l." and "srl" and "s.r.l"
-        normalized = re.sub(rf"(?<!\w){escaped}\.?(?!\w)", "", normalized)
-        # Also match without dots
-        nodots = form.replace(".", "").lower()
-        if nodots != form.lower():
-            normalized = re.sub(rf"(?<!\w){re.escape(nodots)}(?!\w)", "", normalized)
-
-    # Remove short/ambiguous legal forms ONLY at the end of the name
-    for form in TRAILING_LEGAL_FORMS:
-        escaped = re.escape(form.lower())
-        normalized = re.sub(rf"(?<!\w){escaped}\.?\s*$", "", normalized)
-        nodots = form.replace(".", "").lower()
-        if nodots != form.lower():
-            normalized = re.sub(rf"(?<!\w){re.escape(nodots)}\s*$", "", normalized)
+    # Remove legal forms (must handle both with and without dots).
+    # Sede unica: la stessa funzione che dice QUALI forme c'erano
+    # (legal_forms_of) — così le due non possono divergere.
+    normalized, _forms = _strip_legal_forms(normalized)
 
     # Clean up before di pattern matching
     normalized = normalized.strip()
@@ -109,11 +220,8 @@ def _normalize_impl(name: str, strip_person: bool) -> str:
     if strip_person:
         # Handle "di" + personal name pattern
         # E.g., "SHU&SHU DI SHU KEI" -> "SHU&SHU"
-        # Only when 2+ words follow "di" (nome+cognome): a single word after
-        # "di" is usually part of the real name ("Osteria di Mare"), and
-        # stripping it would collapse different businesses onto the same key.
-        di_pattern = re.compile(r"\s+di\s+\w+(?:\s+\w+)+\s*$")
-        normalized = di_pattern.sub("", normalized)
+        # Stessa costante che person_part_of usa per RIESTRARRE il titolare.
+        normalized = _DI_PERSON.sub("", normalized)
 
     # Remove common prefixes
     prefix_pattern = "|".join(re.escape(prefix.lower()) for prefix in COMMON_PREFIXES)

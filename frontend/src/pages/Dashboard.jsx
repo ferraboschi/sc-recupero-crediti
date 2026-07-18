@@ -2,7 +2,8 @@ import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 import StatsWidget from '../components/StatsWidget'
-import { getSyncMarker, getSyncStatus, collectSyncErrors } from '../utils/syncPolling'
+import RiconciliazioneCascata from '../components/RiconciliazioneCascata'
+import SyncStatus from '../components/SyncStatus'
 
 const ACTION_LABELS = {
   first_contact: 'I Contatto',
@@ -45,11 +46,6 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
-  const [syncing, setSyncing] = useState(false)
-  const [syncMessage, setSyncMessage] = useState('')
-  const [syncProgress, setSyncProgress] = useState(null)
-  const [lastSync, setLastSync] = useState(null)
-  const [autoSyncLast, setAutoSyncLast] = useState(null)
   const [todos, setTodos] = useState([])
   const [todoCounts, setTodoCounts] = useState({})
   const [todoLoading, setTodoLoading] = useState(true)
@@ -72,8 +68,6 @@ export default function Dashboard() {
       const response = await client.get('/dashboard', { timeout: 15000 })
       setData(response.data)
       setRetryCount(0)
-      const savedLastSync = localStorage.getItem('lastSyncTime')
-      if (savedLastSync) setLastSync(new Date(savedLastSync))
     } catch (err) {
       console.error(err)
       if (retry < 2) {
@@ -138,113 +132,11 @@ export default function Dashboard() {
     }
   }
 
-  // Ultimo sync AUTOMATICO/manuale dal server (marker 'cases', sopravvive ai
-  // riavvii perché persistito): alimenta la riga "ultimo sync HH:MM".
-  const fetchSchedulerInfo = async () => {
-    try {
-      const payload = await getSyncStatus()
-      const casesLast = payload?.last_sync?.cases?.last_sync
-      if (casesLast) setAutoSyncLast(new Date(casesLast))
-    } catch {
-      // non bloccante: la riga informativa resta senza orario
-    }
-  }
-
   useEffect(() => {
     fetchData()
     fetchTodos()
     fetchConnectorStatus()
-    fetchSchedulerInfo()
   }, [])
-
-  const handleSync = async () => {
-    setSyncing(true)
-    setSyncMessage('')
-    setSyncProgress(null)
-    try {
-      // /sync/full risponde subito 'sync_started' (gira in background):
-      // prima si prende il marker, poi si polla /sync/status per mostrare il
-      // PROGRESSO live sotto il pulsante e capire quando la pipeline è finita
-      // (marker 'cases' cambiato) — altrimenti si mostrano dati PRE-sync.
-      let markerBefore = ''
-      try {
-        markerBefore = await getSyncMarker()
-      } catch {
-        // status non leggibile ORA: il polling adotta il primo marker
-        // osservato come baseline e attende comunque un cambio reale
-      }
-      await client.post('/sync/full')
-
-      // Polling LIVE ogni ~1.5s (max ~4 min): aggiorna il pannello di
-      // avanzamento. I DATI che servono per lavorare (fatture, abbinamenti,
-      // pratiche) sono pronti al passo 6 (marker 'cases' cambiato): a quel
-      // punto mostro subito "Dati aggiornati" e ricarico la vista, SENZA
-      // aspettare l'aggancio ordini (passo 7, enrichment) che continua
-      // visibile nel pannello. Così il pulsante è reattivo (~2 min) invece
-      // di sembrare bloccato per l'intera pipeline.
-      const POLL_MS = 1500
-      const MAX_POLLS = 160
-      let baseline = markerBefore
-      let coreDone = false
-      for (let i = 0; i < MAX_POLLS; i++) {
-        await new Promise(resolve => setTimeout(resolve, POLL_MS))
-        let payload
-        try {
-          payload = await getSyncStatus()
-        } catch {
-          continue // errore transitorio di polling: si riprova
-        }
-        if (payload?.progress) setSyncProgress(payload.progress)
-        const lastSyncData = payload?.last_sync
-        const marker = lastSyncData?.cases?.last_sync || ''
-        if (!baseline) {
-          // Baseline non letta prima del POST: si adotta il primo marker
-          // osservato e si attende comunque che cambi.
-          baseline = marker
-          continue
-        }
-        const markerChanged = marker && marker !== baseline
-
-        if (markerChanged && !coreDone) {
-          // Passo 6 completato: i dati core sono pronti. Esito dai soli
-          // step core (collectSyncErrors esclude già l'aggancio ordini).
-          coreDone = true
-          const errors = collectSyncErrors(lastSyncData)
-          if (errors.length === 0) {
-            setSyncMessage('Dati aggiornati ✓')
-            const syncNow = new Date()
-            setLastSync(syncNow)
-            localStorage.setItem('lastSyncTime', syncNow.toISOString())
-          } else {
-            setSyncMessage(`Errore nella sincronizzazione: step ${errors.join(', ')} falliti — dati non aggiornati`)
-          }
-          // Ricarica SUBITO la vista coi dati freschi (non attende gli ordini).
-          fetchData()
-          fetchTodos()
-          fetchConnectorStatus()
-          fetchSchedulerInfo()
-        }
-
-        // Fine dell'INTERA pipeline (incluso l'aggancio ordini): pannello via.
-        if (payload?.progress?.running === false) break
-      }
-
-      if (!coreDone) {
-        // Timeout prima ancora del passo 6: sync ancora in corso in background.
-        setSyncMessage('Sync ancora in corso in background — i dati mostrati potrebbero non essere definitivi')
-        await fetchData()
-        await fetchTodos()
-      }
-      // Il pannello di progresso e il messaggio spariscono dopo qualche secondo.
-      setTimeout(() => { setSyncMessage(''); setSyncProgress(null) }, 8000)
-    } catch (err) {
-      setSyncMessage('Errore nella sincronizzazione')
-      setSyncProgress(null)
-      console.error(err)
-    } finally {
-      setSyncing(false)
-    }
-  }
 
   const formatCurrency = (value) =>
     new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR', minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(value)
@@ -425,9 +317,9 @@ export default function Dashboard() {
     <div className="space-y-6">
       {/* Search Bar */}
       <div className="sc-card p-4">
-        <div className="flex items-center gap-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
           {/* Search */}
-          <div className="relative flex-1 max-w-md">
+          <div className="relative w-full min-w-0 sm:flex-1 sm:max-w-md">
             <input
               type="text"
               value={searchQuery}
@@ -477,53 +369,13 @@ export default function Dashboard() {
             )}
           </div>
 
-          <div className="flex flex-col items-end gap-1 ml-auto">
-            <div className="flex items-center gap-4">
-              <p className="text-sm text-txt-muted hidden md:block">
-                {lastSync ? `Agg: ${lastSync.toLocaleString('it-IT')}` : ''}
-              </p>
-              {syncMessage && (
-                <p className={`text-sm font-medium ${
-                  syncMessage.includes('Errore') ? 'text-accent-red'
-                    : syncMessage.includes('in corso') ? 'text-accent-amber'
-                    : 'text-accent-green'
-                }`}>
-                  {syncMessage}
-                </p>
-              )}
-              <button onClick={handleSync} disabled={syncing}
-                className={`sc-btn-primary flex items-center gap-2 ${
-                  syncing ? 'opacity-50 cursor-not-allowed' : ''
-                }`}>
-                {syncing ? 'Sync...' : 'Sincronizza'}
-              </button>
-            </div>
-            <p className="text-xs text-txt-muted">
-              Sincronizzazione automatica ogni ora
-              {autoSyncLast ? ` · ultimo sync ${autoSyncLast.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}` : ''}
-            </p>
+          {/* Il sync è automatico ogni ora (scheduler backend): niente pulsante,
+              solo la comunicazione del prossimo/ultimo sync. Su mobile va sotto
+              la barra di ricerca (colonna), non la spinge oltre il bordo. */}
+          <div className="w-full min-w-0 sm:w-auto sm:ml-auto">
+            <SyncStatus variant="detailed" />
           </div>
         </div>
-
-        {/* Progresso live del sync: barra + passo corrente sotto il pulsante.
-            Rassicura l'operatore durante i ~2-3 min del full sync invece di
-            un messaggio statico che sembra rotto. */}
-        {syncProgress?.running && (
-          <div className="mt-4 bg-dark-surface border border-dark-border rounded-lg px-4 py-3">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-sm font-medium text-txt-primary">
-                Passo {syncProgress.step_index}/{syncProgress.total_steps} — {syncProgress.step_label}…
-              </span>
-              <span className="text-xs text-txt-muted">Sincronizzazione in corso</span>
-            </div>
-            <div className="w-full h-2 bg-dark-card rounded-full overflow-hidden">
-              <div
-                className="h-full bg-accent-teal transition-all duration-500"
-                style={{ width: `${syncProgress.total_steps ? Math.round((syncProgress.step_index / syncProgress.total_steps) * 100) : 0}%` }}
-              />
-            </div>
-          </div>
-        )}
       </div>
 
       {/* Connector warnings */}
@@ -542,12 +394,20 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* Riconciliazione: la cascata che chiude i conti + l'evoluzione.
+          IN CIMA, prima delle KPI: è la lettura d'insieme che spiega da dove
+          nasce ogni numero (scaduto → deduzioni → lavorabile → recuperato). */}
+      <RiconciliazioneCascata formatCurrency={formatCurrency} />
+
       {/* Top Stats */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatsWidget label="Totale Scaduto" value={formatCurrency(data.total_scaduto || 0)} color="red" />
         <StatsWidget label="Fatture Scadute" value={data.total_fatture_scadute || 0} subtitle="numero fatture" color="orange" />
         <StatsWidget label="Clienti con Scaduto" value={data.total_clienti_scaduti || 0} subtitle="numero aziende" color="purple" />
-        <StatsWidget label="Da Gestire" value={todos.length || 0} color="blue" />
+        {/* "Clienti da Gestire", non "Da Gestire": il chip omonimo della
+            cascata conta FATTURE, questo conta AZIENDE — stessa etichetta
+            con numeri diversi si leggeva come un bug. */}
+        <StatsWidget label="Clienti da Gestire" value={todos.length || 0} subtitle="numero aziende" color="blue" />
       </div>
 
       {/* Clienti Da Fare - with filters and sorting */}
@@ -647,7 +507,7 @@ export default function Dashboard() {
           ) : todos.length === 0 ? (
             <div className="text-center py-8">
               <p className="text-txt-muted mb-2">Nessuna azione da fare</p>
-              <p className="text-sm text-txt-muted">Sincronizza le fatture e vai nella scheda Clienti per iniziare.</p>
+              <p className="text-sm text-txt-muted">Le fatture si sincronizzano da sole ogni ora. Vai nella scheda Clienti per iniziare.</p>
             </div>
           ) : sortBy === 'priority' && filterPriority === 'all' ? (
             /* Grouped by priority */

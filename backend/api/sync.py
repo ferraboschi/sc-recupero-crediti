@@ -219,12 +219,24 @@ def _sync_invoices_task() -> dict:
                         if due:
                             inv["due_date"] = due
                             inv["due_from_ledger"] = True
-                    cust = clienti_map.get((inv.get("customer_name") or "").strip().lower())
-                    if cust:
-                        if cust.get("piva"):
-                            inv["customer_piva"] = cust["piva"]
-                        inv["customer_phone"] = cust.get("phone")
-                        inv["customer_email"] = cust.get("email")
+                    # SOLO su anagrafica COMPLETA. Il guard degli omonimi vive
+                    # in fetch_clienti_map: quando due righe condividono il
+                    # nome e le P.IVA divergono, l'entry viene RIMOSSA dalla
+                    # mappa (fatturapro.py:818-823), così .get() non serve più
+                    # nulla per quel nome. Ma quel confronto vede solo le righe
+                    # SCARICATE: con un fetch parziale l'omonimo mai letto non
+                    # innesca la rimozione, la mappa sembra univoca e la P.IVA
+                    # finisce sull'azienda sbagliata — dove il matching per
+                    # P.IVA la aggancia in AUTOMATICO, non in quarantena.
+                    # Stessa disciplina di scad_ok (sopra) e del repair, che
+                    # salta il ciclo quando anagrafica_ok è False.
+                    if cli_ok:
+                        cust = clienti_map.get((inv.get("customer_name") or "").strip().lower())
+                        if cust:
+                            if cust.get("piva"):
+                                inv["customer_piva"] = cust["piva"]
+                            inv["customer_phone"] = cust.get("phone")
+                            inv["customer_email"] = cust.get("email")
 
                 # Build set of invoice numbers currently overdue in FatturaPro
                 fetched_invoice_numbers = set()
@@ -275,6 +287,11 @@ def _sync_invoices_task() -> dict:
                         # Keep status as open if it was paid before but reappeared
                         if existing.status == "paid" and inv.get("balance", 0) > 0:
                             existing.status = "open"
+                            # Non era pagata: la "pagata per assenza" è stata
+                            # smentita dai fatti. Lasciare paid_at la farebbe
+                            # contare per sempre nel recuperato.
+                            existing.paid_at = None
+                            existing.amount_due_at_paid = None
                         existing.updated_at = datetime.utcnow()
                         updated += 1
                     else:
@@ -322,6 +339,12 @@ def _sync_invoices_task() -> dict:
                                 # su fetch completi.
                                 streak = (known_inv.missing_streak or 0) + 1
                                 if streak >= PAID_ABSENCE_STREAK:
+                                    # Il residuo va fotografato PRIMA di
+                                    # azzerarlo: è l'importo davvero
+                                    # rientrato, e fra un istante non
+                                    # esisterà più.
+                                    known_inv.amount_due_at_paid = known_inv.amount_due
+                                    known_inv.paid_at = datetime.utcnow()
                                     known_inv.status = "paid"
                                     known_inv.amount_due = 0
                                     known_inv.missing_streak = 0
@@ -347,7 +370,11 @@ def _sync_invoices_task() -> dict:
                 # Aggancia per nome ai Customer che ne sono privi: risolve i
                 # profili "muti" nati dalle fatture (senza passare da Shopify).
                 contacts_enriched = 0
-                if clienti_map:
+                # Come per la P.IVA: solo da anagrafica COMPLETA. Un fetch
+                # parziale non rileva l'omonimo, e qui si scriverebbe il
+                # TELEFONO dell'azienda sbagliata su un cliente — cioè il
+                # numero a cui parte il sollecito WhatsApp.
+                if cli_ok and clienti_map:
                     for customer in session.query(Customer).filter(
                         (Customer.phone.is_(None)) | (Customer.email.is_(None))
                     ).all():
@@ -581,9 +608,17 @@ def _sync_customers_task() -> dict:
                         # Mai sovrascrivere un nome buono con uno vuoto (un
                         # profilo Shopify senza company produce ""), e per i
                         # clienti ADOTTATI tenere il nome derivato dalle
-                        # fatture: è quello su cui lavora il matching.
+                        # fatture: è quello su cui lavora il matching. Il
+                        # nome BONIFICATO a mano (ragione_sociale_locked,
+                        # via assign-name-to-customer) non si tocca MAI:
+                        # senza il lock questo ramo annullerebbe la
+                        # bonifica al primo sync orario.
                         parsed_name = (cust.get("ragione_sociale") or "").strip()
-                        if parsed_name and not (was_adopted and existing.ragione_sociale):
+                        if (
+                            parsed_name
+                            and not (was_adopted and existing.ragione_sociale)
+                            and not existing.ragione_sociale_locked
+                        ):
                             existing.ragione_sociale = parsed_name
                             existing.ragione_sociale_normalized = normalize_ragione_sociale(
                                 parsed_name
@@ -1294,6 +1329,24 @@ def _full_sync_task(include_order_matching: bool = True, manual: bool = False) -
         else:
             logger.info("Full sync completed (order matching skipped: light/hourly run)")
 
+        # Snapshot storico dello scaduto per il grafico di evoluzione. Gira in
+        # coda, dopo che pratiche e pagamenti sono aggiornati. NON deve
+        # rallentare né FAR FALLIRE il sync: se esplode, si logga e si
+        # prosegue — il sync vale più di un punto del grafico. Un solo
+        # snapshot al giorno (UPSERT), quindi il sync orario lo riaggiorna.
+        try:
+            from backend.engine.overdue_history import record_overdue_snapshot
+            snap_session = get_session_direct()
+            try:
+                record_overdue_snapshot(snap_session)
+            finally:
+                snap_session.close()
+        except Exception as e:
+            logger.error(
+                f"Overdue snapshot failed (non-fatal, sync continues): {e}",
+                exc_info=True,
+            )
+
         logger.info(f"Full sync completed: {results}")
         return results
     finally:
@@ -1348,6 +1401,9 @@ async def cleanup_stale_f24():
 
         count = 0
         for inv in stale:
+            # Residuo fotografato prima dell'azzeramento (vedi paid_at).
+            inv.amount_due_at_paid = inv.amount_due
+            inv.paid_at = datetime.utcnow()
             inv.status = "paid"
             inv.amount_due = 0
             inv.days_overdue = 0

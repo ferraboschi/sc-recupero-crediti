@@ -15,8 +15,19 @@ usarla per qualsiasi match.
 import re
 from typing import Optional
 
-_FOREIGN_RE = re.compile(r"^[A-Z]{2,3}\d{8,15}$")
-_ITALIAN_RE = re.compile(r"^\d{11}$")
+# Solo cifre ASCII: `\d` è unicode-aware e int('٣') vale 3, quindi le cifre
+# arabo-indiane/fullwidth passavano il checksum e ottenevano la garanzia
+# forte, pur non potendo MAI combaciare con la gemella ASCII. Usate sempre
+# con fullmatch (il `$` tollera un '\n' finale).
+_FOREIGN_RE = re.compile(r"[A-Z]{2,3}[0-9]{8,15}")
+_ITALIAN_RE = re.compile(r"[0-9]{11}")
+
+# Prefissi paese italiani: 'IT' (ISO alpha-2, lo standard VIES/EU) e 'ITA'
+# (alpha-3, dai campi-paese di molti gestionali). Davanti a sole cifre sono
+# entrambi ridondanti: l'Italia ha solo P.IVA di 11 cifre, quindi se il
+# resto è numerico la P.IVA è italiana — valida o corrotta che sia — e deve
+# passare dal checksum, non da _FOREIGN_RE.
+_IT_PREFIXES = ("ITA", "IT")  # il più lungo per primo
 
 
 def normalize_piva(raw: Optional[str]) -> str:
@@ -24,9 +35,15 @@ def normalize_piva(raw: Optional[str]) -> str:
     if not raw:
         return ""
     piva = re.sub(r"[\s.\-]", "", raw.strip().upper())
-    # 'IT12345678901' e '12345678901' sono la stessa P.IVA italiana
-    if piva.startswith("IT") and _ITALIAN_RE.match(piva[2:]):
-        piva = piva[2:]
+    # 'IT12345678901' e '12345678901' sono la stessa P.IVA italiana.
+    # Il prefisso va tolto ogni volta che il resto è tutto CIFRE, non solo
+    # quando sono esattamente 11: altrimenti una P.IVA italiana corrotta
+    # (10 o 12 cifre) resta 'ITxxx', passa per estera (_FOREIGN_RE) e salta
+    # il checksum.
+    for prefix in _IT_PREFIXES:
+        if piva.startswith(prefix) and piva[len(prefix):].isdigit():
+            piva = piva[len(prefix):]
+            break
     return piva
 
 
@@ -53,9 +70,9 @@ def validate_piva(raw: Optional[str]) -> Optional[str]:
     piva = normalize_piva(raw)
     if not piva:
         return None
-    if _ITALIAN_RE.match(piva):
+    if _ITALIAN_RE.fullmatch(piva):
         return piva if _italian_checksum_ok(piva) else None
-    if _FOREIGN_RE.match(piva):
+    if _FOREIGN_RE.fullmatch(piva):
         return piva
     return None
 
@@ -72,4 +89,4 @@ def is_checksum_backed(raw: Optional[str]) -> bool:
     inventata. Per una GARANZIA forte (semaforo verde) serve il checksum.
     """
     piva = validate_piva(raw)
-    return bool(piva and _ITALIAN_RE.match(piva))
+    return bool(piva and _ITALIAN_RE.fullmatch(piva))

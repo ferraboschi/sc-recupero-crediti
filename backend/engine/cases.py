@@ -17,6 +17,14 @@ Riapertura della STESSA pratica (contatore preservato, todo ripristinati):
 - sempre, se era chiusa 'no_overdue'
 - entro REOPEN_PAID_WINDOW_DAYS se era chiusa 'paid' e una SUA fattura
   torna scaduta-non-pagata (guardia anti-flapping dello scraper)
+- MAI scavalcando un'archiviazione: si riprende l'ULTIMA decisione presa sul
+  debito, non una precedente. Una pratica chiusa PRIMA dell'archiviazione ha
+  il contatore di allora e riaprirla farebbe ripartire il tono da zero.
+
+Il debito archiviato è dichiarato INESIGIBILE: le sue fatture restano nella
+pratica archiviata (scadute e non pagate: è il motivo dell'archiviazione) e
+non riaprono nulla al sync successivo. Solo un debito NUOVO — una fattura
+scaduta che non era nella pratica archiviata — apre una pratica nuova.
 
 Dopo una pratica 'archived' (o con azioni legali) la nuova pratica eredita
 il conteggio contatti: il tono non riparte mai dal sollecito cordiale.
@@ -33,6 +41,10 @@ from backend.config import config
 from backend.database import (
     Customer, Invoice, RecoveryCase, RecoveryAction, ActivityLog, SyncState,
 )
+# Definizione unica di "scaduto" — vive in engine/overdue.py perché la
+# condividono motore e KPI. Ri-esportata qui: è da qui che la importano
+# gli 11 punti del motore.
+from backend.engine.overdue import is_overdue_unpaid  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +79,6 @@ PROGRESSION = {
 }
 
 BACKFILL_HISTORY_CAP_DAYS = 180
-
-
-def is_overdue_unpaid(inv: Invoice) -> bool:
-    """Fattura che tiene viva una pratica: scaduta, non pagata, non contestata."""
-    return inv.status not in ("paid", "disputed") and (inv.days_overdue or 0) > 0
 
 
 def get_open_case(session: Session, customer_id: int) -> Optional[RecoveryCase]:
@@ -224,7 +231,28 @@ def attach_overdue_invoices(session: Session, customer: Customer, case: Recovery
     return attached
 
 
+def _archived_case_ids(session: Session) -> set:
+    """Id di TUTTE le pratiche archiviate: il loro debito è stato dichiarato
+    inesigibile dall'operatore.
+
+    Una fattura agganciata a una di queste pratiche è debito già archiviato:
+    resta scaduta per definizione (è il motivo stesso dell'archiviazione) e
+    non deve far ripartire nulla al sync successivo.
+    """
+    return {
+        row[0] for row in session.query(RecoveryCase.id).filter(
+            RecoveryCase.status == "closed",
+            RecoveryCase.closed_reason == "archived",
+        ).all()
+    }
+
+
 def _find_reopenable_case(session: Session, customer: Customer) -> Optional[RecoveryCase]:
+    """Pratica chiusa che il debito scaduto del cliente può far riaprire, o None.
+
+    I candidati si scorrono dalla chiusura più recente alla più vecchia:
+    riaprire significa riprendere l'ULTIMA decisione presa su questo debito.
+    """
     overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
     case_ids = {inv.case_id for inv in overdue if inv.case_id}
     if not case_ids:
@@ -240,6 +268,14 @@ def _find_reopenable_case(session: Session, customer: Customer) -> Optional[Reco
             return case
         if case.closed_reason == "paid" and case.closed_at and case.closed_at >= cutoff:
             return case
+        if case.closed_reason == "archived":
+            # Un'archiviazione non si scavalca: è la decisione più recente
+            # dell'operatore su questo cliente. Riaprire una pratica chiusa
+            # PRIMA di essa significa tornare indietro nel tempo e riprenderne
+            # il contatore a zero — il cliente appena passato al legale
+            # riceverebbe un primo sollecito cordiale. Fermarsi qui fa cadere
+            # il caso su open_new_case, che eredita il tono dall'archiviata.
+            return None
     return None
 
 
@@ -377,6 +413,7 @@ def update_case_lifecycle(session: Session, allow_close: bool = True) -> Dict[st
         c.customer_id: c
         for c in session.query(RecoveryCase).filter(RecoveryCase.status == "open").all()
     }
+    archived_ids = _archived_case_ids(session)
 
     for customer in customers:
         try:
@@ -389,6 +426,13 @@ def update_case_lifecycle(session: Session, allow_close: bool = True) -> Dict[st
                 if inv.case_id and inv.case is not None and inv.case.customer_id != customer.id:
                     inv.case_id = None
                     stats["detached"] += 1
+
+            # Il debito già archiviato non riapre nulla: le sue fatture restano
+            # scadute per definizione (è il motivo dell'archiviazione) e restano
+            # nella pratica archiviata. Solo un debito NUOVO merita una pratica
+            # nuova. Va dopo lo sgancio difensivo: una fattura riassegnata ha
+            # ormai case_id=None ed è debito nuovo per il cliente che la eredita.
+            overdue = [inv for inv in overdue if inv.case_id not in archived_ids]
 
             # Cliente escluso: la pratica aperta si chiude.
             if customer.excluded:

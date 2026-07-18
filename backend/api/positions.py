@@ -665,6 +665,281 @@ async def assign_piva_to_customer(position_id: int, session: Session = Depends(g
         raise
 
 
+@router.post("/{position_id}/assign-name-to-customer")
+async def assign_name_to_customer(
+    position_id: int,
+    confirm: bool = Query(False, description="Senza confirm: solo anteprima d'impatto, nessuna modifica"),
+    expected_customer_id: int = Query(
+        None,
+        description=(
+            "Obbligatorio col confirm: l'id del cliente mostrato in anteprima. "
+            "Se la fattura è stata riassegnata nel frattempo, il confirm fallisce "
+            "invece di rinominare la vittima sbagliata."
+        ),
+    ),
+    session: Session = Depends(get_session),
+):
+    """Copia la ragione sociale della FATTURA sul CLIENTE abbinato.
+
+    Via ② del menu "Risolvi" sulla riga discordante: stessa azienda, ma il
+    profilo ha il nome vecchio (es. cambio ragione sociale mai recepito in
+    anagrafica). Si aggiorna il CLIENTE dal documento — MAI il contrario:
+    customer_name_raw è la prova documentale, toccarlo renderebbe la
+    verifica circolare.
+
+    Guardie (simmetriche ad assign-piva-to-customer):
+    - 404 se la fattura o il cliente non esistono;
+    - 400 se la fattura non è abbinata o non ha un nome destinatario;
+    - 400/409 sul binding anteprima→conferma: il confirm richiede
+      expected_customer_id (il cliente visto in anteprima) e fallisce se la
+      fattura è stata riassegnata nel frattempo;
+    - 409 se le P.IVA confliggono (entrambe checksum-valide e diverse =
+      entità diverse: il rinomino nasconderebbe un mis-abbinamento — la via
+      giusta è Riassegna);
+    - 409 al confirm se esiste già un ALTRO cliente con la stessa
+      normalized del nuovo nome (ricalcolo fresh, come create-customer):
+      il rename era l'unica porta rimasta per creare il doppione che manda
+      ogni futura fattura omonima in quarantena name_ambiguous. In
+      anteprima l'omonimo viene solo dichiarato (campo `homonym`);
+    - no-op 200 se il nome coincide già sulla NORMALIZED ('Basara Srl' vs
+      'BASARA SRL' non merita né rename né lock).
+
+    Flusso preview→confirm: la prima chiamata (confirm=false) NON applica e
+    ritorna l'impatto — con la stessa lente dell'audit (le già-verificate a
+    mano non contano) e in tre conte separate: quante ALTRE fatture aperte
+    diventerebbero discordanti, quante scenderebbero a 'da controllare', e
+    quante PAGATE resterebbero intestate al vecchio nome (l'audit di default
+    non le mostra: senza questa voce il caso più pericoloso sembra innocuo).
+    Con confirm=true applica: nome + normalized ricalcolata col normalizzatore
+    canonico + ragione_sociale_locked=True (il sync Shopify non deve poter
+    annullare la bonifica al giro successivo).
+    """
+    from types import SimpleNamespace
+    from backend.engine.matching import piva_contradiction
+    from backend.engine.normalizer import (
+        name_similarity_score, normalize_ragione_sociale,
+    )
+    from backend.engine.verify import verify_invoice_customer
+
+    try:
+        position = session.query(Invoice).filter(Invoice.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+        if not position.customer_id:
+            raise HTTPException(
+                status_code=400,
+                detail="La fattura non è abbinata a nessun cliente",
+            )
+
+        customer = session.query(Customer).filter(
+            Customer.id == position.customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Cliente non trovato")
+
+        # ── Binding anteprima→conferma: il confirm deve applicarsi al
+        # cliente che l'operatore ha VISTO in anteprima. Senza, un reassign
+        # concorrente farebbe rinominare (e lockare) la vittima sbagliata.
+        if confirm:
+            if expected_customer_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Il confirm richiede expected_customer_id (il cliente "
+                        "mostrato in anteprima): richiedi prima l'anteprima."
+                    ),
+                )
+            if expected_customer_id != customer.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "La fattura è stata riassegnata a un altro cliente nel "
+                        "frattempo: ricarica la scheda e ripeti l'anteprima."
+                    ),
+                )
+
+        new_name = (position.customer_name_raw or "").strip()
+        if not new_name:
+            raise HTTPException(
+                status_code=400,
+                detail="La fattura non riporta un nome destinatario da assegnare",
+            )
+
+        # P.IVA in contraddizione (entrambe checksum-valide e diverse) =
+        # entità diverse: rinominare il cliente nasconderebbe il vero
+        # problema (fattura abbinata al cliente sbagliato).
+        if piva_contradiction(position, customer):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"La P.IVA della fattura ('{position.customer_piva_raw}') e "
+                    f"quella del cliente '{customer.ragione_sociale}' "
+                    f"('{customer.partita_iva}') sono entrambe valide e DIVERSE: "
+                    f"sono entità diverse, rinominare il profilo nasconderebbe un "
+                    f"abbinamento sbagliato. Usa 'È di un altro cliente' per "
+                    f"riassegnare la fattura."
+                ),
+            )
+
+        old_name = (customer.ragione_sociale or "").strip()
+        new_norm = normalize_ragione_sociale(new_name)
+        if new_norm == normalize_ragione_sociale(old_name):
+            # Stessa entità a meno di grafia ('Basara Srl' vs 'BASARA SRL'):
+            # niente rename e SOPRATTUTTO niente lock inutile.
+            return {
+                "ok": True,
+                "applied": False,
+                "already_aligned": True,
+                "customer_id": customer.id,
+                "old_name": old_name,
+                "new_name": new_name,
+                "similarity": 100,
+                "homonym": None,
+                "impact": {
+                    "would_become_discordant": 0, "invoices": [],
+                    "would_become_warning": 0, "warning_invoices": [],
+                    "paid_would_become_discordant": 0, "paid_invoices": [],
+                },
+            }
+
+        # ── Omonimo: se il nuovo nome appartiene GIÀ a un altro cliente,
+        # il rename creerebbe due anagrafiche con la stessa normalized e
+        # ogni futura fattura omonima finirebbe in quarantena
+        # name_ambiguous. Confronto sul ricalcolo FRESH della normalized
+        # (come create-customer: la colonna può essere stantia). Nel caso
+        # tipico l'omonimo è proprio il vero destinatario della fattura.
+        homonym = None
+        for c in session.query(Customer).filter(Customer.id != customer.id).all():
+            if normalize_ragione_sociale(c.ragione_sociale or "") == new_norm:
+                homonym = c
+                break
+        if homonym and confirm:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Esiste già il cliente '{homonym.ragione_sociale}' "
+                    f"(ID {homonym.id}): questa fattura è probabilmente sua. "
+                    f"Usa 'È di un altro cliente' per riassegnarla invece di "
+                    f"rinominare questo profilo (due clienti con lo stesso "
+                    f"nome manderebbero le prossime fatture in quarantena)."
+                ),
+            )
+
+        # Somiglianza tra vecchio e nuovo nome: la UI la mostra come tono
+        # d'avviso (sotto il 40 il rinomino è il caso PIÙ sospetto, non il
+        # più innocuo).
+        similarity = name_similarity_score(old_name, new_name)
+
+        # ── Impatto: stessa lente dell'audit (le già-verificate a mano non
+        # contano) su TUTTE le altre fatture del cliente. Si ricalcola
+        # verify su un cliente "simulato" col nuovo nome (stessa P.IVA) e
+        # si conta in tre voci separate: aperte che diventano discordanti,
+        # aperte che scendono a 'da controllare', PAGATE che resterebbero
+        # intestate al vecchio nome (l'audit di default non le mostra — è
+        # il caso dell'owner: 1 aperta + 2 pagate sembrava "0 impatti").
+        simulated = SimpleNamespace(
+            ragione_sociale=new_name,
+            partita_iva=customer.partita_iva,
+        )
+        siblings = (
+            session.query(Invoice)
+            .filter(
+                Invoice.customer_id == customer.id,
+                Invoice.id != position.id,
+                Invoice.audit_reviewed_at.is_(None),
+            )
+            .all()
+        )
+        impacted, warned, paid_impacted = [], [], []
+        for sib in siblings:
+            before = verify_invoice_customer(sib, customer)["verdict"]
+            after = verify_invoice_customer(sib, simulated)["verdict"]
+            entry = {
+                "invoice_id": sib.id,
+                "invoice_number": sib.invoice_number,
+                "amount_due": float(sib.amount_due),
+            }
+            if sib.status == "paid":
+                if after == "bad" and before != "bad":
+                    paid_impacted.append(entry)
+            elif after == "bad" and before != "bad":
+                impacted.append(entry)
+            elif after == "warn" and before == "ok":
+                warned.append(entry)
+
+        impact = {
+            "would_become_discordant": len(impacted),
+            "invoices": impacted,
+            "would_become_warning": len(warned),
+            "warning_invoices": warned,
+            "paid_would_become_discordant": len(paid_impacted),
+            "paid_invoices": paid_impacted,
+        }
+
+        if not confirm:
+            # Anteprima: NESSUNA modifica.
+            return {
+                "ok": True,
+                "applied": False,
+                "customer_id": customer.id,
+                "old_name": old_name,
+                "new_name": new_name,
+                "similarity": similarity,
+                "homonym": {
+                    "id": homonym.id,
+                    "ragione_sociale": homonym.ragione_sociale,
+                    "partita_iva": homonym.partita_iva,
+                } if homonym else None,
+                "impact": impact,
+            }
+
+        customer.ragione_sociale = new_name
+        customer.ragione_sociale_normalized = new_norm
+        customer.ragione_sociale_locked = True
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_assign_name",
+            entity_type="customer",
+            entity_id=customer.id,
+            details={
+                "invoice_id": position.id,
+                "invoice_number": position.invoice_number,
+                "customer_id": customer.id,
+                "old_name": old_name,
+                "new_name": new_name,
+                "similarity": similarity,
+                "would_become_discordant": len(impacted),
+                "would_become_warning": len(warned),
+                "paid_would_become_discordant": len(paid_impacted),
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"Ragione sociale del cliente {customer.id} aggiornata da "
+            f"'{old_name}' a '{new_name}' dalla fattura "
+            f"{position.invoice_number} (lock anti-sync attivo)"
+        )
+        return {
+            "ok": True,
+            "applied": True,
+            "customer_id": customer.id,
+            "old_name": old_name,
+            "new_name": new_name,
+            "similarity": similarity,
+            "locked": True,
+            "impact": impact,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error assigning name to customer: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
 @router.post("/{position_id}/mark-reviewed")
 async def mark_reviewed(position_id: int, session: Session = Depends(get_session)):
     """Segna la fattura come 'verificata a mano' nell'audit abbinamenti.

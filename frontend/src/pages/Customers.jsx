@@ -20,6 +20,16 @@ const STATUS_COLORS = {
   waiting: 'badge-promised',
 }
 
+// Ordinamenti disponibili (rispecchiano list_customers lato backend).
+const SORT_OPTIONS = [
+  { value: 'total_overdue', label: 'Scaduto (€)' },
+  { value: 'overdue_count', label: 'N. fatture scadute' },
+  { value: 'days_overdue', label: 'Giorni di scaduto' },
+  { value: 'last_action', label: 'Ultimo sollecito' },
+  { value: 'earliest_due_date', label: 'Scadenza più vicina' },
+  { value: 'ragione_sociale', label: 'Nome (A→Z)' },
+]
+
 export default function Customers() {
   const navigate = useNavigate()
   const [customers, setCustomers] = useState([])
@@ -30,25 +40,69 @@ export default function Customers() {
   const [limit] = useState(50)
   const [search, setSearch] = useState('')
   const [onlyOverdue, setOnlyOverdue] = useState(true)
+  const [toSanitize, setToSanitize] = useState(false)
+  const [noPhone, setNoPhone] = useState(false)
+  const [recoveryStatus, setRecoveryStatus] = useState('')
+  // 'all' = tutti, 'hide' = nascondi esclusi, 'only' = solo esclusi
+  const [excludedFilter, setExcludedFilter] = useState('all')
   const [sortBy, setSortBy] = useState('total_overdue')
   const [sortOrder, setSortOrder] = useState('desc')
   const [excludedToggle, setExcludedToggle] = useState({})
   const [summaryTotalOverdue, setSummaryTotalOverdue] = useState(0)
   const [summaryOverdueCustomers, setSummaryOverdueCustomers] = useState(0)
   const [suggestions, setSuggestions] = useState([])
+  const [sanitizeCount, setSanitizeCount] = useState(null)
+
+  // Parametri correnti della lista (un solo punto di verità, usato anche
+  // dalla richiesta dedicata al riepilogo).
+  const buildListParams = () => {
+    const params = { skip, limit, only_overdue: onlyOverdue, sort_by: sortBy, sort_order: sortOrder }
+    if (search) params.search = search
+    if (toSanitize) params.to_sanitize = true
+    if (noPhone) params.no_phone = true
+    if (recoveryStatus) params.recovery_status = recoveryStatus
+    if (excludedFilter === 'hide') params.excluded = false
+    if (excludedFilter === 'only') params.excluded = true
+    return params
+  }
+
+  // Il riepilogo dice "fuori dai totali": DEVE escludere gli esclusi anche
+  // quando il filtro li MOSTRA in lista. Richiesta dedicata con
+  // excluded=false (limit minimo: servono solo i summary_* del backend).
+  const fetchSummary = async () => {
+    try {
+      const params = { ...buildListParams(), excluded: false, skip: 0, limit: 1 }
+      const res = await client.get('/customers', { params })
+      setSummaryTotalOverdue(res.data.summary_total_overdue || 0)
+      setSummaryOverdueCustomers(res.data.summary_overdue_customers || 0)
+    } catch (err) {
+      console.error('Errore aggiornamento riepilogo:', err)
+    }
+  }
 
   useEffect(() => {
+    let cancelled = false
     const fetchCustomers = async () => {
       try {
         setLoading(true)
-        const params = { skip, limit, only_overdue: onlyOverdue, sort_by: sortBy, sort_order: sortOrder }
-        if (search) params.search = search
+        const params = buildListParams()
 
-        const response = await client.get('/customers', { params })
+        // In modalità 'nascondi' la lista è già excluded=false: i suoi
+        // summary_* sono giusti. Negli altri casi il riepilogo arriva da
+        // una richiesta parallela che esclude gli esclusi.
+        const needsSummaryRequest = excludedFilter !== 'hide'
+        const [response, summaryRes] = await Promise.all([
+          client.get('/customers', { params }),
+          needsSummaryRequest
+            ? client.get('/customers', { params: { ...params, excluded: false, skip: 0, limit: 1 } })
+            : null,
+        ])
+        if (cancelled) return
         setCustomers(response.data.items)
         setTotal(response.data.total)
-        setSummaryTotalOverdue(response.data.summary_total_overdue || 0)
-        setSummaryOverdueCustomers(response.data.summary_overdue_customers || 0)
+        const summarySource = summaryRes ? summaryRes.data : response.data
+        setSummaryTotalOverdue(summarySource.summary_total_overdue || 0)
+        setSummaryOverdueCustomers(summarySource.summary_overdue_customers || 0)
 
         const toggleState = {}
         response.data.items.forEach(c => {
@@ -56,14 +110,29 @@ export default function Customers() {
         })
         setExcludedToggle(toggleState)
       } catch (err) {
+        if (cancelled) return
         setError('Errore nel caricamento dei clienti')
         console.error(err)
       } finally {
-        setLoading(false)
+        if (!cancelled) setLoading(false)
       }
     }
     fetchCustomers()
-  }, [skip, limit, search, onlyOverdue, sortBy, sortOrder])
+    return () => { cancelled = true }
+  }, [skip, limit, search, onlyOverdue, toSanitize, noPhone, recoveryStatus, excludedFilter, sortBy, sortOrder])
+
+  // Conteggio globale "da sanificare" (audit): un solo giro, indipendente
+  // dai filtri della lista. Alimenta il chip/contatore cliccabile.
+  const fetchSanitizeCount = async () => {
+    try {
+      const res = await client.get('/customers/audit-summary')
+      setSanitizeCount(res.data.to_sanitize_count)
+    } catch (err) {
+      console.error('Errore audit-summary:', err)
+      setSanitizeCount(null)
+    }
+  }
+  useEffect(() => { fetchSanitizeCount() }, [])
 
   // "Forse intendevi": suggerimenti approssimati (accenti/forme legali/
   // refusi tollerati). Debounced, su TUTTI i clienti (anche senza scadute).
@@ -95,6 +164,9 @@ export default function Customers() {
         ...excludedToggle,
         [customerId]: newValue,
       })
+      // Il riepilogo cambia in ENTRAMBE le direzioni (escluso ↔ riportato
+      // nel recupero): si riallinea subito, senza aspettare un reload.
+      fetchSummary()
     } catch (err) {
       console.error(err)
     }
@@ -128,7 +200,7 @@ export default function Customers() {
     <div className="space-y-6">
       {/* Filters */}
       <div className="sc-card p-5">
-        <div className="flex flex-col md:flex-row gap-4 items-start md:items-end">
+        <div className="flex flex-col lg:flex-row gap-4 lg:items-end">
           <div className="flex-1">
             <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Ricerca Azienda</label>
             <input
@@ -142,17 +214,103 @@ export default function Customers() {
               className="sc-input w-full"
             />
           </div>
-          <div className="flex items-center gap-4">
-            <label className="flex items-center gap-2 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={onlyOverdue}
-                onChange={(e) => { setOnlyOverdue(e.target.checked); setSkip(0) }}
-                className="rounded border-dark-border bg-dark-surface text-accent-teal focus:ring-accent-teal"
-              />
-              <span className="text-sm font-medium text-txt-secondary">Solo con scadute</span>
-            </label>
+          <div>
+            <label className="block text-xs font-semibold text-txt-label uppercase tracking-wider mb-2">Ordina per</label>
+            <div className="flex gap-2">
+              <select
+                value={sortBy}
+                onChange={(e) => { setSortBy(e.target.value); setSkip(0) }}
+                className="sc-input"
+              >
+                {SORT_OPTIONS.map(o => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+              <button
+                onClick={() => { setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc'); setSkip(0) }}
+                className="sc-btn-secondary px-3"
+                title={sortOrder === 'asc' ? 'Crescente — clicca per decrescente' : 'Decrescente — clicca per crescente'}
+              >
+                {sortOrder === 'asc' ? '↑' : '↓'}
+              </button>
+            </div>
           </div>
+        </div>
+
+        {/* Chip filtri: viste rapide della lista. Un colore = un significato
+            (ambra = da verificare/sanificare, teal = filtro attivo). */}
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => { setOnlyOverdue(!onlyOverdue); setSkip(0) }}
+            className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
+              onlyOverdue
+                ? 'bg-accent-teal/15 text-accent-teal border-accent-teal/40'
+                : 'bg-dark-surface text-txt-secondary border-dark-border hover:border-accent-teal/40'
+            }`}
+          >
+            Solo con scadute
+          </button>
+
+          <button
+            onClick={() => {
+              const next = !toSanitize
+              setToSanitize(next)
+              // Attivandolo mostro TUTTI i clienti da sanificare, anche senza
+              // scadute (un abbinamento sbagliato non dipende dallo scaduto).
+              if (next) setOnlyOverdue(false)
+              setSkip(0)
+            }}
+            className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors flex items-center gap-1.5 ${
+              toSanitize
+                ? 'bg-accent-amber/15 text-accent-amber border-accent-amber/40'
+                : 'bg-dark-surface text-txt-secondary border-dark-border hover:border-accent-amber/40'
+            }`}
+            title="Clienti con abbinamenti da controllare o suggerimenti in attesa"
+          >
+            Da sanificare
+            {sanitizeCount !== null && (
+              <span className={`px-1.5 py-0.5 rounded-full text-xs font-bold ${
+                sanitizeCount > 0 ? 'bg-accent-amber/25 text-accent-amber' : 'bg-accent-green/20 text-accent-green'
+              }`}>
+                {sanitizeCount}
+              </span>
+            )}
+          </button>
+
+          <button
+            onClick={() => { setNoPhone(!noPhone); setSkip(0) }}
+            className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
+              noPhone
+                ? 'bg-accent-teal/15 text-accent-teal border-accent-teal/40'
+                : 'bg-dark-surface text-txt-secondary border-dark-border hover:border-accent-teal/40'
+            }`}
+            title="Clienti senza telefono: non sollecitabili via WhatsApp"
+          >
+            Senza telefono
+          </button>
+
+          <select
+            value={recoveryStatus}
+            onChange={(e) => { setRecoveryStatus(e.target.value); setSkip(0) }}
+            className="sc-input py-1.5 text-sm"
+            title="Filtra per stato pratica"
+          >
+            <option value="">Tutte le pratiche</option>
+            {Object.entries(STATUS_LABELS).map(([key, label]) => (
+              <option key={key} value={key}>{label}</option>
+            ))}
+          </select>
+
+          <select
+            value={excludedFilter}
+            onChange={(e) => { setExcludedFilter(e.target.value); setSkip(0) }}
+            className="sc-input py-1.5 text-sm"
+            title="Gli esclusi sono fuori dai totali della cascata"
+          >
+            <option value="all">Esclusi: mostra</option>
+            <option value="hide">Esclusi: nascondi</option>
+            <option value="only">Solo esclusi</option>
+          </select>
         </div>
 
         {/* "Forse intendevi": suggerimenti approssimati non già in elenco */}
@@ -244,6 +402,12 @@ export default function Customers() {
                     </th>
                     <th
                       className="px-4 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary"
+                      onClick={() => handleSort('days_overdue')}
+                    >
+                      Giorni{sortArrow('days_overdue')}
+                    </th>
+                    <th
+                      className="px-4 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary"
                       onClick={() => handleSort('earliest_due_date')}
                     >
                       Scadenza{sortArrow('earliest_due_date')}
@@ -255,20 +419,32 @@ export default function Customers() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-dark-border">
-                  {customers.map(customer => (
+                  {customers.map(customer => {
+                    // Un solo punto di verità per riga: il toggle locale
+                    // (inizializzato dal server) — così escludere E
+                    // ri-includere si riflettono subito, simmetricamente.
+                    const isExcluded = excludedToggle[customer.id] ?? customer.excluded
+                    const displayName = customer.ragione_sociale || customer.email || `Cliente #${customer.id}`
+                    return (
                     <tr
                       key={customer.id}
-                      className={`sc-table-row cursor-pointer ${
-                        customer.excluded || excludedToggle[customer.id] ? 'opacity-50' : ''
-                      }`}
+                      className={`sc-table-row cursor-pointer ${isExcluded ? 'opacity-50' : ''}`}
                       onClick={() => navigate(`/customers/${customer.id}`)}
                     >
                       <td className="px-4 py-3">
                         <div className="text-sm font-medium text-accent-teal hover:text-accent-cyan">
-                          {customer.ragione_sociale || customer.email || `Cliente #${customer.id}`}
+                          {displayName}
                         </div>
                         {!customer.ragione_sociale && (
                           <span className="text-xs text-txt-muted">(nome mancante)</span>
+                        )}
+                        {isExcluded && (
+                          <span
+                            className="mt-1 inline-block sc-badge bg-[rgba(148,163,184,0.15)] text-txt-muted"
+                            title="Cliente escluso: non conteggiato nei totali della cascata di riconciliazione"
+                          >
+                            Escluso · fuori dai totali
+                          </span>
                         )}
                       </td>
                       <td className="px-4 py-3 text-sm text-txt-muted font-mono text-xs">
@@ -290,6 +466,15 @@ export default function Customers() {
                           <span className="text-txt-muted text-xs">0</span>
                         )}
                       </td>
+                      <td className="px-4 py-3 text-sm text-center">
+                        {(customer.max_days_overdue || 0) > 0 ? (
+                          <span className={`text-xs font-medium ${customer.max_days_overdue > 30 ? 'text-accent-red' : 'text-accent-amber'}`}>
+                            +{customer.max_days_overdue}gg
+                          </span>
+                        ) : (
+                          <span className="text-txt-muted text-xs">-</span>
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-sm text-center text-txt-secondary">
                         {customer.earliest_due_date ? (
                           <span className="text-xs">{formatDate(customer.earliest_due_date)}</span>
@@ -304,6 +489,11 @@ export default function Customers() {
                         {customer.next_action_date ? (
                           <span className="text-xs">{formatDate(customer.next_action_date)}</span>
                         ) : '-'}
+                        {customer.last_action && (
+                          <span className="block text-[10px] text-txt-muted mt-0.5" title="Ultimo sollecito registrato">
+                            ult. sollecito {formatDate(customer.last_action)}
+                          </span>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-sm text-center">
                         {customer.phone ? (
@@ -328,18 +518,27 @@ export default function Customers() {
                       </td>
                       <td className="px-4 py-3 text-center" onClick={(e) => e.stopPropagation()}>
                         <button
-                          onClick={(e) => handleToggleExcluded(customer.id, !excludedToggle[customer.id], e)}
+                          onClick={(e) => handleToggleExcluded(customer.id, !isExcluded, e)}
+                          role="switch"
+                          aria-checked={isExcluded}
+                          aria-label={isExcluded
+                            ? `Riporta ${displayName} nel recupero`
+                            : `Escludi ${displayName} dal recupero`}
+                          title={isExcluded
+                            ? `Riporta ${displayName} nel recupero`
+                            : `Escludi ${displayName} dal recupero`}
                           className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
-                            excludedToggle[customer.id] ? 'bg-accent-red' : 'bg-accent-green'
+                            isExcluded ? 'bg-accent-red' : 'bg-accent-green'
                           }`}
                         >
                           <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                            excludedToggle[customer.id] ? 'translate-x-4.5' : 'translate-x-0.5'
+                            isExcluded ? 'translate-x-4.5' : 'translate-x-0.5'
                           }`} />
                         </button>
                       </td>
                     </tr>
-                  ))}
+                    )
+                  })}
                 </tbody>
               </table>
             </div>

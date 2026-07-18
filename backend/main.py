@@ -84,6 +84,18 @@ async def startup_event():
         except Exception as e:
             logger.error(f"Case backfill error: {e}")
 
+        try:
+            # Backfill una-tantum dello storico STIMATO dello scaduto
+            # (stesso pattern: marker one-shot in sync_state, retry al
+            # prossimo avvio). DOPO il case-backfill: il grafico evoluzione
+            # parte popolato invece che vuoto.
+            from backend.engine.overdue_history import (
+                run_history_backfill_if_needed,
+            )
+            run_history_backfill_if_needed()
+        except Exception as e:
+            logger.error(f"Overdue history backfill error: {e}")
+
         # NB: il repair degli abbinamenti NON gira più allo startup — è uno
         # step del full sync (_full_sync_task), così vede le P.IVA reali già
         # popolate dall'anagrafica invece di girare a vuoto sul boot.

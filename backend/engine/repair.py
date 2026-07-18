@@ -47,7 +47,7 @@ from backend.database import (
 )
 from backend.engine.matching import (
     match_invoice_to_customer, piva_contradiction, run_matching,
-    PIVA_NAME_MISMATCH_THRESHOLD,
+    PIVA_NAME_MISMATCH_THRESHOLD, NAME_CONCORDANT_THRESHOLD,
 )
 from backend.engine.cases import (
     close_case, get_open_case, is_overdue_unpaid, _refresh_customer_status,
@@ -65,9 +65,6 @@ HUMAN_DECIDED_METHODS = ("manual", "fuzzy_confirmed", "unlinked")
 # Marker di osservabilità (ultima esecuzione + stats). La key resta 'v2'
 # per continuità con lo storico in produzione.
 REPAIR_MARKER_KEY = "match_repair_v2"
-
-# Sopra questa somiglianza il nome della fattura CONFERMA il cliente attuale.
-NAME_CONCORDANT_THRESHOLD = 75
 
 
 def _name_score_vs_customer(invoice: Invoice, customer: Customer):

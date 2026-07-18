@@ -102,6 +102,20 @@ async def register_sollecito(
                 "message": "Nessuna fattura scaduta: messaggio copiato ma sollecito non registrato",
             }
 
+        # Le fatture citate devono essere DI questo cliente: un id estraneo
+        # significa che il chiamante sta guardando un altro cliente (race del
+        # frontend fra due fetch) — registrarlo inquinerebbe la pratica con
+        # fatture altrui e falserebbe il tono del prossimo sollecito.
+        # Il controllo sta PRIMA del dedup: anche il merge giornaliero
+        # (existing_today.invoice_ids) è una scrittura da proteggere.
+        own_invoice_ids = {inv.id for inv in customer.invoices}
+        unknown = [i for i in body.invoice_ids if i not in own_invoice_ids]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Fatture non appartenenti al cliente {customer.id}: {unknown}",
+            )
+
         case = ensure_open_case(session, customer)
         today = date.today()
         now = datetime.utcnow()

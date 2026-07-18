@@ -6,7 +6,17 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, extract
 from sqlalchemy.orm import Session, joinedload
 
-from backend.database import get_session, Invoice, Customer, RecoveryAction, RecoveryCase
+from backend.database import (
+    get_session, Invoice, Customer, RecoveryAction, RecoveryCase,
+    OverdueSnapshot,
+)
+from backend.engine.overdue import (
+    overdue_clause, workable_clause, stage_expr,
+    compute_overdue_buckets, compute_recuperato_certo,
+    first_recovery_action_subquery, recovered_invoice_clause,
+    OVERDUE_BUCKETS, CASE_STAGES, RECOVERY_ACTION_TYPES,
+)
+from backend.engine.cases import business_day_start
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -17,24 +27,26 @@ async def get_dashboard(session: Session = Depends(get_session)):
     """
     Get dashboard overview with key statistics.
     Optimized: only returns the stats actually used by the frontend.
+
+    total_scaduto è l'UNIVERSO dello scaduto (contestati/esclusi/orfane
+    compresi): è la cima della cascata di /riconciliazione, che lo spiega
+    riga per riga. Il numero di testa e la cascata che lo scompone devono
+    essere lo stesso numero, o i conti non tornano di nuovo.
     """
     try:
         # Total OVERDUE amount (only invoices past due date)
         total_scaduto = session.query(func.sum(Invoice.amount_due)).filter(
-            Invoice.status != "paid",
-            Invoice.days_overdue > 0,
+            overdue_clause()
         ).scalar() or 0.0
 
         total_fatture_scadute = session.query(func.count(Invoice.id)).filter(
-            Invoice.status != "paid",
-            Invoice.days_overdue > 0,
+            overdue_clause()
         ).scalar() or 0
 
         total_clienti_scaduti = session.query(
             func.count(func.distinct(Invoice.customer_id))
         ).filter(
-            Invoice.status != "paid",
-            Invoice.days_overdue > 0,
+            overdue_clause(),
             Invoice.customer_id.isnot(None),
         ).scalar() or 0
 
@@ -70,8 +82,8 @@ async def search_dashboard(
         results = (
             session.query(
                 Customer,
-                func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).label("total_overdue"),
-                func.count(case((Invoice.days_overdue > 0, 1), else_=None)).label("overdue_count"),
+                func.sum(case((overdue_clause(), Invoice.amount_due), else_=0)).label("total_overdue"),
+                func.count(case((overdue_clause(), 1), else_=None)).label("overdue_count"),
             )
             .outerjoin(Invoice, (Invoice.customer_id == Customer.id) & (Invoice.status != "paid"))
             .filter(
@@ -82,7 +94,7 @@ async def search_dashboard(
                 )
             )
             .group_by(Customer.id)
-            .order_by(func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).desc())
+            .order_by(func.sum(case((overdue_clause(), Invoice.amount_due), else_=0)).desc())
             .limit(20)
             .all()
         )
@@ -119,6 +131,9 @@ async def get_todos(session: Session = Depends(get_session)):
         today = date.today()
 
         # Pre-load ALL overdue stats per customer in ONE query (avoids N+1)
+        # Definizione LAVORABILE: un todo propone un'azione, e il motore
+        # rifiuta i contestati. Contarli qui significa promettere lavoro che
+        # "Copia Messaggio" poi respinge con no_overdue.
         overdue_stats_raw = (
             session.query(
                 Invoice.customer_id,
@@ -127,11 +142,8 @@ async def get_todos(session: Session = Depends(get_session)):
                 func.min(Invoice.due_date).label("oldest_due_date"),
                 func.max(Invoice.days_overdue).label("max_days_overdue"),
             )
-            .filter(
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
-                Invoice.customer_id.isnot(None),
-            )
+            .outerjoin(Customer, Invoice.customer_id == Customer.id)
+            .filter(workable_clause())
             .group_by(Invoice.customer_id)
             .all()
         )
@@ -164,6 +176,8 @@ async def get_todos(session: Session = Depends(get_session)):
         )
 
         # 2. Idle customers with overdue invoices (need first contact)
+        # Stessa definizione LAVORABILE: il cliente con sole fatture
+        # contestate non è un todo — il motore non ha nulla da sollecitare.
         idle_customers_with_overdue = (
             session.query(
                 Customer,
@@ -173,9 +187,7 @@ async def get_todos(session: Session = Depends(get_session)):
             .join(Invoice, Invoice.customer_id == Customer.id)
             .filter(
                 Customer.recovery_status == "idle",
-                Customer.excluded.is_(False),
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
+                workable_clause(),
             )
             .group_by(Customer.id)
             .having(func.count(Invoice.id) > 0)
@@ -318,8 +330,7 @@ async def get_calendar(
                 func.sum(Invoice.amount_due).label("tot"),
             )
             .filter(
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
+                overdue_clause(),
                 Invoice.customer_id.isnot(None),
             )
             .group_by(Invoice.customer_id)
@@ -448,16 +459,10 @@ async def get_attivita(session: Session = Depends(get_session)):
             session.query(
                 Customer,
                 func.count(func.distinct(
-                    case((
-                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
-                        Invoice.id
-                    ), else_=None)
+                    case((overdue_clause(), Invoice.id), else_=None)
                 )).label("overdue_count"),
                 func.sum(
-                    case((
-                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
-                        Invoice.amount_due
-                    ), else_=0)
+                    case((overdue_clause(), Invoice.amount_due), else_=0)
                 ).label("total_overdue"),
             )
             .outerjoin(Invoice, Invoice.customer_id == Customer.id)
@@ -469,10 +474,7 @@ async def get_attivita(session: Session = Depends(get_session)):
             # Exclude customers with no overdue invoices (nothing to recover)
             .having(
                 func.count(func.distinct(
-                    case((
-                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
-                        Invoice.id
-                    ), else_=None)
+                    case((overdue_clause(), Invoice.id), else_=None)
                 )) > 0
             )
             .order_by(Customer.next_action_date.asc().nullslast())
@@ -546,21 +548,11 @@ async def get_attivita(session: Session = Depends(get_session)):
             })
 
         # ── INCASSATI ──
-        # ONLY invoices paid AFTER the first recovery action on that customer.
-        # Subquery: first recovery action date per customer
-        first_action_sub = (
-            session.query(
-                RecoveryAction.customer_id,
-                func.min(RecoveryAction.created_at).label("first_action"),
-            )
-            .filter(
-                RecoveryAction.action_type.in_(
-                    ["first_contact", "second_contact", "lawyer"]
-                ),
-            )
-            .group_by(RecoveryAction.customer_id)
-            .subquery()
-        )
+        # ONLY invoices paid AFTER the first recovery action on that customer,
+        # and issued BEFORE it (una fattura nuova non era da recuperare).
+        # Definizione condivisa (engine/overdue.py): niente azioni annullate
+        # (5a), niente fatture emesse dopo il sollecito (5c).
+        first_action_sub = first_recovery_action_subquery(session)
 
         incassati_raw = (
             session.query(
@@ -581,6 +573,7 @@ async def get_attivita(session: Session = Depends(get_session)):
                 Invoice.status == "paid",
                 Invoice.updated_at >= first_action_sub.c.first_action,
                 Customer.excluded.is_(False),
+                recovered_invoice_clause(first_action_sub),
             )
             .group_by(
                 Customer.id, Customer.ragione_sociale,
@@ -601,8 +594,7 @@ async def get_attivita(session: Session = Depends(get_session)):
                 )
                 .filter(
                     Invoice.customer_id.in_(incassati_ids),
-                    Invoice.status != "paid",
-                    Invoice.days_overdue > 0,
+                    overdue_clause(),
                 )
                 .group_by(Invoice.customer_id)
                 .all()
@@ -646,34 +638,248 @@ async def get_attivita(session: Session = Depends(get_session)):
         raise
 
 
+@router.get("/riconciliazione")
+async def get_riconciliazione(session: Session = Depends(get_session)):
+    """La cascata che spiega il numero di testa, scalino per scalino.
+
+    Nasce da una segnalazione precisa: "vedo da pagare 674.378, poi sotto
+    460.932, e 197.033 recuperato: i conti non tornano". Non tornavano per
+    costruzione — erano tre risposte a tre domande diverse, su tre
+    popolazioni diverse, in due colonne diverse, su due pagine diverse.
+
+    Qui c'è UNA popolazione (l'universo dello scaduto) divisa in categorie
+    MUTUAMENTE ESCLUSIVE, e vale l'identità:
+
+        scaduto_totale == non_abbinati + esclusi + contestati + lavorabile
+
+    L'esclusività è strutturale, non aritmetica: un CASE SQL (bucket_expr)
+    assegna ogni riga a un solo ramo. Le condizioni si sovrappongono nella
+    realtà — una fattura può essere orfana E contestata, un cliente escluso
+    può avere fatture contestate — e sommare secchielli sovrapposti avrebbe
+    ricostruito esattamente il bug che questo endpoint cura.
+
+    Un credito escluso o contestato ESISTE ancora: non lo si insegue, ma
+    resta tracciato e la cascata lo chiude.
+    """
+    try:
+        # ── La cascata: UNA query, un CASE, nessuna somma sovrapposta ──
+        # compute_overdue_buckets vive in engine/overdue.py e lo condivide con
+        # lo snapshot storico: una definizione sola, non due che divergono.
+        buckets = compute_overdue_buckets(session)
+        per_bucket = {b: buckets[b] for b in OVERDUE_BUCKETS}
+
+        # ── Il lavorabile per stato pratica (deve chiudere a sua volta) ──
+        stage_rows = (
+            session.query(
+                stage_expr().label("stato"),
+                func.count(Invoice.id).label("fatture"),
+                func.sum(Invoice.amount_due).label("importo"),
+                func.count(func.distinct(Invoice.customer_id)).label("clienti"),
+            )
+            .outerjoin(Customer, Invoice.customer_id == Customer.id)
+            .filter(workable_clause())
+            .group_by(stage_expr())
+            .all()
+        )
+        per_stato = {
+            s: {"fatture": 0, "importo": 0.0, "clienti": 0} for s in CASE_STAGES
+        }
+        for stato, fatture, importo, clienti in stage_rows:
+            per_stato[stato] = {
+                "fatture": int(fatture or 0),
+                "importo": float(importo or 0),
+                "clienti": int(clienti or 0),
+            }
+
+        totale = buckets["scaduto_totale"]
+
+        cascata = {
+            "scaduto_totale": {
+                **totale,
+                "label": "Scaduto totale",
+                "descrizione": "Tutto il non pagato oltre la scadenza.",
+            },
+            "non_abbinati": {
+                **per_bucket["non_abbinati"],
+                "label": "Non abbinati",
+                "descrizione": "Fatture senza cliente: da abbinare prima di poterle inseguire.",
+            },
+            "esclusi": {
+                **per_bucket["esclusi"],
+                "label": "Esclusi",
+                "descrizione": "Clienti esclusi dal recupero: il credito esiste, non lo si insegue.",
+            },
+            "contestati": {
+                **per_bucket["contestati"],
+                "label": "Contestati",
+                "descrizione": "Fatture contestate: il motore non le sollecita.",
+            },
+            "lavorabile": {
+                **per_bucket["lavorabile"],
+                "label": "Lavorabile",
+                "descrizione": "Lo scaduto che il motore insegue davvero.",
+                "per_stato": per_stato,
+            },
+        }
+
+        return {
+            "cascata": cascata,
+            "recuperato": _recuperato(session),
+            "precedenza": list(OVERDUE_BUCKETS),
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching riconciliazione: {e}", exc_info=True)
+        raise
+
+
+@router.get("/evoluzione")
+async def get_evoluzione(
+    giorni: int = 90, session: Session = Depends(get_session)
+):
+    """La serie storica dello scaduto: il grafico dell'evoluzione nel tempo.
+
+    Ogni punto è lo snapshot di un giorno (uno solo per giorno): scaduto
+    totale, i bucket della cascata, il lavorabile e il recuperato certo
+    (cumulato). Ordinata per data CRESCENTE, così il grafico scorre da
+    sinistra a destra.
+
+    `giorni` è la finestra (default 90). Se nessuno snapshot è stato ancora
+    registrato — lo storico parte dal primo sync dopo il rilascio di questa
+    funzione — la serie è VUOTA, non un 500: il grafico mostrerà "nessun
+    dato" invece di rompersi.
+
+    Ogni punto espone `stimato`: True per le righe ricostruite dal backfill
+    storico (proiezione dalle date fattura), False per gli snapshot veri.
+    Il grafico tratteggia le stime; i punti veri le sostituiscono man mano.
+    """
+    try:
+        # Clamp difensivo: niente finestre negative o assurde.
+        giorni = max(1, min(giorni, 3650))
+        cutoff = business_day_start().date() - timedelta(days=giorni)
+        rows = (
+            session.query(OverdueSnapshot)
+            .filter(OverdueSnapshot.date >= cutoff)
+            .order_by(OverdueSnapshot.date.asc())
+            .all()
+        )
+        serie = [
+            {
+                "data": s.date.isoformat(),
+                "scaduto_totale": s.scaduto_totale,
+                "non_abbinati": s.non_abbinati,
+                "esclusi": s.esclusi,
+                "contestati": s.contestati,
+                "lavorabile": s.lavorabile,
+                "recuperato_certo": s.recuperato_certo,
+                # bool() copre i NULL delle righe pre-ALTER sul DB live
+                "stimato": bool(s.estimated),
+                "fatture": {
+                    "scaduto_totale": s.scaduto_totale_fatture,
+                    "non_abbinati": s.non_abbinati_fatture,
+                    "esclusi": s.esclusi_fatture,
+                    "contestati": s.contestati_fatture,
+                    "lavorabile": s.lavorabile_fatture,
+                    "recuperato_certo": s.recuperato_certo_fatture,
+                },
+            }
+            for s in rows
+        ]
+        return {"giorni": giorni, "serie": serie}
+
+    except Exception as e:
+        logger.error(f"Error fetching evoluzione: {e}", exc_info=True)
+        raise
+
+
+def _recuperato(session: Session) -> dict:
+    """Quanto è rientrato DOPO il primo sollecito.
+
+    Due secchielli che non si toccano mai, divisi da un fatto tecnico
+    onesto: `paid_at` esiste solo dalla migrazione in poi.
+
+    - certo: ha paid_at (data di pagamento vera) e amount_due_at_paid (il
+      residuo fotografato all'atto del pagamento). Numero affidabile.
+    - storico_stimato: righe già 'paid' prima della migrazione. Per loro
+      NON esiste una data di pagamento (updated_at cambia a ogni modifica
+      di riga) NÉ il residuo (amount_due era già stato azzerato). Si stima
+      con quel che c'è — updated_at e l'importo pieno — e si DICHIARA
+      stimato, invece di spacciarlo per certo.
+    """
+    # Prima azione NON annullata per cliente (5a), definizione condivisa.
+    first_action = first_recovery_action_subquery(session)
+
+    # Certo: paid_at valorizzata, dopo il primo sollecito, somma del RESIDUO.
+    # Definizione condivisa con lo snapshot storico (engine/overdue.py): il
+    # "recuperato" della serie storica e quello della cascata sono lo stesso.
+    certo_fatture, certo_importo = compute_recuperato_certo(session)
+
+    # Stimato: SOLO le righe senza paid_at (mai sovrapposto al certo), emesse
+    # prima del sollecito come il certo (5c: stessa clausola condivisa).
+    stimato = (
+        session.query(
+            func.count(Invoice.id),
+            func.sum(func.coalesce(Invoice.amount, 0.0)),
+        )
+        .join(first_action, Invoice.customer_id == first_action.c.customer_id)
+        .filter(
+            Invoice.status == "paid",
+            Invoice.paid_at.is_(None),
+            Invoice.updated_at >= first_action.c.first_action,
+            recovered_invoice_clause(first_action),
+        )
+        .one()
+    )
+
+    return {
+        "certo": {
+            "fatture": certo_fatture,
+            "importo": round(certo_importo, 2),
+            "stimato": False,
+            "label": "Presunto incassato",
+            "nota": (
+                "Dedotto dalla sparizione dalla lista da incassare, non da un "
+                "pagamento verificato. Solo fatture emesse prima del primo "
+                "sollecito e sparite dopo, a residuo."
+            ),
+        },
+        "storico_stimato": {
+            "fatture": int(stimato[0] or 0),
+            "importo": round(float(stimato[1] or 0), 2),
+            "stimato": True,
+            "label": "Storico stimato",
+            "nota": (
+                "Stima: fatture pagate prima che il sistema registrasse la data "
+                "di pagamento. La data è dedotta dall'ultima modifica della riga "
+                "e l'importo è quello pieno (il residuo non è più recuperabile). "
+                "Non sommare a 'Presunto incassato' come se fosse certo."
+            ),
+        },
+    }
+
+
 @router.get("/pipeline")
 async def get_pipeline(session: Session = Depends(get_session)):
     """
     Get pipeline/funnel data for the Attività page.
     Shows customers at each recovery stage — only those with overdue invoices.
     Resolved = ONLY customers who had recovery actions AND then paid.
+
+    Stage e totale parlano la STESSA lingua (il lavorabile): prima il
+    totale non filtrava gli esclusi mentre gli stage sì, e la pipeline si
+    contraddiceva da sola — il totale era più grande della somma delle sue
+    parti.
     """
     try:
-        from sqlalchemy import case  # noqa: F811
-
         # Only count customers who actually have overdue invoices (INNER join)
         pipeline_raw = (
             session.query(
                 Customer.recovery_status,
                 func.count(func.distinct(Customer.id)).label("count"),
-                func.sum(
-                    case((
-                        (Invoice.status != "paid") & (Invoice.days_overdue > 0),
-                        Invoice.amount_due
-                    ), else_=0)
-                ).label("total_overdue"),
+                func.sum(Invoice.amount_due).label("total_overdue"),
             )
             .join(Invoice, Invoice.customer_id == Customer.id)
-            .filter(
-                Customer.excluded.is_(False),
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
-            )
+            .filter(workable_clause())
             .group_by(Customer.recovery_status)
             .all()
         )
@@ -710,21 +916,11 @@ async def get_pipeline(session: Session = Depends(get_session)):
             .scalar() or 0
         )
 
-        # Of which: recovered (invoices paid AFTER first recovery action)
-        # Subquery: first recovery action date per customer
-        first_action_date = (
-            session.query(
-                RecoveryAction.customer_id,
-                func.min(RecoveryAction.created_at).label("first_action"),
-            )
-            .filter(
-                RecoveryAction.action_type.in_(
-                    ["first_contact", "second_contact", "lawyer"]
-                ),
-            )
-            .group_by(RecoveryAction.customer_id)
-            .subquery()
-        )
+        # Of which: recovered (invoices paid AFTER first recovery action and
+        # issued BEFORE it). Definizione condivisa (engine/overdue.py): niente
+        # azioni annullate (5a), niente fatture emesse dopo il sollecito (5c),
+        # così /pipeline non diverge da /riconciliazione e dallo snapshot.
+        first_action_date = first_recovery_action_subquery(session)
 
         # Only count invoices paid (updated_at) AFTER the first recovery action
         recovered_query = (
@@ -736,6 +932,7 @@ async def get_pipeline(session: Session = Depends(get_session)):
             .filter(
                 Invoice.status == "paid",
                 Invoice.updated_at >= first_action_date.c.first_action,
+                recovered_invoice_clause(first_action_date),
             )
         )
         recovered_invoices = recovered_query.all()
@@ -751,14 +948,13 @@ async def get_pipeline(session: Session = Depends(get_session)):
             "recovered_amount": float(recovered_amount or 0),
         }
 
-        # Total customers with overdue
+        # Total customers with overdue — STESSA definizione degli stage
+        # (lavorabile), altrimenti il totale non chiude sulla somma degli
+        # stage che dovrebbe riassumere.
         total_with_overdue = (
             session.query(func.count(func.distinct(Invoice.customer_id)))
-            .filter(
-                Invoice.status != "paid",
-                Invoice.days_overdue > 0,
-                Invoice.customer_id.isnot(None),
-            )
+            .outerjoin(Customer, Invoice.customer_id == Customer.id)
+            .filter(workable_clause())
             .scalar() or 0
         )
 
@@ -788,13 +984,13 @@ async def get_incassato_per_anno(session: Session = Depends(get_session)):
             & (Invoice.due_date < cast(Invoice.updated_at, Date))
         )
 
-        # Subquery: customer IDs that had recovery actions
+        # Subquery: customer IDs that had a NON-cancelled recovery action (5a:
+        # un cliente col solo sollecito annullato non è un cliente sollecitato).
         recovered_customer_ids = (
             session.query(func.distinct(RecoveryAction.customer_id))
             .filter(
-                RecoveryAction.action_type.in_(
-                    ["first_contact", "second_contact", "lawyer"]
-                ),
+                RecoveryAction.action_type.in_(RECOVERY_ACTION_TYPES),
+                RecoveryAction.cancelled.isnot(True),
             )
             .subquery()
         )
