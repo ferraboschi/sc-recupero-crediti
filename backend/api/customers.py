@@ -14,7 +14,7 @@ from backend.database import (
 )
 from backend.engine.cases import get_open_case, contact_count, business_day_start
 from backend.engine.verify import verify_invoice_customer
-from backend.engine.normalizer import normalize_ragione_sociale
+from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
 from backend.engine.overdue import overdue_clause, RECOVERY_ACTION_TYPES
 from backend.engine.piva import validate_piva
 
@@ -605,7 +605,14 @@ async def audit_customer(
             worst = "warn"
         inv_piva = validate_piva(inv.customer_piva_raw)
         if inv_piva:
-            piva_carriers.append((inv.id, inv_piva))
+            # Confidence della bonifica: somiglianza fra la ragione sociale del
+            # cliente e l'intestazione GREZZA della fattura — lo STESSO scorer
+            # che verify riporta come "Somiglianza nomi: X%" (name_score), così
+            # il pannello per-riga e la percentuale di certezza coincidono.
+            name_conf = name_similarity_score(
+                inv.customer_name_raw or "", customer.ragione_sociale or ""
+            )
+            piva_carriers.append((inv.id, inv_piva, name_conf))
         items.append({
             "invoice_id": inv.id,
             "invoice_number": inv.invoice_number,
@@ -655,16 +662,20 @@ async def audit_customer(
     bonifica_piva = None
     bonifica_piva_conflict = None
     if validate_piva(customer.partita_iva) is None and piva_carriers:
-        distinct = sorted({p for _, p in piva_carriers})
+        distinct = sorted({p for _, p, _ in piva_carriers})
         if len(distinct) == 1:
             the_piva = distinct[0]
-            carriers = [iid for iid, p in piva_carriers if p == the_piva]
+            carriers = [(iid, conf) for iid, p, conf in piva_carriers if p == the_piva]
             bonifica_piva = {
                 "piva": the_piva,
                 "invoice_count": len(carriers),
                 # Una qualsiasi delle fatture del gruppo: l'endpoint
                 # assign-piva-to-customer copia la P.IVA sul cliente (CASCADE).
-                "invoice_id": carriers[0],
+                "invoice_id": carriers[0][0],
+                # Certezza (0-100) = somiglianza nome MINIMA del gruppo (il caso
+                # PEGGIORE, conservativo): 100 = ragione sociale identica →
+                # quasi certezza; più bassa = da guardare prima di applicare.
+                "confidence": min(conf for _, conf in carriers),
             }
         else:
             # P.IVA diverse fra le fatture: forse due clienti fusi per errore.
