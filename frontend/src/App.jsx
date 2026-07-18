@@ -47,9 +47,25 @@ function IconSystem() {
   )
 }
 
+// Sotto md la sidebar è off-canvas (overlay), da md in su è statica come
+// sempre. Un solo punto di verità per il breakpoint.
+const DESKTOP_MEDIA_QUERY = '(min-width: 768px)'
+const isDesktopViewport = () => window.matchMedia(DESKTOP_MEDIA_QUERY).matches
+
 export default function App() {
   const location = useLocation()
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  // Aperta di default SOLO su desktop: su mobile partiva aperta e a 375px
+  // lasciava ~150px al contenuto (filtri troncati).
+  const [sidebarOpen, setSidebarOpen] = useState(isDesktopViewport)
+
+  // Al cambio di breakpoint la sidebar torna al suo default: aperta su
+  // desktop, chiusa (off-canvas) su mobile.
+  useEffect(() => {
+    const mq = window.matchMedia(DESKTOP_MEDIA_QUERY)
+    const onChange = (e) => setSidebarOpen(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
 
   // ── Auth state ──────────────────────────────────────────────────
   const [isAuthenticated, setIsAuthenticated] = useState(() => {
@@ -106,8 +122,25 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-dark-bg">
-      {/* ── Sidebar ────────────────────────────────────────────── */}
-      <div className={`${sidebarOpen ? 'w-56' : 'w-16'} bg-dark-surface border-r border-dark-border transition-all duration-300 flex flex-col`}>
+      {/* Backdrop mobile: clic fuori dalla sidebar per chiuderla */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/50 md:hidden"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
+      {/* ── Sidebar ──────────────────────────────────────────────
+          Sotto md: off-canvas fissa (overlay sopra il contenuto).
+          Da md in su: statica nel flusso, larghezza 56/16 come sempre. */}
+      <div
+        className={`fixed inset-y-0 left-0 z-40 w-56 ${
+          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        } md:static md:z-auto md:translate-x-0 ${
+          sidebarOpen ? 'md:w-56' : 'md:w-16'
+        } bg-dark-surface border-r border-dark-border transition-all duration-300 flex flex-col`}
+      >
         {/* Logo */}
         <div className="h-14 flex items-center px-4 border-b border-dark-border">
           <div className="w-7 h-7 rounded-lg bg-accent-teal flex items-center justify-center text-dark-bg font-bold text-sm flex-shrink-0">
@@ -126,6 +159,7 @@ export default function App() {
             <Link
               key={item.path}
               to={item.path}
+              onClick={() => { if (!isDesktopViewport()) setSidebarOpen(false) }}
               title={!sidebarOpen ? item.label : undefined}
               className={`group flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-sm ${
                 isActive(item.path)
@@ -146,10 +180,11 @@ export default function App() {
           ))}
         </nav>
 
-        {/* Toggle */}
-        <div className="px-2 py-3 border-t border-dark-border">
+        {/* Toggle (solo desktop: su mobile si chiude col backdrop o dai link) */}
+        <div className="px-2 py-3 border-t border-dark-border hidden md:block">
           <button
             onClick={() => setSidebarOpen(!sidebarOpen)}
+            aria-label={sidebarOpen ? 'Comprimi la barra laterale' : 'Espandi la barra laterale'}
             className="w-full flex items-center justify-center p-2 rounded-lg hover:bg-dark-card text-txt-muted hover:text-txt-secondary transition-colors"
           >
             <svg className={`w-4 h-4 transition-transform ${sidebarOpen ? '' : 'rotate-180'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -164,6 +199,17 @@ export default function App() {
         {/* Top Bar */}
         <div className="h-14 bg-dark-surface border-b border-dark-border px-4 sm:px-6 flex items-center justify-between gap-3 flex-shrink-0">
           <div className="flex items-center gap-3 min-w-0">
+            {/* Hamburger (solo mobile): apre la sidebar off-canvas */}
+            <button
+              onClick={() => setSidebarOpen(!sidebarOpen)}
+              aria-label="Apri il menu di navigazione"
+              aria-expanded={sidebarOpen}
+              className="md:hidden -ml-1 p-1.5 rounded-lg hover:bg-dark-card text-txt-secondary hover:text-txt-primary transition-colors shrink-0"
+            >
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
             <h1 className="text-base font-semibold text-txt-primary truncate">
               {currentPage?.label || 'Dashboard'}
             </h1>
