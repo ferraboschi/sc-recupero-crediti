@@ -106,8 +106,77 @@ def verify_invoice_customer(
     else:
         level = "warning"
 
+    # `guaranteed` = garanzia da CHECKSUM (verde per costruzione). Va fissato
+    # PRIMA dell'eventuale upgrade manuale: la conferma d'intestazione è verde
+    # ma NON è una garanzia — resta guaranteed=False.
+    guaranteed = level == "verified"
+
+    # ── Conferma d'identità DUREVOLE: intestazione accettata ────────────
+    # Se l'operatore ha dichiarato che questa intestazione appartiene al
+    # cliente (tratto CustomerAcceptedName, letto DAL VIVO dalla relationship),
+    # la fattura esce dai problemi dell'audit (verdict→ok) e il semaforo
+    # diventa verde (level→verified), MA con guaranteed=False: è una conferma
+    # umana, non una garanzia checksum. Vale per costruzione anche per le
+    # fatture FUTURE con la stessa intestazione (nessuna scrittura per-fattura).
+    #
+    # VALVOLA DI SICUREZZA OBBLIGATORIA #1: l'upgrade NON avviene se
+    # piva_conflict è True (P.IVA fattura e cliente entrambe valide e diverse).
+    # Una conferma d'intestazione non deve MAI zittire una P.IVA in
+    # contraddizione: resta critical.
+    #
+    # VALVOLA DI SICUREZZA OBBLIGATORIA #2 (piva_assignable): l'upgrade NON
+    # avviene se la fattura porta una P.IVA valida CHE IL CLIENTE NON HA
+    # (inv_piva valido e cust_piva assente). Lì la strada giusta è ASSEGNARE
+    # la P.IVA al cliente (azione più forte, verde da checksum e cascade sulle
+    # future), non smarcare la riga: accettare il nome spegnerebbe l'offerta
+    # "Assegna P.IVA" e — poiché l'audit passa da verify — nasconderebbe il
+    # cliente dagli insiemi "da sanificare" mentre bonifica-suggestions lo
+    # tiene (divergenza lista/audit). La riga resta quindi al suo esito
+    # naturale (warning) e l'audit continua a offrire bonifica_piva. È anche
+    # ciò che rende VERA l'invariante verify-free di _single_shared_piva. Fuori
+    # da questo caso l'accepted-name smarca regolarmente (fattura senza P.IVA
+    # valida, o cliente che la P.IVA ce l'ha già).
+    #
+    # Lettura difensiva di accepted_names: copre SIA il customer "simulato"
+    # (SimpleNamespace senza la relationship → AttributeError) SIA l'ORM
+    # STACCATO dalla sessione (la lazy-load su un detached solleva
+    # DetachedInstanceError, che un semplice getattr NON cattura). In entrambi
+    # i casi trattiamo l'assenza-di-accepted-names invece di propagare un 500 —
+    # nessun chiamante attuale passa un ORM detached (verificato), ma la lettura
+    # deve restare robusta se un futuro chiamante lo facesse.
+    piva_assignable = inv_piva is not None and cust_piva is None
+    manual_confirmed = False
+    if (
+        customer is not None
+        and not piva_conflict
+        and not piva_assignable
+        and level != "verified"
+        and inv_name_src
+    ):
+        inv_norm = normalize_ragione_sociale(inv_name_src)
+        if inv_norm:
+            try:
+                accepted = getattr(customer, "accepted_names", None) or []
+                accepted = list(accepted)
+            except Exception:
+                accepted = []
+            for an in accepted:
+                if getattr(an, "name_normalized", None) == inv_norm:
+                    manual_confirmed = True
+                    break
+    if manual_confirmed:
+        level = "verified"
+        verdict = "ok"
+
     # ── Messaggio per l'operatore (sul livello del semaforo) ───────────
-    if level == "verified":
+    if manual_confirmed:
+        message = (
+            "✔︎ Confermato a mano: hai indicato che questa intestazione "
+            "appartiene a questo cliente. Non è una garanzia da partita IVA, è "
+            "una tua conferma — e vale anche per le fatture future con questa "
+            "stessa intestazione."
+        )
+    elif level == "verified":
         message = (
             "✔︎ Verificato: ti garantisco di aver ricontrollato che la partita "
             "IVA di questa fattura corrisponde a quella del cliente e che la "
@@ -173,7 +242,10 @@ def verify_invoice_customer(
     return {
         "level": level,               # verified | warning | critical
         "verdict": verdict,           # bad | warn | ok (compat audit)
-        "guaranteed": level == "verified",
+        "guaranteed": guaranteed,     # verde da CHECKSUM (non la conferma manuale)
+        # Verde da conferma UMANA (intestazione accettata), non checksum: la
+        # UI può distinguerlo dal verde-garanzia.
+        "manual_confirmed": manual_confirmed,
         "message": message,
         "piva_match": piva_match,
         "piva_conflict": piva_conflict,

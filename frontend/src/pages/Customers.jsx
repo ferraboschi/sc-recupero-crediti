@@ -52,6 +52,7 @@ export default function Customers() {
   const [summaryOverdueCustomers, setSummaryOverdueCustomers] = useState(0)
   const [suggestions, setSuggestions] = useState([])
   const [sanitizeCount, setSanitizeCount] = useState(null)
+  const [bonificaCount, setBonificaCount] = useState(0)
 
   // Parametri correnti della lista (un solo punto di verità, usato anche
   // dalla richiesta dedicata al riepilogo).
@@ -134,6 +135,19 @@ export default function Customers() {
   }
   useEffect(() => { fetchSanitizeCount() }, [])
 
+  // Quanti clienti sono bonificabili in blocco (P.IVA sulle fatture, assente
+  // sul profilo). Alimenta il banner-scorciatoia verso la vista di revisione.
+  const fetchBonificaCount = async () => {
+    try {
+      const res = await client.get('/customers/bonifica-suggestions')
+      setBonificaCount(res.data.total || 0)
+    } catch (err) {
+      console.error('Errore bonifica-suggestions:', err)
+      setBonificaCount(0)
+    }
+  }
+  useEffect(() => { fetchBonificaCount() }, [])
+
   // "Forse intendevi": suggerimenti approssimati (accenti/forme legali/
   // refusi tollerati). Debounced, su TUTTI i clienti (anche senza scadute).
   useEffect(() => {
@@ -198,6 +212,26 @@ export default function Customers() {
 
   return (
     <div className="space-y-6">
+      {/* Banner-scorciatoia: bonifica P.IVA in blocco. Compare SOLO quando c'è
+          qualcosa da bonificare (come il chip "Da sanificare"), così non
+          aggiunge rumore quando l'anagrafica è già completa. */}
+      {bonificaCount > 0 && (
+        <button
+          onClick={() => navigate('/customers/bonifica')}
+          className="w-full flex items-center justify-between gap-4 rounded-xl border border-accent-teal/40 bg-accent-teal/5 px-5 py-3 text-left hover:bg-accent-teal/10 transition-colors"
+        >
+          <div>
+            <p className="text-sm font-semibold text-accent-teal">
+              {bonificaCount} client{bonificaCount === 1 ? 'e' : 'i'} bonificabil{bonificaCount === 1 ? 'e' : 'i'} in blocco
+            </p>
+            <p className="text-xs text-txt-secondary mt-0.5">
+              Hanno la P.IVA sulle fatture ma non sul profilo: completa l&apos;anagrafica in un colpo.
+            </p>
+          </div>
+          <span className="text-accent-teal font-bold shrink-0" aria-hidden="true">Rivedi →</span>
+        </button>
+      )}
+
       {/* Filters */}
       <div className="sc-card p-5">
         <div className="flex flex-col lg:flex-row gap-4 lg:items-end">

@@ -1,0 +1,454 @@
+"""BONIFICA DUREVOLE dell'anagrafica.
+
+La tesi: "confermato" deve diventare un tratto d'IDENTITÀ del CLIENTE, non
+uno stato per-fattura (audit_reviewed_at) che le fatture future ignorano.
+Il cliente ha due tratti che le fatture usano per abbinarsi/verificarsi — la
+P.IVA e le intestazioni accettate — e qui si bonificano entrambi:
+
+- TIER 1 (P.IVA): bonifica_piva a livello cliente nell'audit + cascade
+  dell'endpoint esistente assign-piva-to-customer (verify dal vivo → verde
+  vero, checksum, anche sulle future).
+- TIER 2 (intestazioni accettate): nuovo tratto CustomerAcceptedName letto
+  DAL VIVO dal verificatore → conferma umana durevole (present + future),
+  con la valvola P.IVA-conflitto e la reversibilità.
+"""
+
+from datetime import date
+
+import pytest
+from sqlalchemy.exc import IntegrityError
+
+from backend.database import Customer, CustomerAcceptedName, Invoice
+from backend.engine.normalizer import normalize_ragione_sociale
+
+# P.IVA italiane checksum-valide (vedi backend/engine/piva.py)
+PIVA_A = "12345678903"
+PIVA_B = "98765432103"
+# La P.IVA del caso reale dell'owner (Cavo Luigi Beverage Solutions srl)
+PIVA_CAVO = "02572440994"
+
+
+def _customer(session, name, **kw):
+    c = Customer(ragione_sociale=name, source=kw.pop("source", "shopify"), **kw)
+    session.add(c)
+    session.commit()
+    return c
+
+
+def _invoice(session, number, customer_id=None, **kw):
+    inv = Invoice(
+        invoice_number=number,
+        amount=kw.pop("amount", 100.0),
+        amount_due=kw.pop("amount_due", 100.0),
+        issue_date=kw.pop("issue_date", date(2026, 4, 1)),
+        due_date=kw.pop("due_date", date(2026, 5, 1)),
+        days_overdue=kw.pop("days_overdue", 10),
+        source_platform=kw.pop("source_platform", "fatturapro"),
+        status=kw.pop("status", "open"),
+        customer_id=customer_id,
+        **kw,
+    )
+    session.add(inv)
+    session.commit()
+    return inv
+
+
+# ── Modello CustomerAcceptedName ─────────────────────────────────────
+
+class TestAcceptedNameModel:
+    def test_relationship_and_persist(self, test_db_session):
+        c = _customer(test_db_session, "Cavo Luigi Beverage Solutions srl")
+        an = CustomerAcceptedName(
+            customer_id=c.id,
+            name_normalized=normalize_ragione_sociale("Cavo Luigi"),
+            note="Cavo Luigi",
+        )
+        test_db_session.add(an)
+        test_db_session.commit()
+        test_db_session.refresh(c)
+        # La relationship Customer.accepted_names è navigabile.
+        assert [a.name_normalized for a in c.accepted_names] == [
+            normalize_ragione_sociale("Cavo Luigi")
+        ]
+        assert c.accepted_names[0].note == "Cavo Luigi"
+
+    def test_unique_customer_name(self, test_db_session):
+        # (customer_id, name_normalized) UNIQUE: niente doppioni della stessa
+        # intestazione — l'add è idempotente per costruzione.
+        c = _customer(test_db_session, "Rossi SRL")
+        key = normalize_ragione_sociale("Mario Rossi")
+        test_db_session.add(CustomerAcceptedName(customer_id=c.id, name_normalized=key))
+        test_db_session.commit()
+        test_db_session.add(CustomerAcceptedName(customer_id=c.id, name_normalized=key))
+        with pytest.raises(IntegrityError):
+            test_db_session.commit()
+        test_db_session.rollback()
+
+    def test_same_name_different_customers_allowed(self, test_db_session):
+        # L'UNIQUE è per-cliente: due clienti diversi possono accettare la
+        # stessa grafia (omonimi legittimi).
+        c1 = _customer(test_db_session, "Uno SRL")
+        c2 = _customer(test_db_session, "Due SRL")
+        key = normalize_ragione_sociale("Insegna Comune")
+        test_db_session.add(CustomerAcceptedName(customer_id=c1.id, name_normalized=key))
+        test_db_session.add(CustomerAcceptedName(customer_id=c2.id, name_normalized=key))
+        test_db_session.commit()  # nessun IntegrityError
+        assert test_db_session.query(CustomerAcceptedName).count() == 2
+
+    def test_cascade_delete_with_customer(self, test_db_session):
+        # delete-orphan: cancellato il cliente, le sue intestazioni non restano
+        # orfane.
+        c = _customer(test_db_session, "Effimero SRL")
+        c.accepted_names.append(
+            CustomerAcceptedName(name_normalized=normalize_ragione_sociale("Effimero"))
+        )
+        test_db_session.commit()
+        assert test_db_session.query(CustomerAcceptedName).count() == 1
+        test_db_session.delete(c)
+        test_db_session.commit()
+        assert test_db_session.query(CustomerAcceptedName).count() == 0
+
+
+# ── Endpoint POST/DELETE accepted-names + lista su GET customer ───────
+
+from backend.database import ActivityLog  # noqa: E402
+
+# Intestazione grezza e cliente con nome dissimile senza P.IVA: senza la
+# conferma d'identità la fattura è discordante (bad), con la conferma esce.
+HEADING = "Sushi Kyoto"
+CUST_NAME = "Ferramenta Bianchi"
+
+
+class TestAcceptedNameEndpoints:
+    def test_add_by_name_persists_and_logs(self, test_client, test_db_session):
+        c = _customer(test_db_session, CUST_NAME)
+        r = test_client.post(
+            f"/api/customers/{c.id}/accepted-names", json={"name": HEADING}
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["already_present"] is False
+        assert body["accepted_name"]["name_normalized"] == normalize_ragione_sociale(HEADING)
+        assert body["accepted_name"]["note"] == HEADING
+        # La lista aggiornata torna nella risposta.
+        assert len(body["accepted_names"]) == 1
+        # Persistito + loggato.
+        assert test_db_session.query(CustomerAcceptedName).filter_by(customer_id=c.id).count() == 1
+        log = test_db_session.query(ActivityLog).filter_by(action="audit_accept_name").one()
+        assert log.entity_type == "customer"
+        assert log.entity_id == c.id
+
+    def test_add_by_invoice_id_takes_raw_name(self, test_client, test_db_session):
+        c = _customer(test_db_session, CUST_NAME)
+        inv = _invoice(
+            test_db_session, "SK/2026", customer_id=c.id, customer_name_raw=HEADING,
+        )
+        r = test_client.post(
+            f"/api/customers/{c.id}/accepted-names", json={"invoice_id": inv.id}
+        )
+        assert r.status_code == 200
+        assert r.json()["accepted_name"]["name_normalized"] == normalize_ragione_sociale(HEADING)
+        assert r.json()["accepted_name"]["note"] == HEADING
+
+    def test_add_is_idempotent(self, test_client, test_db_session):
+        c = _customer(test_db_session, CUST_NAME)
+        test_client.post(f"/api/customers/{c.id}/accepted-names", json={"name": HEADING})
+        # Seconda add stessa intestazione (anche con grafia diversa ma stessa
+        # normalized): no-op, nessun doppione.
+        r = test_client.post(
+            f"/api/customers/{c.id}/accepted-names", json={"name": "sushi   kyoto"}
+        )
+        assert r.status_code == 200
+        assert r.json()["already_present"] is True
+        assert test_db_session.query(CustomerAcceptedName).filter_by(customer_id=c.id).count() == 1
+
+    def test_add_404_missing_customer(self, test_client):
+        assert test_client.post(
+            "/api/customers/9999/accepted-names", json={"name": HEADING}
+        ).status_code == 404
+
+    def test_add_400_empty_name(self, test_client, test_db_session):
+        c = _customer(test_db_session, CUST_NAME)
+        assert test_client.post(
+            f"/api/customers/{c.id}/accepted-names", json={"name": "   "}
+        ).status_code == 400
+
+    def test_add_400_without_name_or_invoice(self, test_client, test_db_session):
+        c = _customer(test_db_session, CUST_NAME)
+        assert test_client.post(
+            f"/api/customers/{c.id}/accepted-names", json={}
+        ).status_code == 400
+
+    def test_add_400_invoice_without_name(self, test_client, test_db_session):
+        c = _customer(test_db_session, CUST_NAME)
+        inv = _invoice(
+            test_db_session, "NN/2026", customer_id=c.id, customer_name_raw="   ",
+        )
+        assert test_client.post(
+            f"/api/customers/{c.id}/accepted-names", json={"invoice_id": inv.id}
+        ).status_code == 400
+
+    def test_remove_by_id_reversible_and_logs(self, test_client, test_db_session):
+        c = _customer(test_db_session, CUST_NAME)
+        add = test_client.post(
+            f"/api/customers/{c.id}/accepted-names", json={"name": HEADING}
+        ).json()
+        an_id = add["accepted_name"]["id"]
+        r = test_client.delete(f"/api/customers/{c.id}/accepted-names/{an_id}")
+        assert r.status_code == 200
+        assert r.json()["accepted_names"] == []
+        assert test_db_session.query(CustomerAcceptedName).filter_by(customer_id=c.id).count() == 0
+        assert test_db_session.query(ActivityLog).filter_by(action="audit_unaccept_name").count() == 1
+
+    def test_remove_by_normalized_name(self, test_client, test_db_session):
+        c = _customer(test_db_session, CUST_NAME)
+        test_client.post(f"/api/customers/{c.id}/accepted-names", json={"name": HEADING})
+        key = normalize_ragione_sociale(HEADING)
+        r = test_client.delete(f"/api/customers/{c.id}/accepted-names/{key}")
+        assert r.status_code == 200
+        assert test_db_session.query(CustomerAcceptedName).filter_by(customer_id=c.id).count() == 0
+
+    def test_remove_404_when_absent(self, test_client, test_db_session):
+        c = _customer(test_db_session, CUST_NAME)
+        assert test_client.delete(
+            f"/api/customers/{c.id}/accepted-names/99999"
+        ).status_code == 404
+
+    def test_get_customer_exposes_accepted_names(self, test_client, test_db_session):
+        c = _customer(test_db_session, CUST_NAME)
+        test_client.post(f"/api/customers/{c.id}/accepted-names", json={"name": HEADING})
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        assert "accepted_names" in detail
+        assert len(detail["accepted_names"]) == 1
+        assert detail["accepted_names"][0]["note"] == HEADING
+
+
+class TestAcceptedNameBulkCascade:
+    def test_one_accept_greens_present_and_future(self, test_client, test_db_session):
+        # Punto 4: aggiungere UN'intestazione rende verdi TUTTE le fatture
+        # aperte con quella intestazione in un colpo, presenti E future —
+        # nessuna scrittura per-fattura (verify legge la lista dal vivo).
+        c = _customer(test_db_session, CUST_NAME)  # nessuna P.IVA
+        i1 = _invoice(test_db_session, "P1/2026", customer_id=c.id, customer_name_raw=HEADING)
+        i2 = _invoice(test_db_session, "P2/2026", customer_id=c.id, customer_name_raw=HEADING)
+        # Prima dell'accept: entrambe discordanti.
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        for it in detail["invoices"]["items"]:
+            assert it["verification"]["level"] == "critical"
+        # UN SOLO accept (da una qualsiasi delle due).
+        test_client.post(f"/api/customers/{c.id}/accepted-names", json={"invoice_id": i1.id})
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        by_num = {it["invoice_number"]: it for it in detail["invoices"]["items"]}
+        for num in ("P1/2026", "P2/2026"):
+            assert by_num[num]["verification"]["level"] == "verified"
+            assert by_num[num]["verification"]["manual_confirmed"] is True
+        # Fattura FUTURA con la stessa intestazione: verde anche lei, senza
+        # nessun'altra azione (la lista è consultata dal vivo).
+        _invoice(test_db_session, "FUT/2026", customer_id=c.id, customer_name_raw=HEADING)
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        by_num = {it["invoice_number"]: it for it in detail["invoices"]["items"]}
+        assert by_num["FUT/2026"]["verification"]["level"] == "verified"
+
+
+class TestVerifyRobustToDetachedCustomer:
+    """FIX 3 — la lettura di accepted_names deve reggere anche a un ORM
+    STACCATO dalla sessione: la lazy-load su un detached solleva
+    DetachedInstanceError, che il getattr difensivo NON cattura (copre solo
+    AttributeError). verify non deve andare in 500 — deve trattarlo come
+    assenza di intestazioni accettate."""
+
+    def test_detached_customer_does_not_raise(self, test_db_session):
+        from backend.engine.verify import verify_invoice_customer
+
+        c = _customer(test_db_session, "Ferramenta Bianchi")
+        test_db_session.add(CustomerAcceptedName(
+            customer_id=c.id,
+            name_normalized=normalize_ragione_sociale("Sushi Kyoto"),
+        ))
+        test_db_session.commit()
+        # Scalari caricati (il caso normale: verify legge ragione_sociale/P.IVA
+        # dal cliente già in mano), MA la relationship accepted_names mai
+        # caricata; poi stacco dalla sessione. Così l'unico accesso che farebbe
+        # partire una lazy-load su detached — e andrebbe in 500 — è quello a
+        # accepted_names, esattamente il ramo del fix.
+        test_db_session.refresh(c)
+        test_db_session.expunge(c)
+
+        # Sanity: l'accesso diretto alla relationship solleva DetachedInstanceError.
+        from sqlalchemy.orm.exc import DetachedInstanceError
+        with pytest.raises(DetachedInstanceError):
+            _ = list(c.accepted_names)
+
+        class _Inv:
+            customer_piva_raw = None
+            customer_name_raw = "Sushi Kyoto"
+
+        # verify non esplode e degrada a "nessuna intestazione accettata".
+        v = verify_invoice_customer(_Inv(), c)
+        assert v["manual_confirmed"] is False
+
+
+class TestAcceptedNameExitsAudit:
+    def test_accepted_customer_leaves_da_sanificare(self, test_client, test_db_session):
+        # Punto 5: un cliente le cui uniche fatture problematiche sono su
+        # intestazioni accettate ESCE da "da sanificare" — l'audit eredita la
+        # whitelist perché passa da verify.
+        c = _customer(test_db_session, CUST_NAME)
+        _invoice(test_db_session, "AUD/2026", customer_id=c.id, customer_name_raw=HEADING)
+        # Prima: dentro tutti e tre gli insiemi dell'audit.
+        assert c.id in test_client.get("/api/customers/audit-summary").json()["customer_ids"]
+        assert test_client.get(f"/api/customers/{c.id}/audit").json()["worst_verdict"] != "ok"
+        ids = [i["id"] for i in test_client.get(
+            "/api/customers?to_sanitize=true&only_overdue=false"
+        ).json()["items"]]
+        assert c.id in ids
+        # Accetto l'intestazione.
+        test_client.post(f"/api/customers/{c.id}/accepted-names", json={"name": HEADING})
+        # Dopo: fuori da tutti e tre.
+        assert c.id not in test_client.get("/api/customers/audit-summary").json()["customer_ids"]
+        aud = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert aud["problem_count"] == 0
+        assert aud["worst_verdict"] == "ok"
+        ids = [i["id"] for i in test_client.get(
+            "/api/customers?to_sanitize=true&only_overdue=false"
+        ).json()["items"]]
+        assert c.id not in ids
+
+
+# ── TIER 1: bonifica_piva a livello cliente + cascade P.IVA ───────────
+
+# Caso reale dell'owner: cliente senza P.IVA, fatture tutte con la stessa
+# P.IVA valida e nome identico → il giallo nasce SOLO dalla P.IVA mancante.
+CAVO = "Cavo Luigi Beverage Solutions srl"
+
+
+class TestBonificaPivaCascade:
+    def test_assign_piva_greens_all_present_and_future(self, test_client, test_db_session):
+        # La CASCADE dell'endpoint esistente: appena il cliente ha la P.IVA,
+        # tutte le sue fatture con quella P.IVA + le future diventano verified
+        # (verde vero, checksum) — verify è calcolato dal vivo.
+        c = _customer(test_db_session, CAVO)  # nessuna P.IVA
+        i1 = _invoice(test_db_session, "C1/2026", customer_id=c.id,
+                      customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        _invoice(test_db_session, "C2/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        # Prima: tutte "Da controllare" (warning), il giallo è solo la P.IVA
+        # mancante sul cliente.
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        for it in detail["invoices"]["items"]:
+            assert it["verification"]["level"] == "warning"
+        # Assegno la P.IVA al cliente da UNA qualsiasi delle fatture.
+        r = test_client.post(f"/api/positions/{i1.id}/assign-piva-to-customer")
+        assert r.status_code == 200
+        # Ora tutte verde-garanzia (checksum), guaranteed True.
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        assert detail["partita_iva"] == PIVA_CAVO
+        for it in detail["invoices"]["items"]:
+            assert it["verification"]["level"] == "verified"
+            assert it["verification"]["guaranteed"] is True
+        # Fattura FUTURA con la stessa P.IVA: verde anche lei, nessun'azione.
+        _invoice(test_db_session, "CFUT/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        by_num = {it["invoice_number"]: it for it in detail["invoices"]["items"]}
+        assert by_num["CFUT/2026"]["verification"]["level"] == "verified"
+
+
+class TestBonificaPivaAudit:
+    def test_offered_when_single_shared_piva(self, test_client, test_db_session):
+        # Caso Cavo Luigi: cliente senza P.IVA, 3 fatture warning con la STESSA
+        # P.IVA valida → l'audit offre bonifica_piva a livello cliente.
+        c = _customer(test_db_session, CAVO)
+        ids = []
+        for n in ("V1/2026", "V2/2026", "V3/2026"):
+            inv = _invoice(test_db_session, n, customer_id=c.id,
+                           customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+            ids.append(inv.id)
+        data = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert data["bonifica_piva"] is not None
+        assert data["bonifica_piva"]["piva"] == PIVA_CAVO
+        assert data["bonifica_piva"]["invoice_count"] == 3
+        assert data["bonifica_piva"]["invoice_id"] in ids
+        assert data["bonifica_piva_conflict"] is None
+
+    def test_not_offered_when_customer_has_piva(self, test_client, test_db_session):
+        # Se il cliente ha già una P.IVA valida non c'è nulla da completare.
+        c = _customer(test_db_session, CAVO, partita_iva=PIVA_A)
+        _invoice(test_db_session, "H/2026", customer_id=c.id,
+                 customer_name_raw="Qualcosa Di Diverso", customer_piva_raw=PIVA_A)
+        data = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert data["bonifica_piva"] is None
+        assert data["bonifica_piva_conflict"] is None
+
+    def test_conflict_when_different_pivas(self, test_client, test_db_session):
+        # GUARDRAIL P.IVA-diverse: le fatture problematiche portano P.IVA
+        # DIVERSE → NON offrire (cliente mis-raggruppato), esponi la lista.
+        c = _customer(test_db_session, CAVO)  # nessuna P.IVA
+        _invoice(test_db_session, "D1/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_A)
+        _invoice(test_db_session, "D2/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_B)
+        data = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert data["bonifica_piva"] is None
+        assert data["bonifica_piva_conflict"] == sorted([PIVA_A, PIVA_B])
+
+    def test_not_offered_when_no_valid_piva_on_invoices(self, test_client, test_db_session):
+        # Problemi ma nessuna P.IVA valida da assegnare (caso Tier 2, non Tier 1).
+        c = _customer(test_db_session, CUST_NAME)
+        _invoice(test_db_session, "NP/2026", customer_id=c.id, customer_name_raw=HEADING)
+        data = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert data["bonifica_piva"] is None
+        assert data["bonifica_piva_conflict"] is None
+
+
+class TestFix1AcceptedNameDoesNotHideAssignablePiva:
+    """FIX 1 (non-regressione della divergenza lista/audit) — quando una
+    fattura porta una P.IVA valida che il cliente NON ha, aver accettato la sua
+    intestazione NON deve smarcarla: la P.IVA resta assegnabile e i TRE insiemi
+    dell'audit (audit-summary / to_sanitize / bonifica-suggestions) CONCORDANO.
+    """
+
+    def test_three_sets_concord_when_piva_is_assignable(self, test_client, test_db_session):
+        # Cliente senza P.IVA + fattura con P.IVA valida + intestazione ACCETTATA.
+        c = _customer(test_db_session, CAVO)  # nessuna P.IVA
+        _invoice(test_db_session, "AC/2026", customer_id=c.id,
+                 customer_name_raw=CAVO, customer_piva_raw=PIVA_CAVO)
+        # Accetto l'intestazione (che nel bug la renderebbe "pulita").
+        r = test_client.post(
+            f"/api/customers/{c.id}/accepted-names", json={"name": CAVO}
+        )
+        assert r.status_code == 200
+
+        # verify per-riga: warning, NON verified (la P.IVA è assegnabile).
+        detail = test_client.get(f"/api/customers/{c.id}").json()
+        assert len(detail["invoices"]["items"]) == 1
+        ver = detail["invoices"]["items"][0]["verification"]
+        assert ver["level"] == "warning"
+        assert ver["manual_confirmed"] is False
+
+        # /{id}/audit: continua a offrire bonifica_piva.
+        aud = test_client.get(f"/api/customers/{c.id}/audit").json()
+        assert aud["bonifica_piva"] is not None
+        assert aud["bonifica_piva"]["piva"] == PIVA_CAVO
+        assert aud["problem_count"] == 1
+        assert aud["worst_verdict"] != "ok"
+
+        # I TRE insiemi concordano: audit-summary, to_sanitize, bonifica-suggestions.
+        summary_ids = test_client.get(
+            "/api/customers/audit-summary"
+        ).json()["customer_ids"]
+        assert c.id in summary_ids
+
+        to_sanitize_ids = [
+            i["id"] for i in test_client.get(
+                "/api/customers?to_sanitize=true&only_overdue=false"
+            ).json()["items"]
+        ]
+        assert c.id in to_sanitize_ids
+
+        bonifica_ids = [
+            i["customer_id"] for i in test_client.get(
+                "/api/customers/bonifica-suggestions"
+            ).json()["items"]
+        ]
+        assert c.id in bonifica_ids

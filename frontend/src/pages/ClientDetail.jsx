@@ -81,7 +81,12 @@ const REVIEWED_STYLE = { badge: 'bg-[rgba(148,163,184,0.15)] text-txt-muted', do
 
 // Badge cliccabile: apre/chiude il pannello di dettaglio della verifica.
 function VerifyBadge({ v, open, onToggle, reviewed }) {
-  const s = reviewed ? REVIEWED_STYLE : (VERIFY_STYLE[v?.level] || VERIFY_STYLE.warning)
+  const base = reviewed ? REVIEWED_STYLE : (VERIFY_STYLE[v?.level] || VERIFY_STYLE.warning)
+  // Verde da conferma UMANA (intestazione accettata): resta verde ma con
+  // etichetta onesta e distinta dal verde-garanzia da checksum.
+  const s = (!reviewed && v?.manual_confirmed)
+    ? { ...base, label: 'Confermato a mano' }
+    : base
   return (
     <button
       type="button"
@@ -354,6 +359,59 @@ export default function ClientDetail() {
         return next
       })
     })
+  }
+
+  // ── BONIFICA DUREVOLE dell'anagrafica ──────────────────────────────
+
+  // TIER 1 — "Completa anagrafica" a livello CLIENTE: la bonifica PIÙ FORTE
+  // (verde vero, checksum). Copia la P.IVA valida — condivisa da tutte le
+  // fatture problematiche — sul cliente che ne è privo. Un click e tutte le
+  // fatture con quella P.IVA, presenti e future, diventano verificate.
+  const handleBonificaPiva = () => {
+    const b = auditData?.bonifica_piva
+    if (!b) return
+    if (!window.confirm(
+      `Completa anagrafica di "${data?.ragione_sociale}": assegnare la P.IVA ${b.piva}?\n\n`
+      + `È presente su ${b.invoice_count} fattur${b.invoice_count === 1 ? 'a' : 'e'} ma manca sul cliente. `
+      + 'Assegni l\'identità al cliente: da ora QUALSIASI fattura, anche FUTURA, con quella '
+      + 'P.IVA si aggancia da sola a questo cliente e risulta verificata.\n\n'
+      + 'La certezza è la somiglianza del NOME, non una verifica della P.IVA: se la P.IVA '
+      + 'fosse un refuso, il verde comparirebbe comunque. Reversibile con "Rimuovi P.IVA".'
+    )) return
+    runAuditAction(b.invoice_id, () => client.post(`/positions/${b.invoice_id}/assign-piva-to-customer`))
+  }
+
+  // TIER 2 — "Conferma identità": intestazione accettata (durevole). Per i
+  // casi senza P.IVA da assegnare (fattura intestata alla persona, grafie
+  // diverse senza P.IVA). Registra la grafia della fattura come tratto
+  // d'identità del cliente: vale per TUTTE le fatture con quella intestazione,
+  // anche future — a differenza di "Segna verificato" (una tantum, per-riga).
+  const handleConfirmIdentity = (item) => {
+    const raw = item.verification?.invoice_name || item.invoice_number
+    if (!window.confirm(
+      `Confermare che l'intestazione "${raw}" appartiene a "${data?.ragione_sociale}"?\n\n`
+      + 'Vale per tutte le fatture con questa intestazione — presenti e future — che diventeranno verificate. '
+      + 'È una conferma manuale, reversibile dalla sezione "Intestazioni accettate".'
+    )) return
+    runAuditAction(item.invoice_id, () =>
+      client.post(`/customers/${customerId}/accepted-names`, { invoice_id: item.invoice_id })
+    )
+  }
+
+  // Rimozione di un'intestazione accettata (reversibilità): le fatture con
+  // quella grafia tornano al loro esito naturale.
+  const handleRemoveAcceptedName = async (entry) => {
+    if (!window.confirm(
+      `Rimuovere l'intestazione accettata "${entry.note || entry.name_normalized}"?\n\n`
+      + 'Le fatture con questa intestazione torneranno "da controllare".'
+    )) return
+    try {
+      await client.delete(`/customers/${customerId}/accepted-names/${entry.id}`)
+      await Promise.all([fetchData(), fetchAudit()])
+    } catch (err) {
+      console.error('Errore rimozione intestazione accettata:', err)
+      alert(err.response?.data?.detail || 'Errore durante la rimozione dell\'intestazione')
+    }
   }
 
   // ── Menu guidato "Risolvi" (riga discordante) ──────────────────────
@@ -1229,6 +1287,47 @@ export default function ClientDetail() {
               {auditData.pending_count > 0 && ` · ${auditData.pending_count} in attesa di conferma`}
             </p>
 
+            {/* TIER 1 — "Completa anagrafica" a livello cliente: la bonifica
+                PIÙ FORTE (verde vero, checksum). In testa al pannello, PREFERITA
+                quando disponibile: un click sana tutte le fatture, presenti e
+                future, per costruzione. */}
+            {auditData.bonifica_piva && (
+              <div className="rounded-xl border border-accent-teal/40 bg-accent-teal/5 p-4 space-y-2">
+                <p className="text-sm font-bold text-accent-teal">Completa anagrafica del cliente</p>
+                <p className="text-sm text-txt-secondary">
+                  Assegna la P.IVA <span className="font-mono text-txt-primary">{auditData.bonifica_piva.piva}</span>{' '}
+                  — presente su {auditData.bonifica_piva.invoice_count} fattur{auditData.bonifica_piva.invoice_count === 1 ? 'a' : 'e'},
+                  assente sul cliente → tutte, presenti e future, diventano verificate.
+                </p>
+                <p className="text-xs text-txt-muted">
+                  Assegna l&apos;identità al cliente: anche una fattura FUTURA con questa P.IVA
+                  si aggancerà da sola. La certezza è la somiglianza del nome, non una verifica
+                  della P.IVA. Reversibile con &laquo;Rimuovi P.IVA&raquo;.
+                </p>
+                <button
+                  onClick={handleBonificaPiva}
+                  disabled={auditActingId != null}
+                  className="sc-btn-primary text-sm font-bold disabled:opacity-50"
+                >
+                  {auditActingId != null ? '…' : `Assegna P.IVA ${auditData.bonifica_piva.piva} al cliente`}
+                </button>
+              </div>
+            )}
+
+            {/* Guardrail P.IVA-diverse: fatture con P.IVA differenti = forse
+                due clienti finiti sullo stesso profilo. Nessuna offerta. */}
+            {auditData.bonifica_piva_conflict?.length > 0 && (
+              <div className="rounded-xl border border-accent-red/40 bg-accent-red/5 p-4 space-y-1">
+                <p className="text-sm font-bold text-accent-red">Qui ci sono P.IVA diverse: forse due clienti</p>
+                <p className="text-sm text-txt-secondary">
+                  Le fatture di questo profilo portano P.IVA differenti
+                  {' '}(<span className="font-mono">{auditData.bonifica_piva_conflict.join(', ')}</span>):
+                  potrebbero essere due clienti diversi sotto lo stesso profilo.
+                  Controlla e riassegna le fatture prima di completare l&apos;anagrafica.
+                </p>
+              </div>
+            )}
+
             {auditData.problem_count === 0 ? (
               <div className="bg-accent-green/10 border border-accent-green/20 rounded-xl p-4 text-center">
                 <p className="text-accent-green font-medium">
@@ -1468,18 +1567,46 @@ export default function ClientDetail() {
                             </div>
                           )}
 
-                          {/* ③ Stessa azienda, solo grafia diversa →
-                              Segna verificato (endpoint esistente) */}
-                          <button
-                            onClick={() => handleAuditToggleReviewed(item)}
-                            disabled={busy}
-                            className={`w-full text-left px-3 py-2 rounded-lg border border-dark-border bg-dark-surface hover:border-accent-green/40 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
-                          >
-                            <span className="text-sm font-semibold text-txt-primary">③ Stessa azienda, solo grafia diversa</span>
-                            <span className="block text-xs text-txt-muted mt-0.5">
-                              L&apos;abbinamento è giusto: segna verificato e silenzia l&apos;avviso.
-                            </span>
-                          </button>
+                          {/* ③ Stessa azienda, solo grafia diversa. L'azione
+                              PRINCIPALE è la conferma d'identità DUREVOLE
+                              (intestazione accettata: vale anche per le
+                              future); il "segna solo questa" resta l'opzione
+                              quieta una tantum. Quando c'è una P.IVA da
+                              assegnare (Tier 1) quella è più forte, quindi la
+                              conferma d'identità qui si mostra solo senza. */}
+                          {!auditData.bonifica_piva ? (
+                            <div className="w-full rounded-lg border border-dark-border bg-dark-surface p-1">
+                              <button
+                                onClick={() => handleConfirmIdentity(item)}
+                                disabled={busy}
+                                className={`w-full text-left px-3 py-2 rounded-lg hover:bg-accent-green/10 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                              >
+                                <span className="text-sm font-semibold text-txt-primary">③ Stessa azienda, solo grafia diversa</span>
+                                <span className="block text-xs text-txt-muted mt-0.5">
+                                  Conferma che questa intestazione è del cliente: durevole, vale per tutte le fatture — anche future.
+                                </span>
+                              </button>
+                              <button
+                                onClick={() => handleAuditToggleReviewed(item)}
+                                disabled={busy}
+                                className={`px-3 py-1 text-xs text-txt-muted hover:text-txt-secondary transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                title="Verifica una tantum: silenzia solo questa fattura, non vale per le future"
+                              >
+                                oppure segna solo questa fattura (una volta)
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => handleAuditToggleReviewed(item)}
+                              disabled={busy}
+                              className={`w-full text-left px-3 py-2 rounded-lg border border-dark-border bg-dark-surface hover:border-accent-green/40 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            >
+                              <span className="text-sm font-semibold text-txt-primary">③ Stessa azienda, solo grafia diversa</span>
+                              <span className="block text-xs text-txt-muted mt-0.5">
+                                L&apos;abbinamento è giusto: segna verificato e silenzia l&apos;avviso.
+                              </span>
+                            </button>
+                          )}
 
                           {/* Via d'uscita fuori menu: non sai di chi è. */}
                           <div className="flex items-center gap-2 pt-1">
@@ -1494,10 +1621,22 @@ export default function ClientDetail() {
                           </div>
                         </div>
                       ) : (
-                        /* Righe warn (o bad già verificate): azioni piatte
-                           esistenti — endpoint invariati, distruttive con
-                           conferma. */
+                        /* Righe warn (o bad già verificate): azioni piatte.
+                           La CONFERMA D'IDENTITÀ (durevole) è l'azione
+                           PRINCIPALE quando non c'è una P.IVA a livello cliente
+                           da assegnare (Tier 1 batte Tier 2); il "Segna
+                           verificato" (una tantum) resta l'opzione quieta. */
                         <div className="flex flex-wrap items-center gap-2">
+                          {!auditData.bonifica_piva && !item.reviewed && (
+                            <button
+                              onClick={() => handleConfirmIdentity(item)}
+                              disabled={busy}
+                              className={`px-3 py-1.5 rounded-lg text-xs font-bold bg-accent-green/20 text-accent-green hover:bg-accent-green/30 transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                              title="Conferma durevole: questa intestazione è di questo cliente, vale anche per le fatture future"
+                            >
+                              {busy ? '…' : 'Conferma identità (vale anche per le future)'}
+                            </button>
+                          )}
                           <button
                             onClick={() => handleAuditUnlink(item)}
                             disabled={busy}
@@ -1517,13 +1656,14 @@ export default function ClientDetail() {
                           <button
                             onClick={() => handleAuditToggleReviewed(item)}
                             disabled={busy}
-                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''} ${
+                            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${busy ? 'opacity-50 cursor-not-allowed' : ''} ${
                               item.reviewed
                                 ? 'bg-dark-surface text-txt-muted hover:text-txt-secondary'
-                                : 'bg-accent-green/15 text-accent-green hover:bg-accent-green/25'
+                                : 'bg-dark-surface text-txt-muted hover:text-txt-secondary'
                             }`}
+                            title="Verifica una tantum, solo questa fattura (non vale per le future)"
                           >
-                            {item.reviewed ? 'Annulla verifica' : 'Segna verificato'}
+                            {item.reviewed ? 'Annulla verifica' : 'Segna solo questa (una volta)'}
                           </button>
                         </div>
                       )}
@@ -1545,6 +1685,45 @@ export default function ClientDetail() {
           </div>
         ) : null}
       </div>
+
+      {/* INTESTAZIONI ACCETTATE (bonifica durevole, Tier 2): il tratto
+          d'identità del cliente. Le fatture con queste grafie sono verificate
+          per costruzione, anche le future. Reversibile per riga. */}
+      {data.accepted_names?.length > 0 && (
+        <div className="sc-card overflow-hidden">
+          <div className="sc-card-header">
+            <h2 className="text-base font-bold text-txt-primary">
+              Intestazioni accettate ({data.accepted_names.length})
+            </h2>
+          </div>
+          <div className="p-5 space-y-3">
+            <p className="text-xs text-txt-muted">
+              Grafie che hai confermato appartenere a questo cliente: le fatture con queste
+              intestazioni sono verificate — anche le future — senza dover ripetere il controllo.
+            </p>
+            <div className="space-y-2">
+              {data.accepted_names.map(an => (
+                <div
+                  key={an.id}
+                  className="flex items-center justify-between gap-3 rounded-lg border border-dark-border bg-dark-surface px-3 py-2"
+                >
+                  <div className="min-w-0">
+                    <p className="text-sm text-txt-primary break-words">{an.note || an.name_normalized}</p>
+                    <p className="text-xs text-txt-muted font-mono break-words">chiave: {an.name_normalized}</p>
+                  </div>
+                  <button
+                    onClick={() => handleRemoveAcceptedName(an)}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-accent-red/10 text-accent-red hover:bg-accent-red/20 transition-colors shrink-0"
+                    title="Rimuovi: le fatture con questa intestazione torneranno «da controllare»"
+                  >
+                    Rimuovi
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* FATTURE IN QUARANTENA SUGGERITE A QUESTO CLIENTE: senza questa
           sezione una fattura in attesa di conferma non compariva MAI sul

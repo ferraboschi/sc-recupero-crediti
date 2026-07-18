@@ -3,6 +3,7 @@ import { Routes, Route, Link, useLocation } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import Positions from './pages/Positions'
 import Customers from './pages/Customers'
+import BonificaAnagrafica from './pages/BonificaAnagrafica'
 import ClientDetail from './pages/ClientDetail'
 import Attivita from './pages/Attivita'
 import System from './pages/System'
@@ -243,6 +244,8 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/attivita" element={<Attivita />} />
             <Route path="/customers" element={<Customers />} />
+            {/* PRIMA di /customers/:customerId così 'bonifica' non è letto come id */}
+            <Route path="/customers/bonifica" element={<BonificaAnagrafica />} />
             <Route path="/customers/:customerId" element={<ClientDetail />} />
             <Route path="/positions" element={<Positions />} />
             <Route path="/system" element={<System />} />

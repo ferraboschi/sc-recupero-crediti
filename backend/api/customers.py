@@ -1,21 +1,36 @@
 """Customers API endpoints."""
 
 import logging
-from typing import Optional
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import or_, func
 from sqlalchemy.orm import Session
 from datetime import datetime
 
-from backend.database import get_session, Customer, Invoice, ActivityLog, RecoveryAction
+from backend.database import (
+    get_session, Customer, Invoice, ActivityLog, RecoveryAction,
+    CustomerAcceptedName,
+)
 from backend.engine.cases import get_open_case, contact_count, business_day_start
 from backend.engine.verify import verify_invoice_customer
+from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
+from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
 from backend.engine.overdue import overdue_clause, RECOVERY_ACTION_TYPES
 from backend.engine.piva import validate_piva
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _accepted_name_dict(an: CustomerAcceptedName) -> dict:
+    """Serializzazione di un'intestazione accettata per l'API/UI."""
+    return {
+        "id": an.id,
+        "name_normalized": an.name_normalized,
+        "note": an.note,
+        "created_at": an.created_at.isoformat() if an.created_at else None,
+    }
 
 
 def _audit_customer_ids(session, include_paid: bool = False) -> set:
@@ -59,6 +74,57 @@ def _audit_customer_ids(session, include_paid: bool = False) -> set:
     for (cid,) in pend:
         ids.add(cid)
     return ids
+
+
+def _single_shared_piva(customer, invoices):
+    """Criterio della bonifica_piva a livello cliente, in UNA definizione sola
+    condivisa da lista e bulk (così non possono divergere dall'audit).
+
+    Dato un cliente e le sue fatture NON pagate, ritorna:
+    - ("single", piva, [carrier_ids], confidence) se il cliente NON ha una
+      P.IVA valida e le sue fatture non-verificate che portano una P.IVA valida
+      ne condividono UNA SOLA;
+    - ("conflict", [piva distinte]) se ne portano di DIVERSE (forse due clienti);
+    - None se il cliente ha già una P.IVA valida, o nessuna fattura porta una
+      P.IVA valida da assegnare.
+
+    confidence = somiglianza nome MINIMA (caso peggiore) fra la ragione sociale
+    del cliente e le intestazioni grezze delle fatture che portano quella P.IVA
+    — lo STESSO scorer di verify (name_similarity_score, il "Somiglianza nomi").
+
+    INVARIANTE (e perché regge): una fattura con P.IVA valida verso un cliente
+    SENZA P.IVA valida non è MAI 'ok' nel verify — è sempre warn/bad. Regge
+    perché verify GATE-a l'upgrade via accepted_names esattamente su questo
+    caso (piva_assignable): un'intestazione accettata NON smarca una fattura la
+    cui P.IVA è ancora assegnabile al cliente (la strada giusta è assegnarla).
+    Senza quel gate l'invariante sarebbe FALSA e questo shortcut divergerebbe
+    dall'audit. Data l'invariante, raccogliere i carrier con P.IVA valida
+    equivale a raccogliere i "problemi con P.IVA" di bonifica_piva SENZA
+    chiamare verify — che leggerebbe accepted_names dal vivo (una lazy-load per
+    cliente = N+1 sulla lista da 115+).
+    """
+    if validate_piva(customer.partita_iva) is not None:
+        return None
+    carriers = []  # (invoice_id, piva, confidence)
+    for inv in invoices:
+        # Le già "Segnate verificate" escono dai problemi (come in bonifica_piva).
+        if inv.audit_reviewed_at is not None:
+            continue
+        ip = validate_piva(inv.customer_piva_raw)
+        if ip is None:
+            continue
+        conf = name_similarity_score(
+            inv.customer_name_raw or "", customer.ragione_sociale or ""
+        )
+        carriers.append((inv.id, ip, conf))
+    if not carriers:
+        return None
+    distinct = sorted({p for _, p, _ in carriers})
+    if len(distinct) > 1:
+        return ("conflict", distinct)
+    the_piva = distinct[0]
+    group = [(iid, conf) for iid, p, conf in carriers if p == the_piva]
+    return ("single", the_piva, [iid for iid, _ in group], min(conf for _, conf in group))
 
 
 @router.get("")
@@ -344,6 +410,159 @@ async def customers_audit_summary(
     return {"to_sanitize_count": len(ids), "customer_ids": sorted(ids)}
 
 
+@router.get("/bonifica-suggestions")
+async def bonifica_suggestions(session: Session = Depends(get_session)):
+    """Lista di revisione della bonifica P.IVA in blocco: TUTTI i clienti
+    bonificabili in un colpo (l'owner ne ha ~115).
+
+    Un cliente entra col criterio IDENTICO a bonifica_piva dell'audit: SENZA
+    P.IVA valida sul profilo + le sue fatture non-pagate che portano una P.IVA
+    valida ne condividono UNA SOLA. I clienti con P.IVA DIVERSE sulle fatture
+    (conflict = "forse due clienti") NON entrano — sono un caso a parte.
+
+    Ordinati per confidence desc, poi total_overdue desc (i più certi e più
+    pesanti in cima), con l'id come tiebreaker stabile.
+
+    EFFICIENZA: UNA sola query aggregata (Invoice ⋈ Customer delle non-pagate),
+    poi raggruppamento in Python. NIENTE query-per-cliente → nessun N+1 su
+    115+. Definito PRIMA di /{customer_id} così 'bonifica-suggestions' non è
+    letto come id.
+    """
+    rows = (
+        session.query(Invoice, Customer)
+        .join(Customer, Invoice.customer_id == Customer.id)
+        .filter(Invoice.status != "paid")
+        .all()
+    )
+    by_customer = {}  # customer_id → {"customer": Customer, "invoices": [Invoice]}
+    for inv, cust in rows:
+        entry = by_customer.setdefault(cust.id, {"customer": cust, "invoices": []})
+        entry["invoices"].append(inv)
+
+    items = []
+    for cid, entry in by_customer.items():
+        cust = entry["customer"]
+        outcome = _single_shared_piva(cust, entry["invoices"])
+        if not outcome or outcome[0] != "single":
+            # Esclusi: già con P.IVA, senza P.IVA da assegnare, o CONFLITTO.
+            continue
+        _, the_piva, carrier_ids, confidence = outcome
+        # Scaduto = universo overdue_clause (status != paid & days_overdue > 0);
+        # le fatture qui sono già non-pagate, resta il solo giorni>0.
+        total_overdue = sum(
+            inv.amount_due for inv in entry["invoices"] if (inv.days_overdue or 0) > 0
+        )
+        items.append({
+            "customer_id": cid,
+            "ragione_sociale": cust.ragione_sociale,
+            "piva_suggerita": the_piva,
+            "invoice_count": len(carrier_ids),
+            "confidence": confidence,
+            "total_overdue": round(float(total_overdue), 2),
+        })
+
+    items.sort(key=lambda i: (-i["confidence"], -i["total_overdue"], i["customer_id"]))
+    return {"total": len(items), "items": items}
+
+
+class BonificaBulkRequest(BaseModel):
+    customer_ids: List[int]
+
+
+@router.post("/bonifica-piva/bulk")
+async def bonifica_piva_bulk(
+    body: BonificaBulkRequest,
+    session: Session = Depends(get_session),
+):
+    """Applica la bonifica P.IVA a PIÙ clienti in un colpo (dalla lista di
+    revisione). Per ogni id RI-VALIDA server-side il criterio (non ci si fida
+    del client) e poi assegna la P.IVA al cliente — stessa logica di
+    assign-piva-to-customer (customer.partita_iva = P.IVA valida). La cascade è
+    automatica: verify è calcolato dal vivo, quindi assegnata la P.IVA tutte le
+    fatture del cliente (presenti e future) con quella P.IVA diventano verdi.
+
+    Esito per-id:
+    - applied          — P.IVA assegnata;
+    - skipped_conflict — nel frattempo le fatture portano P.IVA diverse;
+    - skipped_has_piva — il cliente ha già una P.IVA valida (idempotenza:
+                         ri-eseguire su un bonificato NON è un errore);
+    - skipped_no_piva  — nessuna P.IVA valida da assegnare (dati cambiati);
+    - not_found        — cliente inesistente.
+
+    Definito PRIMA di /{customer_id} (path a due segmenti, ma per coerenza sta
+    con l'altra rotta di bonifica). Efficiente anche qui: i clienti e le loro
+    fatture non-pagate si caricano in DUE query, non una per id.
+    """
+    try:
+        # Dedup preservando l'ordine ricevuto (l'esito segue l'ordine input).
+        ids = list(dict.fromkeys(body.customer_ids or []))
+        if not ids:
+            return {"applied": 0, "results": []}
+
+        customers = {
+            c.id: c
+            for c in session.query(Customer).filter(Customer.id.in_(ids)).all()
+        }
+        inv_by_customer = {}
+        for inv in session.query(Invoice).filter(
+            Invoice.customer_id.in_(ids),
+            Invoice.status != "paid",
+        ).all():
+            inv_by_customer.setdefault(inv.customer_id, []).append(inv)
+
+        results = []
+        applied = 0
+        for cid in ids:
+            cust = customers.get(cid)
+            if cust is None:
+                results.append({"customer_id": cid, "result": "not_found"})
+                continue
+            # Idempotenza + guardia: se ha già una P.IVA valida, niente da fare.
+            if validate_piva(cust.partita_iva) is not None:
+                results.append({"customer_id": cid, "result": "skipped_has_piva"})
+                continue
+            outcome = _single_shared_piva(cust, inv_by_customer.get(cid, []))
+            if outcome and outcome[0] == "single":
+                _, the_piva, carrier_ids, confidence = outcome
+                # Stessa scrittura di assign-piva-to-customer: solo la P.IVA
+                # (ragione_sociale_normalized resta invariato).
+                cust.partita_iva = the_piva
+                session.add(ActivityLog(
+                    action="audit_assign_piva",
+                    entity_type="customer",
+                    entity_id=cid,
+                    details={
+                        "customer_id": cid,
+                        "piva": the_piva,
+                        "invoice_count": len(carrier_ids),
+                        "confidence": confidence,
+                        "bulk": True,
+                    },
+                ))
+                applied += 1
+                results.append({
+                    "customer_id": cid, "result": "applied", "piva": the_piva,
+                })
+            elif outcome and outcome[0] == "conflict":
+                results.append({
+                    "customer_id": cid, "result": "skipped_conflict",
+                    "pivas": outcome[1],
+                })
+            else:
+                results.append({"customer_id": cid, "result": "skipped_no_piva"})
+
+        session.commit()
+        logger.info(
+            f"Bonifica P.IVA in blocco: {applied}/{len(ids)} clienti bonificati"
+        )
+        return {"applied": applied, "results": results}
+
+    except Exception as e:
+        logger.error(f"Error in bulk P.IVA bonifica: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
 @router.get("/{customer_id}")
 async def get_customer_detail(
     customer_id: int,
@@ -512,6 +731,11 @@ async def get_customer_detail(
             "recovery_actions": action_list,
             "contact_action_count": contact_action_count,
             "case": case_block,
+            # Intestazioni accettate (bonifica durevole): il tratto d'identità
+            # che rende verdi le fatture con quella grafia, presenti e future.
+            "accepted_names": [
+                _accepted_name_dict(an) for an in customer.accepted_names
+            ],
         }
 
     except HTTPException:
@@ -561,6 +785,13 @@ async def audit_customer(
     items = []
     reviewed_count = 0
     worst = "ok"
+    # TIER 1 — "Completa anagrafica" a livello CLIENTE: fra i problemi mostrati
+    # raccolgo le P.IVA VALIDE portate dalle fatture. Se il cliente non ha
+    # P.IVA e i problemi ne condividono UNA SOLA → si offre la bonifica a
+    # livello cliente (l'assegnazione CASCADE su tutte, presenti e future).
+    # Se ne portano di DIVERSE è segnale di cliente mis-raggruppato: niente
+    # offerta, si espone la lista delle P.IVA distinte.
+    piva_carriers = []  # (invoice_id, validated_piva)
     for inv in invoices:
         v = verify_invoice_customer(inv, customer)
         verdict = v["verdict"]
@@ -577,6 +808,16 @@ async def audit_customer(
             worst = "bad"
         elif worst != "bad":
             worst = "warn"
+        inv_piva = validate_piva(inv.customer_piva_raw)
+        if inv_piva:
+            # Confidence della bonifica: somiglianza fra la ragione sociale del
+            # cliente e l'intestazione GREZZA della fattura — lo STESSO scorer
+            # che verify riporta come "Somiglianza nomi: X%" (name_score), così
+            # il pannello per-riga e la percentuale di certezza coincidono.
+            name_conf = name_similarity_score(
+                inv.customer_name_raw or "", customer.ragione_sociale or ""
+            )
+            piva_carriers.append((inv.id, inv_piva, name_conf))
         items.append({
             "invoice_id": inv.id,
             "invoice_number": inv.invoice_number,
@@ -621,6 +862,30 @@ async def audit_customer(
         for p in pending
     ]
 
+    # TIER 1 — bonifica_piva a livello cliente. Solo se il cliente NON ha una
+    # P.IVA valida: se ce l'ha, non c'è anagrafica da completare.
+    bonifica_piva = None
+    bonifica_piva_conflict = None
+    if validate_piva(customer.partita_iva) is None and piva_carriers:
+        distinct = sorted({p for _, p, _ in piva_carriers})
+        if len(distinct) == 1:
+            the_piva = distinct[0]
+            carriers = [(iid, conf) for iid, p, conf in piva_carriers if p == the_piva]
+            bonifica_piva = {
+                "piva": the_piva,
+                "invoice_count": len(carriers),
+                # Una qualsiasi delle fatture del gruppo: l'endpoint
+                # assign-piva-to-customer copia la P.IVA sul cliente (CASCADE).
+                "invoice_id": carriers[0][0],
+                # Certezza (0-100) = somiglianza nome MINIMA del gruppo (il caso
+                # PEGGIORE, conservativo): 100 = ragione sociale identica →
+                # quasi certezza; più bassa = da guardare prima di applicare.
+                "confidence": min(conf for _, conf in carriers),
+            }
+        else:
+            # P.IVA diverse fra le fatture: forse due clienti fusi per errore.
+            bonifica_piva_conflict = distinct
+
     total_problems = counts["warn"] + counts["bad"]
     return {
         "customer_id": customer.id,
@@ -635,6 +900,11 @@ async def audit_customer(
         "worst_verdict": worst if items else ("warn" if pending_suggestions else "ok"),
         "items": items,
         "pending_suggestions": pending_suggestions,
+        # TIER 1: presente SOLO quando c'è una singola P.IVA da assegnare al
+        # cliente (altrimenti null); conflict = lista P.IVA distinte se le
+        # fatture ne portano di diverse (avviso "forse due clienti").
+        "bonifica_piva": bonifica_piva,
+        "bonifica_piva_conflict": bonifica_piva_conflict,
     }
 
 
@@ -788,6 +1058,312 @@ async def unlock_customer_name(
         raise
     except Exception as e:
         logger.error(f"Error unlocking customer name: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.post("/{customer_id}/clear-piva")
+async def clear_customer_piva(
+    customer_id: int,
+    session: Session = Depends(get_session),
+):
+    """Rimuove la P.IVA assegnata per errore: via di ritorno dalla bonifica.
+
+    Simmetrico ad assign-piva-to-customer / bonifica-piva/bulk: se una P.IVA è
+    stata copiata sul cliente sbagliato, la si azzera e le fatture tornano al
+    loro esito naturale (verify dal vivo). Reversibilità dichiarata come nota #4
+    dell'analisi.
+
+    Reversibilità COMPLETA: azzerare la sola P.IVA non basta. Finché era sul
+    cliente, una fattura FUTURA di un'ALTRA azienda con quella P.IVA si è
+    agganciata in automatico (match_method='piva'); resterebbe attaccata al
+    cliente sbagliato (importi e solleciti inclusi). Perciò, dopo l'azzeramento,
+    si SCOLLEGANO le fatture entrate SOLO grazie alla P.IVA: quelle con
+    match_method='piva' la cui somiglianza-nome col cliente è sotto soglia
+    (< PIVA_NAME_MISMATCH_THRESHOLD, lo stesso scorer del matching). Le fatture
+    PROPRIE del cliente (agganciate per nome — name_exact/manual/… — o con nome
+    concorde, somiglianza >= soglia) NON si toccano: l'anti-poisoning guard del
+    matching lascia entrare per sola P.IVA solo le estranee senza nome (o con
+    nome discordante-nullo), ed è esattamente quel residuo che qui si scollega.
+
+    NB sul sync: azzerare qui è sicuro. Il sync scrive customer.partita_iva
+    SOLO da Shopify (_sync_customers_task) e SOLO se Shopify riporta una P.IVA
+    checksum-valida; un cliente bonificato senza P.IVA su Shopify non viene
+    ri-toccato. (Il sync fatture FatturaPro non scrive mai la P.IVA sul cliente,
+    solo su customer_piva_raw della fattura.)
+
+    Guardie:
+    - 404 se il cliente non esiste;
+    - 400 se il cliente non ha una P.IVA da rimuovere (niente da azzerare).
+    """
+    try:
+        customer = session.query(Customer).filter(
+            Customer.id == customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        old_piva = (customer.partita_iva or "").strip()
+        if not old_piva:
+            raise HTTPException(
+                status_code=400,
+                detail="Il cliente non ha una P.IVA da rimuovere",
+            )
+
+        customer.partita_iva = None
+
+        # Scollega le fatture estranee che avevano cavalcato la P.IVA: entrate
+        # per sola P.IVA (match_method='piva') e con nome sotto soglia rispetto
+        # al cliente — le PROPRIE (name_exact/… o nome concorde) restano.
+        piva_matched = session.query(Invoice).filter(
+            Invoice.customer_id == customer_id,
+            Invoice.match_method == "piva",
+        ).all()
+        unlinked_ids = []
+        for inv in piva_matched:
+            score = name_similarity_score(
+                inv.customer_name_raw or "", customer.ragione_sociale or ""
+            )
+            if score < PIVA_NAME_MISMATCH_THRESHOLD:
+                inv.customer_id = None
+                inv.match_method = None
+                inv.match_score = None
+                unlinked_ids.append(inv.id)
+
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_clear_piva",
+            entity_type="customer",
+            entity_id=customer_id,
+            details={
+                "ragione_sociale": customer.ragione_sociale,
+                "removed_piva": old_piva,
+                "unlinked_invoice_ids": unlinked_ids,
+            },
+        ))
+        # Un log per fattura scollegata: tracciabilità per singola riga (la
+        # scheda cliente e l'audit possono citare l'azione).
+        for iid in unlinked_ids:
+            session.add(ActivityLog(
+                action="audit_unlink_foreign_invoice",
+                entity_type="invoice",
+                entity_id=iid,
+                details={
+                    "customer_id": customer_id,
+                    "reason": "piva_cleared",
+                    "removed_piva": old_piva,
+                },
+            ))
+        session.commit()
+
+        logger.info(
+            f"P.IVA '{old_piva}' rimossa dal cliente {customer_id} "
+            f"('{customer.ragione_sociale}'); "
+            f"{len(unlinked_ids)} fattura/e estranea/e scollegata/e"
+        )
+        return {
+            "ok": True,
+            "customer_id": customer.id,
+            "partita_iva": None,
+            "unlinked_invoice_ids": unlinked_ids,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error clearing customer P.IVA: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+class AcceptedNameRequest(BaseModel):
+    # Una delle due: il nome grezzo da accettare, oppure la fattura da cui
+    # prenderlo (customer_name_raw). invoice_id ha la precedenza.
+    name: Optional[str] = None
+    invoice_id: Optional[int] = None
+
+
+@router.post("/{customer_id}/accepted-names")
+async def add_accepted_name(
+    customer_id: int,
+    body: AcceptedNameRequest,
+    session: Session = Depends(get_session),
+):
+    """Conferma d'identità DUREVOLE: aggiunge un'intestazione accettata al
+    cliente (tratto letto dal vivo da verify_invoice_customer).
+
+    A differenza di mark-reviewed (per-fattura, one-off), questa conferma vale
+    per TUTTE le fatture del cliente con quella intestazione — presenti e
+    future — in un colpo, senza scritture per-fattura. Idempotente
+    sull'UNIQUE (no-op se la grafia è già accettata) + ActivityLog.
+
+    Guardie:
+    - 404 se il cliente o la fattura non esistono;
+    - 400 se manca sia name sia invoice_id, o l'intestazione è vuota / non
+      normalizzabile.
+    """
+    try:
+        customer = session.query(Customer).filter(
+            Customer.id == customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        raw = None
+        source_invoice_id = None
+        if body.invoice_id is not None:
+            inv = session.query(Invoice).filter(
+                Invoice.id == body.invoice_id
+            ).first()
+            if not inv:
+                raise HTTPException(status_code=404, detail="Fattura non trovata")
+            raw = (inv.customer_name_raw or "").strip()
+            source_invoice_id = inv.id
+        elif body.name is not None:
+            raw = body.name.strip()
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Serve 'name' o 'invoice_id' da cui prendere l'intestazione",
+            )
+
+        if not raw:
+            raise HTTPException(
+                status_code=400,
+                detail="L'intestazione da accettare è vuota",
+            )
+        norm = normalize_ragione_sociale(raw)
+        if not norm:
+            raise HTTPException(
+                status_code=400,
+                detail="L'intestazione da accettare non è normalizzabile",
+            )
+
+        # Idempotente: no-op se la grafia (normalizzata) è già accettata.
+        existing = session.query(CustomerAcceptedName).filter(
+            CustomerAcceptedName.customer_id == customer_id,
+            CustomerAcceptedName.name_normalized == norm,
+        ).first()
+        if existing:
+            return {
+                "ok": True,
+                "already_present": True,
+                "accepted_name": _accepted_name_dict(existing),
+                "accepted_names": [
+                    _accepted_name_dict(a) for a in customer.accepted_names
+                ],
+            }
+
+        an = CustomerAcceptedName(
+            customer_id=customer_id, name_normalized=norm, note=raw,
+        )
+        session.add(an)
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_accept_name",
+            entity_type="customer",
+            entity_id=customer_id,
+            details={
+                "ragione_sociale": customer.ragione_sociale,
+                "accepted_raw": raw,
+                "name_normalized": norm,
+                "invoice_id": source_invoice_id,
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"Intestazione '{raw}' (norm '{norm}') accettata per il cliente "
+            f"{customer_id} ('{customer.ragione_sociale}')"
+        )
+        session.refresh(customer)
+        return {
+            "ok": True,
+            "already_present": False,
+            "accepted_name": _accepted_name_dict(an),
+            "accepted_names": [
+                _accepted_name_dict(a) for a in customer.accepted_names
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding accepted name: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.delete("/{customer_id}/accepted-names/{name_or_id}")
+async def remove_accepted_name(
+    customer_id: int,
+    name_or_id: str,
+    session: Session = Depends(get_session),
+):
+    """Rimuove un'intestazione accettata (reversibilità della conferma).
+
+    `name_or_id` può essere l'id della riga o l'intestazione normalizzata.
+    Rimosso l'ultimo appiglio, le fatture con quella grafia tornano al loro
+    esito naturale (warning/discordante) — il tratto d'identità è reversibile.
+    """
+    try:
+        customer = session.query(Customer).filter(
+            Customer.id == customer_id
+        ).first()
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        base = session.query(CustomerAcceptedName).filter(
+            CustomerAcceptedName.customer_id == customer_id
+        )
+        row = None
+        if name_or_id.isdigit():
+            row = base.filter(CustomerAcceptedName.id == int(name_or_id)).first()
+        if row is None:
+            norm = normalize_ragione_sociale(name_or_id)
+            if norm:
+                row = base.filter(
+                    CustomerAcceptedName.name_normalized == norm
+                ).first()
+        if not row:
+            raise HTTPException(
+                status_code=404, detail="Intestazione accettata non trovata"
+            )
+
+        removed = _accepted_name_dict(row)
+        session.delete(row)
+        session.commit()
+
+        session.add(ActivityLog(
+            action="audit_unaccept_name",
+            entity_type="customer",
+            entity_id=customer_id,
+            details={
+                "ragione_sociale": customer.ragione_sociale,
+                "name_normalized": removed["name_normalized"],
+                "note": removed["note"],
+            },
+        ))
+        session.commit()
+
+        logger.info(
+            f"Intestazione accettata '{removed['name_normalized']}' rimossa "
+            f"dal cliente {customer_id}"
+        )
+        session.refresh(customer)
+        return {
+            "ok": True,
+            "removed": removed,
+            "accepted_names": [
+                _accepted_name_dict(a) for a in customer.accepted_names
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing accepted name: {e}", exc_info=True)
         session.rollback()
         raise
 
