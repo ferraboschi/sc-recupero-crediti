@@ -11,25 +11,77 @@ from datetime import datetime
 from backend.database import get_session, Customer, Invoice, ActivityLog, RecoveryAction
 from backend.engine.cases import get_open_case, contact_count, business_day_start
 from backend.engine.verify import verify_invoice_customer
+from backend.engine.overdue import overdue_clause, RECOVERY_ACTION_TYPES
+from backend.engine.piva import validate_piva
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _audit_customer_ids(session, include_paid: bool = False) -> set:
+    """Insieme dei clienti "da sanificare": quelli con almeno una fattura
+    dall'esito warn/bad (verify_invoice_customer) NON già verificata a mano,
+    oppure con almeno un suggerimento pendente in quarantena.
+
+    Efficienza: UNA sola scansione batch con join su Customer (i clienti
+    arrivano nella stessa query, niente SELECT-per-fattura → niente N+1),
+    più una query DISTINCT per i suggerimenti pendenti. Il verify è
+    Python-level (fuzzy sui nomi, non esprimibile in SQL): si itera, ma su
+    una scansione sola e joinata, non ricaricando l'intero DB per cliente.
+    """
+    ids = set()
+    q = (
+        session.query(Invoice, Customer)
+        .join(Customer, Invoice.customer_id == Customer.id)
+        .filter(Invoice.audit_reviewed_at.is_(None))
+    )
+    if not include_paid:
+        q = q.filter(Invoice.status != "paid")
+    for inv, cust in q.all():
+        if verify_invoice_customer(inv, cust)["verdict"] in ("warn", "bad"):
+            ids.add(cust.id)
+
+    # Suggerimenti pendenti verso un cliente: puro SQL, nessun verify.
+    pend = (
+        session.query(Invoice.suggested_customer_id)
+        .filter(
+            Invoice.customer_id.is_(None),
+            Invoice.suggested_customer_id.isnot(None),
+            Invoice.status != "paid",
+        )
+        .distinct()
+    )
+    for (cid,) in pend:
+        if cid:
+            ids.add(cid)
+    return ids
 
 
 @router.get("")
 async def list_customers(
     session: Session = Depends(get_session),
     search: str = Query(None),
-    excluded: bool = Query(None),
+    excluded: bool = Query(None, description="Filtra per stato escluso (true/false). Omesso = tutti."),
     only_overdue: bool = Query(False, description="Show only customers with overdue invoices"),
-    sort_by: str = Query(None, description="Sort field: total_overdue, overdue_count, ragione_sociale"),
+    to_sanitize: bool = Query(False, description="Solo clienti 'da sanificare' (audit warn/bad o suggerimento pendente)"),
+    no_phone: bool = Query(False, description="Solo clienti senza telefono (non sollecitabili)"),
+    recovery_status: str = Query(None, description="Filtra per stato pratica (idle/first_contact/…)"),
+    sort_by: str = Query(None, description="Sort field: total_overdue, overdue_count, days_overdue, last_action, earliest_due_date, ragione_sociale"),
     sort_order: str = Query("desc", description="Sort order: asc or desc"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
 ):
     """
     List customers with optional search and filter by excluded status.
-    Supports filtering to only_overdue customers and sorting by overdue amounts.
+
+    Filtri: only_overdue, to_sanitize (audit), no_phone (non sollecitabili),
+    recovery_status (stato pratica), excluded.
+    Ordinamenti: total_overdue (scaduto), overdue_count (n. fatture scadute),
+    days_overdue (max giorni scaduto), last_action (ultimo sollecito),
+    earliest_due_date (scadenza più vicina), ragione_sociale.
+
+    La definizione di "scaduto" NON è ricopiata: usa overdue_clause() (la
+    stessa della cascata di riconciliazione).
     """
     try:
         # Step 1: Get invoice stats using SQL aggregation (much faster than loading all rows)
@@ -39,9 +91,10 @@ async def list_customers(
                 Invoice.customer_id,
                 func.count(Invoice.id).label("invoice_count"),
                 func.sum(Invoice.amount_due).label("total_due"),
-                func.sum(case((Invoice.days_overdue > 0, 1), else_=0)).label("overdue_count"),
-                func.sum(case((Invoice.days_overdue > 0, Invoice.amount_due), else_=0)).label("total_overdue"),
-                func.min(case((Invoice.days_overdue > 0, Invoice.due_date), else_=None)).label("earliest_due_date"),
+                func.sum(case((overdue_clause(), 1), else_=0)).label("overdue_count"),
+                func.sum(case((overdue_clause(), Invoice.amount_due), else_=0)).label("total_overdue"),
+                func.min(case((overdue_clause(), Invoice.due_date), else_=None)).label("earliest_due_date"),
+                func.max(case((overdue_clause(), Invoice.days_overdue), else_=None)).label("max_days_overdue"),
             )
             .filter(Invoice.status != "paid", Invoice.customer_id.isnot(None))
             .group_by(Invoice.customer_id)
@@ -56,7 +109,29 @@ async def list_customers(
                 "overdue_count": row[3] or 0,
                 "total_overdue": float(row[4] or 0),
                 "earliest_due_date": row[5],
+                "max_days_overdue": row[6] or 0,
             }
+
+        # Ultimo sollecito per cliente: MAX(created_at) fra i contatti reali
+        # (RECOVERY_ACTION_TYPES, non annullati). Una query aggregata sola —
+        # niente N+1. Serve all'ordinamento e alla colonna "ultimo sollecito".
+        last_action_rows = (
+            session.query(
+                RecoveryAction.customer_id,
+                func.max(RecoveryAction.created_at).label("last_action"),
+            )
+            .filter(
+                RecoveryAction.action_type.in_(RECOVERY_ACTION_TYPES),
+                RecoveryAction.cancelled.isnot(True),
+            )
+            .group_by(RecoveryAction.customer_id)
+            .all()
+        )
+        last_action_by_customer = {r[0]: r[1] for r in last_action_rows}
+
+        # Insieme "da sanificare" (audit): calcolato UNA sola volta e solo se
+        # il filtro è attivo — è la parte costosa (verify Python-level).
+        sanitize_ids = _audit_customer_ids(session) if to_sanitize else None
 
         # Step 2: Query customers with basic filters
         query = session.query(Customer)
@@ -74,17 +149,32 @@ async def list_customers(
         if excluded is not None:
             query = query.filter(Customer.excluded == excluded)
 
+        if recovery_status:
+            query = query.filter(Customer.recovery_status == recovery_status)
+
+        if no_phone:
+            # Non sollecitabile: telefono NULL o stringa vuota/di soli spazi.
+            query = query.filter(
+                or_(Customer.phone.is_(None), func.trim(Customer.phone) == "")
+            )
+
         all_customers = query.all()
 
         # Step 3: Build enriched list
         enriched = []
         for cust in all_customers:
-            stats = invoice_stats.get(cust.id, {"invoice_count": 0, "total_due": 0.0, "overdue_count": 0, "total_overdue": 0.0, "earliest_due_date": None})
-            enriched.append({"customer": cust, **stats})
+            stats = invoice_stats.get(cust.id, {"invoice_count": 0, "total_due": 0.0, "overdue_count": 0, "total_overdue": 0.0, "earliest_due_date": None, "max_days_overdue": 0})
+            enriched.append({
+                "customer": cust,
+                "last_action": last_action_by_customer.get(cust.id),
+                **stats,
+            })
 
-        # Step 4: Filter only_overdue
+        # Step 4: Filtri in-Python (dipendono dagli aggregati / dall'audit)
         if only_overdue:
             enriched = [e for e in enriched if e["overdue_count"] > 0]
+        if to_sanitize:
+            enriched = [e for e in enriched if e["customer"].id in sanitize_ids]
 
         total = len(enriched)
 
@@ -97,6 +187,15 @@ async def list_customers(
             enriched.sort(key=lambda e: e["total_overdue"], reverse=(sort_order == "desc"))
         elif sort_by == "overdue_count":
             enriched.sort(key=lambda e: e["overdue_count"], reverse=(sort_order == "desc"))
+        elif sort_by == "days_overdue":
+            enriched.sort(key=lambda e: e["max_days_overdue"], reverse=(sort_order == "desc"))
+        elif sort_by == "last_action":
+            from datetime import datetime as _dt
+            far_past = _dt.min
+            enriched.sort(
+                key=lambda e: e.get("last_action") or far_past,
+                reverse=(sort_order == "desc"),
+            )
         elif sort_by == "earliest_due_date":
             from datetime import date as date_type
             far_future = date_type(9999, 12, 31)
@@ -129,7 +228,9 @@ async def list_customers(
                 "total_due": entry["total_due"],
                 "overdue_count": entry["overdue_count"],
                 "total_overdue": entry["total_overdue"],
+                "max_days_overdue": entry["max_days_overdue"],
                 "earliest_due_date": entry["earliest_due_date"].isoformat() if entry.get("earliest_due_date") else None,
+                "last_action": entry["last_action"].isoformat() if entry.get("last_action") else None,
                 "created_at": cust.created_at.isoformat(),
             })
 
@@ -205,6 +306,22 @@ async def suggest_customers(
             "total_overdue": s["total_overdue"],
         })
     return {"query": q, "items": items}
+
+
+@router.get("/audit-summary")
+async def customers_audit_summary(
+    include_paid: bool = Query(False, description="Considera anche le fatture pagate"),
+    session: Session = Depends(get_session),
+):
+    """Conteggio "da sanificare" per la lista Clienti: quanti clienti hanno
+    almeno una fattura con esito audit warn/bad (non già verificata) o un
+    suggerimento pendente. Restituisce anche l'elenco degli id, così il
+    frontend può marcare le righe senza un secondo giro.
+
+    Definito PRIMA di /{customer_id} così 'audit-summary' non è letto come id.
+    """
+    ids = _audit_customer_ids(session, include_paid=include_paid)
+    return {"to_sanitize_count": len(ids), "customer_ids": sorted(ids)}
 
 
 @router.get("/{customer_id}")
@@ -374,6 +491,116 @@ async def get_customer_detail(
     except Exception as e:
         logger.error(f"Error fetching customer detail: {e}", exc_info=True)
         raise
+
+
+@router.get("/{customer_id}/audit")
+async def audit_customer(
+    customer_id: int,
+    include_paid: bool = Query(False, description="Audita anche le fatture pagate"),
+    include_reviewed: bool = Query(False, description="Includi anche le fatture già segnate verificate"),
+    session: Session = Depends(get_session),
+):
+    """Audit abbinamenti del SINGOLO cliente aperto: per ogni sua fattura
+    confronta destinatario/P.IVA col cliente (verify_invoice_customer) e
+    restituisce i problemi (warn/bad) con il metodo/score di abbinamento, più
+    i suggerimenti pendenti verso questo cliente.
+
+    A differenza dell'audit globale (/system/match-audit, che fa .all() su
+    TUTTO il DB), qui si scandiscono SOLO le fatture di questo cliente: niente
+    scansione dell'intera tabella, niente N+1 (nessun caricamento cliente
+    ripetuto: il cliente è già in mano). È lo stesso motore di verify, quindi
+    i livelli/verdetti coincidono col semaforo per-riga e con l'audit globale.
+
+    Le fatture già verificate a mano (audit_reviewed_at) escono dai problemi,
+    salvo include_reviewed=true; con include_paid=true copre anche le pagate.
+    """
+    customer = session.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    q = session.query(Invoice).filter(Invoice.customer_id == customer_id)
+    if not include_paid:
+        q = q.filter(Invoice.status != "paid")
+    invoices = q.order_by(Invoice.due_date.desc()).all()
+
+    counts = {"ok": 0, "warn": 0, "bad": 0}
+    items = []
+    reviewed_count = 0
+    worst = "ok"
+    for inv in invoices:
+        v = verify_invoice_customer(inv, customer)
+        verdict = v["verdict"]
+        counts[verdict] += 1
+        if verdict == "ok":
+            continue
+        is_reviewed = inv.audit_reviewed_at is not None
+        if is_reviewed:
+            reviewed_count += 1
+            if not include_reviewed:
+                continue
+        if verdict == "bad":
+            worst = "bad"
+        elif worst != "bad":
+            worst = "warn"
+        items.append({
+            "invoice_id": inv.id,
+            "invoice_number": inv.invoice_number,
+            "amount_due": float(inv.amount_due),
+            "status": inv.status,
+            "match_method": inv.match_method,
+            "match_score": inv.match_score,
+            "name_score": v["name_score"],
+            "verdict": verdict,
+            "verification": v,
+            "reviewed": is_reviewed,
+            # La fattura ha una P.IVA valida e il cliente no: si può copiare
+            # la P.IVA della fattura sul cliente con un click.
+            "can_assign_piva": (
+                validate_piva(inv.customer_piva_raw) is not None
+                and validate_piva(customer.partita_iva) is None
+            ),
+        })
+
+    # Suggerimenti pendenti in quarantena verso QUESTO cliente (customer_id
+    # NULL + suggested_customer_id → lui): l'audit li segnala come "da
+    # abbinare". Query scoped, nessun verify sull'intero DB.
+    pending = (
+        session.query(Invoice)
+        .filter(
+            Invoice.customer_id.is_(None),
+            Invoice.suggested_customer_id == customer_id,
+        )
+        .order_by(Invoice.due_date.desc())
+        .all()
+    )
+    pending_suggestions = [
+        {
+            "id": p.id,
+            "invoice_number": p.invoice_number,
+            "amount_due": float(p.amount_due),
+            "customer_name_raw": p.customer_name_raw,
+            "suggested_method": p.suggested_method,
+            "suggested_score": p.suggested_score,
+            "verification": verify_invoice_customer(p, customer),
+        }
+        for p in pending
+    ]
+
+    total_problems = counts["warn"] + counts["bad"]
+    return {
+        "customer_id": customer.id,
+        "customer_name": customer.ragione_sociale,
+        "customer_piva": customer.partita_iva,
+        "counts": counts,
+        "total_invoices": len(invoices),
+        "total_problems": total_problems,
+        "problem_count": len(items),
+        "reviewed_count": reviewed_count,
+        "pending_count": len(pending_suggestions),
+        "worst_verdict": worst if items else ("warn" if pending_suggestions else "ok"),
+        "items": items,
+        "pending_suggestions": pending_suggestions,
+    }
 
 
 @router.get("/{customer_id}/neighbors")
