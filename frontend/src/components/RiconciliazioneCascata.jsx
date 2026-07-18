@@ -338,7 +338,7 @@ function Evoluzione({ serie, loading, error, giorni, setGiorni, onRetry, formatC
     <div className="sc-card p-5 flex flex-col">
       <div className="flex items-center justify-between gap-2 mb-4 flex-wrap">
         <SectionTitle>Evoluzione</SectionTitle>
-        <div className="flex items-center gap-1">
+        <div className="flex flex-wrap items-center justify-end gap-1">
           {GIORNI_OPTIONS.map((g) => (
             <button
               key={g}

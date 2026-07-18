@@ -177,10 +177,12 @@ export default function SyncStatus({ variant = 'compact' }) {
       tone = 'text-txt-muted'; textTone = 'text-txt-muted'
     }
 
+    // Sotto sm (topbar strettissima, es. 375px con sidebar aperta) resta la
+    // sola icona + tooltip: il countdown per esteso vive nella dashboard.
     return (
-      <div className="flex items-center gap-1.5 whitespace-nowrap" title={title}>
+      <div className="flex items-center gap-1.5 min-w-0" title={title}>
         <Icon className={`w-3.5 h-3.5 shrink-0 ${tone}`} />
-        <span className={`text-xs ${textTone}`}>
+        <span className={`text-xs truncate hidden sm:inline ${textTone}`}>
           <span className="md:hidden">{short}</span>
           <span className="hidden md:inline">{full}</span>
         </span>
@@ -189,9 +191,13 @@ export default function SyncStatus({ variant = 'compact' }) {
   }
 
   // ── Variante DETTAGLIATA (dashboard) ────────────────────────────────────
+  // min-w-0/max-w-full + testo che va a capo: mai forzare il contenitore oltre
+  // la sua larghezza (a 375px la card diventa una colonna stretta).
+  const wrapCls = 'flex flex-col items-end gap-0.5 text-right min-w-0 max-w-full'
+
   if (s.mode === 'inProgress') {
     return (
-      <div className="flex items-center gap-2 text-right" title={title}>
+      <div className="flex items-center justify-end gap-2 min-w-0 max-w-full" title={title}>
         <SpinIcon className="w-4 h-4 text-accent-teal shrink-0" />
         <span className="text-sm font-medium text-accent-teal">Sincronizzazione in corso…</span>
       </div>
@@ -200,8 +206,8 @@ export default function SyncStatus({ variant = 'compact' }) {
 
   if (s.mode === 'down') {
     return (
-      <div className="flex flex-col items-end gap-0.5" title={title}>
-        <div className="flex items-center gap-2">
+      <div className={wrapCls} title={title}>
+        <div className="flex items-center gap-2 min-w-0">
           <WarnIcon className="w-4 h-4 text-accent-amber shrink-0" />
           <span className="text-sm font-medium text-accent-amber">Sincronizzazione automatica non attiva</span>
         </div>
@@ -211,26 +217,27 @@ export default function SyncStatus({ variant = 'compact' }) {
   }
 
   return (
-    <div className="flex flex-col items-end gap-0.5" title={title}>
-      <div className="flex items-center gap-2">
+    <div className={wrapCls} title={title}>
+      <div className="flex items-center gap-2 min-w-0">
         <ClockIcon className="w-4 h-4 text-accent-teal shrink-0" />
         <span className="text-sm text-txt-secondary">Sincronizzazione automatica ogni ora</span>
       </div>
-      <span className="text-xs text-txt-muted">
-        {s.mode === 'ok' && s.nextTimeText
-          ? <>Prossimo alle {s.nextTimeText} · {s.countdownText}</>
-          : s.mode === 'starting'
-            ? 'In avvio…'
-            : 'Verifica prossimo sync…'}
+      {/* I due segmenti (prossimo · aggiornato) vanno a capo indipendentemente:
+          ciascuno è nowrap così non si spezza a metà, ma insieme wrappano. */}
+      <div className="flex flex-wrap items-center justify-end gap-x-1.5 gap-y-0.5 text-xs">
+        <span className="text-txt-muted whitespace-nowrap">
+          {s.mode === 'ok' && s.nextTimeText
+            ? `Prossimo alle ${s.nextTimeText} · ${s.countdownText}`
+            : s.mode === 'starting'
+              ? 'In avvio…'
+              : 'Verifica prossimo sync…'}
+        </span>
         {s.agoText && (
-          <>
-            {' · '}
-            <span className={s.fresh ? 'text-accent-green' : 'text-txt-muted'}>
-              aggiornato {s.agoText}
-            </span>
-          </>
+          <span className={`whitespace-nowrap ${s.fresh ? 'text-accent-green' : 'text-txt-muted'}`}>
+            aggiornato {s.agoText}
+          </span>
         )}
-      </span>
+      </div>
     </div>
   )
 }

@@ -162,27 +162,27 @@ export default function App() {
       {/* ── Main Content ───────────────────────────────────────── */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Top Bar */}
-        <div className="h-14 bg-dark-surface border-b border-dark-border px-6 flex items-center justify-between flex-shrink-0">
-          <div className="flex items-center gap-3">
-            <h1 className="text-base font-semibold text-txt-primary">
+        <div className="h-14 bg-dark-surface border-b border-dark-border px-4 sm:px-6 flex items-center justify-between gap-3 flex-shrink-0">
+          <div className="flex items-center gap-3 min-w-0">
+            <h1 className="text-base font-semibold text-txt-primary truncate">
               {currentPage?.label || 'Dashboard'}
             </h1>
             {currentPage?.hint && (
-              <span className="text-xs text-txt-muted hidden sm:block">
+              <span className="text-xs text-txt-muted hidden sm:block whitespace-nowrap">
                 — {currentPage.hint}
               </span>
             )}
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0">
             <SyncStatus />
-            <div className="flex items-center gap-2 text-xs text-txt-muted">
+            <div className="flex items-center gap-2 text-xs text-txt-muted shrink-0">
               <div className="w-1.5 h-1.5 bg-accent-green rounded-full pulse-glow"></div>
-              Attivo
+              <span className="hidden sm:inline">Attivo</span>
             </div>
             <button
               onClick={handleLogout}
               title="Esci"
-              className="p-1.5 rounded-lg hover:bg-dark-card text-txt-muted hover:text-accent-red transition-colors"
+              className="p-1.5 rounded-lg hover:bg-dark-card text-txt-muted hover:text-accent-red transition-colors shrink-0"
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />

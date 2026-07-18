@@ -317,9 +317,9 @@ export default function Dashboard() {
     <div className="space-y-6">
       {/* Search Bar */}
       <div className="sc-card p-4">
-        <div className="flex items-center gap-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
           {/* Search */}
-          <div className="relative flex-1 max-w-md">
+          <div className="relative w-full min-w-0 sm:flex-1 sm:max-w-md">
             <input
               type="text"
               value={searchQuery}
@@ -370,8 +370,9 @@ export default function Dashboard() {
           </div>
 
           {/* Il sync è automatico ogni ora (scheduler backend): niente pulsante,
-              solo la comunicazione del prossimo/ultimo sync. */}
-          <div className="ml-auto shrink-0">
+              solo la comunicazione del prossimo/ultimo sync. Su mobile va sotto
+              la barra di ricerca (colonna), non la spinge oltre il bordo. */}
+          <div className="w-full min-w-0 sm:w-auto sm:ml-auto">
             <SyncStatus variant="detailed" />
           </div>
         </div>
