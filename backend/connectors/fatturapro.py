@@ -568,8 +568,21 @@ class FatturaProConnector:
             # della lista: il server potrebbe aver troncato il limit in
             # silenzio, e dichiarare "completa" una lista mozza è esattamente
             # ciò che marca pagate le fatture non lette. Si chiede la riga
-            # successiva: se non c'è, la lista è finita — dimostrato, non
-            # supposto. Costa una richiesta.
+            # successiva oltre l'ultima letta: se la sonda non porta NULLA DI
+            # NUOVO, la lista è finita — dimostrato, non supposto. Costa una
+            # richiesta.
+            #   Attenzione a cosa conta come "nulla di nuovo": sul FatturaPro
+            # reale (verificato 2026-08-18 con richieste dirette) il server NON
+            # clampa il limit — lo ONORA, e le 549 righe arrivano in questa
+            # unica pagina. Ma IGNORA uno `start` oltre la fine della lista:
+            # invece della pagina vuota che proverebbe la fine, rispedisce le
+            # PRIME righe (duplicati, probe_overlap 10/10 — mai numeri nuovi).
+            # Perciò "sonda vuota" e "sonda di soli duplicati" provano ENTRAMBE
+            # la fine; solo un numero fattura NUOVO nella sonda dimostra che
+            # oltre `batch` c'è dell'altro. Confondere i due era il difetto:
+            # ripiego a offset ad ogni sync → slittamento → partial=True perenne
+            # → payment detection mai eseguita (Speranzina 952 mai uscita da
+            # "Da incassare").
             probe, _, _, probe_failure = self._fetch_list_page(
                 xcrud_key, colmap, len(batch), PROBE_LIMIT
             )
@@ -580,9 +593,24 @@ class FatturaProConnector:
                 _add_batch(batch)
                 return all_invoices, True
 
-            if not probe:
+            # La sonda porta almeno un numero fattura NON già in `batch`?
+            # Se no (vuota, o soli duplicati perché il server ha ignorato lo
+            # `start` oltre la fine), la pagina unica È la lista completa.
+            batch_numbers = {inv.get("invoice_number") for inv in batch}
+            probe_has_new = any(
+                inv.get("invoice_number") not in batch_numbers for inv in probe
+            )
+            if not probe_has_new:
                 _add_batch(batch)
-                logger.info(f"Fetched {len(all_invoices)} overdue invoices in a single page")
+                if probe:
+                    logger.info(
+                        f"Fetched {len(all_invoices)} overdue invoices in a "
+                        f"single page (probe returned {len(probe)} already-seen "
+                        f"rows — the server ignored the offset past end-of-list, "
+                        f"list is complete)"
+                    )
+                else:
+                    logger.info(f"Fetched {len(all_invoices)} overdue invoices in a single page")
                 return all_invoices, dropped_rows > 0
 
             # ── Ripiego: la pagina unica non è bastata ──
