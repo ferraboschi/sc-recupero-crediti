@@ -586,3 +586,136 @@ class TestFixOrdinamentoStabileSbloccaSottoClamp:
         # Nessuna fattura ancora in lista è stata marcata 'paid' per errore.
         live = {r["number"] for r in backend.rows}
         assert not (paid & live), "false-paid su fatture ancora da incassare"
+
+
+# ── Il fix VERO dell'incidente: la sonda di SOLI duplicati ────────────
+#
+# CAUSA RADICE verificata con richieste dirette al FatturaPro reale
+# (2026-08-18), NON ipotesi. Il server NON clampa il limit come temeva PR #12:
+# lo ONORA — `q(limit=5000)` restituisce TUTTE le 549 righe in UNA pagina.
+# Ma IGNORA uno `start` oltre la fine: `q(start=549, limit=10)` NON torna vuota,
+# rispedisce le prime righe (probe_overlap 10/10 — DUPLICATI, mai numeri nuovi).
+# Il codice leggeva "sonda non vuota" come "ci sono altre righe" → ripiego a
+# offset → slittamento → partial=True a OGNI sync → payment detection saltata →
+# i pagamenti (Speranzina 952, uscita da "Da incassare") mai registrati.
+# Il fix: una sonda di soli duplicati prova la fine tanto quanto una vuota.
+
+
+class LimitHonoringDuplicateProbeBackend:
+    """Il FatturaPro REALE (verificato con richieste dirette 2026-08-18).
+
+    ONORA il limit: `limit >= totale` restituisce TUTTE le righe in una pagina
+    sola (NON clampa a 100). Ma IGNORA uno `start` oltre la fine della lista:
+    invece della pagina vuota che proverebbe la fine, rispedisce le prime
+    righe — DUPLICATI, mai numeri nuovi. È la sonda che, letta ingenuamente,
+    fa credere che ci siano altre righe.
+    """
+
+    def __init__(self, rows):
+        self.rows = rows          # lista viva: i test la mutano
+        self.calls = []
+
+    def query(self, start, limit):
+        self.calls.append((start, limit))
+        ordered = sorted(self.rows, key=lambda r: r["number"])  # ordine stabile
+        if start >= len(ordered):
+            # start oltre la fine: il server lo IGNORA e serve le prime righe
+            # (duplicati). Verificato: probe_overlap 10/10.
+            return ordered[:limit]
+        return ordered[start:start + limit]
+
+
+class TestServerOnoraLimitESondaDuplicata:
+    """L'incidente REALE. Il server ONORA il limit: le 549 righe arrivano in
+    UNA pagina. Ma la sonda a start=549 NON torna vuota — il server ignora lo
+    `start` oltre la fine e rispedisce le prime righe (DUPLICATI). Leggerlo come
+    'ci sono altre righe' → ripiego a offset → partial=True a OGNI sync →
+    payment detection mai eseguita (Speranzina 952 mai uscita da 'Da incassare').
+    Il fix: una sonda di SOLI duplicati prova la fine tanto quanto una vuota.
+    """
+
+    def test_probe_di_soli_duplicati_e_lista_completa_non_partial(self, monkeypatch):
+        # 549 righe come la lista reale; la pagina unica le prende tutte.
+        rows = _invoices(549, per_day=8)
+        backend = LimitHonoringDuplicateProbeBackend(rows)
+        conn = _unstable_connector(monkeypatch, backend)
+
+        invoices, partial = conn.fetch_overdue_invoices()
+
+        assert len(invoices) == 549, (
+            f"la pagina unica prende tutte le 549 righe: raccolte {len(invoices)}"
+        )
+        nums = {inv["invoice_number"] for inv in invoices}
+        assert len(nums) == 549  # nessun duplicato accumulato
+        assert partial is False, (
+            "sonda di SOLI duplicati = fine lista DIMOSTRATA; il ripiego a "
+            "offset (e il partial perenne) era il difetto di produzione"
+        )
+        # Una pagina + una sonda, e basta: NON si ripiega a offset. Senza il fix
+        # qui ci sarebbero decine di chiamate offset (duplicati all'infinito).
+        assert backend.calls == [(0, 5000), (549, 10)]
+
+    def test_sonda_con_righe_nuove_ripiega_come_prima(self, monkeypatch):
+        """Regressione sul DISCRIMINANTE: se la sonda porta anche UNA riga
+        NUOVA (lista davvero più lunga della pagina — server che clampa), il
+        ripiego a offset deve scattare come prima e raccogliere tutto. Il fix
+        NON deve scambiare righe nuove per duplicati."""
+        rows = [{"number": f"2026/{i:08d}/SAK - Fattura",
+                 "date": date(2026, 5, 1) - timedelta(days=i)}  # date distinte
+                for i in range(240)]
+        backend = UnstableXcrudBackend(rows, clamp=100)  # clampa → la sonda porta righe NUOVE
+        conn = _unstable_connector(monkeypatch, backend)
+
+        invoices, partial = conn.fetch_overdue_invoices()
+
+        assert len(invoices) == 240  # tutte raccolte via ripiego a offset
+        assert partial is False
+        # Il ripiego È scattato: più di (pagina + sonda) chiamate.
+        assert len(backend.calls) > 2
+
+    def test_end_to_end_pagamento_registrato_sotto_server_reale(self, monkeypatch, test_db_session):
+        """Dal fetch al DB, sul comportamento del server REALE: pagina unica +
+        sonda duplicata = fetch COMPLETO, quindi la payment detection riparte.
+        Una fattura che esce dalla lista (pagata) viene marcata 'paid' alla 2ª
+        assenza; le altre restano 'open' (nessun false-paid). È il caso
+        Speranzina 952, dal fetch al DB."""
+        from backend.api import sync as sync_mod
+
+        backend = LimitHonoringDuplicateProbeBackend(_invoices(200, per_day=8))
+        conn = _unstable_connector(monkeypatch, backend)
+
+        class _FakeFP:
+            def login(self):
+                return True
+
+            def fetch_overdue_invoices(self):
+                return conn.fetch_overdue_invoices()
+
+            def fetch_scadenze_map(self, **kw):
+                return {}, True
+
+            def fetch_clienti_map(self):
+                return {}, True
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(sync_mod, "FatturaProConnector", lambda *a, **kw: _FakeFP())
+        monkeypatch.setattr(sync_mod, "get_session_direct", lambda: test_db_session)
+
+        sync_mod._sync_invoices_task()      # #1 popola (200 fatture, fetch completo)
+        paid_number = backend.rows[3]["number"]
+        backend.rows.pop(3)                 # una fattura pagata DAVVERO esce
+        sync_mod._sync_invoices_task()      # #2 assente (streak 1)
+        sync_mod._sync_invoices_task()      # #3 assente (streak 2) → paid
+
+        paid = {
+            inv.invoice_number
+            for inv in test_db_session.query(Invoice)
+            .filter(Invoice.status == "paid").all()
+        }
+        # La fattura uscita è stata rilevata come pagata: il freeze è superato.
+        assert paid_number in paid
+        # Nessuna fattura ancora in lista è stata marcata 'paid' per errore.
+        live = {r["number"] for r in backend.rows}
+        assert not (paid & live), "false-paid su fatture ancora da incassare"
