@@ -7,14 +7,16 @@ pratica, e alla chiusura (saldo) il ciclo riparte pulito.
 
 import os
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from io import BytesIO
 
+from backend.config import config
 from backend.database import get_session, Customer, Invoice, RecoveryAction, ActivityLog
 from backend.engine.cases import (
     CONTACT_TYPES, business_day_start, contact_count, ensure_open_case,
@@ -56,6 +58,86 @@ def _serialize_action(a: RecoveryAction) -> dict:
         "case_id": a.case_id,
         "created_at": a.created_at.isoformat(),
     }
+
+
+# --- Utilizzo: contatore dei solleciti per giorno (sola lettura) ---
+
+def _italian_day(dt: datetime) -> date:
+    """Giorno di calendario ITALIANO di un timestamp salvato in UTC naive.
+
+    created_at è scritto con datetime.utcnow() (UTC, senza tzinfo): il server
+    gira in UTC, quindi date() nudo sposterebbe il confine di giornata a
+    mezzanotte UTC (l'1-2 di notte italiane). Coerente con business_day_start.
+    """
+    tz = ZoneInfo(config.TIMEZONE)
+    return dt.replace(tzinfo=timezone.utc).astimezone(tz).date()
+
+
+@router.get("/utilizzo")
+async def get_utilizzo(session: Session = Depends(get_session)):
+    """Contatore d'utilizzo: quanti clienti sono stati sollecitati ogni giorno.
+
+    Sola lettura, nessuna mutazione. Un "sollecito" è una RecoveryAction con un
+    `channel` valorizzato (il flusso Copia Messaggio / link WhatsApp è l'unico
+    che scrive un channel) e non annullata. La data è il giorno di calendario
+    italiano di `created_at`.
+
+    - `eventi`: una riga per sollecito {data, customer_id, cliente, action_type,
+      channel}, ordinata per data desc, poi cliente.
+    - `per_giorno`: il contatore giornaliero {data, clienti_sollecitati
+      (distinti), eventi_totali}, ordinato per data desc.
+
+    Dall'inizio dei dati: nessun floor sulla data. Una sola query aggregata
+    (join a Customer per il nome), il resto è una fold in memoria — il conteggio
+    query è costante indipendentemente dal volume dei dati.
+    """
+    rows = (
+        session.query(
+            RecoveryAction.customer_id,
+            RecoveryAction.action_type,
+            RecoveryAction.channel,
+            RecoveryAction.created_at,
+            Customer.ragione_sociale,
+        )
+        .join(Customer, Customer.id == RecoveryAction.customer_id)
+        .filter(RecoveryAction.channel.isnot(None))
+        .filter(RecoveryAction.cancelled.isnot(True))
+        .all()
+    )
+
+    eventi = []
+    per_giorno: dict = {}  # data (str) -> {"customers": set, "eventi": int}
+    for customer_id, action_type, channel, created_at, ragione_sociale in rows:
+        if created_at is None:
+            continue
+        data_str = _italian_day(created_at).isoformat()
+        eventi.append({
+            "data": data_str,
+            "customer_id": customer_id,
+            "cliente": ragione_sociale,
+            "action_type": action_type,
+            "channel": channel,
+        })
+        bucket = per_giorno.setdefault(data_str, {"customers": set(), "eventi": 0})
+        bucket["customers"].add(customer_id)
+        bucket["eventi"] += 1
+
+    # Ordina eventi per data desc, poi cliente asc (sort stabile: prima la
+    # chiave secondaria, poi la primaria).
+    eventi.sort(key=lambda e: (e["cliente"] or "").casefold())
+    eventi.sort(key=lambda e: e["data"], reverse=True)
+
+    per_giorno_list = [
+        {
+            "data": d,
+            "clienti_sollecitati": len(v["customers"]),
+            "eventi_totali": v["eventi"],
+        }
+        for d, v in per_giorno.items()
+    ]
+    per_giorno_list.sort(key=lambda x: x["data"], reverse=True)
+
+    return {"eventi": eventi, "per_giorno": per_giorno_list}
 
 
 # --- Registrazione solleciti (Copia Messaggio / WhatsApp) ---
