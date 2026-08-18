@@ -15,6 +15,18 @@ scivola RIPETE righe su una pagina e ne SALTA altre; la deduplica nascondeva
 le ripetizioni e dei salti non si accorgeva nessuno. Ora si chiede la lista
 in UNA pagina (niente OFFSET = niente finestra che scivoli) e una sonda
 DIMOSTRA che è tutta lì. Vedi TestDannoRigheMaiCreate / TestDannoFantasmiPaid.
+
+2026-08-18 — INCIDENTE DI PRODUZIONE. In produzione il server CLAMPA il limit
+(tronca `limit=5000` a ~100), quindi la pagina unica non basta mai e si cade
+SEMPRE nel ripiego a offset. Lì l'orderby forzato `documenti.Data` (non
+univoco) faceva scivolare la finestra a ogni giro: `partial=True` a ogni sync
+("551 agg, 0 pagate (PARZIALE)"), payment detection mai eseguita, scaduto solo
+in crescita. Il fix: paginare sull'ordinamento di DEFAULT (orderby VUOTO =
+chiave primaria, univoca e stabile), lo STESSO con cui `_paginate_xcrud_list`
+scarica in produzione le 1251 righe di clienti.php a pagine da 100 nonostante
+il clamp. La deduplica resta come rete: se il default non fosse univoco, un
+salto forza un duplicato → `partial=True` (mai una fattura 'paid' per errore).
+Vedi TestFixOrdinamentoStabileSbloccaSottoClamp.
 """
 
 import random
@@ -86,9 +98,11 @@ class TestUniformAjaxPagination:
         numbers = [inv["invoice_number"] for inv in invoices]
         assert "FT-R" not in numbers  # righe renderizzate ignorate
         assert len(numbers) == 12
-        # Una sola query per i dati: start=0, ordinamento imposto, limite ampio
+        # Una sola query per i dati: start=0, ordinamento di DEFAULT (orderby
+        # vuoto = chiave primaria, univoca e stabile → a prova di clamp; NON
+        # più documenti.Data, non univoca), limite ampio
         assert posts["calls"][0]["xcrud[start]"] == "0"
-        assert posts["calls"][0]["xcrud[orderby]"] == "documenti.Data"
+        assert posts["calls"][0]["xcrud[orderby]"] == ""
         assert posts["calls"][0]["xcrud[limit]"] == "5000"
         # …e la sonda subito dopo l'ultima riga letta
         assert posts["calls"][1]["xcrud[start]"] == "12"
@@ -394,3 +408,163 @@ class TestSondaDiCompletezza:
         assert len(invoices) == 30
         assert partial is False
         assert backend.calls == [(0, 5000), (30, 10)]
+
+
+# ── Il fix dell'incidente di produzione ──────────────────────────────
+#
+# Il server REALE non è ostile: TRONCA (clampa) il limit — come fa con
+# clienti.php, che `_paginate_xcrud_list` scarica comunque per intero (1251
+# righe a pagine da 100) — e su orderby VUOTO ordina per la chiave primaria,
+# UNIVOCA e stabile fra query identiche. Questo backend lo modella: clampa il
+# limit e, su orderby vuoto, serve una finestra offset STABILE (ordinata per
+# numero documento, che qui fa da chiave primaria). Con un orderby esplicito e
+# non univoco permuterebbe i pari-data — ma il fix non lo invia più.
+
+
+class ClampedDefaultOrderBackend:
+    """Server che CLAMPA il limit e, su orderby vuoto, ordina in modo STABILE
+    per chiave univoca (qui il numero documento)."""
+
+    def __init__(self, rows, clamp=100):
+        self.rows = rows
+        self.clamp = clamp
+        self.calls = []
+
+    def query(self, start, limit, orderby):
+        self.calls.append((start, limit, orderby))
+        limit = min(limit, self.clamp)
+        if orderby == "":
+            # Ordinamento di default = chiave primaria univoca → STABILE.
+            ordered = sorted(self.rows, key=lambda r: r["number"])
+        else:
+            # Orderby non univoco (es. documenti.Data): permuta i pari-data in
+            # funzione dell'offset — il modello che teneva partial=True.
+            buckets = {}
+            for r in self.rows:
+                buckets.setdefault(r["date"], []).append(r)
+            ordered = []
+            for d in sorted(buckets, reverse=True):
+                group = list(buckets[d])
+                random.Random(start * 100_003 + d.toordinal()).shuffle(group)
+                ordered.extend(group)
+        return ordered[start:start + limit]
+
+
+def _default_order_connector(monkeypatch, backend):
+    """Connettore il cui fake_post passa anche l'orderby al backend."""
+    conn = FatturaProConnector()
+    conn._authenticated = True
+    monkeypatch.setattr(conn.client, "get", lambda *a, **kw: FakeResponse(_page([])))
+
+    def fake_post(url, data=None, **kw):
+        rows = backend.query(
+            int(data["xcrud[start]"]),
+            int(data["xcrud[limit]"]),
+            data.get("xcrud[orderby]", ""),
+        )
+        return FakeResponse(_page([_dated_row(r) for r in rows],
+                                  with_key=False, with_header=False))
+
+    monkeypatch.setattr(conn.client, "post", fake_post)
+    return conn
+
+
+class TestFixOrdinamentoStabileSbloccaSottoClamp:
+    """Il fix: il server clampa il limit (qui a 100) su ~770 fatture con DATE
+    RIPETUTE (fatturazione a batch) — lo scenario che teneva partial=True a
+    ogni sync. Sull'ordinamento di default (chiave primaria, univoca) la
+    finestra offset piastrella senza scivolare: TUTTE le righe arrivano e la
+    pagina finale corta DIMOSTRA la completezza → partial=False, e il
+    rilevamento pagamenti riparte."""
+
+    def test_clamp_100_su_770_righe_date_ripetute_e_partial_false(self, monkeypatch):
+        rows = _invoices(770, per_day=8)  # 770 fatture, ~8 per data → date NON univoche
+        backend = ClampedDefaultOrderBackend(rows, clamp=100)
+        conn = _default_order_connector(monkeypatch, backend)
+
+        invoices, partial = conn.fetch_overdue_invoices()
+
+        assert len(invoices) == 770, (
+            f"il clamp a 100 non deve far perdere fatture: raccolte "
+            f"{len(invoices)}/770"
+        )
+        nums = {inv["invoice_number"] for inv in invoices}
+        assert len(nums) == 770  # tutte distinte, nessuna persa né ripetuta
+        assert partial is False, (
+            "ordinamento stabile + pagina finale corta = completezza dimostrata"
+        )
+
+    def test_la_lista_fatture_pagina_su_orderby_vuoto(self, monkeypatch):
+        """Regressione sul fix stesso: la lista fatture NON deve più forzare
+        documenti.Data — deve paginare sull'ordinamento di default (PK)."""
+        backend = ClampedDefaultOrderBackend(_invoices(300, per_day=8), clamp=100)
+        conn = _default_order_connector(monkeypatch, backend)
+
+        conn.fetch_overdue_invoices()
+
+        assert backend.calls, "nessuna query effettuata"
+        assert all(orderby == "" for (_s, _l, orderby) in backend.calls), (
+            "la lista fatture deve paginare sull'ordinamento di default (PK), "
+            "non su documenti.Data"
+        )
+
+    def test_default_non_univoco_degrada_a_partial_non_a_false_paid(self, monkeypatch):
+        """La rete di sicurezza: SE — contro l'atteso — l'ordinamento di
+        default di documenti NON fosse univoco, la paginazione scivolerebbe.
+        Il duplicato lo rileva → partial=True. Mai una lista mozza dichiarata
+        completa (che marcherebbe 'paid' le fatture non lette)."""
+        # per_day=8 + clamp: con orderby vuoto trattato come NON univoco
+        # (permutazione dei pari-data), il modello pessimista.
+        backend = UnstableXcrudBackend(_invoices(434, per_day=8), clamp=100)
+        conn = _unstable_connector(monkeypatch, backend)
+
+        invoices, partial = conn.fetch_overdue_invoices()
+
+        assert len(invoices) == 434 or partial is True
+
+    def test_end_to_end_il_rilevamento_pagamenti_riparte(self, monkeypatch, test_db_session):
+        """La prova che l'incidente è chiuso, dal fetch al DB. Sotto clamp +
+        ordinamento stabile il fetch è COMPLETO (partial=False), quindi la
+        payment detection RIPARTE: una fattura che esce davvero dalla lista
+        viene marcata 'paid' dopo due assenze, mentre tutte le altre restano
+        'open' (nessun false-paid)."""
+        from backend.api import sync as sync_mod
+
+        backend = ClampedDefaultOrderBackend(_invoices(250, per_day=8), clamp=100)
+        conn = _default_order_connector(monkeypatch, backend)
+
+        class _FakeFP:
+            def login(self):
+                return True
+
+            def fetch_overdue_invoices(self):
+                return conn.fetch_overdue_invoices()
+
+            def fetch_scadenze_map(self, **kw):
+                return {}, True
+
+            def fetch_clienti_map(self):
+                return {}, True
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(sync_mod, "FatturaProConnector", lambda *a, **kw: _FakeFP())
+        monkeypatch.setattr(sync_mod, "get_session_direct", lambda: test_db_session)
+
+        sync_mod._sync_invoices_task()      # #1 popola (250 fatture, fetch completo)
+        paid_number = backend.rows[3]["number"]
+        backend.rows.pop(3)                 # una fattura pagata DAVVERO esce
+        sync_mod._sync_invoices_task()      # #2 assente (streak 1)
+        sync_mod._sync_invoices_task()      # #3 assente (streak 2) → paid
+
+        paid = {
+            inv.invoice_number
+            for inv in test_db_session.query(Invoice)
+            .filter(Invoice.status == "paid").all()
+        }
+        # La fattura uscita è stata rilevata come pagata: il freeze è superato.
+        assert paid_number in paid
+        # Nessuna fattura ancora in lista è stata marcata 'paid' per errore.
+        live = {r["number"] for r in backend.rows}
+        assert not (paid & live), "false-paid su fatture ancora da incassare"

@@ -337,9 +337,22 @@ class FatturaProConnector:
             return None
 
     def _fetch_list_page(
-        self, xcrud_key: str, colmap: Dict[str, int], start: int, limit: int
+        self, xcrud_key: str, colmap: Dict[str, int], start: int, limit: int,
+        orderby: str = "",
     ) -> Tuple[List[Dict[str, Any]], Optional[str], int, Optional[str]]:
         """Una pagina della lista fatture via xcrud AJAX.
+
+        `orderby` DEFAULT VUOTO, e non è un dettaglio: un orderby vuoto lascia
+        a xcrud il suo ordinamento di default — la chiave primaria (indice
+        clusterizzato), UNIVOCA e stabile fra query identiche. È lo stesso
+        ordinamento con cui `_paginate_xcrud_list` scarica in produzione le
+        1251 righe di clienti.php a pagine da 100 NONOSTANTE il server tronchi
+        il limit: su una chiave univoca la finestra offset piastrella senza
+        buchi e senza ripetizioni, e una pagina più corta del richiesto
+        DIMOSTRA la fine della lista. Un orderby ESPLICITO e non univoco (com'era
+        `documenti.Data`) rompe proprio questo: i pari-chiave possono uscire in
+        ordine diverso a ogni query, la finestra scivola, e sotto il clamp del
+        server la completezza non è più dimostrabile → partial per sempre.
 
         Returns (batch, new_key, drops, failure). `failure` è None solo se la
         risposta è un frammento xcrud valido; altrimenti è il motivo. Chi
@@ -347,17 +360,21 @@ class FatturaProConnector:
         sessione scaduta a metà restituisce la pagina di login con status 200
         e zero righe, che è indistinguibile da "finito" se non si guarda.
         """
+        data = {
+            "xcrud[key]": xcrud_key,
+            "xcrud[orderby]": orderby,
+            "xcrud[start]": str(start),
+            "xcrud[limit]": str(limit),
+            "xcrud[instance]": "documenti",
+            "xcrud[task]": "list",
+        }
+        # `order` ha senso solo con un orderby esplicito; su orderby vuoto
+        # (default PK) non va inviato — è così che pagina clienti.php.
+        if orderby:
+            data["xcrud[order]"] = "desc"
         resp = self.client.post(
             f"{self.base_url}/xcrud/xcrud_ajax.php",
-            data={
-                "xcrud[key]": xcrud_key,
-                "xcrud[orderby]": "documenti.Data",
-                "xcrud[order]": "desc",
-                "xcrud[start]": str(start),
-                "xcrud[limit]": str(limit),
-                "xcrud[instance]": "documenti",
-                "xcrud[task]": "list",
-            },
+            data=data,
             headers={
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": f"{self.base_url}/documenti.php?s=1",
@@ -400,17 +417,32 @@ class FatturaProConnector:
         l'header): così un'eventuale colonna in più — es. Scadenza — non
         disallinea gli importi.
 
-        PERCHÉ UNA PAGINA SOLA. `xcrud[orderby]` è `documenti.Data`, che non è
-        univoca. Su un ordinamento non totale il DB è libero di restituire i
-        pari-data in un ordine diverso a ogni query, e con LIMIT/OFFSET quella
-        libertà diventa perdita di dati: la finestra scivola, RIPETE righe su
-        una pagina e ne SALTA altre, che non compaiono in NESSUNA pagina.
-        Nessuna riga è malformata, quindi dropped_rows resta 0 e il fetch si
-        dichiarava completo: le fatture saltate non venivano mai create
-        (invisibili — il caso Belfiore 655/2026), e quelle già in DB finivano
-        marcate 'paid' con amount_due=0 alla seconda assenza consecutiva.
-        Senza OFFSET non c'è finestra che possa scivolare, e l'ordine dei
-        pari-data torna irrilevante.
+        ORDINAMENTO STABILE, NON `documenti.Data`. La paginazione xcrud passa
+        `xcrud[orderby]` VUOTO: xcrud usa allora il suo ordinamento di default,
+        la chiave primaria (indice clusterizzato), UNIVOCA e stabile fra query
+        identiche. È lo stesso ordinamento con cui `_paginate_xcrud_list`
+        scarica in produzione le 1251 righe di clienti.php a pagine da 100
+        NONOSTANTE il server tronchi (clampa) il limit: su una chiave univoca la
+        finestra offset piastrella la lista senza buchi né ripetizioni, e una
+        pagina più corta del richiesto DIMOSTRA la fine — a prova di clamp.
+          Prima qui si forzava `orderby=documenti.Data`, non univoca. Su un
+        ordinamento non totale il DB è libero di restituire i pari-data in
+        ordine diverso a ogni query: con l'offset la finestra scivola, RIPETE
+        righe su una pagina e ne SALTA altre. In produzione il server clampa il
+        limit (una pagina non basta mai), quindi si cadeva SEMPRE nella
+        paginazione a offset, la finestra scivolava a ogni giro e la
+        completezza non era mai dimostrabile → `partial=True` a ogni sync → la
+        payment detection non partiva mai → lo scaduto solo cresceva. È il
+        difetto che questo fix chiude: caso Belfiore 655/2026 e "551 agg …
+        (PARZIALE)" perenne.
+          RETE DI SICUREZZA (non rimossa). Anche con l'orderby stabile la
+        deduplica per invoice_number resta accesa nel ripiego a offset: se —
+        contro l'atteso — l'ordinamento di default di documenti NON fosse
+        univoco, una finestra che scivola RIPETE una riga (e per pigeonhole, su
+        una pagina finale corta, un salto ne FORZA la ripetizione). Il
+        duplicato viene rilevato → `partial=True`. Quindi il caso peggiore
+        degrada allo stallo onesto di oggi, MAI a una fattura marcata 'paid'
+        per errore.
 
         Returns:
             (invoices, partial) — partial=True quando il fetch NON è
@@ -501,8 +533,11 @@ class FatturaProConnector:
             xcrud_key = key_input.get("value")
 
             # ── La lista in una pagina sola ──
-            # Una query, start=0, limite ampio: niente OFFSET, niente finestra
-            # che possa scivolare fra i pari-data.
+            # Una query, start=0, limite ampio: se il server lo onora, tutta la
+            # lista arriva senza offset. Se lo clampa (produzione), la sonda qui
+            # sotto se ne accorge e si ripiega sulla paginazione — che ora è
+            # stabile perché `_fetch_list_page` ordina sulla chiave primaria
+            # (orderby vuoto), non su `documenti.Data`.
             batch, new_key, drops, failure = self._fetch_list_page(
                 xcrud_key, colmap, 0, FETCH_LIMIT
             )
