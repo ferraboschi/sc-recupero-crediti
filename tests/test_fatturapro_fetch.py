@@ -16,16 +16,20 @@ le ripetizioni e dei salti non si accorgeva nessuno. Ora si chiede la lista
 in UNA pagina (niente OFFSET = niente finestra che scivoli) e una sonda
 DIMOSTRA che è tutta lì. Vedi TestDannoRigheMaiCreate / TestDannoFantasmiPaid.
 
-2026-08-18 — INCIDENTE DI PRODUZIONE. In produzione il server CLAMPA il limit
-(tronca `limit=5000` a ~100), quindi la pagina unica non basta mai e si cade
-SEMPRE nel ripiego a offset. Lì l'orderby forzato `documenti.Data` (non
-univoco) faceva scivolare la finestra a ogni giro: `partial=True` a ogni sync
-("551 agg, 0 pagate (PARZIALE)"), payment detection mai eseguita, scaduto solo
-in crescita. Il fix: paginare sull'ordinamento di DEFAULT (orderby VUOTO =
-chiave primaria, univoca e stabile), lo STESSO con cui `_paginate_xcrud_list`
-scarica in produzione le 1251 righe di clienti.php a pagine da 100 nonostante
-il clamp. La deduplica resta come rete: se il default non fosse univoco, un
-salto forza un duplicato → `partial=True` (mai una fattura 'paid' per errore).
+2026-08-18 — INCIDENTE DI PRODUZIONE (secondo fix, quello giusto). In produzione
+il server CLAMPA il limit (tronca `limit=5000` a ~100), quindi la pagina unica
+non basta mai e si cade SEMPRE nel ripiego a offset. PR #14 aveva provato a
+lasciare `xcrud[orderby]` VUOTO sperando che il default di xcrud fosse la PK
+univoca: FALSO, verificato sul FatturaPro reale — la pagina `documenti.php?s=1`
+è ordinata di default per `documenti.Data` (colonna "↓ Data"), NON univoca.
+Con orderby vuoto la finestra offset scivolava ancora sui pari-data → partial
+per sempre ("551 agg, 0 pagate (PARZIALE)"), payment detection mai eseguita,
+scaduto solo in crescita. Il fix VERO: forzare `documenti.NumeroSezionale` (il
+numero fattura progressivo), l'UNICA colonna univoca della lista documenti.
+Su una chiave univoca e totale la finestra offset piastrella senza buchi anche
+sotto clamp, e la pagina finale corta DIMOSTRA la completezza → partial=False.
+La deduplica resta come rete: se NumeroSezionale non fosse univoco, un salto
+forza un duplicato → `partial=True` (mai una fattura 'paid' per errore).
 Vedi TestFixOrdinamentoStabileSbloccaSottoClamp.
 """
 
@@ -98,11 +102,12 @@ class TestUniformAjaxPagination:
         numbers = [inv["invoice_number"] for inv in invoices]
         assert "FT-R" not in numbers  # righe renderizzate ignorate
         assert len(numbers) == 12
-        # Una sola query per i dati: start=0, ordinamento di DEFAULT (orderby
-        # vuoto = chiave primaria, univoca e stabile → a prova di clamp; NON
-        # più documenti.Data, non univoca), limite ampio
+        # Una sola query per i dati: start=0, ordinamento su
+        # documenti.NumeroSezionale (colonna UNIVOCA reale → a prova di clamp;
+        # NON documenti.Data né orderby vuoto, che ereditava il default Data
+        # non univoco), limite ampio
         assert posts["calls"][0]["xcrud[start]"] == "0"
-        assert posts["calls"][0]["xcrud[orderby]"] == ""
+        assert posts["calls"][0]["xcrud[orderby]"] == "documenti.NumeroSezionale"
         assert posts["calls"][0]["xcrud[limit]"] == "5000"
         # …e la sonda subito dopo l'ultima riga letta
         assert posts["calls"][1]["xcrud[start]"] == "12"
@@ -414,16 +419,23 @@ class TestSondaDiCompletezza:
 #
 # Il server REALE non è ostile: TRONCA (clampa) il limit — come fa con
 # clienti.php, che `_paginate_xcrud_list` scarica comunque per intero (1251
-# righe a pagine da 100) — e su orderby VUOTO ordina per la chiave primaria,
-# UNIVOCA e stabile fra query identiche. Questo backend lo modella: clampa il
-# limit e, su orderby vuoto, serve una finestra offset STABILE (ordinata per
-# numero documento, che qui fa da chiave primaria). Con un orderby esplicito e
-# non univoco permuterebbe i pari-data — ma il fix non lo invia più.
+# righe a pagine da 100). La chiave UNIVOCA della lista documenti è
+# `documenti.NumeroSezionale` (il numero fattura progressivo); il default della
+# pagina, invece, è `documenti.Data`, NON univoca. Questo backend modella
+# ENTRAMBE le verità: clampa il limit e, SOLO su orderby=documenti.NumeroSezionale,
+# serve una finestra offset STABILE (ordinata per numero documento). Su
+# qualsiasi altro orderby — vuoto (che eredita il default Data) o
+# documenti.Data — permuta i pari-data in funzione dell'offset, il modello che
+# teneva partial=True. È questo che fa fallire il test senza il fix e passare
+# col fix.
 
 
 class ClampedDefaultOrderBackend:
-    """Server che CLAMPA il limit e, su orderby vuoto, ordina in modo STABILE
-    per chiave univoca (qui il numero documento)."""
+    """Server che CLAMPA il limit. Ordina in modo STABILE (per chiave univoca)
+    SOLO se l'orderby è `documenti.NumeroSezionale`; su vuoto/documenti.Data —
+    non univoci — permuta i pari-data e la finestra scivola."""
+
+    UNIQUE_ORDERBY = "documenti.NumeroSezionale"
 
     def __init__(self, rows, clamp=100):
         self.rows = rows
@@ -433,12 +445,13 @@ class ClampedDefaultOrderBackend:
     def query(self, start, limit, orderby):
         self.calls.append((start, limit, orderby))
         limit = min(limit, self.clamp)
-        if orderby == "":
-            # Ordinamento di default = chiave primaria univoca → STABILE.
+        if orderby == self.UNIQUE_ORDERBY:
+            # Colonna univoca reale → ordine TOTALE e stabile fra query.
             ordered = sorted(self.rows, key=lambda r: r["number"])
         else:
-            # Orderby non univoco (es. documenti.Data): permuta i pari-data in
-            # funzione dell'offset — il modello che teneva partial=True.
+            # Orderby non univoco (vuoto = default Data, o documenti.Data
+            # esplicito): permuta i pari-data in funzione dell'offset — il
+            # modello che teneva partial=True.
             buckets = {}
             for r in self.rows:
                 buckets.setdefault(r["date"], []).append(r)
@@ -472,8 +485,8 @@ def _default_order_connector(monkeypatch, backend):
 class TestFixOrdinamentoStabileSbloccaSottoClamp:
     """Il fix: il server clampa il limit (qui a 100) su ~770 fatture con DATE
     RIPETUTE (fatturazione a batch) — lo scenario che teneva partial=True a
-    ogni sync. Sull'ordinamento di default (chiave primaria, univoca) la
-    finestra offset piastrella senza scivolare: TUTTE le righe arrivano e la
+    ogni sync. Ordinando su `documenti.NumeroSezionale` (colonna univoca reale)
+    la finestra offset piastrella senza scivolare: TUTTE le righe arrivano e la
     pagina finale corta DIMOSTRA la completezza → partial=False, e il
     rilevamento pagamenti riparte."""
 
@@ -494,27 +507,32 @@ class TestFixOrdinamentoStabileSbloccaSottoClamp:
             "ordinamento stabile + pagina finale corta = completezza dimostrata"
         )
 
-    def test_la_lista_fatture_pagina_su_orderby_vuoto(self, monkeypatch):
-        """Regressione sul fix stesso: la lista fatture NON deve più forzare
-        documenti.Data — deve paginare sull'ordinamento di default (PK)."""
+    def test_la_lista_fatture_pagina_su_numero_sezionale(self, monkeypatch):
+        """Regressione sul fix stesso: la lista fatture deve paginare su
+        `documenti.NumeroSezionale` (colonna univoca) — NON su documenti.Data
+        e NON con orderby vuoto (che eredita il default Data, non univoco)."""
         backend = ClampedDefaultOrderBackend(_invoices(300, per_day=8), clamp=100)
         conn = _default_order_connector(monkeypatch, backend)
 
         conn.fetch_overdue_invoices()
 
         assert backend.calls, "nessuna query effettuata"
-        assert all(orderby == "" for (_s, _l, orderby) in backend.calls), (
-            "la lista fatture deve paginare sull'ordinamento di default (PK), "
-            "non su documenti.Data"
+        assert all(
+            orderby == "documenti.NumeroSezionale"
+            for (_s, _l, orderby) in backend.calls
+        ), (
+            "la lista fatture deve paginare su documenti.NumeroSezionale "
+            "(colonna univoca), non su documenti.Data né orderby vuoto"
         )
 
-    def test_default_non_univoco_degrada_a_partial_non_a_false_paid(self, monkeypatch):
-        """La rete di sicurezza: SE — contro l'atteso — l'ordinamento di
-        default di documenti NON fosse univoco, la paginazione scivolerebbe.
-        Il duplicato lo rileva → partial=True. Mai una lista mozza dichiarata
-        completa (che marcherebbe 'paid' le fatture non lette)."""
-        # per_day=8 + clamp: con orderby vuoto trattato come NON univoco
-        # (permutazione dei pari-data), il modello pessimista.
+    def test_numero_sezionale_non_univoco_degrada_a_partial_non_a_false_paid(self, monkeypatch):
+        """La rete di sicurezza: SE — contro l'atteso — `documenti.NumeroSezionale`
+        NON fosse univoco, la paginazione scivolerebbe. Il duplicato lo rileva
+        → partial=True. Mai una lista mozza dichiarata completa (che
+        marcherebbe 'paid' le fatture non lette)."""
+        # UnstableXcrudBackend ignora l'orderby e permuta SEMPRE i pari-data
+        # (per_day=8 + clamp): modella l'ipotesi pessimista in cui la colonna
+        # scelta non fosse davvero univoca.
         backend = UnstableXcrudBackend(_invoices(434, per_day=8), clamp=100)
         conn = _unstable_connector(monkeypatch, backend)
 
