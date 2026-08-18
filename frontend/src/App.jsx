@@ -6,6 +6,7 @@ import Customers from './pages/Customers'
 import BonificaAnagrafica from './pages/BonificaAnagrafica'
 import ClientDetail from './pages/ClientDetail'
 import Attivita from './pages/Attivita'
+import Utilizzo from './pages/Utilizzo'
 import System from './pages/System'
 import Login from './pages/Login'
 import SyncStatus from './components/SyncStatus'
@@ -36,6 +37,13 @@ function IconInvoices() {
   return (
     <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+    </svg>
+  )
+}
+function IconUtilizzo() {
+  return (
+    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M3 3v18h18M7 15l3-3 3 3 5-6" />
     </svg>
   )
 }
@@ -108,6 +116,7 @@ export default function App() {
     { path: '/attivita', label: 'Attivita', icon: <IconActivity />, hint: 'Azioni di recupero' },
     { path: '/customers', label: 'Clienti', icon: <IconCustomers />, hint: 'Anagrafica debitori' },
     { path: '/positions', label: 'Fatture', icon: <IconInvoices />, hint: 'Elenco fatture' },
+    { path: '/utilizzo', label: 'Utilizzo', icon: <IconUtilizzo />, hint: 'Solleciti per giorno' },
     { path: '/system', label: 'Sistema', icon: <IconSystem />, hint: 'Diagnostica' },
   ]
 
@@ -248,6 +257,7 @@ export default function App() {
             <Route path="/customers/bonifica" element={<BonificaAnagrafica />} />
             <Route path="/customers/:customerId" element={<ClientDetail />} />
             <Route path="/positions" element={<Positions />} />
+            <Route path="/utilizzo" element={<Utilizzo />} />
             <Route path="/system" element={<System />} />
           </Routes>
         </div>
