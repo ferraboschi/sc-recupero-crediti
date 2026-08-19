@@ -10,6 +10,7 @@ import Utilizzo from './pages/Utilizzo'
 import System from './pages/System'
 import Login from './pages/Login'
 import SyncStatus from './components/SyncStatus'
+import ReconcileButton from './components/ReconcileButton'
 
 /* ── SVG icon components ─────────────────────────────────────────── */
 function IconDashboard() {
@@ -230,6 +231,9 @@ export default function App() {
             )}
           </div>
           <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+            {/* Azione quotidiana principale: rileva subito gli incassi già
+                segnati in FatturaPro. Nell'header, non sepolta in Sistema. */}
+            <ReconcileButton label="Aggiorna incassi" />
             <SyncStatus />
             <div className="flex items-center gap-2 text-xs text-txt-muted shrink-0">
               <div className="w-1.5 h-1.5 bg-accent-green rounded-full pulse-glow"></div>
