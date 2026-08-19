@@ -7,14 +7,16 @@ pratica, e alla chiusura (saldo) il ciclo riparte pulito.
 
 import os
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from io import BytesIO
 
+from backend.config import config
 from backend.database import get_session, Customer, Invoice, RecoveryAction, ActivityLog
 from backend.engine.cases import (
     CONTACT_TYPES, business_day_start, contact_count, ensure_open_case,
@@ -56,6 +58,88 @@ def _serialize_action(a: RecoveryAction) -> dict:
         "case_id": a.case_id,
         "created_at": a.created_at.isoformat(),
     }
+
+
+# --- Utilizzo: registro giorno-per-giorno del lavoro reale (sola lettura) ---
+
+def _italian_day(dt: datetime) -> date:
+    """Giorno di calendario ITALIANO di un timestamp salvato in UTC naive.
+
+    created_at e' scritto con datetime.utcnow() (UTC, senza tzinfo): il server
+    gira in UTC, quindi date() nudo sposterebbe il confine di giornata a
+    mezzanotte UTC (l'1-2 di notte italiane). Coerente con business_day_start.
+    """
+    tz = ZoneInfo(config.TIMEZONE)
+    return dt.replace(tzinfo=timezone.utc).astimezone(tz).date()
+
+
+@router.get("/utilizzo")
+async def get_utilizzo(session: Session = Depends(get_session)):
+    """Registro d'utilizzo: quante AZIONI di recupero, su quanti ACCOUNT, al giorno.
+
+    Sola lettura, nessuna mutazione. E' il monitor per vedere quanto la persona
+    ha davvero usato il sistema: un'azione = una RecoveryAction con un `channel`
+    valorizzato (il flusso Copia Messaggio / WhatsApp e' l'unico che scrive un
+    channel: e' il segnale NON falsificabile del lavoro reale) e non annullata.
+    La data e' il giorno di calendario italiano di `created_at`.
+
+    - `per_giorno`: il conteggio giornaliero {data, azioni (n. solleciti),
+      account (clienti DISTINTI)}, ordinato per data desc. E' la vista audit
+      principale (la timeline dell'uso).
+    - `eventi`: una riga per sollecito {data, customer_id, cliente, action_type,
+      channel}, ordinata per data desc, poi cliente. E' il dettaglio per giorno.
+
+    Dall'inizio dei dati: nessun floor sulla data. Una sola query aggregata
+    (join a Customer per il nome), il resto e' una fold in memoria — il conteggio
+    query e' costante indipendentemente dal volume dei dati (niente N+1).
+    """
+    rows = (
+        session.query(
+            RecoveryAction.customer_id,
+            RecoveryAction.action_type,
+            RecoveryAction.channel,
+            RecoveryAction.created_at,
+            Customer.ragione_sociale,
+        )
+        .join(Customer, Customer.id == RecoveryAction.customer_id)
+        .filter(RecoveryAction.channel.isnot(None))
+        .filter(RecoveryAction.cancelled.isnot(True))
+        .all()
+    )
+
+    eventi = []
+    per_giorno: dict = {}  # data (str) -> {"customers": set, "azioni": int}
+    for customer_id, action_type, channel, created_at, ragione_sociale in rows:
+        if created_at is None:
+            continue
+        data_str = _italian_day(created_at).isoformat()
+        eventi.append({
+            "data": data_str,
+            "customer_id": customer_id,
+            "cliente": ragione_sociale,
+            "action_type": action_type,
+            "channel": channel,
+        })
+        bucket = per_giorno.setdefault(data_str, {"customers": set(), "azioni": 0})
+        bucket["customers"].add(customer_id)
+        bucket["azioni"] += 1
+
+    # Ordina eventi per data desc, poi cliente asc (sort stabile: prima la
+    # chiave secondaria, poi la primaria).
+    eventi.sort(key=lambda e: (e["cliente"] or "").casefold())
+    eventi.sort(key=lambda e: e["data"], reverse=True)
+
+    per_giorno_list = [
+        {
+            "data": d,
+            "azioni": v["azioni"],
+            "account": len(v["customers"]),
+        }
+        for d, v in per_giorno.items()
+    ]
+    per_giorno_list.sort(key=lambda x: x["data"], reverse=True)
+
+    return {"eventi": eventi, "per_giorno": per_giorno_list}
 
 
 # --- Registrazione solleciti (Copia Messaggio / WhatsApp) ---
