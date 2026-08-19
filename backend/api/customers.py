@@ -596,6 +596,16 @@ async def get_customer_detail(
                 "status": inv.status,
                 "source_platform": inv.source_platform,
                 "shopify_order_number": inv.shopify_order_number,
+                # Trasparenza incasso (sola lettura): dove sta OGNI fattura
+                # rispetto al rilevamento pagamenti, così l'owner non deve più
+                # chiedere "è registrata?".
+                #  - missing_streak > 0 → sparita dalla lista FatturaPro, sta
+                #    per essere marcata pagata (conferma incasso in corso);
+                #  - updated_at → ultimo sync che ha toccato la riga;
+                #  - paid_at → quando è stata marcata pagata (se lo è).
+                "missing_streak": inv.missing_streak or 0,
+                "updated_at": inv.updated_at.isoformat() if inv.updated_at else None,
+                "paid_at": inv.paid_at.isoformat() if inv.paid_at else None,
                 # Controllo puntuale P.IVA + ragione sociale (istantaneo:
                 # confronta dati già in DB, nessun sync). Semaforo per-riga.
                 "verification": verify_invoice_customer(inv, customer),
