@@ -117,6 +117,8 @@ export default function System() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [syncing, setSyncing] = useState(false)
+  const [reconciling, setReconciling] = useState(false)
+  const [reconcileMsg, setReconcileMsg] = useState(null)
   const [audit, setAudit] = useState(null)
   const [auditLoading, setAuditLoading] = useState(false)
   const [auditError, setAuditError] = useState(null)
@@ -277,6 +279,28 @@ export default function System() {
     }
   }
 
+  // "Aggiorna incassi adesso": chiama il reconcile SINCRONO (due passaggi di
+  // rilevamento pagamenti), mostra l'esito e ricarica. Disabilitato durante
+  // l'esecuzione per evitare il doppio invio.
+  const triggerReconcile = async () => {
+    setReconciling(true)
+    setReconcileMsg(null)
+    try {
+      const res = await fetch(`${API}/sync/reconcile-incassi`, { method: 'POST', headers: authHeaders() })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const d = await res.json()
+      // Verde SOLO per incassi davvero registrati (confermati); ambra per
+      // lista incompleta; muto quando non c'è nulla di nuovo.
+      const tone = d.partial ? 'warning' : (d.marked_paid > 0 ? 'success' : 'muted')
+      setReconcileMsg({ text: d.message, tone })
+      await fetchData()
+    } catch (e) {
+      setReconcileMsg({ text: `Errore: ${e.message}`, tone: 'warning' })
+    } finally {
+      setReconciling(false)
+    }
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -314,13 +338,32 @@ export default function System() {
           </p>
         </div>
         <div className="flex items-center gap-3">
+          {/* Esito reconcile ACCANTO ai pulsanti (non sopra): niente
+              layout shift, i pulsanti non si spostano. */}
+          {reconcileMsg && (
+            <span className={`text-sm font-medium ${
+              reconcileMsg.tone === 'success' ? 'text-accent-green'
+                : reconcileMsg.tone === 'warning' ? 'text-accent-amber'
+                : 'text-txt-muted'
+            }`}>
+              {reconcileMsg.text}
+            </span>
+          )}
           <StatusBadge status={data.status} />
           <button
             onClick={triggerSync}
-            disabled={syncing}
-            className={`sc-btn-primary ${syncing ? 'opacity-50 cursor-not-allowed' : ''}`}
+            disabled={syncing || reconciling}
+            className={`sc-btn-primary ${(syncing || reconciling) ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
             {syncing ? 'Sync in corso...' : 'Forza Sync Completo'}
+          </button>
+          <button
+            onClick={triggerReconcile}
+            disabled={reconciling || syncing}
+            className={`sc-btn-secondary ${(reconciling || syncing) ? 'opacity-50 cursor-not-allowed' : ''}`}
+            title="Esegue due passaggi di rilevamento pagamenti: gli incassi già registrati in FatturaPro si vedono subito."
+          >
+            {reconciling ? 'Aggiornamento incassi…' : 'Aggiorna incassi adesso'}
           </button>
           <button
             onClick={fetchData}

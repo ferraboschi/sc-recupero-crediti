@@ -1958,6 +1958,27 @@ export default function ClientDetail() {
                     <span className={`${INVOICE_STATUS_COLORS[inv.status] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'} sc-badge`}>
                       {inv.status === 'open' ? 'Aperto' : inv.status === 'paid' ? 'Pagato' : inv.status}
                     </span>
+                    {/* Trasparenza incasso (sola lettura): chiude il dubbio
+                        "è registrata?". Verde SOLO per la pagata (confermata);
+                        muto per "da incassare" e per la conferma in corso. */}
+                    {inv.status === 'paid' ? (
+                      <div className="mt-1 text-[11px] text-accent-green/80">
+                        Pagata{inv.paid_at ? ` · ${formatDate(inv.paid_at)}` : ''}
+                      </div>
+                    ) : (inv.missing_streak || 0) >= 1 ? (
+                      <div className="mt-1">
+                        <span
+                          className="inline-block text-[10px] px-1.5 py-0.5 rounded bg-[rgba(148,163,184,0.15)] text-txt-muted"
+                          title="Sparita dalla lista «Da incassare» di FatturaPro: sta per essere marcata pagata. Usa «Aggiorna incassi adesso» per confermarla subito."
+                        >
+                          Conferma incasso in corso ({inv.missing_streak}/2)
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="mt-1 text-[11px] text-txt-muted">
+                        Da incassare{inv.updated_at ? ` · aggiornato ${formatDate(inv.updated_at)}` : ''}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-3 text-sm text-center">
                     <button
