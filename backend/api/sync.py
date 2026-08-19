@@ -1134,6 +1134,74 @@ def _locked_task(task_fn):
     return wrapper
 
 
+def _reconcile_incassi_task() -> dict:
+    """Riconciliazione IMMEDIATA degli incassi: esegue il passo fatture +
+    rilevamento pagamenti DUE VOLTE di fila.
+
+    Perché due volte: il rilevamento marca 'paid' solo alla SECONDA assenza
+    consecutiva su fetch COMPLETI (PAID_ABSENCE_STREAK=2, che NON si tocca —
+    è la rete di sicurezza contro una riga persa per un attimo dal fetch). Con
+    lo scheduler orario servono ~2 ore. Qui, su richiesta dell'owner, si fanno
+    i due passaggi subito: una fattura già sparita dalla lista FatturaPro
+    (incasso registrato) passa da streak 0 → 2 e viene marcata pagata ADESSO.
+
+    Sicurezza ereditata: il rilevamento è già gated su `partial` DENTRO
+    _sync_invoices_task (un fetch incompleto non marca nulla). Qui non si
+    reimplementa nulla — si chiama il task esistente e si legge il suo flag
+    `partial`. Al primo passaggio parziale ci si ferma e si è onesti.
+
+    Lock: usa lo STESSO _sync_lock degli altri sync. Se un sync completo è già
+    in corso, degrada con grazia (niente doppio rilevamento in parallelo che
+    corromperebbe missing_streak, niente deadlock). _sync_invoices_task NON
+    prende il lock da sé (lo fa il wrapper _locked_task / il full sync), quindi
+    chiamarlo qui mentre teniamo il lock è sicuro (nessuna rientranza).
+
+    Ritorna: {passes, marked_paid, partial, message}.
+    """
+    if not _sync_lock.acquire(blocking=False):
+        logger.warning("Reconcile incassi saltato: un altro sync è in corso")
+        return {
+            "passes": 0,
+            "marked_paid": 0,
+            "partial": False,
+            "message": "Sincronizzazione già in corso, riprova",
+        }
+    try:
+        passes = 0
+        marked_paid = 0
+        partial = False
+        for _ in range(2):
+            res = _sync_invoices_task()
+            passes += 1
+            fp = res.get("fatturapro", {}) if isinstance(res, dict) else {}
+            marked_paid += fp.get("paid_detected", 0) or 0
+            if fp.get("partial"):
+                # Lista incompleta: il task non ha marcato nulla (gate su
+                # partial). Fermarsi — un secondo passaggio sarebbe altrettanto
+                # cieco. Si dice all'operatore di riprovare tra poco.
+                partial = True
+                break
+
+        if marked_paid:
+            message = (
+                "1 incasso registrato" if marked_paid == 1
+                else f"{marked_paid} incassi registrati"
+            )
+        elif partial:
+            message = "Lista FatturaPro incompleta, riprova tra poco"
+        else:
+            message = "Nessun nuovo incasso da registrare"
+
+        return {
+            "passes": passes,
+            "marked_paid": marked_paid,
+            "partial": partial,
+            "message": message,
+        }
+    finally:
+        _sync_lock.release()
+
+
 @router.post("/invoices")
 async def sync_invoices(background_tasks: BackgroundTasks):
     """Trigger manual sync of invoices from FatturaPro."""
@@ -1142,6 +1210,20 @@ async def sync_invoices(background_tasks: BackgroundTasks):
         "status": "sync_started",
         "message": "Invoice sync started in background"
     }
+
+
+@router.post("/reconcile-incassi")
+def reconcile_incassi():
+    """Aggiorna incassi ADESSO: due passaggi di fetch+rilevamento pagamenti in
+    serie, così un incasso già registrato in FatturaPro si vede subito invece
+    di attendere due sync orari.
+
+    Endpoint SINCRONO (def → threadpool FastAPI): a differenza degli altri
+    sync (fire-and-forget in background) qui l'operatore vuole l'esito SUBITO
+    ({passes, marked_paid, partial, message}). Il lavoro è breve (due fetch) e
+    protetto dal medesimo _sync_lock, quindi non si accavalla col full sync.
+    """
+    return _reconcile_incassi_task()
 
 
 @router.post("/customers")
