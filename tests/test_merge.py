@@ -308,6 +308,36 @@ def test_pick_survivor_prefers_active_over_excluded(test_db_session):
     assert survivor.id == active.id
 
 
+def test_pick_survivor_prefers_distinctive_over_generic(test_db_session):
+    # Caso BASARA dal vivo: la scheda-spazzatura "ristorante" ha lo shopify_id,
+    # ma il survivor dev'essere quella col BRAND, altrimenti le varianti non le
+    # corrispondono e il cluster resta splittato.
+    s = test_db_session
+    from backend.engine.merge import _pick_survivor
+    junk = _cust(s, "ristorante", PIVA_A, shopify_id="gid://1")
+    real = _cust(s, "Basara Milano Italia Srl", PIVA_A, source="fatturapro")
+    survivor = _pick_survivor([junk, real], {})
+    assert survivor.id == real.id
+
+
+def test_auto_merge_distinctive_survivor_merges_variants(test_db_session):
+    # Cluster BASARA reale: 2 varianti col brand + 1 spazzatura "ristorante".
+    # Le varianti si fondono (survivor = brand), "ristorante" resta in revisione.
+    s = test_db_session
+    _cust(s, "ristorante", PIVA_A, shopify_id="gid://1")
+    _cust(s, "BASARA MILANO ITALIA SRL", PIVA_A, source="fatturapro")
+    _cust(s, "BASARA MILANO ITALIA S.R.L. a socio unico", PIVA_A, source="fatturapro")
+    res = auto_merge_exact_piva(s)
+    assert res["merged"] == 1        # una BASARA fusa nell'altra
+    assert res["left_for_review"] == 1  # "ristorante" non corrisponde al brand
+    survivors = [
+        c.ragione_sociale
+        for c in s.query(Customer).filter(Customer.merged_into.is_(None)).all()
+    ]
+    assert any("BASARA" in n.upper() for n in survivors)
+    assert "ristorante" in survivors
+
+
 def test_find_clusters_excludes_already_merged(test_db_session):
     s = test_db_session
     survivor = _cust(s, "TANOSHI GROUP SRLS", PIVA_A, shopify_id="gid://1")
