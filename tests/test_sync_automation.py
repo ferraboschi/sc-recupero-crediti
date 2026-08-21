@@ -96,23 +96,25 @@ class TestSyncProgress:
         assert by_step["invoices"]["running"] is True
         assert by_step["invoices"]["step_index"] == 1
         assert by_step["invoices"]["step_label"] == "Fatture (FatturaPro)"
-        assert by_step["invoices"]["total_steps"] == 6
+        assert by_step["invoices"]["total_steps"] == 7
         assert by_step["invoices"]["manual"] is True
         assert by_step["invoices"]["include_order_matching"] is False
-        assert by_step["cases"]["step_index"] == 6
+        # cases è ora lo step 7 (dopo l'inserimento di 'merge' come step 6).
+        assert by_step["cases"]["step_index"] == 7
         assert by_step["cases"]["step_label"] == "Pratiche di recupero"
 
         # A fine run il progresso è chiuso
         assert sync_mod._sync_progress["running"] is False
 
-    def test_total_steps_seven_when_full(self, monkeypatch):
+    def test_total_steps_eight_when_full(self, monkeypatch):
+        # 8 step col full sync dopo l'aggiunta di 'merge' (deduplica clienti).
         calls = []
         snapshots = []
         _patch_steps(monkeypatch, calls, snapshots)
         sync_mod._full_sync_task(include_order_matching=True)
         by_step = {name: prog for name, prog in snapshots}
-        assert by_step["invoices"]["total_steps"] == 7
-        assert by_step["order_matching"]["step_index"] == 7
+        assert by_step["invoices"]["total_steps"] == 8
+        assert by_step["order_matching"]["step_index"] == 8
         assert by_step["order_matching"]["step_label"] == "Aggancio ordini Shopify"
 
     def test_running_false_even_if_a_step_explodes(self, monkeypatch):

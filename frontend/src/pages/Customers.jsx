@@ -53,6 +53,7 @@ export default function Customers() {
   const [suggestions, setSuggestions] = useState([])
   const [sanitizeCount, setSanitizeCount] = useState(null)
   const [bonificaCount, setBonificaCount] = useState(0)
+  const [dupCount, setDupCount] = useState(0)
 
   // Parametri correnti della lista (un solo punto di verità, usato anche
   // dalla richiesta dedicata al riepilogo).
@@ -148,6 +149,19 @@ export default function Customers() {
   }
   useEffect(() => { fetchBonificaCount() }, [])
 
+  // Quanti gruppi di schede duplicate (stessa P.IVA) restano da unire a mano.
+  // L'auto-merge del sync fonde già i sicuri; qui restano quelli da confermare.
+  const fetchDupCount = async () => {
+    try {
+      const res = await client.get('/customers/merge-suggestions')
+      setDupCount(res.data.count || 0)
+    } catch (err) {
+      console.error('Errore merge-suggestions:', err)
+      setDupCount(0)
+    }
+  }
+  useEffect(() => { fetchDupCount() }, [])
+
   // "Forse intendevi": suggerimenti approssimati (accenti/forme legali/
   // refusi tollerati). Debounced, su TUTTI i clienti (anche senza scadute).
   useEffect(() => {
@@ -229,6 +243,25 @@ export default function Customers() {
             </p>
           </div>
           <span className="text-accent-teal font-bold shrink-0" aria-hidden="true">Rivedi →</span>
+        </button>
+      )}
+
+      {/* Duplicati da unire a mano (stessa P.IVA, nome da confermare o P.IVA
+          estera). I sicuri li fonde già l'auto-merge del sync. */}
+      {dupCount > 0 && (
+        <button
+          onClick={() => navigate('/customers/duplicati')}
+          className="w-full flex items-center justify-between gap-4 rounded-xl border border-accent-amber/40 bg-accent-amber/5 px-5 py-3 text-left hover:bg-accent-amber/10 transition-colors"
+        >
+          <div>
+            <p className="text-sm font-semibold text-accent-amber">
+              {dupCount} grupp{dupCount === 1 ? 'o' : 'i'} di duplicati da unire
+            </p>
+            <p className="text-xs text-txt-secondary mt-0.5">
+              Stessa azienda su più schede: uniscile così un solo messaggio recupera tutte le fatture.
+            </p>
+          </div>
+          <span className="text-accent-amber font-bold shrink-0" aria-hidden="true">Rivedi →</span>
         </button>
       )}
 

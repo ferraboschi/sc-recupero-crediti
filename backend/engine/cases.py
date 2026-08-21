@@ -406,7 +406,11 @@ def update_case_lifecycle(session: Session, allow_close: bool = True) -> Dict[st
     """
     stats = {"opened": 0, "reopened": 0, "closed": 0, "attached": 0, "detached": 0}
 
-    customers = session.query(Customer).options(
+    # I clienti fusi (merged_into) non hanno più fatture proprie e non devono
+    # generare/toccare pratiche: fuori dal ciclo.
+    customers = session.query(Customer).filter(
+        Customer.merged_into.is_(None)
+    ).options(
         joinedload(Customer.invoices),
     ).all()
     open_cases = {
@@ -512,7 +516,11 @@ def backfill_cases(session: Session) -> Dict[str, Any]:
     now = datetime.utcnow()
     history_cutoff = now - timedelta(days=BACKFILL_HISTORY_CAP_DAYS)
 
-    customers = session.query(Customer).options(
+    # I clienti fusi (merged_into) non hanno più fatture proprie e non devono
+    # generare/toccare pratiche: fuori dal ciclo.
+    customers = session.query(Customer).filter(
+        Customer.merged_into.is_(None)
+    ).options(
         joinedload(Customer.invoices),
     ).all()
 

@@ -55,7 +55,9 @@ async def get_dashboard(session: Session = Depends(get_session)):
             Invoice.status != "paid"
         ).scalar() or 0
 
-        total_customers = session.query(func.count(Customer.id)).scalar() or 0
+        total_customers = session.query(func.count(Customer.id)).filter(
+            Customer.merged_into.is_(None)
+        ).scalar() or 0
 
         return {
             "total_scaduto": float(total_scaduto),
@@ -88,6 +90,7 @@ async def search_dashboard(
             .outerjoin(Invoice, (Invoice.customer_id == Customer.id) & (Invoice.status != "paid"))
             .filter(
                 Customer.excluded.is_(False),
+                Customer.merged_into.is_(None),
                 or_(
                     Customer.ragione_sociale.ilike(search_term),
                     Customer.partita_iva.ilike(search_term),
@@ -396,7 +399,9 @@ async def get_stats(session: Session = Depends(get_session)):
     try:
         total_crediti = session.query(func.sum(Invoice.amount_due)).scalar() or 0.0
         total_positions = session.query(func.count(Invoice.id)).scalar() or 0
-        total_customers = session.query(func.count(Customer.id)).scalar() or 0
+        total_customers = session.query(func.count(Customer.id)).filter(
+            Customer.merged_into.is_(None)
+        ).scalar() or 0
 
         # Count by status
         open_positions = session.query(func.count(Invoice.id)).filter(
@@ -468,6 +473,7 @@ async def get_attivita(session: Session = Depends(get_session)):
             .outerjoin(Invoice, Invoice.customer_id == Customer.id)
             .filter(
                 Customer.excluded.is_(False),
+                Customer.merged_into.is_(None),
                 Customer.recovery_status.notin_(["idle", "archived"]),
             )
             .group_by(Customer.id)

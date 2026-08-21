@@ -6,7 +6,10 @@ services:
   - type: web
     name: sc-recupero-api
     runtime: python
-    plan: starter  # allineato al piano reale del servizio (verificato 16/07): free = spin-down, scheduler inaffidabile
+    plan: standard  # 1 CPU / 2GB. Salito da starter (0.5 CPU) il 21/08: su starter
+    # il sync pesante (parsing HTML fatture + matching rapidfuzz) teneva la GIL e
+    # affamava /api/health → timeout 5s → "server failure" di Render. NB: il piano
+    # reale lo imposta l'owner dal dashboard (questo file è documentazione).
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health

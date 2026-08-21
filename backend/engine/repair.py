@@ -153,7 +153,11 @@ def repair_matches(session: Session) -> Dict[str, Any]:
     if cust_ids:
         for c in session.query(Customer).filter(Customer.id.in_(cust_ids)).all():
             customers_by_id[c.id] = c
-    all_customers = session.query(Customer).all()
+    # I clienti fusi (merged_into) non sono candidati di re-abbinamento:
+    # ri-attaccarci una fattura ricreerebbe lo split appena chiuso.
+    all_customers = session.query(Customer).filter(
+        Customer.merged_into.is_(None)
+    ).all()
 
     # ── Passo 1: detach su contraddizione P.IVA confermata dal nome ──
     # La contraddizione P.IVA da sola NON basta: il valore avvelenato può

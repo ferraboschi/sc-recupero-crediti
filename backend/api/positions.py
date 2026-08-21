@@ -420,7 +420,8 @@ async def create_customer_from_invoice(position_id: int, session: Session = Depe
             # validate_piva toglie il prefisso 'IT'; in anagrafica può esserci
             # ancora la variante prefissata (es. clienti importati da Shopify).
             existing = session.query(Customer).filter(
-                Customer.partita_iva.in_([piva, f"IT{piva}"])
+                Customer.partita_iva.in_([piva, f"IT{piva}"]),
+                Customer.merged_into.is_(None),
             ).first()
             if existing:
                 raise HTTPException(
@@ -439,7 +440,7 @@ async def create_customer_from_invoice(position_id: int, session: Session = Depe
             # da quella della fattura è un'entità diversa (stessa regola di
             # matching/auto-create): non blocca la creazione.
             existing = None
-            for c in session.query(Customer).all():
+            for c in session.query(Customer).filter(Customer.merged_into.is_(None)).all():
                 if normalize_ragione_sociale(c.ragione_sociale or "") != name_norm:
                     continue
                 cust_piva = validate_piva(c.partita_iva)
@@ -809,7 +810,9 @@ async def assign_name_to_customer(
         # (come create-customer: la colonna può essere stantia). Nel caso
         # tipico l'omonimo è proprio il vero destinatario della fattura.
         homonym = None
-        for c in session.query(Customer).filter(Customer.id != customer.id).all():
+        for c in session.query(Customer).filter(
+            Customer.id != customer.id, Customer.merged_into.is_(None)
+        ).all():
             if normalize_ragione_sociale(c.ragione_sociale or "") == new_norm:
                 homonym = c
                 break
@@ -1120,6 +1123,13 @@ async def reassign_position(
         new_customer = session.query(Customer).filter(Customer.id == new_customer_id).first()
         if not new_customer:
             raise HTTPException(status_code=404, detail="Target customer not found")
+        if new_customer.merged_into is not None:
+            # Scheda unificata in un'altra: riattaccarci una fattura ricreerebbe
+            # lo split. Rimanda alla sopravvissuta.
+            raise HTTPException(
+                status_code=409,
+                detail="Cliente unificato in un altro: riassegna alla scheda sopravvissuta",
+            )
 
         # ── REGOLA P.IVA IMPRESCINDIBILE ──
         # Se la fattura ha P.IVA e il cliente destinazione ha una P.IVA DIVERSA,

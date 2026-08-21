@@ -209,7 +209,12 @@ async def list_customers(
         # sort seguenti si sposterebbero fra richieste e la paginazione
         # salterebbe/ripeterebbe righe (stessa classe di bug già corretta su
         # fatture e positions).
-        query = session.query(Customer).order_by(Customer.id)
+        # merged_into IS NULL: i duplicati fusi restano nel DB per audit ma
+        # non compaiono in elenco/conteggi (le loro fatture sono già sulla
+        # scheda sopravvissuta).
+        query = session.query(Customer).filter(
+            Customer.merged_into.is_(None)
+        ).order_by(Customer.id)
 
         if search:
             search_pattern = f"%{search}%"
@@ -355,7 +360,7 @@ async def suggest_customers(
     rows = session.query(
         Customer.id, Customer.ragione_sociale,
         Customer.partita_iva, Customer.excluded,
-    ).all()
+    ).filter(Customer.merged_into.is_(None)).all()
     if not rows:
         return {"query": q, "items": []}
 
@@ -563,6 +568,138 @@ async def bonifica_piva_bulk(
         raise
 
 
+class MergeRequest(BaseModel):
+    survivor_id: int
+    duplicate_ids: List[int]
+
+
+@router.get("/merge-suggestions")
+async def merge_suggestions(session: Session = Depends(get_session)):
+    """Cluster di schede che sono la STESSA azienda (stessa P.IVA), da unire.
+
+    L'auto-merge del sync fonde già i cluster sicuri (P.IVA italiana
+    checksum-valida + nome corrispondente); qui restano soprattutto quelli da
+    confermare a mano: nome non corrispondente ("la P.IVA coincide, controlla
+    il nome") o P.IVA estera (solo formato, mai auto).
+
+    Per ogni membro `corresponds` = il nome corrisponde al survivor proposto
+    (rete di sicurezza: la P.IVA comanda, il nome scarta le collisioni palesi).
+    Definito PRIMA di /{customer_id} così 'merge-suggestions' non è letto come id.
+    """
+    from backend.engine.merge import (
+        _pick_survivor, find_piva_clusters, names_correspond,
+    )
+    from backend.engine.piva import is_checksum_backed
+
+    clusters = find_piva_clusters(session)
+    counts = dict(
+        session.query(Invoice.customer_id, func.count(Invoice.id))
+        .filter(Invoice.customer_id.isnot(None))
+        .group_by(Invoice.customer_id).all()
+    )
+    overdue_counts = dict(
+        session.query(Invoice.customer_id, func.count(Invoice.id))
+        .filter(overdue_clause(), Invoice.customer_id.isnot(None))
+        .group_by(Invoice.customer_id).all()
+    )
+    out = []
+    for piva, members in sorted(clusters.items()):
+        survivor = _pick_survivor(members, counts)
+        checksum = is_checksum_backed(piva)
+        rows = []
+        all_corr = True
+        for c in members:
+            if c.id == survivor.id:
+                corr, score = True, 100
+            else:
+                corr, score = names_correspond(
+                    survivor.ragione_sociale, c.ragione_sociale
+                )
+                if not corr:
+                    all_corr = False
+            rows.append({
+                "id": c.id,
+                "nome": c.ragione_sociale,
+                "partita_iva": c.partita_iva,
+                "phone": c.phone,
+                "invoice_count": counts.get(c.id, 0),
+                "overdue_count": overdue_counts.get(c.id, 0),
+                "is_survivor": c.id == survivor.id,
+                "corresponds": corr,
+                "name_score": score,
+            })
+        out.append({
+            "piva": piva,
+            "checksum_backed": checksum,
+            "auto_eligible": checksum and all_corr,
+            "survivor_id": survivor.id,
+            "members": rows,
+        })
+    return {"clusters": out, "count": len(out)}
+
+
+@router.post("/merge")
+async def merge_customers_endpoint(
+    body: MergeRequest,
+    session: Session = Depends(get_session),
+):
+    """Unisce a mano uno o più duplicati nella scheda sopravvissuta.
+
+    La P.IVA comanda: ogni duplicato deve condividere ESATTAMENTE la P.IVA
+    (normalizzata) del survivor — è la garanzia che sia la stessa azienda. Il
+    nome può differire (è l'operatore a confermare, es. "ristorante" ≡ Basara).
+    Idempotente: i già-fusi o inesistenti si saltano.
+    """
+    from backend.engine.merge import merge_customers as _do_merge
+    from backend.engine.piva import normalize_piva
+    try:
+        survivor = session.query(Customer).filter(
+            Customer.id == body.survivor_id,
+            Customer.merged_into.is_(None),
+        ).first()
+        if not survivor:
+            raise HTTPException(
+                status_code=404,
+                detail="Scheda sopravvissuta non trovata (o già fusa)",
+            )
+        surv_piva = normalize_piva(survivor.partita_iva)
+        if not surv_piva:
+            raise HTTPException(
+                status_code=400,
+                detail="La scheda sopravvissuta non ha una P.IVA: "
+                "impossibile garantire il merge",
+            )
+        merged = 0
+        skipped = []
+        for dup_id in body.duplicate_ids:
+            if dup_id == survivor.id:
+                continue
+            dup = session.query(Customer).filter(Customer.id == dup_id).first()
+            if not dup or dup.merged_into is not None:
+                skipped.append({"id": dup_id, "reason": "not_found_or_merged"})
+                continue
+            if normalize_piva(dup.partita_iva) != surv_piva:
+                # Sicurezza: mai fondere P.IVA diverse (aziende diverse).
+                skipped.append({"id": dup_id, "reason": "piva_mismatch"})
+                continue
+            _do_merge(session, survivor, dup)
+            merged += 1
+        session.add(ActivityLog(
+            action="customers_merged",
+            entity_type="customer",
+            entity_id=survivor.id,
+            details={"merged": merged, "skipped": skipped},
+        ))
+        session.commit()
+        return {"survivor_id": survivor.id, "merged": merged, "skipped": skipped}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error merging customers: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
 @router.get("/{customer_id}")
 async def get_customer_detail(
     customer_id: int,
@@ -719,6 +856,9 @@ async def get_customer_detail(
             "phones": customer.phones_json or [],
             "email": customer.email,
             "excluded": customer.excluded,
+            # Se valorizzato, questa scheda è stata FUSA in un'altra: la UI
+            # reindirizza alla sopravvissuta invece di mostrare un profilo vuoto.
+            "merged_into": customer.merged_into,
             # Nome bloccato dalla bonifica manuale (assign-name-to-customer):
             # la UI mostra il badge + "Sblocca nome" solo quando è True.
             "ragione_sociale_locked": bool(customer.ragione_sociale_locked),
@@ -1494,7 +1634,8 @@ async def create_customer(
         email = body.email
 
         existing = session.query(Customer).filter(
-            Customer.ragione_sociale == ragione_sociale
+            Customer.ragione_sociale == ragione_sociale,
+            Customer.merged_into.is_(None),
         ).first()
         if existing:
             return {
