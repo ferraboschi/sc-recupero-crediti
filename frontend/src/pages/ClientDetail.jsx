@@ -217,6 +217,12 @@ export default function ClientDetail() {
     try {
       setLoading(true)
       const response = await client.get(`/customers/${customerId}`)
+      // Scheda fusa in un'altra (duplicato deduplicato): reindirizza alla
+      // sopravvissuta invece di mostrare un profilo vuoto (link/bookmark vecchi).
+      if (response.data.merged_into) {
+        navigate(`/customers/${response.data.merged_into}`, { replace: true })
+        return
+      }
       setData(response.data)
       const items = response.data.invoices?.items || []
       const overdueIds = items
@@ -232,7 +238,7 @@ export default function ClientDetail() {
     } finally {
       setLoading(false)
     }
-  }, [customerId])
+  }, [customerId, navigate])
 
   const fetchNeighbors = useCallback(async () => {
     try {

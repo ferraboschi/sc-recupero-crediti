@@ -39,6 +39,12 @@ class Customer(Base):
     excluded = Column(Boolean, default=False)
     source = Column(String, default="shopify")  # shopify / fatturapro / fatture24 / manual
     tags = Column(String, nullable=True)
+    # Deduplica anagrafica: se valorizzato, questa scheda è stata FUSA in
+    # un'altra (stessa P.IVA). Resta nel DB per audit (mai hard-delete) ma va
+    # ESCLUSA da liste/conteggi/ricerca/aggregati. La sopravvissuta è merged_into.
+    # Le fatture/azioni/pratiche del duplicato sono già ripuntate alla
+    # sopravvissuta al momento del merge (engine/merge.py).
+    merged_into = Column(Integer, ForeignKey("customers.id"), nullable=True, index=True)
     # Recovery workflow — cache dello stato della pratica aperta, per liste/filtri.
     # La fonte di verità del ciclo di recupero è RecoveryCase.
     recovery_status = Column(String, default="idle")  # idle / first_contact / second_contact / lawyer / archived / waiting
@@ -431,6 +437,13 @@ def _run_migrations(engine):
         "ALTER TABLE overdue_snapshots ADD COLUMN estimated BOOLEAN DEFAULT FALSE",
         "UPDATE overdue_snapshots SET estimated = FALSE "
         "WHERE estimated IS NULL",
+        # Deduplica anagrafica: puntatore alla scheda sopravvissuta del merge
+        # (stessa P.IVA). Additiva, degrado grazioso: finché il prod è indietro
+        # di questa migrazione la colonna non esiste e i lettori la trattano
+        # come "nessun merge" (tutti attivi).
+        "ALTER TABLE customers ADD COLUMN merged_into INTEGER",
+        "CREATE INDEX IF NOT EXISTS ix_customers_merged_into "
+        "ON customers (merged_into)",
     ]
     try:
         raw = engine.raw_connection()

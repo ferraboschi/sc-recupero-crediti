@@ -365,7 +365,10 @@ def run_matching(session: Session) -> Dict[str, Any]:
     ).all()
     stats['total'] = len(unmatched_invoices)
 
-    customers = session.query(Customer).all()
+    # Esclude i clienti fusi (merged_into): un duplicato deduplicato non deve
+    # più attrarre fatture, altrimenti il match ricrea lo split che il merge
+    # ha appena chiuso.
+    customers = session.query(Customer).filter(Customer.merged_into.is_(None)).all()
     if not customers:
         logger.warning("No customers found in database for matching")
         stats['unmatched'] = len(unmatched_invoices)

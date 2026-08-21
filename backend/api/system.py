@@ -49,15 +49,18 @@ async def get_system_status():
                 "message": f"Database connection failed: {e}"
             })
 
-        # Table counts
-        total_customers = session.query(func.count(Customer.id)).scalar() or 0
+        # Table counts (esclusi i clienti fusi: sono nascosti dagli elenchi)
+        total_customers = session.query(func.count(Customer.id)).filter(
+            Customer.merged_into.is_(None)
+        ).scalar() or 0
         total_invoices = session.query(func.count(Invoice.id)).scalar() or 0
         open_cases = session.query(func.count(RecoveryCase.id)).filter(
             RecoveryCase.status == "open"
         ).scalar() or 0
 
         customers_shopify = session.query(func.count(Customer.id)).filter(
-            Customer.source == "shopify"
+            Customer.source == "shopify",
+            Customer.merged_into.is_(None),
         ).scalar() or 0
         customers_auto = total_customers - customers_shopify
 
@@ -175,6 +178,7 @@ async def get_system_status():
 
         # Check: customers without invoices
         customers_no_invoices = session.query(func.count(Customer.id)).filter(
+            Customer.merged_into.is_(None),
             ~Customer.id.in_(
                 session.query(Invoice.customer_id).filter(
                     Invoice.customer_id.isnot(None)
@@ -204,6 +208,7 @@ async def get_system_status():
         # (all overdue invoices paid → status should be updated)
         active_cust_ids = session.query(Customer.id).filter(
             Customer.excluded.is_(False),
+            Customer.merged_into.is_(None),
             Customer.recovery_status.in_(
                 ["first_contact", "second_contact", "lawyer"]
             ),

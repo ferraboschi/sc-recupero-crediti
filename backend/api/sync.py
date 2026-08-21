@@ -376,7 +376,8 @@ def _sync_invoices_task() -> dict:
                 # numero a cui parte il sollecito WhatsApp.
                 if cli_ok and clienti_map:
                     for customer in session.query(Customer).filter(
-                        (Customer.phone.is_(None)) | (Customer.email.is_(None))
+                        (Customer.phone.is_(None)) | (Customer.email.is_(None)),
+                        Customer.merged_into.is_(None),
                     ).all():
                         info = clienti_map.get((customer.ragione_sociale or "").strip().lower())
                         if not info:
@@ -538,6 +539,7 @@ def _sync_customers_task() -> dict:
                 for orphan in session.query(Customer).filter(
                     Customer.shopify_id.is_(None),
                     Customer.partita_iva.isnot(None),
+                    Customer.merged_into.is_(None),
                 ).all():
                     orphan_piva = validate_piva(orphan.partita_iva)
                     if orphan_piva and orphan_piva not in orphans_by_piva:
@@ -851,9 +853,11 @@ def _match_orders_task() -> dict:
         "errors": [], "already_matched": 0, "near_misses": [],
     }
     try:
-        # Get all customers that have a shopify_id
+        # Get all customers that have a shopify_id (esclusi i fusi: un dup
+        # deduplicato non deve attrarre ordini alla scheda morta).
         customers = session.query(Customer).filter(
             Customer.shopify_id.isnot(None),
+            Customer.merged_into.is_(None),
         ).all()
 
         if not customers:
@@ -1292,8 +1296,9 @@ def _full_sync_task(include_order_matching: bool = True, manual: bool = False) -
         logger.warning("Full sync already in progress, skipping")
         return {"error": "Sync already in progress"}
 
-    # 7 passi col full sync, 6 senza l'aggancio ordini finale.
-    total_steps = 7 if include_order_matching else 6
+    # 8 passi col full sync, 7 senza l'aggancio ordini finale (in più: la
+    # deduplica anagrafica prima delle pratiche).
+    total_steps = 8 if include_order_matching else 7
     now_iso = datetime.utcnow().isoformat()
     _sync_progress["running"] = True
     _sync_progress["manual"] = manual
@@ -1379,11 +1384,30 @@ def _full_sync_task(include_order_matching: bool = True, manual: bool = False) -
             logger.error(f"Auto-create failed: {e}", exc_info=True)
             results["auto_create"] = {"error": str(e)}
 
-        # Step 6: Case lifecycle. Con fetch fatture PARZIALE la payment
+        # Step 6: Deduplica anagrafica — fonde le schede che sono la stessa
+        # azienda (stessa P.IVA italiana checksum-valida + nome corrispondente).
+        # Gira DOPO auto-create (tutti i clienti esistono) e PRIMA delle
+        # pratiche, così il survivor riceve subito stato/pratica giusti. Le
+        # fatture del duplicato sono ripuntate dal merge → matching/repair (già
+        # passati) non le ri-splittano; i cluster non corrispondenti restano
+        # per l'approvazione manuale. Sessione dedicata: commit per-cluster.
+        _set_progress("merge", "Deduplica clienti", 6, total_steps)
+        try:
+            from backend.engine.merge import auto_merge_exact_piva
+            merge_session = get_session_direct()
+            try:
+                results["merge"] = auto_merge_exact_piva(merge_session)
+            finally:
+                merge_session.close()
+        except Exception as e:
+            logger.error(f"Auto-merge failed: {e}", exc_info=True)
+            results["merge"] = {"error": str(e)}
+
+        # Step 7: Case lifecycle. Con fetch fatture PARZIALE la payment
         # detection non è affidabile → niente chiusure (solo aperture).
         # È l'ULTIMO passo "interattivo": il suo marker (cases.last_sync)
         # segnala alla Dashboard che i dati che servono sono pronti.
-        _set_progress("cases", "Pratiche di recupero", 6, total_steps)
+        _set_progress("cases", "Pratiche di recupero", 7, total_steps)
         try:
             invoices_result = results.get("invoices", {})
             fp = invoices_result.get("fatturapro", {}) if isinstance(invoices_result, dict) else {}
@@ -1393,14 +1417,14 @@ def _full_sync_task(include_order_matching: bool = True, manual: bool = False) -
             logger.error(f"Case lifecycle failed: {e}", exc_info=True)
             results["cases"] = {"error": str(e)}
 
-        # Step 7 (enrichment finale): aggancio ordini Shopify. Ultimo e più
+        # Step 8 (enrichment finale): aggancio ordini Shopify. Ultimo e più
         # lento — la Dashboard ha già smesso di attendere (marker cases).
         # Attacca solo shopify_order_id/number a fatture già presenti: non
         # crea clienti né fatture, quindi ritardarlo (o saltarlo nel sync
         # orario) non perde nulla di nuovo.
         if include_order_matching:
             logger.info("Interactive sync complete; order matching (enrichment) follows")
-            _set_progress("order_matching", "Aggancio ordini Shopify", 7, total_steps)
+            _set_progress("order_matching", "Aggancio ordini Shopify", 8, total_steps)
             try:
                 results["order_matching"] = _match_orders_task()
             except Exception as e:

@@ -4,6 +4,7 @@ import Dashboard from './pages/Dashboard'
 import Positions from './pages/Positions'
 import Customers from './pages/Customers'
 import BonificaAnagrafica from './pages/BonificaAnagrafica'
+import MergeDuplicati from './pages/MergeDuplicati'
 import ClientDetail from './pages/ClientDetail'
 import Attivita from './pages/Attivita'
 import Utilizzo from './pages/Utilizzo'
@@ -257,8 +258,9 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/attivita" element={<Attivita />} />
             <Route path="/customers" element={<Customers />} />
-            {/* PRIMA di /customers/:customerId così 'bonifica' non è letto come id */}
+            {/* PRIMA di /customers/:customerId così 'bonifica'/'duplicati' non sono letti come id */}
             <Route path="/customers/bonifica" element={<BonificaAnagrafica />} />
+            <Route path="/customers/duplicati" element={<MergeDuplicati />} />
             <Route path="/customers/:customerId" element={<ClientDetail />} />
             <Route path="/positions" element={<Positions />} />
             <Route path="/utilizzo" element={<Utilizzo />} />
