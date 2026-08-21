@@ -139,16 +139,24 @@ def _merge_phones(survivor: Customer, dup: Customer) -> None:
 
 
 def _pick_survivor(members: list[Customer], counts: dict[int, int]) -> Customer:
-    """La scheda sopravvissuta del cluster: preferisci l'identità Shopify
-    canonica (ha shopify_id), poi più fatture, poi id più basso (stabile)."""
+    """La scheda sopravvissuta del cluster.
+
+    Ordine di preferenza:
+    - ATTIVA prima dell'esclusa (non ereditare un'esclusione che nasconde credito);
+    - nome DISTINTIVO prima del generico: se il survivor fosse una scheda-
+      spazzatura ("ristorante"), le varianti col vero brand ("Basara Milano
+      Italia SRL") non le corrisponderebbero e non si fonderebbero — il cluster
+      resterebbe splittato. Un survivor col brand fa fondere le sue varianti e
+      lascia la spazzatura alla revisione;
+    - identità Shopify canonica (shopify_id), poi più fatture, poi id (stabile).
+    """
     def key(c: Customer):
         return (
-            1 if c.excluded else 0,       # ATTIVO prima dell'escluso: la
-                                          # sopravvissuta non deve ereditare
-                                          # un'esclusione che nasconde credito.
-            0 if c.shopify_id else 1,     # identità Shopify canonica
-            -counts.get(c.id, 0),         # più fatture
-            c.id,                         # deterministico
+            1 if c.excluded else 0,
+            0 if _distinctive_tokens(c.ragione_sociale) else 1,
+            0 if c.shopify_id else 1,
+            -counts.get(c.id, 0),
+            c.id,
         )
     return sorted(members, key=key)[0]
 
