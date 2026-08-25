@@ -296,6 +296,24 @@ class TestScadenzarioAnagraficaEnrichment:
         assert inv.due_date_source != "real"
         assert inv.due_date != date(2025, 10, 11)
 
+    def test_paid_invoice_with_pre_issue_due_swept(self, monkeypatch, test_db_session):
+        # Le fatture PAGATE non entrano nel fetch overdue → il self-heal del
+        # ramo 'existing' non le vede. Lo sweep d'integrità le corregge lo
+        # stesso (caso reale dei 5 residui: 2026/1008 ecc., tutte pagate).
+        _mk_invoice(
+            test_db_session, "2026/00001008/SAK - Fattura",
+            issue_date=date(2026, 6, 4),
+            due_date=date(2025, 8, 1), due_date_source="real", status="paid",
+        )
+        # Il fetch NON contiene questa fattura (è pagata, fuori dagli overdue).
+        _run_invoice_sync(monkeypatch, test_db_session, [_raw("A/2026")])
+        inv = test_db_session.query(Invoice).filter(
+            Invoice.invoice_number.like("%1008%")
+        ).one()
+        assert inv.due_date >= inv.issue_date       # mai prima dell'emissione
+        assert inv.due_date_source == "assumed"
+        assert inv.status == "paid"                 # lo sweep non tocca lo stato
+
     def test_piva_joined_by_customer_name(self, monkeypatch, test_db_session):
         # La P.IVA arriva dall'anagrafica per nome — così Rooftop (IT) non
         # può assorbire una fattura QOQA (P.IVA diversa).
