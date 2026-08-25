@@ -40,6 +40,12 @@ class TestDocKey:
     def test_no_numeric_falls_back_to_upper(self):
         assert doc_key("FT-ABC") == "FT-ABC"
 
+    def test_unparseable_del_year_degrades_to_yearless(self):
+        # Format-drift: 'del' con anno a 2 cifre → l'anno non si estrae, la
+        # chiave ricade su quella SENZA anno. Degrado SICURO: un mancato match
+        # dà 'assumed', mai una data di un altro anno.
+        assert doc_key("1438/SAK del 17/08/26") == "1438/SAK"
+
 
 # HTML di test: struttura xcrud reale (colonne verificate in produzione)
 

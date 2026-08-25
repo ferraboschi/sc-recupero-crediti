@@ -216,16 +216,6 @@ def _sync_invoices_task() -> dict:
                 for inv in raw_invoices:
                     if scad_ok:
                         due = scadenze_map.get(_doc_key(inv["invoice_number"]))
-                        issue = inv.get("date")
-                        # Una scadenza non precede MAI l'emissione: se accade è
-                        # un match sbagliato (tipico: un'omonima di un altro
-                        # anno) → si scarta, mai assegnare una data più vecchia.
-                        if due and issue and due < issue:
-                            logger.warning(
-                                "Scadenza %s precede l'emissione %s per %s: "
-                                "match scartato", due, issue, inv["invoice_number"],
-                            )
-                            due = None
                         if due:
                             inv["due_date"] = due
                             inv["due_from_ledger"] = True
@@ -247,6 +237,24 @@ def _sync_invoices_task() -> dict:
                                 inv["customer_piva"] = cust["piva"]
                             inv["customer_phone"] = cust.get("phone")
                             inv["customer_email"] = cust.get("email")
+
+                # GUARDIA DATA UNIVERSALE: nessuna scadenza — dallo scadenzario
+                # O dalla colonna della lista — può precedere l'emissione. È il
+                # segno di un match sbagliato (omonima di un altro anno) o di un
+                # dato storto: si scarta, mai assegnare una data più vecchia
+                # dell'emissione. Copre anche le fatture NUOVE (che non passano
+                # dal self-heal del ramo 'existing').
+                for inv in raw_invoices:
+                    due = inv.get("due_date")
+                    issue = inv.get("date")
+                    if due and issue and due < issue:
+                        logger.warning(
+                            "Scadenza %s precede l'emissione %s per %s: "
+                            "scartata (match errato)",
+                            due, issue, inv.get("invoice_number"),
+                        )
+                        inv["due_date"] = None
+                        inv["due_from_ledger"] = False
 
                 # Build set of invoice numbers currently overdue in FatturaPro
                 fetched_invoice_numbers = set()

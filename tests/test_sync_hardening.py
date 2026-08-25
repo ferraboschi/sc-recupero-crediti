@@ -283,6 +283,19 @@ class TestScadenzarioAnagraficaEnrichment:
         assert inv.due_date >= inv.issue_date        # mai prima dell'emissione
         assert inv.due_date_source == "assumed"
 
+    def test_pre_issue_due_date_from_list_column_rejected(self, monkeypatch, test_db_session):
+        # La scadenza dalla COLONNA della lista (non dallo scadenzario) che
+        # precede l'emissione va scartata anche per una fattura NUOVA (la
+        # guardia universale copre entrambe le fonti).
+        raw = _raw("2026/00001348/SAK - Fattura", name="Noh")
+        raw["due_date"] = date(2025, 10, 11)  # colonna lista, pre-emissione
+        _run_invoice_sync(monkeypatch, test_db_session, [raw])
+        inv = test_db_session.query(Invoice).filter(
+            Invoice.invoice_number.like("%1348%")
+        ).one()
+        assert inv.due_date_source != "real"
+        assert inv.due_date != date(2025, 10, 11)
+
     def test_piva_joined_by_customer_name(self, monkeypatch, test_db_session):
         # La P.IVA arriva dall'anagrafica per nome — così Rooftop (IT) non
         # può assorbire una fattura QOQA (P.IVA diversa).
