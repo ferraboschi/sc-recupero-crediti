@@ -238,7 +238,8 @@ class TestScadenzarioAnagraficaEnrichment:
         result = _run_invoice_sync(
             monkeypatch, test_db_session,
             [_raw("2026/00001093/SAK - Fattura", name="Custode srl")],
-            scadenze={"1093/SAK": date(2026, 7, 15)},
+            # Chiave YEAR-AWARE, com'è costruita dal connettore (doc_key).
+            scadenze={"2026/1093/SAK": date(2026, 7, 15)},
         )
         assert result["fatturapro"]["due_date_enriched"] == 1
         inv = test_db_session.query(Invoice).filter(
@@ -246,6 +247,41 @@ class TestScadenzarioAnagraficaEnrichment:
         ).one()
         assert inv.due_date == date(2026, 7, 15)
         assert inv.due_date_source == "real"
+
+    def test_pre_issue_due_date_rejected(self, monkeypatch, test_db_session):
+        # GUARDIA (bug Speranzina/Noh): una scadenza che PRECEDE l'emissione
+        # è un match sbagliato (omonima di un altro anno) → scartata, mai
+        # applicata come 'real', mai una data più vecchia dell'emissione.
+        result = _run_invoice_sync(
+            monkeypatch, test_db_session,
+            [_raw("2026/00001438/SAK - Fattura", name="La Speranzina Spa")],
+            scadenze={"2026/1438/SAK": date(2025, 9, 24)},  # emissione è 2026-05-01
+        )
+        assert result["fatturapro"]["due_date_enriched"] == 0
+        inv = test_db_session.query(Invoice).filter(
+            Invoice.invoice_number.like("%1438%")
+        ).one()
+        assert inv.due_date_source != "real"
+        assert inv.due_date != date(2025, 9, 24)
+
+    def test_existing_corrupt_pre_issue_due_date_self_heals(self, monkeypatch, test_db_session):
+        # Auto-riparazione dello stato GIÀ corrotto: una due_date memorizzata
+        # prima dell'emissione (residuo del vecchio bug) torna ad 'assumed',
+        # anche senza scadenzario per quel ciclo.
+        _mk_invoice(
+            test_db_session, "2026/00001438/SAK - Fattura",
+            issue_date=date(2026, 5, 1),
+            due_date=date(2025, 9, 24), due_date_source="real",
+        )
+        _run_invoice_sync(
+            monkeypatch, test_db_session,
+            [_raw("2026/00001438/SAK - Fattura", name="La Speranzina Spa")],
+        )
+        inv = test_db_session.query(Invoice).filter(
+            Invoice.invoice_number.like("%1438%")
+        ).one()
+        assert inv.due_date >= inv.issue_date        # mai prima dell'emissione
+        assert inv.due_date_source == "assumed"
 
     def test_piva_joined_by_customer_name(self, monkeypatch, test_db_session):
         # La P.IVA arriva dall'anagrafica per nome — così Rooftop (IT) non

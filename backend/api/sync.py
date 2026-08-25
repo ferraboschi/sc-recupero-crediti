@@ -216,6 +216,16 @@ def _sync_invoices_task() -> dict:
                 for inv in raw_invoices:
                     if scad_ok:
                         due = scadenze_map.get(_doc_key(inv["invoice_number"]))
+                        issue = inv.get("date")
+                        # Una scadenza non precede MAI l'emissione: se accade è
+                        # un match sbagliato (tipico: un'omonima di un altro
+                        # anno) → si scarta, mai assegnare una data più vecchia.
+                        if due and issue and due < issue:
+                            logger.warning(
+                                "Scadenza %s precede l'emissione %s per %s: "
+                                "match scartato", due, issue, inv["invoice_number"],
+                            )
+                            due = None
                         if due:
                             inv["due_date"] = due
                             inv["due_from_ledger"] = True
@@ -284,6 +294,15 @@ def _sync_invoices_task() -> dict:
                             elif from_ledger and existing.due_date != inv["due_date"]:
                                 existing.due_date = inv["due_date"]
                                 due_enriched += 1
+                        # Auto-riparazione: una due_date memorizzata PRIMA
+                        # dell'emissione è corrotta (residuo del vecchio bug
+                        # omonime cross-anno). Se lo scadenzario di questo ciclo
+                        # non l'ha già corretta, ricade su 'assumed'
+                        # (emissione+30), mai una scadenza di un anno prima.
+                        if (existing.due_date and existing.issue_date
+                                and existing.due_date < existing.issue_date):
+                            existing.due_date = existing.issue_date + timedelta(days=30)
+                            existing.due_date_source = "assumed"
                         # Keep status as open if it was paid before but reappeared
                         if existing.status == "paid" and inv.get("balance", 0) > 0:
                             existing.status = "open"

@@ -15,21 +15,27 @@ from backend.connectors.fatturapro import (
 
 class TestDocKey:
     def test_modern_format_with_series(self):
-        assert doc_key("2026/00001093/SAK - Fattura") == "1093/SAK"
+        # YEAR-AWARE: l'anno fa parte della chiave (numerazione riparte ogni anno).
+        assert doc_key("2026/00001093/SAK - Fattura") == "2026/1093/SAK"
 
     def test_scadenzario_format(self):
-        assert doc_key("1093/SAK del 15/06/2026") == "1093/SAK"
+        assert doc_key("1093/SAK del 15/06/2026") == "2026/1093/SAK"
 
     def test_list_and_ledger_join_to_same_key(self):
         # I due formati delle due fonti devono collassare sulla stessa chiave
         assert doc_key("2026/00000655/SAK - Fattura") == doc_key("655/SAK del 15/04/2026")
 
-    def test_bare_number_year_drops_year(self):
-        assert doc_key("435/2023") == "435"
+    def test_cross_year_same_number_distinct_keys(self):
+        # Il cuore del bug Speranzina/Noh: 2025 e 2026 con lo STESSO numero
+        # sono fatture DIVERSE → chiavi diverse, mai collidenti.
+        assert doc_key("2026/00001438/SAK") != doc_key("2025/00001438/SAK")
+
+    def test_bare_number_year_kept(self):
+        assert doc_key("435/2023") == "2023/435"
 
     def test_zero_padded_progressivo_that_looks_like_year(self):
-        # 00002023 (8 char) è il progressivo, 2026 è l'anno da scartare
-        assert doc_key("2026/00002023/SAK") == "2023/SAK"
+        # 00002023 (8 char) è il progressivo, 2026 è l'anno (ora in chiave)
+        assert doc_key("2026/00002023/SAK") == "2026/2023/SAK"
 
     def test_no_numeric_falls_back_to_upper(self):
         assert doc_key("FT-ABC") == "FT-ABC"
@@ -55,6 +61,19 @@ SCADENZARIO_HTML = """
     <td>Bonifico</td><td>Unicredit</td><td>IT..</td><td>50,00</td><td>50,00</td><td></td></tr>
 <tr><td>05/01/2026</td><td></td><td>300/SAK del 01/01/2026</td><td>Rata Due srl</td>
     <td>Bonifico</td><td>Unicredit</td><td>IT..</td><td>50,00</td><td>50,00</td><td></td></tr>
+</table>
+"""
+
+# Stesso numero (1438/SAK) in due anni diversi: due fatture DIVERSE, entrambe
+# con rata aperta. È il caso reale del bug (La Speranzina 1438, Noh 1348).
+CROSS_YEAR_HTML = """
+<table class="xcrud-list">
+<tr><th>Scadenza</th><th>Proroga</th><th>Documento</th><th>Cliente</th>
+    <th>Modalità</th><th>Banca</th><th>Iban</th><th>Importo</th><th>Sospeso</th><th></th></tr>
+<tr><td>17/09/2026</td><td></td><td>1438/SAK del 17/08/2026</td><td>La Speranzina Spa</td>
+    <td>Bonifico</td><td>Unicredit</td><td>IT..</td><td>100,00</td><td>100,00</td><td></td></tr>
+<tr><td>24/09/2025</td><td></td><td>1438/SAK del 24/08/2025</td><td>La Speranzina Spa</td>
+    <td>Bonifico</td><td>Unicredit</td><td>IT..</td><td>200,00</td><td>200,00</td><td></td></tr>
 </table>
 """
 
@@ -114,33 +133,45 @@ class TestScadenzeMap:
     def test_belfiore_655_present(self, monkeypatch):
         conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
         smap, _ = conn.fetch_scadenze_map()
-        assert smap[doc_key("655/SAK")] == date(2026, 4, 15)
+        assert smap[doc_key("655/SAK del 15/04/2026")] == date(2026, 4, 15)
 
     def test_proroga_overrides_scadenza(self, monkeypatch):
         conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
         smap, _ = conn.fetch_scadenze_map()
         # 500/SAK: scadenza 01/03 ma proroga 30/06 → vince la proroga
-        assert smap[doc_key("500/SAK")] == date(2026, 6, 30)
+        assert smap[doc_key("500/SAK del 01/02/2026")] == date(2026, 6, 30)
 
     def test_settled_installment_ignored(self, monkeypatch):
         conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
         smap, _ = conn.fetch_scadenze_map()
         # 400/SAK ha Sospeso=0,00 → rata saldata, non deve comparire
-        assert doc_key("400/SAK") not in smap
+        assert doc_key("400/SAK del 01/01/2026") not in smap
+
+    def test_cross_year_same_number_not_collided(self, monkeypatch):
+        # REGRESSIONE Speranzina/Noh: la fattura 2026 tiene la SUA scadenza
+        # (17/09/2026), NON quella dell'omonima 2025 (24/09/2025). Prima del
+        # fix la nuova risultava scaduta da un anno.
+        conn = _connector_scadenzario(monkeypatch, CROSS_YEAR_HTML)
+        smap, _ = conn.fetch_scadenze_map()
+        assert smap[doc_key("2026/00001438/SAK")] == date(2026, 9, 17)
+        assert smap[doc_key("2025/00001438/SAK")] == date(2025, 9, 24)
+        assert smap[doc_key("2026/00001438/SAK")] != date(2025, 9, 24)
 
     def test_multiple_installments_keeps_earliest(self, monkeypatch):
         conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
         smap, _ = conn.fetch_scadenze_map()
         # 300/SAK ha due rate aperte (05/02 e 05/01) → tiene la più vecchia
-        assert smap[doc_key("300/SAK")] == date(2026, 1, 5)
+        assert smap[doc_key("300/SAK del 01/01/2026")] == date(2026, 1, 5)
 
     def test_target_keys_only_covers_requested(self, monkeypatch):
         # Con target_keys si tengono solo le fatture richieste
         conn = _connector_scadenzario(monkeypatch, SCADENZARIO_HTML)
-        smap, complete = conn.fetch_scadenze_map(target_keys={doc_key("655/SAK")})
+        smap, complete = conn.fetch_scadenze_map(
+            target_keys={doc_key("655/SAK del 15/04/2026")}
+        )
         assert complete
-        assert doc_key("655/SAK") in smap
-        assert doc_key("690/SAK") not in smap
+        assert doc_key("655/SAK del 15/04/2026") in smap
+        assert doc_key("690/SAK del 20/04/2026") not in smap
 
     def test_convergence_stops_early_when_targets_covered(self, monkeypatch):
         # Pagina 1 (via GET) con key+instance → una rata target; le pagine
@@ -168,10 +199,10 @@ class TestScadenzeMap:
 
         monkeypatch.setattr(conn.client, "post", fake_post)
         smap, complete = conn.fetch_scadenze_map(
-            target_keys={doc_key("999/SAK")}, patience=3
+            target_keys={doc_key("999/SAK del 01/07/2026")}, patience=3
         )
         assert complete                      # target coperto → completo
-        assert smap[doc_key("999/SAK")] == date(2026, 8, 1)
+        assert smap[doc_key("999/SAK del 01/07/2026")] == date(2026, 8, 1)
         assert posts["n"] == 0               # target già in pagina 1: nessun AJAX
 
 
@@ -236,9 +267,9 @@ class TestScadenzarioPaginationStart:
 
         monkeypatch.setattr(conn.client, "post", fake_post)
         smap, complete = conn.fetch_scadenze_map(
-            target_keys={doc_key("9999/SAK")}, patience=3
+            target_keys={doc_key("9999/SAK del 01/11/2026")}, patience=3
         )
-        assert smap.get(doc_key("9999/SAK")) == date(2026, 12, 1)
+        assert smap.get(doc_key("9999/SAK del 01/11/2026")) == date(2026, 12, 1)
         assert complete
 
 
