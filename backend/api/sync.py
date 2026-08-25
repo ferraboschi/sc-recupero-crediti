@@ -238,6 +238,24 @@ def _sync_invoices_task() -> dict:
                             inv["customer_phone"] = cust.get("phone")
                             inv["customer_email"] = cust.get("email")
 
+                # GUARDIA DATA UNIVERSALE: nessuna scadenza — dallo scadenzario
+                # O dalla colonna della lista — può precedere l'emissione. È il
+                # segno di un match sbagliato (omonima di un altro anno) o di un
+                # dato storto: si scarta, mai assegnare una data più vecchia
+                # dell'emissione. Copre anche le fatture NUOVE (che non passano
+                # dal self-heal del ramo 'existing').
+                for inv in raw_invoices:
+                    due = inv.get("due_date")
+                    issue = inv.get("date")
+                    if due and issue and due < issue:
+                        logger.warning(
+                            "Scadenza %s precede l'emissione %s per %s: "
+                            "scartata (match errato)",
+                            due, issue, inv.get("invoice_number"),
+                        )
+                        inv["due_date"] = None
+                        inv["due_from_ledger"] = False
+
                 # Build set of invoice numbers currently overdue in FatturaPro
                 fetched_invoice_numbers = set()
 
@@ -284,6 +302,15 @@ def _sync_invoices_task() -> dict:
                             elif from_ledger and existing.due_date != inv["due_date"]:
                                 existing.due_date = inv["due_date"]
                                 due_enriched += 1
+                        # Auto-riparazione: una due_date memorizzata PRIMA
+                        # dell'emissione è corrotta (residuo del vecchio bug
+                        # omonime cross-anno). Se lo scadenzario di questo ciclo
+                        # non l'ha già corretta, ricade su 'assumed'
+                        # (emissione+30), mai una scadenza di un anno prima.
+                        if (existing.due_date and existing.issue_date
+                                and existing.due_date < existing.issue_date):
+                            existing.due_date = existing.issue_date + timedelta(days=30)
+                            existing.due_date_source = "assumed"
                         # Keep status as open if it was paid before but reappeared
                         if existing.status == "paid" and inv.get("balance", 0) > 0:
                             existing.status = "open"

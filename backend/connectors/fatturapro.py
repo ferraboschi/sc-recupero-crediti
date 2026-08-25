@@ -18,14 +18,32 @@ logger = logging.getLogger(__name__)
 
 
 def doc_key(raw: str) -> str:
-    """Chiave canonica per il JOIN fattura↔scadenzario/anagrafica.
+    """Chiave canonica YEAR-AWARE per il JOIN fattura↔scadenzario.
 
-    Lo scadenzario elenca "1170/SAK del 24/06/2026", la lista fatture
-    "2026/00001170/SAK - Fattura": entrambe collassano su "1170/SAK"
-    (progressivo senza zeri iniziali + suffisso serie, anno scartato).
-    Replica la logica provata in produzione da SC-order-app.
+    Lo scadenzario elenca "1170/SAK del 24/06/2026" (anno nella data 'del' =
+    emissione), la lista fatture "2026/00001170/SAK - Fattura" (anno in testa):
+    entrambe collassano su "2026/1170/SAK".
+
+    L'ANNO È PARTE DELLA CHIAVE. La numerazione riparte ogni anno, quindi
+    "2025/00001438/SAK" e "2026/00001438/SAK" sono fatture DIVERSE. Scartando
+    l'anno collidevano e — con lo scadenzario che tiene la scadenza aperta più
+    VECCHIA — la fattura nuova (2026) ereditava la scadenza della vecchia
+    omonima (2025), risultando scaduta da un anno. Pericoloso: faceva partire
+    solleciti su fatture non ancora scadute.
+
+    Se l'anno non è ricavabile da nessuna delle due forme, si ricade sulla
+    chiave senza anno (retrocompatibile): un eventuale mancato match degrada a
+    scadenza 'assumed', mai a una data di un altro anno.
     """
-    head = re.split(r"\s+del\s+", str(raw or ""), flags=re.IGNORECASE)[0]
+    s = str(raw or "")
+    # Anno dalla data 'del GG/MM/AAAA' (forma scadenzario), se presente.
+    year = None
+    split = re.split(r"\s+del\s+", s, flags=re.IGNORECASE)
+    if len(split) > 1:
+        m = re.search(r"\b\d{1,2}/\d{1,2}/(\d{4})\b", split[1])
+        if m:
+            year = m.group(1)
+    head = split[0]
     head = re.sub(r"\s*[-–]\s*(Fattura|Nota.*|Ricevuta).*", "", head, flags=re.IGNORECASE).strip()
     parts = [p.strip() for p in head.split("/") if p.strip()]
     numeric = [p for p in parts if p.isdigit()]
@@ -36,14 +54,19 @@ def doc_key(raw: str) -> str:
         # ("00001093", 8 char) non viene scambiato per un anno.
         return len(p) == 4 and 1900 <= int(p) <= 2099
 
-    # Scarta l'anno solo se resta almeno un altro gruppo numerico (il progressivo)
+    # Anno dal gruppo-anno in testa (forma lista fatture), se non già trovato.
+    if year is None:
+        year = next((p for p in numeric if _is_year(p)), None)
+
     candidates = [p for p in numeric if not _is_year(p)] or numeric
     if not candidates:
-        return head.upper()
+        base = head.upper()
+        return f"{year}/{base}" if year else base
     # Il progressivo è il gruppo (rimasto) con la stringa più lunga
     prog = max(candidates, key=len)
     num = str(int(prog))
-    return f"{num}/{suffix}" if suffix else num
+    core = f"{num}/{suffix}" if suffix else num
+    return f"{year}/{core}" if year else core
 
 
 def _it_date_to_date(s: str) -> Optional[date]:
