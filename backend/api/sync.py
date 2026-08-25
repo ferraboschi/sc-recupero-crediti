@@ -391,6 +391,28 @@ def _sync_invoices_task() -> dict:
                 else:
                     logger.warning("PARTIAL fetch — payment detection skipped")
 
+                # ── SWEEP D'INTEGRITÀ SCADENZE ──
+                # Nessuna fattura — PAGATA inclusa — può avere una scadenza
+                # prima dell'emissione: è impossibile e storicamente era il
+                # residuo del bug omonime cross-anno. Le fatture pagate non
+                # entrano nel fetch overdue, quindi l'auto-riparazione del ramo
+                # 'existing' non le vede: qui si correggono TUTTE, ad 'assumed'
+                # (emissione+30). Idempotente: dopo la prima correzione la
+                # WHERE non trova più righe.
+                corrupt_due = session.query(Invoice).filter(
+                    Invoice.due_date.isnot(None),
+                    Invoice.issue_date.isnot(None),
+                    Invoice.due_date < Invoice.issue_date,
+                ).all()
+                for c_inv in corrupt_due:
+                    c_inv.due_date = c_inv.issue_date + timedelta(days=30)
+                    c_inv.due_date_source = "assumed"
+                if corrupt_due:
+                    logger.info(
+                        "Integrità scadenze: corrette %d fatture con "
+                        "due_date < emissione", len(corrupt_due),
+                    )
+
                 session.commit()
 
                 # ── Contatti (telefono/email) dall'anagrafica FatturaPro ──
