@@ -15,7 +15,7 @@ router = APIRouter()
 
 
 @router.get("")
-async def get_system_status():
+def get_system_status():
     """
     Comprehensive system health and alignment diagnostics.
 
@@ -414,7 +414,7 @@ def _summarize_sync_result(key: str, result: dict) -> str:
 # ── Audit abbinamenti fatture→clienti ────────────────────────────────
 
 @router.get("/match-audit")
-async def match_audit(
+def match_audit(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
     only_problems: bool = Query(True, description="Solo esiti warn/bad"),

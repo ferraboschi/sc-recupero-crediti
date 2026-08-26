@@ -7,7 +7,7 @@ from io import StringIO
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, contains_eager
 
 from backend.database import get_session, Invoice, Customer, ActivityLog
 
@@ -16,7 +16,7 @@ router = APIRouter()
 
 
 @router.get("")
-async def list_positions(
+def list_positions(
     session: Session = Depends(get_session),
     status: str = Query(None),
     min_amount: float = Query(None),
@@ -44,7 +44,12 @@ async def list_positions(
     from datetime import date as date_type
 
     try:
-        query = session.query(Invoice).outerjoin(Customer)
+        # contains_eager: il Customer già in outerjoin popola la relazione
+        # Invoice.customer → niente N+1 (prima ogni riga faceva una query a
+        # parte per il cliente: ~10s a pagina, che bloccavano l'event loop).
+        query = session.query(Invoice).outerjoin(Customer).options(
+            contains_eager(Invoice.customer)
+        )
 
         # Apply filters
         if status:
@@ -168,7 +173,7 @@ async def list_positions(
 
 
 @router.get("/export")
-async def export_positions(session: Session = Depends(get_session)):
+def export_positions(session: Session = Depends(get_session)):
     """Export all positions as CSV."""
     try:
         positions = session.query(Invoice).outerjoin(Customer).all()
@@ -222,7 +227,7 @@ async def export_positions(session: Session = Depends(get_session)):
 
 
 @router.get("/suggestions")
-async def list_suggestions(session: Session = Depends(get_session)):
+def list_suggestions(session: Session = Depends(get_session)):
     """Fatture in quarantena: abbinamento suggerito da confermare o rifiutare.
 
     Il matching automatico assegna solo i casi sicuri (P.IVA univoca, nome
@@ -282,7 +287,7 @@ async def list_suggestions(session: Session = Depends(get_session)):
 
 
 @router.post("/{position_id}/confirm-suggestion")
-async def confirm_suggestion(position_id: int, session: Session = Depends(get_session)):
+def confirm_suggestion(position_id: int, session: Session = Depends(get_session)):
     """Conferma il suggerimento: la fattura viene abbinata al cliente proposto."""
     try:
         position = session.query(Invoice).filter(Invoice.id == position_id).first()
@@ -341,7 +346,7 @@ async def confirm_suggestion(position_id: int, session: Session = Depends(get_se
 
 
 @router.post("/{position_id}/reject-suggestion")
-async def reject_suggestion(position_id: int, session: Session = Depends(get_session)):
+def reject_suggestion(position_id: int, session: Session = Depends(get_session)):
     """Rifiuta il suggerimento: la fattura resta senza cliente e non verrà
     più riproposta in automatico (match_method='unlinked')."""
     try:
@@ -380,7 +385,7 @@ async def reject_suggestion(position_id: int, session: Session = Depends(get_ses
 
 
 @router.post("/{position_id}/create-customer")
-async def create_customer_from_invoice(position_id: int, session: Session = Depends(get_session)):
+def create_customer_from_invoice(position_id: int, session: Session = Depends(get_session)):
     """Crea un NUOVO cliente dai dati grezzi della fattura e la abbina.
 
     Serve quando il suggerimento in quarantena è sbagliato (es. fattura
@@ -511,7 +516,7 @@ async def create_customer_from_invoice(position_id: int, session: Session = Depe
 
 
 @router.post("/{position_id}/unlink")
-async def unlink_position(position_id: int, session: Session = Depends(get_session)):
+def unlink_position(position_id: int, session: Session = Depends(get_session)):
     """Scollega una fattura dal cliente (abbinamento errato).
 
     La fattura viene marcata 'unlinked': non verrà mai più abbinata in
@@ -575,7 +580,7 @@ async def unlink_position(position_id: int, session: Session = Depends(get_sessi
 
 
 @router.post("/{position_id}/assign-piva-to-customer")
-async def assign_piva_to_customer(position_id: int, session: Session = Depends(get_session)):
+def assign_piva_to_customer(position_id: int, session: Session = Depends(get_session)):
     """Copia la P.IVA della FATTURA sul CLIENTE abbinato.
 
     Caso incoerente segnalato dall'audit come 'Dubbio': la fattura riporta
@@ -667,7 +672,7 @@ async def assign_piva_to_customer(position_id: int, session: Session = Depends(g
 
 
 @router.post("/{position_id}/assign-name-to-customer")
-async def assign_name_to_customer(
+def assign_name_to_customer(
     position_id: int,
     confirm: bool = Query(False, description="Senza confirm: solo anteprima d'impatto, nessuna modifica"),
     expected_customer_id: int = Query(
@@ -944,7 +949,7 @@ async def assign_name_to_customer(
 
 
 @router.post("/{position_id}/mark-reviewed")
-async def mark_reviewed(position_id: int, session: Session = Depends(get_session)):
+def mark_reviewed(position_id: int, session: Session = Depends(get_session)):
     """Segna la fattura come 'verificata a mano' nell'audit abbinamenti.
 
     L'operatore ha controllato di persona questo abbinamento dubbio/critico
@@ -978,7 +983,7 @@ async def mark_reviewed(position_id: int, session: Session = Depends(get_session
 
 
 @router.post("/{position_id}/unmark-reviewed")
-async def unmark_reviewed(position_id: int, session: Session = Depends(get_session)):
+def unmark_reviewed(position_id: int, session: Session = Depends(get_session)):
     """Annulla la verifica manuale: la fattura torna tra i problemi dell'audit."""
     try:
         position = session.query(Invoice).filter(Invoice.id == position_id).first()
@@ -1007,7 +1012,7 @@ async def unmark_reviewed(position_id: int, session: Session = Depends(get_sessi
 
 
 @router.get("/{position_id}")
-async def get_position_detail(position_id: int, session: Session = Depends(get_session)):
+def get_position_detail(position_id: int, session: Session = Depends(get_session)):
     """Get detailed information for a single position."""
     try:
         position = session.query(Invoice).filter(Invoice.id == position_id).first()
@@ -1047,7 +1052,7 @@ async def get_position_detail(position_id: int, session: Session = Depends(get_s
 
 
 @router.put("/{position_id}/status")
-async def update_position_status(
+def update_position_status(
     position_id: int,
     new_status: str,
     session: Session = Depends(get_session),
@@ -1102,7 +1107,7 @@ async def update_position_status(
 
 
 @router.put("/{position_id}/reassign")
-async def reassign_position(
+def reassign_position(
     position_id: int,
     new_customer_id: int = Query(..., description="ID of the customer to reassign this invoice to"),
     force: bool = Query(False, description="Force reassignment even if P.IVA conflict detected"),

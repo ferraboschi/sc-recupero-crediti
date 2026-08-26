@@ -91,7 +91,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 # ── Endpoints ───────────────────────────────────────────────────────
 @router.post("/login", response_model=LoginResponse)
-async def login(body: LoginRequest):
+def login(body: LoginRequest):
     """Authenticate and return a JWT token."""
     if body.username != _ADMIN_USER or not _verify_password(body.password):
         logger.warning(f"Failed login attempt for user '{body.username}'")
@@ -107,6 +107,6 @@ async def login(body: LoginRequest):
 
 
 @router.get("/me")
-async def get_me(user: str = Depends(verify_token)):
+def get_me(user: str = Depends(verify_token)):
     """Return the current authenticated user."""
     return {"user": user}

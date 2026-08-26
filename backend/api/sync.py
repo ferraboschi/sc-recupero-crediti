@@ -1542,7 +1542,7 @@ async def get_sync_status():
 
 
 @router.post("/cleanup-stale-f24")
-async def cleanup_stale_f24():
+def cleanup_stale_f24():
     """Mark all Fattura24 invoices as paid (cleanup for stale data when F24 API is unavailable).
 
     This is a one-off maintenance endpoint. Use CSV import to re-add F24 invoices if needed.

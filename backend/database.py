@@ -344,11 +344,16 @@ def get_engine():
     else:
         # PostgreSQL (Supabase Session Pooler) — use small QueuePool
         # to keep connections alive and avoid SSL handshake per request
+        # pool 5+5=10: gli endpoint DB ora girano nel threadpool (def, non più
+        # async-def sul solo event loop), quindi più richieste toccano il DB in
+        # parallelo. 10 dà margine sul singolo operatore + il sync, restando
+        # ben sotto il limite del pooler Supabase (tutto passa da qui, non può
+        # esaurire le connessioni del DB).
         _engine = create_engine(
             db_url,
             echo=False,
-            pool_size=3,
-            max_overflow=2,
+            pool_size=5,
+            max_overflow=5,
             pool_timeout=10,
             pool_recycle=300,
             pool_pre_ping=True,

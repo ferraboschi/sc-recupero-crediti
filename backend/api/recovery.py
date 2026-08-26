@@ -74,7 +74,7 @@ def _italian_day(dt: datetime) -> date:
 
 
 @router.get("/utilizzo")
-async def get_utilizzo(session: Session = Depends(get_session)):
+def get_utilizzo(session: Session = Depends(get_session)):
     """Registro d'utilizzo: quante AZIONI di recupero, su quanti ACCOUNT, al giorno.
 
     Sola lettura, nessuna mutazione. E' il monitor per vedere quanto la persona
@@ -145,7 +145,7 @@ async def get_utilizzo(session: Session = Depends(get_session)):
 # --- Registrazione solleciti (Copia Messaggio / WhatsApp) ---
 
 @router.post("/customers/{customer_id}/solleciti")
-async def register_sollecito(
+def register_sollecito(
     customer_id: int,
     body: SollecitoCreate,
     session: Session = Depends(get_session),
@@ -301,7 +301,7 @@ async def register_sollecito(
 
 
 @router.delete("/customers/{customer_id}/solleciti/{action_id}")
-async def undo_sollecito(
+def undo_sollecito(
     customer_id: int,
     action_id: int,
     session: Session = Depends(get_session),
@@ -376,7 +376,7 @@ async def undo_sollecito(
 # --- Customer recovery actions ---
 
 @router.get("/customers/{customer_id}/actions")
-async def get_customer_actions(
+def get_customer_actions(
     customer_id: int,
     session: Session = Depends(get_session),
 ):
@@ -409,7 +409,7 @@ async def get_customer_actions(
 
 
 @router.post("/customers/{customer_id}/actions")
-async def create_action(
+def create_action(
     customer_id: int,
     action: ActionCreate,
     session: Session = Depends(get_session),
@@ -554,7 +554,7 @@ async def create_action(
 
 
 @router.put("/customers/{customer_id}/actions/{action_id}/complete")
-async def complete_action(
+def complete_action(
     customer_id: int,
     action_id: int,
     outcome: Optional[str] = Query(None, description="Action outcome: contacted/promised/partial_payment/paid/unreachable/disputed/no_answer"),
@@ -665,7 +665,7 @@ async def complete_action(
 
 
 @router.patch("/customers/{customer_id}/actions/{action_id}/reschedule")
-async def reschedule_action(
+def reschedule_action(
     customer_id: int,
     action_id: int,
     new_date: str = Query(..., description="New scheduled date in YYYY-MM-DD format"),
@@ -733,7 +733,7 @@ async def reschedule_action(
 # --- PDF Riepilogativo ---
 
 @router.get("/customers/{customer_id}/pdf-riepilogativo")
-async def generate_pdf_riepilogativo(
+def generate_pdf_riepilogativo(
     customer_id: int,
     session: Session = Depends(get_session),
     overdue_only: bool = Query(True, description="Include only overdue invoices"),
@@ -779,7 +779,7 @@ async def generate_pdf_riepilogativo(
 
 
 @router.get("/invoices/{invoice_id}/pdf")
-async def generate_single_invoice_pdf(
+def generate_single_invoice_pdf(
     invoice_id: int,
     session: Session = Depends(get_session),
 ):
@@ -814,7 +814,7 @@ async def generate_single_invoice_pdf(
 
 
 @router.get("/customers/{customer_id}/pdf-selected")
-async def generate_selected_invoices_pdf(
+def generate_selected_invoices_pdf(
     customer_id: int,
     invoice_ids: str = Query(..., description="Comma-separated invoice IDs"),
     session: Session = Depends(get_session),
@@ -1083,7 +1083,7 @@ def _build_invoice_pdf(customer, invoice):
 
 
 @router.get("/customers/{customer_id}/invoices-zip")
-async def download_invoices_zip(
+def download_invoices_zip(
     customer_id: int,
     invoice_ids: str = Query(
         ..., description="Comma-separated invoice IDs"

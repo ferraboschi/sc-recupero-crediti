@@ -157,18 +157,23 @@ def start_scheduler():
         logger.error(f"Failed to schedule hourly job: {e}", exc_info=True)
         raise
 
-    # Schedule a startup sync 60 seconds after boot (Render cold start recovery)
+    # Sync al boot (recupero da cold start di Render). LEGGERO (run_hourly_job,
+    # senza l'aggancio ordini Shopify che è il passo più lento e CPU-pesante):
+    # il full sync con order-matching lo fa il giornaliero alle 8:30. Un sync
+    # pesante subito dopo il boot metteva sotto pressione l'istanza proprio
+    # nella finestra in cui Render valuta l'health check. Ritardato a 120s per
+    # dare tempo ai primi health check di passare.
     from datetime import timedelta
     _scheduler.add_job(
-        run_daily_job,
+        run_hourly_job,
         trigger="date",
-        run_date=datetime.now(pytz.timezone(config.TIMEZONE)) + timedelta(seconds=60),
+        run_date=datetime.now(pytz.timezone(config.TIMEZONE)) + timedelta(seconds=120),
         id="startup_sync",
-        name="Startup sync after cold start",
+        name="Startup light sync after cold start",
         replace_existing=True,
         max_instances=1,
     )
-    logger.info("Scheduled startup sync in 60 seconds")
+    logger.info("Scheduled startup light sync in 120 seconds")
 
     _scheduler.start()
     _scheduler_started = True
