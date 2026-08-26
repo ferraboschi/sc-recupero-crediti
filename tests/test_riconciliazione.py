@@ -119,8 +119,9 @@ class TestPaidAtColumn:
         _invoice(test_db_session, "F24/1", amount_due=80.0,
                  source_platform="fatture24")
 
-        import asyncio
-        asyncio.run(sync_mod.cleanup_stale_f24())
+        # cleanup_stale_f24 è ora un endpoint sincrono (gira nel threadpool),
+        # si chiama direttamente.
+        sync_mod.cleanup_stale_f24()
 
         inv = test_db_session.query(Invoice).filter_by(invoice_number="F24/1").one()
         assert inv.status == "paid"

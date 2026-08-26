@@ -23,7 +23,7 @@ router = APIRouter()
 
 
 @router.get("")
-async def get_dashboard(session: Session = Depends(get_session)):
+def get_dashboard(session: Session = Depends(get_session)):
     """
     Get dashboard overview with key statistics.
     Optimized: only returns the stats actually used by the frontend.
@@ -73,7 +73,7 @@ async def get_dashboard(session: Session = Depends(get_session)):
 
 
 @router.get("/search")
-async def search_dashboard(
+def search_dashboard(
     q: str,
     session: Session = Depends(get_session),
 ):
@@ -123,7 +123,7 @@ async def search_dashboard(
 
 
 @router.get("/todos")
-async def get_todos(session: Session = Depends(get_session)):
+def get_todos(session: Session = Depends(get_session)):
     """
     Get todo list for the dashboard — pending recovery actions and customers needing attention.
     Groups: overdue (past due), today, upcoming (next 14 days), and idle customers with overdue invoices.
@@ -281,7 +281,7 @@ async def get_todos(session: Session = Depends(get_session)):
 
 
 @router.get("/calendar")
-async def get_calendar(
+def get_calendar(
     session: Session = Depends(get_session),
     year: int = None,
     month: int = None,
@@ -390,7 +390,7 @@ async def get_calendar(
 
 
 @router.get("/stats")
-async def get_stats(session: Session = Depends(get_session)):
+def get_stats(session: Session = Depends(get_session)):
     """
     Get summary statistics for the dashboard.
 
@@ -449,7 +449,7 @@ async def get_stats(session: Session = Depends(get_session)):
 
 
 @router.get("/attivita")
-async def get_attivita(session: Session = Depends(get_session)):
+def get_attivita(session: Session = Depends(get_session)):
     """
     Get data for the Attività page:
     1. contacted: customers with recovery actions (not idle/archived)
@@ -645,7 +645,7 @@ async def get_attivita(session: Session = Depends(get_session)):
 
 
 @router.get("/riconciliazione")
-async def get_riconciliazione(session: Session = Depends(get_session)):
+def get_riconciliazione(session: Session = Depends(get_session)):
     """La cascata che spiega il numero di testa, scalino per scalino.
 
     Nasce da una segnalazione precisa: "vedo da pagare 674.378, poi sotto
@@ -740,7 +740,7 @@ async def get_riconciliazione(session: Session = Depends(get_session)):
 
 
 @router.get("/evoluzione")
-async def get_evoluzione(
+def get_evoluzione(
     giorni: int = 90, session: Session = Depends(get_session)
 ):
     """La serie storica dello scaduto: il grafico dell'evoluzione nel tempo.
@@ -865,7 +865,7 @@ def _recuperato(session: Session) -> dict:
 
 
 @router.get("/pipeline")
-async def get_pipeline(session: Session = Depends(get_session)):
+def get_pipeline(session: Session = Depends(get_session)):
     """
     Get pipeline/funnel data for the Attività page.
     Shows customers at each recovery stage — only those with overdue invoices.
@@ -975,7 +975,7 @@ async def get_pipeline(session: Session = Depends(get_session)):
 
 
 @router.get("/incassato")
-async def get_incassato_per_anno(session: Session = Depends(get_session)):
+def get_incassato_per_anno(session: Session = Depends(get_session)):
     """
     Get collected amounts grouped by year.
     ONLY counts invoices for customers who had recovery actions

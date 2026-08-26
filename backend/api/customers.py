@@ -128,7 +128,7 @@ def _single_shared_piva(customer, invoices):
 
 
 @router.get("")
-async def list_customers(
+def list_customers(
     session: Session = Depends(get_session),
     search: str = Query(None),
     excluded: bool = Query(None, description="Filtra per stato escluso (true/false). Omesso = tutti."),
@@ -340,7 +340,7 @@ async def list_customers(
 
 
 @router.get("/suggest")
-async def suggest_customers(
+def suggest_customers(
     q: str = Query(..., min_length=2, description="Testo di ricerca approssimato"),
     limit: int = Query(6, ge=1, le=20),
     session: Session = Depends(get_session),
@@ -400,7 +400,7 @@ async def suggest_customers(
 
 
 @router.get("/audit-summary")
-async def customers_audit_summary(
+def customers_audit_summary(
     include_paid: bool = Query(False, description="Considera anche le fatture pagate"),
     session: Session = Depends(get_session),
 ):
@@ -416,7 +416,7 @@ async def customers_audit_summary(
 
 
 @router.get("/bonifica-suggestions")
-async def bonifica_suggestions(session: Session = Depends(get_session)):
+def bonifica_suggestions(session: Session = Depends(get_session)):
     """Lista di revisione della bonifica P.IVA in blocco: TUTTI i clienti
     bonificabili in un colpo (l'owner ne ha ~115).
 
@@ -475,7 +475,7 @@ class BonificaBulkRequest(BaseModel):
 
 
 @router.post("/bonifica-piva/bulk")
-async def bonifica_piva_bulk(
+def bonifica_piva_bulk(
     body: BonificaBulkRequest,
     session: Session = Depends(get_session),
 ):
@@ -574,7 +574,7 @@ class MergeRequest(BaseModel):
 
 
 @router.get("/merge-suggestions")
-async def merge_suggestions(session: Session = Depends(get_session)):
+def merge_suggestions(session: Session = Depends(get_session)):
     """Cluster di schede che sono la STESSA azienda (stessa P.IVA), da unire.
 
     L'auto-merge del sync fonde già i cluster sicuri (P.IVA italiana
@@ -639,7 +639,7 @@ async def merge_suggestions(session: Session = Depends(get_session)):
 
 
 @router.post("/merge")
-async def merge_customers_endpoint(
+def merge_customers_endpoint(
     body: MergeRequest,
     session: Session = Depends(get_session),
 ):
@@ -701,7 +701,7 @@ async def merge_customers_endpoint(
 
 
 @router.get("/{customer_id}")
-async def get_customer_detail(
+def get_customer_detail(
     customer_id: int,
     session: Session = Depends(get_session),
 ):
@@ -896,7 +896,7 @@ async def get_customer_detail(
 
 
 @router.get("/{customer_id}/audit")
-async def audit_customer(
+def audit_customer(
     customer_id: int,
     include_paid: bool = Query(False, description="Audita anche le fatture pagate"),
     include_reviewed: bool = Query(False, description="Includi anche le fatture già segnate verificate"),
@@ -1059,7 +1059,7 @@ async def audit_customer(
 
 
 @router.get("/{customer_id}/neighbors")
-async def get_customer_neighbors(
+def get_customer_neighbors(
     customer_id: int,
     session: Session = Depends(get_session),
 ):
@@ -1115,7 +1115,7 @@ async def get_customer_neighbors(
 
 
 @router.put("/{customer_id}/exclude")
-async def toggle_customer_exclusion(
+def toggle_customer_exclusion(
     customer_id: int,
     exclude: bool,
     session: Session = Depends(get_session),
@@ -1160,7 +1160,7 @@ async def toggle_customer_exclusion(
 
 
 @router.post("/{customer_id}/unlock-name")
-async def unlock_customer_name(
+def unlock_customer_name(
     customer_id: int,
     session: Session = Depends(get_session),
 ):
@@ -1213,7 +1213,7 @@ async def unlock_customer_name(
 
 
 @router.post("/{customer_id}/clear-piva")
-async def clear_customer_piva(
+def clear_customer_piva(
     customer_id: int,
     session: Session = Depends(get_session),
 ):
@@ -1334,7 +1334,7 @@ class AcceptedNameRequest(BaseModel):
 
 
 @router.post("/{customer_id}/accepted-names")
-async def add_accepted_name(
+def add_accepted_name(
     customer_id: int,
     body: AcceptedNameRequest,
     session: Session = Depends(get_session),
@@ -1446,7 +1446,7 @@ async def add_accepted_name(
 
 
 @router.delete("/{customer_id}/accepted-names/{name_or_id}")
-async def remove_accepted_name(
+def remove_accepted_name(
     customer_id: int,
     name_or_id: str,
     session: Session = Depends(get_session),
@@ -1519,7 +1519,7 @@ async def remove_accepted_name(
 
 
 @router.put("/{customer_id}/phone")
-async def update_customer_phone(
+def update_customer_phone(
     customer_id: int,
     phone: str,
     session: Session = Depends(get_session),
@@ -1621,7 +1621,7 @@ class CreateCustomerRequest(BaseModel):
 
 
 @router.post("")
-async def create_customer(
+def create_customer(
     body: CreateCustomerRequest,
     session: Session = Depends(get_session),
 ):
