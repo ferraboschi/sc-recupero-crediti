@@ -8,6 +8,7 @@ import MergeDuplicati from './pages/MergeDuplicati'
 import ClientDetail from './pages/ClientDetail'
 import Attivita from './pages/Attivita'
 import Utilizzo from './pages/Utilizzo'
+import Avvocato from './pages/Avvocato'
 import System from './pages/System'
 import Login from './pages/Login'
 import SyncStatus from './components/SyncStatus'
@@ -46,6 +47,13 @@ function IconUtilizzo() {
   return (
     <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M3 3v18h18M7 15l3-3 3 3 5-6" />
+    </svg>
+  )
+}
+function IconAvvocato() {
+  return (
+    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v18M7 21h10M5 7h14M12 3l-7 4 2.5 5a3 3 0 01-5 0L9 7m3-4l7 4-2.5 5a3 3 0 005 0L15 7" />
     </svg>
   )
 }
@@ -119,6 +127,7 @@ export default function App() {
     { path: '/customers', label: 'Clienti', icon: <IconCustomers />, hint: 'Anagrafica debitori' },
     { path: '/positions', label: 'Fatture', icon: <IconInvoices />, hint: 'Elenco fatture' },
     { path: '/utilizzo', label: 'Utilizzo', icon: <IconUtilizzo />, hint: 'Registro del lavoro' },
+    { path: '/avvocato', label: 'Avvocato', icon: <IconAvvocato />, hint: 'Pratiche legali' },
     { path: '/system', label: 'Sistema', icon: <IconSystem />, hint: 'Diagnostica' },
   ]
 
@@ -264,6 +273,7 @@ export default function App() {
             <Route path="/customers/:customerId" element={<ClientDetail />} />
             <Route path="/positions" element={<Positions />} />
             <Route path="/utilizzo" element={<Utilizzo />} />
+            <Route path="/avvocato" element={<Avvocato />} />
             <Route path="/system" element={<System />} />
           </Routes>
         </div>
