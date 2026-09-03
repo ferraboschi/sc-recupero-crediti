@@ -30,7 +30,7 @@ from backend.database import (
     get_session, Customer, Invoice, RecoveryAction,
 )
 from backend.engine.overdue import overdue_clause
-from backend.engine.cases import get_open_case, contact_count, ensure_open_case
+from backend.engine.cases import get_open_case
 from backend.api.recovery import _build_invoice_pdf
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,13 @@ def _lat1(s) -> str:
     return str(s if s is not None else "").encode("latin-1", "replace").decode("latin-1")
 
 
+def _debt_clause():
+    """Debito PERSEGUIBILE (= is_overdue_unpaid in SQL): scaduto, non pagato,
+    NON contestato. Le contestate non vanno né nel totale che decide la soglia
+    né nel dossier consegnato all'avvocato."""
+    return overdue_clause() & (Invoice.status != "disputed")
+
+
 def _case_delivered_to_lawyer(session: Session, case) -> bool:
     """La pratica APERTA ha un'azione 'lawyer' COMPLETATA = consegnata."""
     return session.query(RecoveryAction).filter(
@@ -85,7 +92,7 @@ def _overdue_invoices(session: Session, customer_id: int):
     """Le fatture scadute non pagate del cliente (stessa definizione ovunque)."""
     return (
         session.query(Invoice)
-        .filter(Invoice.customer_id == customer_id, overdue_clause())
+        .filter(Invoice.customer_id == customer_id, _debt_clause())
         .order_by(Invoice.due_date.asc())
         .all()
     )
@@ -95,38 +102,24 @@ def _candidate_rows(session: Session):
     """Calcola i candidati alla pratica legale.
 
     Ritorna una lista di dict ordinata per scaduto desc. UNA aggregazione per
-    lo scaduto + UNA per l'ultimo sollecito; contact_count si calcola solo sui
-    pochi clienti sopra soglia (non un N+1 sull'intera anagrafica).
+    lo scaduto; contatti e ultimo sollecito si calcolano — SCOPED alla pratica
+    aperta — solo sui pochi clienti sopra soglia (non un N+1 sull'anagrafica).
     """
-    # 1. Scaduto netto per cliente (overdue_clause = definizione condivisa).
+    # 1. Debito PERSEGUIBILE per cliente (esclude pagate/contestate).
     stats = dict(
         (r[0], {"total_overdue": float(r[1] or 0), "overdue_count": int(r[2] or 0)})
         for r in session.query(
             Invoice.customer_id,
-            func.sum(case((overdue_clause(), Invoice.amount_due), else_=0)),
-            func.sum(case((overdue_clause(), 1), else_=0)),
+            func.sum(case((_debt_clause(), Invoice.amount_due), else_=0)),
+            func.sum(case((_debt_clause(), 1), else_=0)),
         )
         .filter(Invoice.status != "paid", Invoice.customer_id.isnot(None))
         .group_by(Invoice.customer_id)
         .all()
     )
 
-    # 2. Ultimo sollecito (1°/2° contatto, non annullato) per cliente.
-    last_soll = dict(
-        (r[0], r[1])
-        for r in session.query(
-            RecoveryAction.customer_id,
-            func.max(RecoveryAction.created_at),
-        )
-        .filter(
-            RecoveryAction.action_type.in_(CONTACT_TYPES),
-            RecoveryAction.cancelled.isnot(True),
-        )
-        .group_by(RecoveryAction.customer_id)
-        .all()
-    )
-
-    # 3. Clienti sopra soglia, attivi, non fusi.
+    # 2. Clienti sopra soglia, attivi (excluded IS NOT TRUE gestisce anche i
+    #    NULL legacy), non fusi.
     over_ids = [cid for cid, s in stats.items() if s["total_overdue"] > LAWYER_MIN_DEBT]
     if not over_ids:
         return []
@@ -135,7 +128,7 @@ def _candidate_rows(session: Session):
         .filter(
             Customer.id.in_(over_ids),
             Customer.merged_into.is_(None),
-            Customer.excluded.is_(False),
+            Customer.excluded.isnot(True),
         )
         .all()
     )
@@ -154,10 +147,23 @@ def _candidate_rows(session: Session):
         # sollecito): escludere per stato svuoterebbe la lista.
         if _case_delivered_to_lawyer(session, case_obj):
             continue
-        cc = contact_count(session, case_obj)
-        if cc < 2:  # servono ENTRAMBI i solleciti
+        # Contatti FRESCHI del ciclo corrente (NON gli ereditati): servono
+        # entrambi i solleciti in QUESTA pratica, e l'ultimo sollecito dev'essere
+        # di questo ciclo — così un caso riaperto con soli contatti ereditati non
+        # appare "pronto" senza essere stato davvero risollecitato.
+        fresh = (
+            session.query(RecoveryAction)
+            .filter(
+                RecoveryAction.case_id == case_obj.id,
+                RecoveryAction.action_type.in_(CONTACT_TYPES),
+                RecoveryAction.completed_at.isnot(None),
+                RecoveryAction.cancelled.isnot(True),
+            )
+            .all()
+        )
+        if len(fresh) < 2:  # servono ENTRAMBI i solleciti in questo ciclo
             continue
-        ls = last_soll.get(cust.id)
+        ls = max((a.created_at for a in fresh if a.created_at), default=None)
         days_since = (today - ls.date()).days if ls else None
         rows.append({
             "id": cust.id,
@@ -165,7 +171,7 @@ def _candidate_rows(session: Session):
             "partita_iva": cust.partita_iva,
             "total_overdue": stats[cust.id]["total_overdue"],
             "overdue_count": stats[cust.id]["overdue_count"],
-            "contact_count": cc,
+            "contact_count": len(fresh),
             "last_sollecito": ls.isoformat() if ls else None,
             "days_since_last_sollecito": days_since,
             "ready": days_since is None or days_since >= LAWYER_GRACE_DAYS,
@@ -333,7 +339,10 @@ def dossier_zip_all(session: Session = Depends(get_session)):
             customer = session.query(Customer).filter(Customer.id == r["id"]).first()
             if not customer:
                 continue
-            folder = _safe(customer.ragione_sociale)
+            # id nel nome cartella: due ragioni sociali diverse possono
+            # collassare sulla stessa forma _safe (es. "Rossi & Figli" vs
+            # "Rossi, Figli") e sovrascriversi nello ZIP.
+            folder = f"{customer.id}_{_safe(customer.ragione_sociale)}"
             # Resiliente: un cliente che fa fallire la generazione (dati sporchi)
             # non deve affossare l'intero pacchetto — si salta e si prosegue.
             try:
@@ -360,20 +369,27 @@ def handover_to_lawyer(customer_id: int, session: Session = Depends(get_session)
     customer = session.query(Customer).filter(
         Customer.id == customer_id,
         Customer.merged_into.is_(None),
-    ).first()
+    ).with_for_update().first()
     if not customer:
         raise HTTPException(status_code=404, detail="Cliente non trovato")
+    case_open = get_open_case(session, customer_id)
+    if case_open is None:
+        # Nessuna pratica aperta = non è (più) un candidato: saldato o chiuso
+        # tra il caricamento della lista e il clic. NON si fabbrica una pratica
+        # fantasma; si chiede di aggiornare la lista.
+        raise HTTPException(
+            status_code=409,
+            detail="Nessuna pratica aperta per questo cliente: aggiorna la lista",
+        )
     # Idempotenza: "consegnato" = la pratica APERTA ha già un'azione 'lawyer'
     # COMPLETATA (non lo stadio, non un handover di un ciclo passato).
-    case_open = get_open_case(session, customer_id)
-    if case_open and _case_delivered_to_lawyer(session, case_open):
+    if _case_delivered_to_lawyer(session, case_open):
         return {"customer_id": customer_id, "already": True, "recovery_status": customer.recovery_status}
     try:
         now = datetime.utcnow()
-        case_obj = case_open or ensure_open_case(session, customer)
         session.add(RecoveryAction(
             customer_id=customer_id,
-            case_id=case_obj.id if case_obj else None,
+            case_id=case_open.id,
             action_type="lawyer",
             completed_at=now,
             outcome="handover",

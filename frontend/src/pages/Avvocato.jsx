@@ -27,7 +27,7 @@ export default function Avvocato() {
   const [meta, setMeta] = useState({ min_debt: 1500, grace_days: 14 })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [busyId, setBusyId] = useState(null)
+  const [busyKey, setBusyKey] = useState(null)  // `${id}:dl` | `${id}:ho`
   const [busyAll, setBusyAll] = useState(false)
 
   const load = useCallback(async () => {
@@ -49,14 +49,14 @@ export default function Avvocato() {
 
   const downloadDossier = async (item) => {
     try {
-      setBusyId(item.id)
+      setBusyKey(`${item.id}:dl`)
       const res = await client.get(`/avvocato/customers/${item.id}/dossier-zip`, { responseType: 'blob' })
       downloadBlob(res.data, `dossier_${safeName(item.ragione_sociale)}.zip`)
     } catch (err) {
       console.error(err)
       setError('Errore nel download del dossier')
     } finally {
-      setBusyId(null)
+      setBusyKey(null)
     }
   }
 
@@ -81,14 +81,14 @@ export default function Avvocato() {
       + 'Assicurati di aver già scaricato il dossier da consegnare.'
     )) return
     try {
-      setBusyId(item.id)
+      setBusyKey(`${item.id}:ho`)
       await client.post(`/avvocato/customers/${item.id}/handover`)
       await load()
     } catch (err) {
       console.error(err)
       setError('Errore nel passaggio all\'avvocato')
     } finally {
-      setBusyId(null)
+      setBusyKey(null)
     }
   }
 
@@ -187,14 +187,14 @@ export default function Avvocato() {
                       <div className="flex items-center justify-end gap-2">
                         <button
                           onClick={() => downloadDossier(item)}
-                          disabled={busyId === item.id}
+                          disabled={busyKey === `${item.id}:dl`}
                           className="sc-btn-secondary text-xs whitespace-nowrap disabled:opacity-40"
                         >
-                          {busyId === item.id ? '…' : 'Scarica dossier'}
+                          Scarica dossier
                         </button>
                         <button
                           onClick={() => handover(item)}
-                          disabled={busyId === item.id}
+                          disabled={busyKey === `${item.id}:ho`}
                           className="sc-btn-primary text-xs whitespace-nowrap disabled:opacity-40"
                           title="Registra il passaggio all'avvocato e togli dalla lista"
                         >

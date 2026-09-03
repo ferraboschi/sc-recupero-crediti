@@ -197,12 +197,99 @@ def test_dossier_handles_non_latin1_name(test_client, test_db_session):
 
 
 def test_dossier_zip_all(test_client, test_db_session):
-    _make_candidate(test_db_session, "Uno SRL", debt=2000, solleciti=2)
-    _make_candidate(test_db_session, "Due SRL", debt=3000, solleciti=2)
+    a = _make_candidate(test_db_session, "Uno SRL", debt=2000, solleciti=2)
+    b = _make_candidate(test_db_session, "Due SRL", debt=3000, solleciti=2)
     r = test_client.get("/api/avvocato/dossier-zip-all")
     assert r.status_code == 200
     zf = zipfile.ZipFile(io.BytesIO(r.content))
     names = zf.namelist()
-    # una cartella per candidato
-    assert any(n.startswith("Uno_SRL/") for n in names)
-    assert any(n.startswith("Due_SRL/") for n in names)
+    # una cartella per candidato, prefissata dall'id (niente collisioni di nome)
+    assert any(n.startswith(f"{a.id}_Uno_SRL/") for n in names)
+    assert any(n.startswith(f"{b.id}_Due_SRL/") for n in names)
+
+
+def test_dossier_zip_all_name_collision_no_overwrite(test_client, test_db_session):
+    # Due ragioni sociali diverse che collassano sullo stesso _safe non devono
+    # sovrascriversi: l'id nel folder le tiene separate.
+    a = _make_candidate(test_db_session, "Rossi & Figli", debt=2000, solleciti=2)
+    b = _make_candidate(test_db_session, "Rossi, Figli", debt=2000, solleciti=2)
+    r = test_client.get("/api/avvocato/dossier-zip-all")
+    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    folders = {n.split("/")[0] for n in zf.namelist()}
+    assert f"{a.id}_Rossi_Figli" in folders
+    assert f"{b.id}_Rossi_Figli" in folders
+
+
+# ── fix del controagente ────────────────────────────────────────────
+
+def test_disputed_excluded_from_debt(test_client, test_db_session):
+    # Contestata esclusa dal totale: 1000 open + 700 disputed → 1000 < 1500.
+    cust = _cust(test_db_session, "Contestata SRL")
+    _inv(test_db_session, cust, "OPEN-1", 1000.0)
+    _inv(test_db_session, cust, "DISP-1", 700.0, status="disputed")
+    case = RecoveryCase(customer_id=cust.id, status="open")
+    test_db_session.add(case)
+    test_db_session.commit()
+    _contact(test_db_session, cust, case, "first_contact", days_ago=27)
+    _contact(test_db_session, cust, case, "second_contact", days_ago=20)
+    assert test_client.get("/api/avvocato/candidates").json()["count"] == 0
+
+
+def test_disputed_not_in_reported_total(test_client, test_db_session):
+    cust = _cust(test_db_session, "Misto SRL")
+    _inv(test_db_session, cust, "OPEN", 2000.0)
+    _inv(test_db_session, cust, "DISP", 500.0, status="disputed")
+    case = RecoveryCase(customer_id=cust.id, status="open")
+    test_db_session.add(case)
+    test_db_session.commit()
+    _contact(test_db_session, cust, case, "first_contact", days_ago=27)
+    _contact(test_db_session, cust, case, "second_contact", days_ago=20)
+    it = test_client.get("/api/avvocato/candidates").json()["items"][0]
+    assert it["total_overdue"] == 2000.0
+    assert it["overdue_count"] == 1  # la contestata non conta
+
+
+def test_inherited_only_not_candidate(test_client, test_db_session):
+    # Pratica con contatti EREDITATI ma nessun sollecito FRESCO → non candidato
+    # (evita il falso "pronto" di un caso riaperto mai risollecitato).
+    cust = _cust(test_db_session, "Riaperto SRL")
+    _inv(test_db_session, cust, "R-1", 2000.0)
+    case = RecoveryCase(customer_id=cust.id, status="open", inherited_contacts=2)
+    test_db_session.add(case)
+    test_db_session.commit()
+    assert test_client.get("/api/avvocato/candidates").json()["count"] == 0
+
+
+def test_excluded_null_still_candidate(test_client, test_db_session):
+    cust = _make_candidate(test_db_session, "NullExcl SRL", debt=2000, solleciti=2)
+    cust.excluded = None  # legacy row
+    test_db_session.commit()
+    assert test_client.get("/api/avvocato/candidates").json()["count"] == 1
+
+
+def test_past_delivered_reappears_new_cycle(test_client, test_db_session):
+    # Consegnato in un ciclo PASSATO (chiuso) + NUOVO debito con 2 solleciti
+    # freschi → deve RIAPPARIRE (delivered è scoped alla pratica aperta).
+    cust = _cust(test_db_session, "Ritorno SRL")
+    old = RecoveryCase(customer_id=cust.id, status="closed")
+    test_db_session.add(old)
+    test_db_session.commit()
+    test_db_session.add(RecoveryAction(
+        customer_id=cust.id, case_id=old.id, action_type="lawyer",
+        completed_at=datetime.utcnow() - timedelta(days=200)))
+    _inv(test_db_session, cust, "NEW-1", 2000.0)
+    new = RecoveryCase(customer_id=cust.id, status="open")
+    test_db_session.add(new)
+    test_db_session.commit()
+    _contact(test_db_session, cust, new, "first_contact", days_ago=27)
+    _contact(test_db_session, cust, new, "second_contact", days_ago=20)
+    assert test_client.get("/api/avvocato/candidates").json()["count"] == 1
+
+
+def test_handover_no_open_case_rejected(test_client, test_db_session):
+    # Nessuna pratica aperta (saldato) → 409, e NON si fabbrica una pratica.
+    cust = _cust(test_db_session, "Saldato SRL")
+    _inv(test_db_session, cust, "P", 100.0, status="paid")
+    r = test_client.post(f"/api/avvocato/customers/{cust.id}/handover")
+    assert r.status_code == 409
+    assert test_db_session.query(RecoveryCase).filter_by(customer_id=cust.id).count() == 0
