@@ -250,6 +250,34 @@ class RecoveryAction(Base):
     case = relationship("RecoveryCase", back_populates="actions")
 
 
+class RecoveryActionInvoice(Base):
+    """Normalizza RecoveryAction.invoice_ids: UNA riga per (azione, fattura).
+
+    Rende autorevole la numerazione PER-FATTURA dei solleciti: quante volte
+    una singola fattura è stata sollecitata = COUNT ... GROUP BY invoice_id su
+    questa tabella (niente cache = niente drift, niente N+1). `invoice_ids`
+    sull'azione resta popolato in parallelo (dual-write) finché la transizione
+    non è completa — degrado grazioso se il prod è indietro di una migration.
+
+    Tabella NUOVA: la crea create_all (nessuna ALTER necessaria). Il backfill
+    dello storico è una-tantum (engine/action_invoices.py, marker in
+    sync_state).
+    """
+    __tablename__ = "recovery_action_invoices"
+
+    # ON DELETE CASCADE difensivo: oggi né azioni né fatture vengono mai
+    # hard-deleted (si marcano cancelled/annullata), ma se un domani succedesse
+    # le righe di join se ne andrebbero con loro invece di violare la FK.
+    action_id = Column(
+        Integer, ForeignKey("recovery_actions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    invoice_id = Column(
+        Integer, ForeignKey("invoices.id", ondelete="CASCADE"),
+        primary_key=True, index=True,
+    )
+
+
 class ActivityLog(Base):
     __tablename__ = "activity_log"
 

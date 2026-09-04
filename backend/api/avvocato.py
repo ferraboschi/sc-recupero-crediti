@@ -31,6 +31,9 @@ from backend.database import (
 )
 from backend.engine.overdue import overdue_clause
 from backend.engine.cases import get_open_case
+from backend.engine.action_invoices import (
+    per_invoice_sollecito_stats, per_invoice_actions,
+)
 from backend.api.recovery import _build_invoice_pdf
 
 logger = logging.getLogger(__name__)
@@ -193,9 +196,14 @@ def list_candidates(session: Session = Depends(get_session)):
     }
 
 
-def _build_dossier_pdf(customer, invoices, actions):
-    """Dossier legale: intestazione + tabella fatture (con date) + timeline
-    attività (con date) + totale. fpdf2, stesso stile del riepilogativo."""
+def _build_dossier_pdf(customer, invoices, actions, per_invoice=None):
+    """Dossier legale: intestazione + tabella fatture (con date) + stato
+    solleciti PER FATTURA (con note che viaggiano col debito) + timeline
+    attività complessiva + totale. fpdf2, stesso stile del riepilogativo.
+
+    `per_invoice` = {invoice_id: {"count", "last_at", "actions": [...]}}: se
+    presente, il dossier riporta all'avvocato, fattura per fattura, quanti
+    solleciti ha ricevuto e le note delle attività che la citano."""
     from fpdf import FPDF
 
     pdf = FPDF()
@@ -252,6 +260,35 @@ def _build_dossier_pdf(customer, invoices, actions):
     pdf.cell(widths[2] + widths[3] + widths[4], 9, "EUR", border=1, fill=True, align="L")
     pdf.ln(12)
 
+    # Stato solleciti PER FATTURA — il soggetto del recupero è la fattura: per
+    # ognuna, quanti solleciti ha ricevuto, l'ultimo quando, e le note delle
+    # attività che la citano (la nota viaggia col debito fino al legale).
+    if per_invoice:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "Stato solleciti per fattura", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+        for inv in invoices:
+            info = per_invoice.get(inv.id) or {}
+            cnt = int(info.get("count", 0) or 0)
+            last_at = info.get("last_at")
+            last_s = last_at.strftime("%d/%m/%Y") if last_at else "-"
+            head = f"{inv.invoice_number} - {cnt} sollecit{'o' if cnt == 1 else 'i'}"
+            if cnt:
+                head += f" (ultimo {last_s})"
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.multi_cell(0, 6, _lat1(head), new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 8)
+            for a in info.get("actions", []):
+                when = a.completed_at or a.created_at or a.scheduled_date
+                when_s = when.strftime("%d/%m/%Y") if when else "-"
+                label = ACTION_LABELS.get(a.action_type, a.action_type or "-")
+                line = f"   {when_s} - {label}"
+                if a.notes:
+                    line += f" - {a.notes}"
+                pdf.multi_cell(0, 5, _lat1(line), new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(1)
+        pdf.ln(6)
+
     # Timeline attività di recupero
     pdf.set_font("Helvetica", "B", 12)
     pdf.cell(0, 8, "Attività di recupero svolte", new_x="LMARGIN", new_y="NEXT")
@@ -291,8 +328,29 @@ def _customer_dossier_files(session: Session, customer):
         .order_by(RecoveryAction.created_at.asc())
         .all()
     )
+    # Stato solleciti + note PER FATTURA (via tabella di join): riportati
+    # all'avvocato fattura per fattura, così la nota viaggia col debito.
+    # Degrado grazioso: se la tabella di join non c'è ancora (prod indietro di
+    # una migration nella finestra iniziale del boot) il dossier si genera
+    # comunque, senza la sezione per-fattura — il resto è invariato.
+    inv_ids = [inv.id for inv in invoices]
+    try:
+        _stats = per_invoice_sollecito_stats(session, inv_ids)
+        _acts = per_invoice_actions(session, inv_ids)
+        per_invoice = {
+            inv.id: {
+                "count": _stats.get(inv.id, {}).get("count", 0),
+                "last_at": _stats.get(inv.id, {}).get("last_at"),
+                "actions": _acts.get(inv.id, []),
+            }
+            for inv in invoices
+        }
+    except Exception as e:
+        logger.warning("Sezione solleciti per-fattura saltata: %s", e)
+        session.rollback()
+        per_invoice = {}
     files = [(f"dossier_{_safe(customer.ragione_sociale)}.pdf",
-              bytes(_build_dossier_pdf(customer, invoices, actions)))]
+              bytes(_build_dossier_pdf(customer, invoices, actions, per_invoice)))]
     for inv in invoices:
         # Resiliente: il PDF singola fattura riusa il builder di recovery.py
         # (font core = latin-1); un carattere fuori latin-1 nel nome non deve

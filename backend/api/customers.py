@@ -13,6 +13,7 @@ from backend.database import (
     CustomerAcceptedName,
 )
 from backend.engine.cases import get_open_case, contact_count, business_day_start
+from backend.engine.action_invoices import per_invoice_sollecito_stats
 from backend.engine.verify import verify_invoice_customer
 from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
 from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
@@ -720,10 +721,32 @@ def get_customer_detail(
         total_amount = sum(inv.amount for inv in invoices if inv.status != "paid")
         total_due = sum(inv.amount_due for inv in invoices if inv.status != "paid")
 
+        # Solleciti PER-FATTURA (deriva-on-read dalla tabella di join): quante
+        # volte è stata sollecitata OGNI singola fattura. Una query sola per le
+        # fatture del cliente — niente N+1. Il soggetto è la fattura: due
+        # fatture dello stesso cliente possono avere conteggi diversi.
+        # Degrado grazioso: se il prod è indietro di una migration (tabella di
+        # join non ancora creata nella finestra iniziale del boot) la pagina
+        # cliente non deve andare in 500 — si mostra 0 e si prosegue.
+        try:
+            sollecito_stats = per_invoice_sollecito_stats(
+                session, [inv.id for inv in invoices]
+            )
+        except Exception as e:
+            logger.warning(f"per_invoice_sollecito_stats non disponibile: {e}")
+            session.rollback()
+            sollecito_stats = {}
+
         invoice_list = [
             {
                 "id": inv.id,
                 "invoice_number": inv.invoice_number,
+                "sollecito_count": sollecito_stats.get(inv.id, {}).get("count", 0),
+                "last_sollecito": (
+                    sollecito_stats[inv.id]["last_at"].isoformat()
+                    if sollecito_stats.get(inv.id, {}).get("last_at")
+                    else None
+                ),
                 "amount": float(inv.amount),
                 "amount_due": float(inv.amount_due),
                 "issue_date": inv.issue_date.isoformat() if inv.issue_date else None,
