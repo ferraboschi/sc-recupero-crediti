@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from backend.database import init_db
 from backend.config import config
 from backend.scheduler import start_scheduler, stop_scheduler
-from backend.api import auth, dashboard, positions, customers, sync, recovery, system
+from backend.api import auth, dashboard, positions, customers, sync, recovery, system, avvocato
 from backend.api.auth import verify_token
 
 # Configure logging
@@ -134,6 +134,7 @@ app.include_router(customers.router, prefix="/api/customers", tags=["customers"]
 app.include_router(sync.router, prefix="/api/sync", tags=["sync"], dependencies=[Depends(verify_token)])
 app.include_router(recovery.router, prefix="/api/recovery", tags=["recovery"], dependencies=[Depends(verify_token)])
 app.include_router(system.router, prefix="/api/system", tags=["system"], dependencies=[Depends(verify_token)])
+app.include_router(avvocato.router, prefix="/api/avvocato", tags=["avvocato"], dependencies=[Depends(verify_token)])
 
 
 # Mount static files for frontend (if they exist)
