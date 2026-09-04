@@ -85,6 +85,18 @@ async def startup_event():
             logger.error(f"Case backfill error: {e}")
 
         try:
+            # Backfill una-tantum della tabella di join azione↔fattura
+            # (solleciti per-fattura). Idempotente: marker in sync_state,
+            # retry al prossimo avvio. DOPO il case-backfill: le azioni hanno
+            # già la loro pratica/fatture agganciate.
+            from backend.engine.action_invoices import (
+                run_backfill_action_invoices_if_needed,
+            )
+            run_backfill_action_invoices_if_needed()
+        except Exception as e:
+            logger.error(f"Action-invoices backfill error: {e}")
+
+        try:
             # Backfill una-tantum dello storico STIMATO dello scaduto
             # (stesso pattern: marker one-shot in sync_state, retry al
             # prossimo avvio). DOPO il case-backfill: il grafico evoluzione

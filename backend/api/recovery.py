@@ -23,6 +23,7 @@ from backend.engine.cases import (
     get_open_case, is_overdue_unpaid, schedule_next_action, close_case,
     _refresh_customer_status,
 )
+from backend.engine.action_invoices import set_action_invoices
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -200,6 +201,18 @@ def register_sollecito(
                 detail=f"Fatture non appartenenti al cliente {customer.id}: {unknown}",
             )
 
+        # Set di fatture CITATE dal sollecito. Un copy senza selezione esplicita
+        # (invoice_ids vuoto) "sollecita l'intero debito": lo si attribuisce a
+        # TUTTE le fatture scadute correnti — stessa semantica del backfill
+        # legacy — così il conteggio per-fattura e il dossier non mostrano "0
+        # solleciti" per una fattura davvero sollecitata. Non tocca numerazione
+        # né tono (contact_count resta invariato).
+        cited_ids = (
+            sorted(set(body.invoice_ids))
+            if body.invoice_ids
+            else sorted(inv.id for inv in overdue)
+        )
+
         case = ensure_open_case(session, customer)
         today = date.today()
         now = datetime.utcnow()
@@ -215,8 +228,11 @@ def register_sollecito(
         ).order_by(RecoveryAction.completed_at.desc()).first()
 
         if existing_today:
-            merged = sorted(set((existing_today.invoice_ids or []) + body.invoice_ids))
+            merged = sorted(set((existing_today.invoice_ids or []) + cited_ids))
             existing_today.invoice_ids = merged
+            # Dual-write della tabella di join: le fatture appena aggiunte
+            # dal secondo copy odierno ereditano lo stesso sollecito.
+            set_action_invoices(session, existing_today.id, merged)
             n = contact_count(session, case)
             session.commit()
             return {
@@ -251,11 +267,14 @@ def register_sollecito(
             completed_at=now,
             outcome="contacted",
             channel=body.channel,
-            invoice_ids=sorted(set(body.invoice_ids)),
-            notes=f"Sollecito n. {n} via {channel_label} ({len(body.invoice_ids)} fatture)",
+            invoice_ids=cited_ids,
+            notes=f"Sollecito n. {n} via {channel_label} ({len(cited_ids)} fatture)",
         )
         session.add(action)
         session.flush()
+
+        # Dual-write della tabella di join (numerazione per-fattura autorevole).
+        set_action_invoices(session, action.id, cited_ids)
 
         for p in pending_contacts:
             p.cancelled = True
@@ -273,7 +292,7 @@ def register_sollecito(
                 "case_id": case.id,
                 "sollecito_n": n,
                 "channel": body.channel,
-                "invoice_ids": body.invoice_ids,
+                "invoice_ids": cited_ids,
             },
         ))
         session.commit()
