@@ -213,8 +213,16 @@ def _candidate_rows(session: Session):
         )
         if len(fresh) < 2:  # servono ENTRAMBI i solleciti in questo ciclo
             continue
-        ls = max((a.created_at for a in fresh if a.created_at), default=None)
+        # "Pronto" si misura sull'ultimo sollecito delle fatture MATURE non
+        # consegnate (≥2 solleciti propri): un 1° sollecito ieri sulla fattura
+        # NUOVA non deve rimandare il legale per le vecchie.
+        mature_last = [
+            inv_stats[i.id]["last_at"] for i in undelivered
+            if inv_stats.get(i.id, {}).get("count", 0) >= 2 and inv_stats[i.id].get("last_at")
+        ]
+        ls = max(mature_last) if mature_last else max((a.created_at for a in fresh if a.created_at), default=None)
         days_since = (today - ls.date()).days if ls else None
+        has_mature = bool(mature_last)
         rows.append({
             "id": cust.id,
             "ragione_sociale": cust.ragione_sociale,
@@ -228,6 +236,7 @@ def _candidate_rows(session: Session):
             "recovery_status": cust.recovery_status,
             "invoices": inv_rows,
             "undelivered_total": float(sum(i.amount_due or 0 for i in undelivered)),
+            "has_mature_invoice": has_mature,
         })
     rows.sort(key=lambda r: r["total_overdue"], reverse=True)
     return rows

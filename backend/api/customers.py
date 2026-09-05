@@ -12,7 +12,7 @@ from backend.database import (
     get_session, Customer, Invoice, ActivityLog, RecoveryAction,
     CustomerAcceptedName,
 )
-from backend.engine.cases import get_open_case, contact_count, business_day_start
+from backend.engine.cases import get_open_case, contact_count, business_day_start, _has_unlinked_contacts
 from backend.engine.action_invoices import per_invoice_sollecito_stats
 from backend.engine.verify import verify_invoice_customer
 from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
@@ -736,6 +736,24 @@ def get_customer_detail(
             logger.warning(f"per_invoice_sollecito_stats non disponibile: {e}")
             session.rollback()
             sollecito_stats = {}
+        # Fatture già citate da un sollecito WhatsApp di OGGI (stesso predicato
+        # della dedup in register_sollecito): il frontend abbassa di 1 lo
+        # stadio effettivo → un ri-copy resta cordiale e la fattura non sale
+        # di stadio in giornata.
+        today_ids = set()
+        try:
+            for row in (
+                session.query(RecoveryAction.invoice_ids)
+                .filter(
+                    RecoveryAction.customer_id == customer_id,
+                    RecoveryAction.channel.in_(("whatsapp_copy", "whatsapp_link")),
+                    RecoveryAction.completed_at >= business_day_start(),
+                    RecoveryAction.cancelled.isnot(True),
+                ).all()
+            ):
+                today_ids |= set(row[0] or [])
+        except Exception:
+            session.rollback()
 
         invoice_list = [
             {
@@ -747,6 +765,7 @@ def get_customer_detail(
                     if sollecito_stats.get(inv.id, {}).get("last_at")
                     else None
                 ),
+                "sollecito_today": inv.id in today_ids,
                 "amount": float(inv.amount),
                 "amount_due": float(inv.amount_due),
                 "issue_date": inv.issue_date.isoformat() if inv.issue_date else None,
@@ -866,6 +885,9 @@ def get_customer_detail(
                 "opened_at": open_case.opened_at.isoformat() if open_case.opened_at else None,
                 "contact_count": contact_action_count,
                 "inherited_contacts": open_case.inherited_contacts or 0,
+                # Contatti completati senza fatture collegate (storico
+                # pre-tabella): il tono resta perentorio (rete legacy).
+                "has_unlinked_contacts": _has_unlinked_contacts(session, open_case),
                 "reopened_after_archive": bool(open_case.reopened_after_archive),
                 "sollecito_registered_today": sollecito_today,
             }

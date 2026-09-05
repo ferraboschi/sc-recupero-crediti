@@ -40,6 +40,7 @@ from sqlalchemy.orm import Session, joinedload
 from backend.config import config
 from backend.database import (
     Customer, Invoice, RecoveryCase, RecoveryAction, ActivityLog, SyncState,
+    RecoveryActionInvoice,
 )
 # Definizione unica di "scaduto" — vive in engine/overdue.py perché la
 # condividono motore e KPI. Ri-esportata qui: è da qui che la importano
@@ -97,6 +98,26 @@ def contact_count(session: Session, case: RecoveryCase) -> int:
         RecoveryAction.cancelled.isnot(True),
     ).count()
     return n + (case.inherited_contacts or 0)
+
+
+def _has_unlinked_contacts(session: Session, case: RecoveryCase) -> bool:
+    """La pratica ha contatti completati NON collegati a fatture (righe di
+    join assenti = storico pre-tabella)? Solo allora vale la rete legacy."""
+    acts = session.query(RecoveryAction.id, RecoveryAction.invoice_ids).filter(
+        RecoveryAction.case_id == case.id,
+        RecoveryAction.action_type.in_(CONTACT_TYPES),
+        RecoveryAction.completed_at.isnot(None),
+        RecoveryAction.cancelled.isnot(True),
+    ).all()
+    if not acts:
+        return False
+    ids = [a[0] for a in acts]
+    linked = {r[0] for r in session.query(RecoveryActionInvoice.action_id)
+              .filter(RecoveryActionInvoice.action_id.in_(ids)).all()}
+    # Legacy = invoice_ids NULL (colonna assente all'epoca) E nessuna riga di
+    # join. Un [] ESPLICITO ("non ha citato nulla", es. contatto completato
+    # senza scadute) NON è legacy e non deve avvelenare la pratica.
+    return any(inv_ids is None and aid not in linked for aid, inv_ids in acts)
 
 
 def _case_has_lawyer_actions(session: Session, case: RecoveryCase) -> bool:
@@ -341,12 +362,28 @@ def _refresh_customer_status(session: Session, customer: Customer, case: Recover
     bucket per stadio della riconciliazione sono keyed su questo campo
     (engine/overdue.py): il totale non cambia, cambia la ripartizione.
     """
-    from backend.engine.action_invoices import delivered_invoice_ids
-    n = contact_count(session, case)
+    from backend.engine.action_invoices import (
+        delivered_invoice_ids, per_invoice_sollecito_stats,
+    )
     overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
     all_delivered = bool(overdue) and (
         {i.id for i in overdue} <= delivered_invoice_ids(session, case, overdue)
     )
+    # Stadio = il PEGGIORE fra le scadute (max solleciti ricevuti da UNA
+    # fattura, tabella di join) + i contatti EREDITATI da una pratica
+    # archiviata/legale (il tono non riparte mai cordiale: regola owner).
+    # Rete di sicurezza legacy SOLO se la pratica ha contatti completati SENZA
+    # righe di join (storico pre-tabella non collegato): se i contatti sono
+    # collegati ma le loro fatture sono state pagate, la scaduta residua mai
+    # sollecitata parte davvero da zero.
+    inherited = case.inherited_contacts or 0
+    stats = per_invoice_sollecito_stats(session, [i.id for i in overdue]) if overdue else {}
+    if stats:
+        n = max(v["count"] for v in stats.values()) + inherited
+    elif _has_unlinked_contacts(session, case):
+        n = contact_count(session, case)
+    else:
+        n = inherited
     if all_delivered:
         customer.recovery_status = "lawyer"
     elif n >= 2:
@@ -373,6 +410,7 @@ def schedule_next_action(
     case: RecoveryCase,
     contacts_done: int,
     scheduled_date: Optional[date] = None,
+    superseded_by: Optional[int] = None,
 ) -> Optional[RecoveryAction]:
     """Pianifica la prossima azione dopo un contatto — UNICA fonte della
     progressione (+7 → second, +14 → lawyer, +30 → follow-up lawyer).
@@ -387,9 +425,35 @@ def schedule_next_action(
         RecoveryAction.cancelled.isnot(True),
     ).first()
     if pending_lawyer:
-        customer.next_action_date = pending_lawyer.scheduled_date
-        customer.next_action_type = "lawyer"
-        return None
+        # Il todo legale vale solo se ALMENO una scaduta non consegnata ha
+        # ricevuto 2 solleciti propri: se le fatture per cui era stato
+        # pianificato sono state pagate e resta solo debito nuovo, è stantio
+        # → si annulla e si segue la progressione normale.
+        from backend.engine.action_invoices import (
+            per_invoice_sollecito_stats, delivered_invoice_ids,
+        )
+        overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
+        delivered = delivered_invoice_ids(session, case, overdue) if overdue else set()
+        stats = per_invoice_sollecito_stats(session, [i.id for i in overdue if i.id not in delivered])
+        mature = any(v["count"] + (case.inherited_contacts or 0) >= 2 for v in stats.values())
+        # È stantio SOLO il todo "Auto-pianificata dopo il N° contatto" quando
+        # NESSUNA fattura lo giustifica più: niente scadute mature non
+        # consegnate E niente fatture CONSEGNATE ancora impagate (il follow-up
+        # avvocato esiste proprio per quelle). Un todo creato a mano è una
+        # decisione dell'operatore e blocca sempre.
+        auto_planned = (pending_lawyer.notes or "").startswith("Auto-pianificata dopo il")
+        if (not auto_planned or mature or delivered
+                or _has_unlinked_contacts(session, case)):
+            customer.next_action_date = pending_lawyer.scheduled_date
+            customer.next_action_type = "lawyer"
+            return None
+        pending_lawyer.cancelled = True
+        # Stesso formato del supersede dei contatti: l'undo del sollecito che
+        # lo ha soppiantato lo ripristina.
+        pending_lawyer.cancelled_reason = (
+            f"superseded_by_sollecito:{superseded_by}" if superseded_by else "superseded_by_sollecito:stale"
+        )
+        pending_lawyer.notes = f"{pending_lawyer.notes} | annullato: le fatture del passaggio legale sono state pagate" if pending_lawyer.notes else "annullato: le fatture del passaggio legale sono state pagate"
 
     next_type, delta_days = PROGRESSION.get(contacts_done, PROGRESSION["default"])
     next_date = scheduled_date or (date.today() + timedelta(days=delta_days))
@@ -679,6 +743,65 @@ def run_backfill_if_needed() -> Optional[Dict[str, Any]]:
     except Exception as e:
         session.rollback()
         logger.error(f"Case backfill FAILED (will retry at next startup): {e}", exc_info=True)
+        return None
+    finally:
+        session.close()
+
+
+def resplit_status_if_needed() -> Optional[Dict[str, Any]]:
+    """Una-tantum al primo avvio dopo il deploy del rollup per-fattura: ricalcola
+    lo stato di TUTTE le pratiche aperte e registra ogni spostamento in
+    ActivityLog ('status_resplit', vecchio → nuovo). I bucket per stadio della
+    riconciliazione sono keyed sullo stato: così il salto nei tile è UN evento
+    spiegabile, non una deriva cliente per cliente nelle settimane. Il totale
+    non cambia di un euro; cambia solo la ripartizione I/II contatto/Avvocato.
+    """
+    from backend.database import get_session_direct
+    session = get_session_direct()
+    try:
+        marker = session.query(SyncState).filter_by(key="status_resplit_v1").first()
+        if marker and (marker.result or {}).get("done"):
+            return {"skipped": True}
+        # Vincolo: il rollup per-fattura ha senso solo DOPO il backfill della
+        # tabella di join; se non è (ancora) completato si rimanda al prossimo
+        # avvio, altrimenti si demolirebbero stati corretti (es. 'lawyer' con
+        # handover moderno) sulla base di righe di join assenti.
+        jb = session.query(SyncState).filter_by(key="action_invoices_backfill").first()
+        if not (jb and (jb.result or {}).get("done")):
+            logger.info("Status resplit rimandato: backfill azione↔fattura non completato")
+            return {"skipped": "waiting_join_backfill"}
+        moved = []
+        cases = session.query(RecoveryCase).filter(RecoveryCase.status == "open").all()
+        for case in cases:
+            customer = case.customer
+            if customer is None or customer.excluded:
+                continue
+            old = customer.recovery_status
+            _refresh_customer_status(session, customer, case)
+            if customer.recovery_status != old:
+                moved.append({"customer_id": customer.id, "customer": customer.ragione_sociale,
+                              "from": old, "to": customer.recovery_status})
+                session.add(ActivityLog(
+                    action="status_resplit", entity_type="customer", entity_id=customer.id,
+                    details={"from": old, "to": customer.recovery_status,
+                             "note": "rollup per-fattura: lo stadio segue la fattura più sollecitata; "
+                                     "'lawyer' solo con tutte le scadute consegnate"},
+                ))
+        now = datetime.utcnow()
+        if not marker:
+            marker = SyncState(key="status_resplit_v1")
+            session.add(marker)
+        marker.last_sync = now
+        marker.result = {"done": True, "cases": len(cases), "moved": len(moved)}
+        marker.updated_at = now
+        session.add(ActivityLog(action="status_resplit_done",
+                                details={"cases": len(cases), "moved": len(moved), "items": moved[:200]}))
+        session.commit()
+        logger.info(f"Status resplit done: {len(moved)}/{len(cases)} clienti spostati")
+        return {"cases": len(cases), "moved": len(moved)}
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Status resplit FAILED (retry al prossimo avvio): {e}", exc_info=True)
         return None
     finally:
         session.close()
