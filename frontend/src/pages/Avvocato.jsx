@@ -238,7 +238,14 @@ export default function Avvocato() {
                 {items.map(item => (
                   <React.Fragment key={item.id}>
                   <tr className="sc-table-row">
-                    <td className="px-4 py-3 text-sm font-medium text-txt-primary">{item.ragione_sociale}</td>
+                    <td className="px-4 py-3 text-sm font-medium text-txt-primary">
+                      {item.ragione_sociale}
+                      {item.has_mature_invoice === false && (
+                        <span className="ml-2 sc-badge bg-[rgba(148,163,184,0.15)] text-txt-muted" title="Nessuna fattura non consegnata con almeno 2 solleciti propri: scegli a mano">
+                          nessuna fattura matura
+                        </span>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-sm font-mono text-txt-secondary">{item.partita_iva || '—'}</td>
                     <td className="px-4 py-3 text-sm text-right">
                       <div className="font-bold text-accent-red">{formatCurrency(item.total_overdue)}</div>

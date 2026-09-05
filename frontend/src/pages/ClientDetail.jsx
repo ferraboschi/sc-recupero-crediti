@@ -171,6 +171,7 @@ export default function ClientDetail() {
   const [selectedInvoices, setSelectedInvoices] = useState(new Set())
   // Selezione mista (fatture a stadi diversi): quale stadio sto scrivendo
   const [messageStage, setMessageStage] = useState(null)
+  useEffect(() => { setMessageStage(null) }, [selectedInvoices])
   const [phoneEdit, setPhoneEdit] = useState(null)
   const [updatingInvoice, setUpdatingInvoice] = useState(null)
   const [showAllInvoices, setShowAllInvoices] = useState(false)
@@ -728,11 +729,23 @@ export default function ClientDetail() {
   // già sollecitate (→ 2°, perentorio). Se la selezione è mista si manda UN
   // messaggio per stadio; l'operatore sceglie con i chip.
   const selectedInvoiceObjs = (data?.invoices?.items || []).filter(inv => selectedInvoices.has(inv.id))
+  // Stadio EFFETTIVO della fattura: i solleciti ricevuti, MENO quello di oggi
+  // (un ri-copy in giornata è lo stesso sollecito), PIÙ i contatti ereditati
+  // da una pratica archiviata (il tono non riparte mai cordiale).
+  const inheritedContacts = data?.case?.inherited_contacts || 0
+  // Contatti storici senza fatture collegate: il tono resta perentorio.
+  const forceSecond = !!data?.case?.has_unlinked_contacts
+  const effStage = (inv) => (inv.sollecito_count || 0) + inheritedContacts + (forceSecond ? 1 : 0)
+  // Le fatture GIÀ sollecitate oggi non si rimandano: gruppo a parte, non
+  // inviabile (un ri-copy in giornata non è un nuovo sollecito).
   const stageGroups = {
-    first: selectedInvoiceObjs.filter(inv => (inv.sollecito_count || 0) === 0),
-    second: selectedInvoiceObjs.filter(inv => (inv.sollecito_count || 0) >= 1),
+    today: selectedInvoiceObjs.filter(inv => inv.sollecito_today),
+    first: selectedInvoiceObjs.filter(inv => !inv.sollecito_today && effStage(inv) === 0),
+    second: selectedInvoiceObjs.filter(inv => !inv.sollecito_today && effStage(inv) >= 1),
   }
-  const isMixed = stageGroups.first.length > 0 && stageGroups.second.length > 0
+  const groupTotal = (st) => (stageGroups[st] || []).reduce((s, inv) => s + (inv.amount_due || 0), 0)
+  const isMixed = (stageGroups.first.length > 0 && stageGroups.second.length > 0)
+    || (stageGroups.today.length > 0 && (stageGroups.first.length + stageGroups.second.length) > 0)
   const activeStage = isMixed
     ? (messageStage || 'first')
     : (stageGroups.second.length > 0 ? 'second' : 'first')
@@ -744,6 +757,11 @@ export default function ClientDetail() {
       title="Fatture a stadi diversi: un messaggio per stadio, il tono segue la fattura"
     >
       <span>Messaggio per:</span>
+      {stageGroups.today.length > 0 && (
+        <span className="sc-badge bg-dark-surface text-txt-muted" title="Già sollecitate oggi: non si rimandano">
+          già oggi · {stageGroups.today.length} fatt.
+        </span>
+      )}
       {['first', 'second'].map(st => (
         <button
           key={st}
@@ -753,7 +771,7 @@ export default function ClientDetail() {
             ? 'bg-accent-teal/20 text-accent-teal ring-1 ring-accent-teal/40'
             : 'bg-dark-surface text-txt-secondary hover:text-txt-primary'}`}
         >
-          {st === 'first' ? '1° sollecito' : '2° sollecito'} · {stageGroups[st].length} fatt.
+          {st === 'first' ? '1° sollecito' : '2° sollecito'} · {stageGroups[st].length} fatt. · {formatCurrency(groupTotal(st))}
         </button>
       ))}
     </div>
@@ -821,11 +839,12 @@ export default function ClientDetail() {
     return new Date(exp) <= new Date()
   }
 
-  const registerSollecito = async (channel) => {
+  const registerSollecito = async (channel, explicitIds = null) => {
     // Cliente escluso: il copy resta possibile ma non è un sollecito
     if (data?.excluded) return
     // Si registra il sollecito SOLO per il gruppo del messaggio copiato
-    const invoiceIds = activeGroup.map(inv => inv.id)
+    // (al retry si usano le fatture del messaggio USCITO, non la selezione attuale)
+    const invoiceIds = explicitIds || activeGroup.map(inv => inv.id)
     try {
       const res = await client.post(`/recovery/customers/${customerId}/solleciti`, {
         invoice_ids: invoiceIds,
@@ -865,6 +884,7 @@ export default function ClientDetail() {
       return
     }
     const message = buildWhatsAppMessage()
+    if (!message) return
     const url = `https://wa.me/${number}?text=${encodeURIComponent(message)}`
     window.open(url, '_blank')
     registerSollecito('whatsapp_link')
@@ -1033,7 +1053,7 @@ export default function ClientDetail() {
           </p>
           <div className="flex gap-2 mt-3">
             <button
-              onClick={() => registerSollecito(sollecitoError.channel)}
+              onClick={() => registerSollecito(sollecitoError.channel, sollecitoError.invoiceIds)}
               className="px-3 py-1.5 bg-accent-red text-dark-bg rounded text-xs font-bold hover:brightness-110"
             >
               Riprova registrazione
@@ -2098,6 +2118,9 @@ export default function ClientDetail() {
         {/* Action bar for selected invoices */}
         {selectedInvoices.size > 0 && (
           <div className="px-6 py-4 bg-accent-green/5 border-t border-accent-green/20">
+            {/* Selettore di stadio su RIGA PROPRIA con slot riservato: appare
+                solo con selezione mista, senza spostare i pulsanti. */}
+            <div className="min-h-[1.75rem] mb-1 flex items-center">{stagePicker}</div>
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm font-medium text-accent-green">
@@ -2119,7 +2142,6 @@ export default function ClientDetail() {
                 >
                   {promemoria ? '...' : 'Scarica Promemoria'}
                 </button>
-                {stagePicker}
                 <button
                   onClick={handleCopyWhatsApp}
                   className={`sc-btn-secondary text-sm font-bold transition-colors ${

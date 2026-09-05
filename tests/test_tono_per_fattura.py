@@ -150,3 +150,116 @@ def test_recopy_same_invoice_same_day_does_not_escalate(test_client, test_db_ses
     assert r2["action_id"] == r1["action_id"]
     assert r2["sollecito_n"] == 1
     assert per_invoice_sollecito_stats(test_db_session, [s.id])[s.id]["count"] == 1
+
+
+def test_inherited_contacts_keep_tone(test_client, test_db_session, giugno_settembre):
+    """Contatti ereditati da una pratica archiviata: il tono non riparte mai
+    cordiale (regola owner) — si sommano allo stadio della fattura."""
+    cust, (g1, g2, s) = giugno_settembre
+    case = ensure_open_case(test_db_session, cust)
+    case.inherited_contacts = 2
+    test_db_session.commit()
+    r = _post(test_client, cust.id, [s.id])
+    assert r["sollecito_n"] == 3
+    act = test_db_session.query(RecoveryAction).get(r["action_id"])
+    assert act.action_type == "second_contact"
+
+
+def test_cross_stage_recopy_splits_not_merges(test_client, test_db_session, giugno_settembre):
+    """Ri-copy della nuova + vecchia insieme: la nuova (già citata oggi) non
+    si riconta; la vecchia va nel SUO stadio in un'azione separata."""
+    cust, (g1, g2, s) = giugno_settembre
+    r1 = _post(test_client, cust.id, [s.id])
+    r2 = _post(test_client, cust.id, [s.id, g1.id])
+    assert r2["action_id"] != r1["action_id"]
+    assert r2["sollecito_n"] == 3
+    a2 = test_db_session.query(RecoveryAction).get(r2["action_id"])
+    assert a2.action_type == "second_contact" and a2.invoice_ids == [g1.id]
+    a1 = test_db_session.query(RecoveryAction).get(r1["action_id"])
+    assert a1.invoice_ids == [s.id]
+
+
+def test_undo_restores_rollup(test_client, test_db_session, giugno_settembre):
+    cust, (g1, g2, s) = giugno_settembre
+    g1.status = "paid"; g2.status = "paid"
+    test_db_session.commit()
+    r = _post(test_client, cust.id, [s.id])
+    test_db_session.refresh(cust)
+    assert cust.recovery_status == "first_contact"
+    test_client.delete(f"/api/recovery/customers/{cust.id}/solleciti/{r['action_id']}")
+    test_db_session.refresh(cust)
+    assert cust.recovery_status == "idle"
+
+
+def test_fallback_not_applied_when_reminded_invoices_paid(test_db_session, giugno_settembre):
+    """Le sollecitate (collegate) sono pagate, resta solo la nuova mai
+    sollecitata: niente rete legacy → idle, non second_contact."""
+    cust, (g1, g2, s) = giugno_settembre
+    case = ensure_open_case(test_db_session, cust)
+    g1.status = "paid"; g2.status = "paid"
+    test_db_session.commit()
+    _refresh_customer_status(test_db_session, cust, case)
+    assert cust.recovery_status == "idle"
+
+
+def test_customer_detail_sollecito_today(test_client, giugno_settembre):
+    cust, (g1, g2, s) = giugno_settembre
+    _post(test_client, cust.id, [s.id])
+    det = test_client.get(f"/api/customers/{cust.id}").json()
+    by = {i["id"]: i for i in det["invoices"]["items"]}
+    assert by[s.id]["sollecito_today"] is True and by[g1.id]["sollecito_today"] is False
+
+
+def test_unlinked_manual_contact_keeps_tone(test_client, test_db_session, giugno_settembre):
+    """Contatto completato SENZA fatture collegate (storico): la numerazione
+    non ricomincia cordiale (rete legacy sulla numerazione)."""
+    cust, (g1, g2, s) = giugno_settembre
+    case = ensure_open_case(test_db_session, cust)
+    test_db_session.add(RecoveryAction(customer_id=cust.id, case_id=case.id, action_type="first_contact",
+                                       completed_at=datetime.utcnow() - timedelta(days=5)))
+    test_db_session.commit()
+    r = _post(test_client, cust.id, [s.id])
+    assert r["sollecito_n"] >= 2
+    det = test_client.get(f"/api/customers/{cust.id}").json()
+    assert det["case"]["has_unlinked_contacts"] is True
+
+
+def test_stale_lawyer_todo_cancelled_when_invoices_paid(test_client, test_db_session, giugno_settembre):
+    """Todo legale pianificato per le vecchie; le vecchie vengono pagate; resta
+    solo la nuova (0 solleciti): il todo è stantio → annullato, progressione
+    normale (prossima azione = 2° contatto, non avvocato)."""
+    from backend.engine.cases import schedule_next_action
+    cust, (g1, g2, s) = giugno_settembre
+    case = ensure_open_case(test_db_session, cust)
+    todo = RecoveryAction(customer_id=cust.id, case_id=case.id, action_type="lawyer",
+                          scheduled_date=date.today() - timedelta(days=2),
+                          notes="Auto-pianificata dopo il 2° contatto")
+    test_db_session.add(todo)
+    g1.status = "paid"; g2.status = "paid"
+    test_db_session.commit()
+    r = _post(test_client, cust.id, [s.id])
+    assert r["sollecito_n"] == 1
+    test_db_session.refresh(todo)
+    assert todo.cancelled is True
+    test_db_session.refresh(cust)
+    assert cust.next_action_type == "second_contact"
+
+
+def test_resplit_marks_moved_customers(test_db_session, giugno_settembre, monkeypatch):
+    from backend.engine import cases as cases_mod
+    from backend.database import ActivityLog
+    cust, (g1, g2, s) = giugno_settembre
+    cust.recovery_status = "lawyer"  # stato stantio (nessuna consegna)
+    test_db_session.commit()
+    monkeypatch.setattr("backend.database.get_session_direct", lambda: test_db_session)
+    # get_session_direct è importato lazy dentro la funzione → patchare il modulo database
+    orig_close = test_db_session.close
+    monkeypatch.setattr(test_db_session, "close", lambda: None)
+    res = cases_mod.resplit_status_if_needed()
+    assert res and res["moved"] >= 1
+    test_db_session.refresh(cust)
+    assert cust.recovery_status == "second_contact"
+    logs = test_db_session.query(ActivityLog).filter_by(action="status_resplit").all()
+    assert any(l.entity_id == cust.id and l.details["from"] == "lawyer" for l in logs)
+    assert cases_mod.resplit_status_if_needed() == {"skipped": True}
+    monkeypatch.setattr(test_db_session, "close", orig_close)

@@ -97,6 +97,14 @@ async def startup_event():
             logger.error(f"Action-invoices backfill error: {e}")
 
         try:
+            # Una-tantum: ridistribuzione degli stati cliente col rollup
+            # per-fattura, registrata in ActivityLog (status_resplit).
+            from backend.engine.cases import resplit_status_if_needed
+            resplit_status_if_needed()
+        except Exception as e:
+            logger.error(f"Status resplit error: {e}")
+
+        try:
             # Backfill una-tantum dello storico STIMATO dello scaduto
             # (stesso pattern: marker one-shot in sync_state, retry al
             # prossimo avvio). DOPO il case-backfill: il grafico evoluzione

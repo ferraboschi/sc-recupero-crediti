@@ -21,7 +21,7 @@ from backend.database import get_session, Customer, Invoice, RecoveryAction, Act
 from backend.engine.cases import (
     CONTACT_TYPES, business_day_start, contact_count, ensure_open_case,
     get_open_case, is_overdue_unpaid, schedule_next_action, close_case,
-    _refresh_customer_status,
+    _refresh_customer_status, _has_unlinked_contacts,
 )
 from backend.engine.action_invoices import (
     set_action_invoices, delivered_invoice_ids, per_invoice_sollecito_stats,
@@ -224,14 +224,11 @@ def register_sollecito(
         # gentile vale per il gruppo (una fattura nuova riceve il SUO 1°
         # sollecito anche se il cliente è già al 2° su altre). Il frontend
         # raggruppa la selezione per stadio: un messaggio per stadio.
-        prev = per_invoice_sollecito_stats(session, cited_ids)
-        min_prev = min((prev.get(i, {}).get("count", 0) for i in cited_ids), default=0)
-        n = min_prev + 1
-        action_type = "first_contact" if n == 1 else "second_contact"
+        # Contatti EREDITATI da una pratica archiviata/legale precedente: il
+        # tono non riparte mai cordiale con quel cliente (regola owner) → si
+        # sommano allo stadio di ogni fattura.
+        inherited = case.inherited_contacts or 0
 
-        # Dedup: già registrato oggi un sollecito WhatsApp DELLO STESSO STADIO
-        # per questa pratica? Due stadi diversi nello stesso giorno (1° per la
-        # fattura nuova, 2° per le vecchie) sono DUE solleciti distinti.
         # "Oggi" = giornata lavorativa italiana (il server gira in UTC).
         start_of_day = business_day_start()
         todays = session.query(RecoveryAction).filter(
@@ -240,13 +237,51 @@ def register_sollecito(
             RecoveryAction.completed_at >= start_of_day,
             RecoveryAction.cancelled.isnot(True),
         ).order_by(RecoveryAction.completed_at.desc()).all()
-        # 1) STESSA FATTURA, stesso giorno = stesso sollecito (un ri-copy per
-        #    un refuso non deve far salire la fattura di stadio in un giorno);
-        # 2) altrimenti stesso STADIO oggi → si unisce a quel sollecito.
-        cited_set = set(cited_ids)
-        existing_today = next(
-            (a for a in todays if cited_set & set(a.invoice_ids or [])), None
-        ) or next((a for a in todays if a.action_type == action_type), None)
+        today_ids = set()
+        for a in todays:
+            today_ids |= set(a.invoice_ids or [])
+
+        # 1) STESSA FATTURA, stesso giorno = stesso sollecito: un ri-copy (refuso)
+        #    non è un nuovo sollecito e non fa salire la fattura di stadio. Le
+        #    fatture già citate oggi si SEPARANO dal resto (mai unite a un'azione
+        #    di un altro stadio).
+        already = [i for i in cited_ids if i in today_ids]
+        rest = [i for i in cited_ids if i not in today_ids]
+        if not rest:
+            existing = next(a for a in todays if set(a.invoice_ids or []) & set(already))
+            prev_all = per_invoice_sollecito_stats(session, existing.invoice_ids or [])
+            n_existing = min((prev_all.get(i, {}).get("count", 1) for i in (existing.invoice_ids or [])), default=1) + inherited
+            return {
+                "registered": True,
+                "already_registered_today": True,
+                "action_id": existing.id,
+                "sollecito_n": n_existing,
+                "next_action": {
+                    "action_type": customer.next_action_type,
+                    "scheduled_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
+                },
+            }
+        cited_ids = rest
+
+        # Numerazione PER-FATTURA: il numero del sollecito è quello delle
+        # fatture citate — stadio più basso fra loro + ereditati + 1, così la
+        # tonalità più gentile vale per il gruppo (una fattura nuova riceve il
+        # SUO 1° sollecito anche se il cliente è già al 2° su altre). Il
+        # frontend raggruppa la selezione per stadio: un messaggio per stadio.
+        prev = per_invoice_sollecito_stats(session, cited_ids)
+        min_prev = min((prev.get(i, {}).get("count", 0) for i in cited_ids), default=0)
+        n = min_prev + inherited + 1
+        # Rete legacy: contatti completati SENZA fatture collegate (storico
+        # pre-tabella, o registrati a mano nella finestra pre-backfill) → non
+        # si ricomincia cordiale: vale il contatore di pratica (vecchia regola).
+        if _has_unlinked_contacts(session, case):
+            n = max(n, contact_count(session, case) + 1)
+        action_type = "first_contact" if n == 1 else "second_contact"
+
+        # 2) stesso STADIO oggi → si unisce a quel sollecito. Due stadi diversi
+        #    nello stesso giorno (1° per la nuova, 2° per le vecchie) sono DUE
+        #    solleciti distinti.
+        existing_today = next((a for a in todays if a.action_type == action_type), None)
 
         if existing_today:
             merged = sorted(set((existing_today.invoice_ids or []) + cited_ids))
@@ -254,12 +289,14 @@ def register_sollecito(
             # Dual-write della tabella di join: le fatture appena aggiunte
             # dal secondo copy odierno ereditano lo stesso sollecito.
             set_action_invoices(session, existing_today.id, merged)
+            session.flush()
+            _refresh_customer_status(session, customer, case)
             session.commit()
             return {
                 "registered": True,
                 "already_registered_today": True,
                 "action_id": existing_today.id,
-                "sollecito_n": 1 if existing_today.action_type == "first_contact" else n,
+                "sollecito_n": n,
                 "next_action": {
                     "action_type": customer.next_action_type,
                     "scheduled_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
@@ -292,6 +329,9 @@ def register_sollecito(
 
         # Dual-write della tabella di join (numerazione per-fattura autorevole).
         set_action_invoices(session, action.id, cited_ids)
+        # flush esplicito: le righe di join devono essere visibili alle query
+        # che seguono (schedule_next_action, rollup) anche senza autoflush.
+        session.flush()
 
         for p in pending_contacts:
             p.cancelled = True
@@ -389,6 +429,7 @@ def undo_sollecito(
         customer = session.query(Customer).filter(Customer.id == customer_id).first()
         case = get_open_case(session, customer_id)
         if customer and case:
+            session.flush()  # l'annullamento e la delete devono essere visibili al refresh
             _refresh_customer_status(session, customer, case)
 
         session.add(ActivityLog(
@@ -657,8 +698,11 @@ def complete_action(
                         session.flush()
                         set_action_invoices(session, action.id, cited)
                     n = contact_count(session, case)
-                    customer.recovery_status = "first_contact" if n <= 1 else "second_contact"
                     next_action = schedule_next_action(session, customer, case, n)
+                    # Stato cliente = rollup PER-FATTURA (non il contatore di
+                    # pratica): altrimenti il prossimo refresh lo cambierebbe.
+                    session.flush()
+                    _refresh_customer_status(session, customer, case)
                 else:  # lawyer completato → consegna ESPLICITA + follow-up +30gg
                     # Le fatture consegnate si scrivono SEMPRE (invoice_ids +
                     # join): quelle scadute non ancora consegnate. Mai più
