@@ -10,6 +10,11 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session, contains_eager
 
 from backend.database import get_session, Invoice, Customer, ActivityLog
+from pydantic import BaseModel
+from backend.engine.overdue import is_overdue_unpaid, is_suspect_bounce
+from backend.engine.cases import get_open_case
+from typing import Optional
+from datetime import date as _date
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -151,6 +156,11 @@ def list_positions(
                     "due_date": pos.due_date.isoformat() if pos.due_date else None,
                     "due_date_source": pos.due_date_source or ("assumed" if pos.due_date else None),
                     "days_overdue": pos.days_overdue,
+                    "payment_pending": pos.payment_pending,
+                    "in_incasso": bool(pos.payment_pending) and pos.bounced_at is None and pos.status != "paid",
+                    "suspect_bounce": is_suspect_bounce(pos),
+                    "bounced_at": pos.bounced_at.isoformat() if pos.bounced_at else None,
+                    "payment_pending_expected": pos.payment_pending_expected.isoformat() if pos.payment_pending_expected else None,
                     "status": pos.status,
                     "source_platform": pos.source_platform,
                     "customer_name_raw": pos.customer_name_raw,
@@ -1028,6 +1038,14 @@ def get_position_detail(position_id: int, session: Session = Depends(get_session
             "due_date": position.due_date.isoformat() if position.due_date else None,
             "due_date_source": position.due_date_source or ("assumed" if position.due_date else None),
             "days_overdue": position.days_overdue,
+            "payment_pending": position.payment_pending,
+            "payment_pending_at": position.payment_pending_at.isoformat() if position.payment_pending_at else None,
+            "payment_pending_expected": position.payment_pending_expected.isoformat() if position.payment_pending_expected else None,
+            "payment_pending_note": position.payment_pending_note,
+            "bounced_at": position.bounced_at.isoformat() if position.bounced_at else None,
+            "bounced_note": position.bounced_note,
+            "in_incasso": bool(position.payment_pending) and position.bounced_at is None and position.status != "paid",
+            "suspect_bounce": is_suspect_bounce(position),
             "status": position.status,
             "source_platform": position.source_platform,
             "match_method": position.match_method,
@@ -1217,5 +1235,220 @@ def reassign_position(
         raise
     except Exception as e:
         logger.error(f"Error reassigning position: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+# ── Assegno in mano (Fase 3, decisioni owner) ────────────────────────
+# Stato PER-FATTURA scritto SOLO dall'operatore: mai dall'importatore, mai
+# azzerando amount_due, mai scrivendo su FatturaPro (che continua a vederla
+# aperta finché l'assegno non è incassato: a quel punto il rilevamento per
+# assenza la marca pagata come sempre).
+
+class AssegnoBody(BaseModel):
+    method: str = "assegno"
+    expected_date: Optional[str] = None   # YYYY-MM-DD, incasso previsto
+    note: Optional[str] = None
+
+
+class InsolutoBody(BaseModel):
+    note: Optional[str] = None
+
+
+def _pos_payload(position: Invoice) -> dict:
+    return {
+        "id": position.id,
+        "status": position.status,
+        "amount_due": float(position.amount_due),
+        "payment_pending": position.payment_pending,
+        "payment_pending_at": position.payment_pending_at.isoformat() if position.payment_pending_at else None,
+        "payment_pending_expected": position.payment_pending_expected.isoformat() if position.payment_pending_expected else None,
+        "payment_pending_note": position.payment_pending_note,
+        "payment_pending_amount": position.payment_pending_amount,
+        "bounced_at": position.bounced_at.isoformat() if position.bounced_at else None,
+        "bounced_note": position.bounced_note,
+        "in_incasso": bool(position.payment_pending) and position.bounced_at is None and position.status != "paid",
+        "suspect_bounce": is_suspect_bounce(position),
+    }
+
+
+@router.post("/{position_id}/assegno")
+def register_assegno(
+    position_id: int,
+    body: AssegnoBody,
+    session: Session = Depends(get_session),
+):
+    """Registra 'pagata con assegno da incassare' (data prevista + nota).
+
+    La fattura esce dal LAVORABILE (stop solleciti, non candidabile al
+    legale) e va nel bucket 'In incasso (assegni)' dentro l'universo; conta
+    come recuperato (sotto-voce) dalla registrazione. Idempotente: una
+    seconda registrazione aggiorna data/nota. Un assegno registrato dopo un
+    insoluto AZZERA l'allarme (nuovo assegno = nuova promessa)."""
+    from backend.engine.cases import refresh_customer_lifecycle
+    if body.method != "assegno":
+        raise HTTPException(status_code=400, detail="Tipo pagamento non supportato")
+    expected = None
+    if body.expected_date:
+        try:
+            expected = _date.fromisoformat(body.expected_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Data incasso prevista non valida (YYYY-MM-DD)")
+    position = session.query(Invoice).filter(Invoice.id == position_id).with_for_update().first()
+    if not position:
+        raise HTTPException(status_code=404, detail="Position not found")
+    if position.status == "paid":
+        raise HTTPException(status_code=409, detail="Fattura già pagata")
+    if position.status == "disputed":
+        raise HTTPException(status_code=409, detail="Fattura contestata: risolvi prima la contestazione")
+    if (position.days_overdue or 0) <= 0 and position.bounced_at is None:
+        raise HTTPException(status_code=409, detail="Solo per fatture scadute")
+    if position.customer_id is None:
+        raise HTTPException(status_code=409, detail="Abbina prima la fattura a un cliente")
+    try:
+        now = datetime.utcnow()
+        was_bounced = position.bounced_at is not None
+        already_pending = bool(position.payment_pending) and not was_bounced
+        was_suspect = is_suspect_bounce(position)
+        position.payment_pending = "assegno"
+        # Data e importo DI REGISTRAZIONE (attribuzione al recuperato, audit)
+        # NON si spostano modificando nota/data: cambiano solo alla prima
+        # registrazione o dopo un insoluto (nuovo assegno = nuova promessa).
+        if not already_pending:
+            position.payment_pending_at = now
+            position.payment_pending_amount = float(position.amount_due)
+        position.payment_pending_expected = expected
+        position.payment_pending_note = (body.note or "").strip() or None
+        position.bounced_at = None
+        position.bounced_note = None
+        session.flush()
+        customer = position.customer
+        if customer is not None:
+            refresh_customer_lifecycle(session, customer)
+        session.add(ActivityLog(
+            action="assegno_registrato",
+            entity_type="invoice",
+            entity_id=position.id,
+            details={
+                "invoice_number": position.invoice_number,
+                "customer_id": position.customer_id,
+                "amount_due": float(position.amount_due),
+                "expected_date": expected.isoformat() if expected else None,
+                "note": position.payment_pending_note,
+                "after_bounce": was_bounced,
+                "after_suspect": was_suspect,
+            },
+        ))
+        session.commit()
+        return _pos_payload(position)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Errore registrazione assegno: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.post("/{position_id}/assegno/insoluto")
+def register_insoluto(
+    position_id: int,
+    body: Optional[InsolutoBody] = None,
+    session: Session = Depends(get_session),
+):
+    """ASSEGNO INSOLUTO (reato): la fattura torna SUBITO scaduta e lavorabile,
+    la stessa pratica si riapre con lo storico solleciti (nessuna finestra),
+    il recuperato si storna (derivato), la riga porta l'allarme."""
+    from backend.engine.cases import refresh_customer_lifecycle, reopen_case
+    position = session.query(Invoice).filter(Invoice.id == position_id).with_for_update().first()
+    if not position:
+        raise HTTPException(status_code=404, detail="Position not found")
+    # Ammesso anche sul SOSPETTO segnalato dal sync (riaperta su FatturaPro
+    # dopo pagamento con assegno: payment_pending_at valorizzato, pending NULL).
+    suspect = is_suspect_bounce(position)
+    if (not position.payment_pending and not suspect) or position.bounced_at is not None:
+        raise HTTPException(status_code=409, detail="Nessun assegno in attesa su questa fattura")
+    if position.status == "paid":
+        raise HTTPException(status_code=409, detail="Fattura già pagata su FatturaPro")
+    try:
+        now = datetime.utcnow()
+        position.bounced_at = now
+        position.bounced_note = ((body.note if body else None) or "").strip() or None
+        session.flush()
+        customer = position.customer
+        if customer is not None:
+            # Riapre SENZA ESITAZIONE la STESSA pratica della fattura (storico
+            # solleciti intatto) prima del lifecycle, che altrimenti potrebbe
+            # sceglierne un'altra o aprirne una nuova.
+            # Riapre SENZA ESITAZIONE la STESSA pratica della fattura (storico
+            # intatto) — MAI scavalcando un'ARCHIVIAZIONE (decisione
+            # dell'operatore: il debito archiviato resta archiviato, l'allarme
+            # c'è comunque e sarà lui a decidere se riaprire) e solo se la
+            # fattura è davvero tornata lavorabile (non contestata).
+            if (position.case is not None and position.case.status == "closed"
+                    and position.case.closed_reason != "archived"
+                    and is_overdue_unpaid(position)
+                    and get_open_case(session, customer.id) is None):
+                reopen_case(session, position.case)
+                session.flush()  # visibile al lifecycle anche senza autoflush
+            refresh_customer_lifecycle(session, customer)
+        session.add(ActivityLog(
+            action="assegno_insoluto",
+            entity_type="invoice",
+            entity_id=position.id,
+            details={
+                "invoice_number": position.invoice_number,
+                "customer_id": position.customer_id,
+                "amount_due": float(position.amount_due),
+                "note": position.bounced_note,
+            },
+        ))
+        session.commit()
+        return _pos_payload(position)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Errore registrazione insoluto: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+@router.delete("/{position_id}/assegno")
+def cancel_assegno(position_id: int, session: Session = Depends(get_session)):
+    """Annulla una registrazione fatta per errore (non un insoluto): la
+    fattura torna semplicemente scaduta/lavorabile, senza allarme. Vale anche
+    per SMENTIRE un sospetto insoluto segnalato dal sync ("Non è insoluto":
+    es. nota di credito o correzione su FatturaPro, non un assegno tornato)."""
+    from backend.engine.cases import refresh_customer_lifecycle
+    position = session.query(Invoice).filter(Invoice.id == position_id).with_for_update().first()
+    if not position:
+        raise HTTPException(status_code=404, detail="Position not found")
+    suspect = is_suspect_bounce(position)
+    if not position.payment_pending and not suspect:
+        raise HTTPException(status_code=409, detail="Nessun assegno registrato su questa fattura")
+    if position.bounced_at is not None:
+        raise HTTPException(status_code=409, detail="Assegno insoluto: registra un nuovo assegno, non annullare")
+    try:
+        position.payment_pending = None
+        position.payment_pending_at = None
+        position.payment_pending_expected = None
+        position.payment_pending_note = None
+        position.payment_pending_amount = None
+        position.bounced_note = None
+        session.flush()
+        customer = position.customer
+        if customer is not None:
+            refresh_customer_lifecycle(session, customer)
+        session.add(ActivityLog(
+            action="assegno_sospetto_annullato" if suspect else "assegno_annullato",
+            entity_type="invoice",
+            entity_id=position.id,
+            details={"invoice_number": position.invoice_number, "customer_id": position.customer_id},
+        ))
+        session.commit()
+        return _pos_payload(position)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Errore annullamento assegno: {e}", exc_info=True)
         session.rollback()
         raise

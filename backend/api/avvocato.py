@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 from backend.database import (
     get_session, Customer, Invoice, RecoveryAction, RecoveryActionInvoice,
 )
-from backend.engine.overdue import overdue_clause
+from backend.engine.overdue import overdue_clause, in_incasso_clause
 from backend.engine.cases import get_open_case
 from backend.engine.action_invoices import (
     per_invoice_sollecito_stats, per_invoice_actions, set_action_invoices,
@@ -97,7 +97,7 @@ def _debt_clause():
     """Debito PERSEGUIBILE (= is_overdue_unpaid in SQL): scaduto, non pagato,
     NON contestato. Le contestate non vanno né nel totale che decide la soglia
     né nel dossier consegnato all'avvocato."""
-    return overdue_clause() & (Invoice.status != "disputed")
+    return overdue_clause() & (Invoice.status != "disputed") & ~in_incasso_clause()
 
 
 def _lawyer_actions(session: Session, case):
@@ -323,9 +323,16 @@ def _build_dossier_pdf(customer, invoices, actions, per_invoice=None, context=No
     if context is not None:
         od = context.get("others_delivered") or []
         oo = context.get("others_open") or []
+        ii = context.get("in_incasso") or []
         pdf.set_font("Helvetica", "I", 9)
+        if ii:
+            pdf.multi_cell(0, 5, _lat1(
+                f"Fatture scadute coperte da assegno in attesa di incasso (NON affidate): {len(ii)} per EUR "
+                + f"{sum(float(i.amount_due) for i in ii):,.2f}".replace(",", ".")
+                + " - " + ", ".join(i.invoice_number for i in ii)), new_x="LMARGIN", new_y="NEXT")
         if not od and not oo:
-            pdf.multi_cell(0, 5, "Il presente dossier comprende tutte le fatture scadute del cliente.",
+            pdf.multi_cell(0, 5, "Il presente dossier comprende tutte le altre fatture scadute del cliente."
+                           if ii else "Il presente dossier comprende tutte le fatture scadute del cliente.",
                            new_x="LMARGIN", new_y="NEXT")
         else:
             def _eur(xs):
@@ -424,9 +431,19 @@ def _customer_dossier_files(session: Session, customer, invoice_ids=None):
         for i in session.query(Invoice.id, Invoice.invoice_number)
         .filter(Invoice.customer_id == customer.id).all()
     }
+    # Fatture coperte da ASSEGNO in attesa di incasso: non perseguibili (fuori
+    # dal dossier e dalla soglia) ma FatturaPro le vede aperte → il legale
+    # deve saperlo (perimetro esplicito).
+    in_incasso = (
+        session.query(Invoice)
+        .filter(Invoice.customer_id == customer.id, overdue_clause(), in_incasso_clause(),
+                Invoice.status != "disputed")
+        .all()
+    )
     context = {
         "others_delivered": [i for i in others if i.id in delivered],
         "others_open": [i for i in others if i.id not in delivered],
+        "in_incasso": in_incasso,
         "numbers": numbers,
     }
     actions = (

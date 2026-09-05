@@ -17,7 +17,7 @@ import client from '../api/client'
  * Sostituisce i numeri scollegati che non tornavano ("674.378" in testa,
  * "460.932 in gestione", "197.033 recuperato" — tre risposte a tre domande
  * diverse). Qui i numeri chiudono a vista perché è il BACKEND a garantire
- * l'identità scaduto_totale = non_abbinati + esclusi + contestati + lavorabile.
+ * l'identità scaduto_totale = non_abbinati + esclusi + contestati + in_incasso + lavorabile.
  *
  * REGOLA FERREA: non si ricalcola nulla lato client (era proprio il ricalcolo
  * a generare il bug). Si mostrano i numeri del backend, punto.
@@ -60,7 +60,7 @@ const GIORNI_OPTIONS = [30, 90, 180]
 const CHART_SERIES = [
   { key: 'scaduto_totale', label: 'Scaduto totale', color: '#f87171' }, // accent-red
   { key: 'lavorabile', label: 'Lavorabile', color: '#fbbf24' }, // accent-amber
-  { key: 'recuperato_certo', label: 'Presunto incassato', color: '#4ade80' }, // accent-green
+  { key: 'recuperato_certo', label: 'Presunto incassato (cassa)', color: '#4ade80' }, // accent-green — gli assegni in mano NON sono cassa: serie a parte (recuperato_assegni)
 ]
 
 // Tratteggio dei segmenti STIMATI (storico ricostruito dalle date fattura).
@@ -196,7 +196,7 @@ function Cascata({ recon, loading, error, onRetry, formatCurrency }) {
   const certo = rec.certo
   const stimato = rec.storico_stimato
 
-  const deduzioni = [c.non_abbinati, c.esclusi, c.contestati].filter(Boolean)
+  const deduzioni = [c.non_abbinati, c.esclusi, c.contestati, c.in_incasso].filter(Boolean)
   const perStato = c.lavorabile?.per_stato || {}
 
   return (
@@ -324,6 +324,33 @@ function Cascata({ recon, loading, error, onRetry, formatCurrency }) {
             <p className="mt-1.5 text-[11px] leading-snug text-txt-muted">
               {certo.nota}
             </p>
+          )}
+
+          {/* In incasso da assegni (decisione owner Q2): conta dalla
+              registrazione ma NON è cassa — sotto-voce separata, con totale. */}
+          {rec.in_incasso_assegni && (rec.in_incasso_assegni.fatture || 0) > 0 && (
+            <div className="mt-3 bg-dark-surface border border-dark-border rounded-lg px-3 py-2.5">
+              <div className="flex items-baseline justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-accent-teal">{rec.in_incasso_assegni.label || 'In incasso da assegni'}</p>
+                  <p className="text-xs text-txt-muted">
+                    {rec.in_incasso_assegni.fatture} fatture · assegni in mano, non ancora cassa
+                  </p>
+                </div>
+                <p className="text-base font-bold text-accent-teal whitespace-nowrap tabular-nums">
+                  {formatCurrency(rec.in_incasso_assegni.importo || 0)}
+                </p>
+              </div>
+              {rec.in_incasso_assegni.nota && (
+                <p className="mt-1.5 text-[11px] leading-snug text-txt-muted">{rec.in_incasso_assegni.nota}</p>
+              )}
+              {rec.totale && (
+                <p className="mt-2 text-xs text-txt-secondary">
+                  Recuperato totale (incassato + in incasso):{' '}
+                  <strong className="tabular-nums text-txt-primary">{formatCurrency(rec.totale.importo || 0)}</strong>
+                </p>
+              )}
+            </div>
           )}
 
           {/* Lo storico stimato — MAI sommato al certo, con la sua nota onesta */}

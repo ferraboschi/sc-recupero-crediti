@@ -319,6 +319,21 @@ def _sync_invoices_task() -> dict:
                             # contare per sempre nel recuperato.
                             existing.paid_at = None
                             existing.amount_due_at_paid = None
+                            if existing.payment_pending_at is not None and not existing.payment_pending:
+                                # Era stata pagata con ASSEGNO (poi confermata pagata) e
+                                # FatturaPro la RIAPRE: nei fatti è un sospetto insoluto.
+                                # Il sync NON marca l'insoluto (decisione dell'operatore,
+                                # regola owner) ma lo SEGNALA: nota sulla riga + log +
+                                # alert; l'operatore conferma con "Insoluto".
+                                existing.bounced_note = (
+                                    "Riaperta su FatturaPro dopo pagamento con assegno: verificare insoluto"
+                                )
+                                session.add(ActivityLog(
+                                    action="assegno_sospetto_insoluto", entity_type="invoice",
+                                    entity_id=existing.id,
+                                    details={"invoice_number": existing.invoice_number,
+                                             "customer_id": existing.customer_id},
+                                ))
                         existing.updated_at = datetime.utcnow()
                         updated += 1
                     else:
@@ -373,6 +388,11 @@ def _sync_invoices_task() -> dict:
                                     known_inv.amount_due_at_paid = known_inv.amount_due
                                     known_inv.paid_at = datetime.utcnow()
                                     known_inv.status = "paid"
+                                    # Incasso confermato: lo stato "assegno in mano" /
+                                    # "insoluto" è risolto (il sync CHIUDE, mai apre).
+                                    known_inv.payment_pending = None
+                                    known_inv.bounced_at = None
+                                    known_inv.bounced_note = None
                                     known_inv.amount_due = 0
                                     known_inv.missing_streak = 0
                                     known_inv.updated_at = datetime.utcnow()
@@ -1560,6 +1580,9 @@ def cleanup_stale_f24():
             inv.amount_due_at_paid = inv.amount_due
             inv.paid_at = datetime.utcnow()
             inv.status = "paid"
+            inv.payment_pending = None
+            inv.bounced_at = None
+            inv.bounced_note = None
             inv.amount_due = 0
             inv.days_overdue = 0
             count += 1

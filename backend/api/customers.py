@@ -1,6 +1,7 @@
 """Customers API endpoints."""
 
 import logging
+from datetime import date
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -14,6 +15,7 @@ from backend.database import (
 )
 from backend.engine.cases import get_open_case, contact_count, business_day_start, _has_unlinked_contacts
 from backend.engine.action_invoices import per_invoice_sollecito_stats
+from backend.engine.overdue import is_suspect_bounce
 from backend.engine.verify import verify_invoice_customer
 from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
 from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
@@ -773,6 +775,21 @@ def get_customer_detail(
                 "due_date_source": inv.due_date_source or ("assumed" if inv.due_date else None),
                 "days_overdue": inv.days_overdue,
                 "status": inv.status,
+                # Assegno in mano (Fase 3): stato per-fattura scritto solo
+                # dall'operatore. in_incasso = fuori dal lavorabile.
+                "payment_pending": inv.payment_pending,
+                "payment_pending_at": inv.payment_pending_at.isoformat() if inv.payment_pending_at else None,
+                "payment_pending_expected": inv.payment_pending_expected.isoformat() if inv.payment_pending_expected else None,
+                "payment_pending_note": inv.payment_pending_note,
+                "payment_pending_amount": float(inv.payment_pending_amount) if inv.payment_pending_amount is not None else None,
+                "bounced_at": inv.bounced_at.isoformat() if inv.bounced_at else None,
+                "bounced_note": inv.bounced_note,
+                "in_incasso": bool(inv.payment_pending) and inv.bounced_at is None and inv.status != "paid",
+                "suspect_bounce": is_suspect_bounce(inv),
+                "pending_overdue": bool(
+                    inv.payment_pending and inv.bounced_at is None and inv.status != "paid"
+                    and inv.payment_pending_expected and inv.payment_pending_expected < date.today()
+                ),
                 "source_platform": inv.source_platform,
                 "shopify_order_number": inv.shopify_order_number,
                 # Trasparenza incasso (sola lettura): dove sta OGNI fattura

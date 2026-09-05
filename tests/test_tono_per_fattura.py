@@ -344,3 +344,16 @@ def test_resplit_waits_for_join_backfill(test_db_session, giugno_settembre, monk
     monkeypatch.setattr("backend.database.get_session_direct", lambda: test_db_session)
     monkeypatch.setattr(test_db_session, "close", lambda: None)
     assert cases_mod.resplit_status_if_needed() == {"skipped": "waiting_join_backfill"}
+
+
+def test_rollup_keeps_operator_wait(test_db_session, giugno_settembre):
+    """Un todo di ATTESA pendente (scelta dell'operatore) non viene
+    sovrascritto dal rollup per-fattura."""
+    cust, (g1, g2, s) = giugno_settembre
+    case = ensure_open_case(test_db_session, cust)
+    test_db_session.add(RecoveryAction(customer_id=cust.id, case_id=case.id, action_type="wait",
+                                       scheduled_date=date.today() + timedelta(days=10)))
+    test_db_session.commit()
+    _refresh_customer_status(test_db_session, cust, case)
+    assert cust.recovery_status == "waiting"
+    assert cust.next_action_type == "wait"
