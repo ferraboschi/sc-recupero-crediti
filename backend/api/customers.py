@@ -16,6 +16,7 @@ from backend.database import (
 from backend.engine.cases import get_open_case, contact_count, business_day_start, _has_unlinked_contacts
 from backend.engine.action_invoices import per_invoice_sollecito_stats
 from backend.engine.overdue import is_suspect_bounce
+from backend.engine.stages import build_stage_groups, STAGE_LABELS
 from backend.engine.verify import verify_invoice_customer
 from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
 from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
@@ -756,6 +757,14 @@ def get_customer_detail(
                 today_ids |= set(row[0] or [])
         except Exception:
             session.rollback()
+        # Stadio di avanzamento PER FATTURA + gruppi per stadio (Fase 4):
+        # definizione unica in engine/stages.py. Degrado grazioso.
+        try:
+            stage_info = build_stage_groups(session, customer, get_open_case(session, customer_id), today_ids=today_ids)
+        except Exception as e:
+            logger.warning(f"stage groups non disponibili: {e}")
+            session.rollback()
+            stage_info = {"invoices": {}, "labels": {}, "groups": [], "client_actions": [], "pending": []}
 
         invoice_list = [
             {
@@ -768,6 +777,8 @@ def get_customer_detail(
                     else None
                 ),
                 "sollecito_today": inv.id in today_ids,
+                "stage": stage_info["invoices"].get(inv.id),
+                "stage_label": stage_info.get("labels", {}).get(inv.id) or STAGE_LABELS.get(stage_info["invoices"].get(inv.id)),
                 "amount": float(inv.amount),
                 "amount_due": float(inv.amount_due),
                 "issue_date": inv.issue_date.isoformat() if inv.issue_date else None,
@@ -943,6 +954,11 @@ def get_customer_detail(
             "recovery_actions": action_list,
             "contact_action_count": contact_action_count,
             "case": case_block,
+            # Fase 4: gruppi di fatture per stadio con la loro storia; azioni
+            # sul cliente non legate a fatture; todo pendenti.
+            "stage_groups": stage_info["groups"],
+            "client_actions": stage_info["client_actions"],
+            "pending_actions": stage_info["pending"],
             # Intestazioni accettate (bonifica durevole): il tratto d'identità
             # che rende verdi le fatture con quella grafia, presenti e future.
             "accepted_names": [

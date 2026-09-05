@@ -39,6 +39,13 @@ class ActionCreate(BaseModel):
     action_type: str  # first_contact / second_contact / lawyer / archive / wait / note
     scheduled_date: Optional[str] = None  # YYYY-MM-DD
     notes: Optional[str] = None
+    # Fatture citate (Fase 4): una nota "di gruppo" cita le fatture del
+    # gruppo e viaggia con loro fino al dossier avvocato.
+    invoice_ids: List[int] = []
+
+
+class NotesUpdate(BaseModel):
+    notes: Optional[str] = None
 
 
 class SollecitoCreate(BaseModel):
@@ -585,6 +592,18 @@ def create_action(
             notes=action.notes,
         )
         session.add(new_action)
+        if action.invoice_ids:
+            own = {inv.id for inv in customer.invoices}
+            unknown = [i for i in action.invoice_ids if i not in own]
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Fatture non appartenenti al cliente {customer.id}: {unknown}",
+                )
+            cited = sorted(set(action.invoice_ids))
+            new_action.invoice_ids = cited
+            session.flush()
+            set_action_invoices(session, new_action.id, cited)
 
         # Update customer recovery status and next action
         # Use user-provided scheduled_date if available, otherwise use defaults
@@ -1297,4 +1316,39 @@ def download_invoices_zip(
             f"Error generating invoices ZIP: {e}",
             exc_info=True,
         )
+        raise
+
+
+@router.put("/customers/{customer_id}/actions/{action_id}/notes")
+def update_action_notes(
+    customer_id: int,
+    action_id: int,
+    body: NotesUpdate,
+    session: Session = Depends(get_session),
+):
+    """Modifica la NOTA di un'azione dalla sua riga (Fase 4): ogni azione ha
+    una nota, scrivibile e modificabile inline. Non tocca stato, date o
+    numerazione."""
+    action = session.query(RecoveryAction).filter(
+        RecoveryAction.id == action_id,
+        RecoveryAction.customer_id == customer_id,
+    ).first()
+    if not action:
+        raise HTTPException(status_code=404, detail="Azione non trovata")
+    if action.cancelled:
+        raise HTTPException(status_code=409, detail="Azione annullata: la nota non si modifica")
+    try:
+        old = action.notes
+        action.notes = (body.notes or "").strip() or None
+        session.add(ActivityLog(
+            action="action_notes_edited",
+            entity_type="recovery_action",
+            entity_id=action.id,
+            details={"customer_id": customer_id, "old": old, "new": action.notes},
+        ))
+        session.commit()
+        return {"id": action.id, "notes": action.notes}
+    except Exception as e:
+        logger.error(f"Errore modifica nota azione: {e}", exc_info=True)
+        session.rollback()
         raise

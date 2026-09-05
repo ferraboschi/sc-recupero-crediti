@@ -369,6 +369,8 @@ def _build_dossier_pdf(customer, invoices, actions, per_invoice=None, context=No
                 when_s = when.strftime("%d/%m/%Y") if when else "-"
                 label = ACTION_LABELS.get(a.action_type, a.action_type or "-")
                 line = f"   {when_s} - {label}"
+                if a.channel:
+                    line += f" ({CHANNEL_LABELS.get(a.channel, a.channel)})"
                 if a.notes:
                     line += f" - {a.notes}"
                 pdf.multi_cell(0, 5, _lat1(line), new_x="LMARGIN", new_y="NEXT")
