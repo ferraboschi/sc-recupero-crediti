@@ -1880,6 +1880,7 @@ export default function ClientDetail() {
                 <th className="px-3 py-3 text-right text-xs font-semibold text-txt-label uppercase tracking-wider cursor-pointer hover:text-txt-primary" onClick={() => handleInvoiceSort('days_overdue')}>
                   GG{invoiceSortArrow('days_overdue')}
                 </th>
+                <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider" title="Solleciti ricevuti da QUESTA fattura (il soggetto è la fattura, non il cliente)">Solleciti (fattura)</th>
                 <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider">Stato</th>
                 <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider">Azioni</th>
               </tr>
@@ -1961,6 +1962,23 @@ export default function ClientDetail() {
                     )}
                   </td>
                   <td className="px-3 py-3 text-sm text-center">
+                    {/* Solleciti PER-FATTURA (tabella di join, Fase 1): il
+                        soggetto è la fattura — una scaduta nuova parte da 0
+                        anche se il cliente è già al 2° su altre. */}
+                    {inv.status === 'paid' ? (
+                      <span className="text-txt-muted">—</span>
+                    ) : (inv.sollecito_count || 0) === 0 ? (
+                      <span className="text-txt-muted text-xs" title="Nessun sollecito su questa fattura">0</span>
+                    ) : (
+                      <span
+                        className={`sc-badge ${(inv.sollecito_count || 0) >= 2 ? 'bg-accent-amber/15 text-accent-amber' : 'bg-accent-teal/15 text-accent-teal'}`}
+                        title={inv.last_sollecito ? `Ultimo sollecito: ${formatDate(inv.last_sollecito)}` : ''}
+                      >
+                        {inv.sollecito_count} sollecit{inv.sollecito_count === 1 ? 'o' : 'i'}
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-3 py-3 text-sm text-center">
                     <span className={`${INVOICE_STATUS_COLORS[inv.status] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'} sc-badge`}>
                       {inv.status === 'open' ? 'Aperto' : inv.status === 'paid' ? 'Pagato' : inv.status}
                     </span>
@@ -1999,7 +2017,7 @@ export default function ClientDetail() {
                 </tr>
                 {openVerify.has(inv.id) && inv.verification && (
                   <tr key={`${inv.id}-verify`} className="bg-dark-surface/40">
-                    <td colSpan={10} className="px-3 pb-3">
+                    <td colSpan={11} className="px-3 pb-3">
                       <VerifyDetail v={inv.verification} />
                       {/* Via d'uscita dal giallo: l'operatore che ha
                           controllato a mano lo registra qui (stesso

@@ -126,6 +126,49 @@ def per_invoice_actions(
     return out
 
 
+def delivered_invoice_ids(session: Session, case, overdue_invoices) -> set:
+    """Fatture del ciclo APERTO già CONSEGNATE all'avvocato — PER FATTURA.
+
+    = fatture citate dalle azioni 'lawyer' COMPLETATE non annullate della
+    pratica (tabella di join). Un'azione LEGACY (invoice_ids NULL e nessuna
+    riga di join: handover pre-tabella o todo legale completato) valeva
+    "tutto il cliente": la si attribuisce alle fatture GIÀ SCADUTE alla data
+    della consegna (due_date < data) — stesso proxy del backfill — così una
+    fattura scaduta DOPO quella consegna NON risulta consegnata (caso Ferro).
+    invoice_ids == [] esplicito = nulla consegnato. Unica definizione: la usano
+    la sezione Avvocato e il rollup dello stato cliente.
+    `overdue_invoices` = oggetti Invoice (serve due_date).
+    """
+    acts = (
+        session.query(RecoveryAction)
+        .filter(
+            RecoveryAction.case_id == case.id,
+            RecoveryAction.action_type == "lawyer",
+            RecoveryAction.completed_at.isnot(None),
+            RecoveryAction.cancelled.isnot(True),
+        )
+        .all()
+    )
+    if not acts:
+        return set()
+    rows = (
+        session.query(RecoveryActionInvoice.action_id, RecoveryActionInvoice.invoice_id)
+        .filter(RecoveryActionInvoice.action_id.in_([a.id for a in acts]))
+        .all()
+    )
+    linked = {r[0] for r in rows}
+    delivered = {r[1] for r in rows}
+    for a in acts:
+        if a.id in linked or a.invoice_ids is not None:
+            continue  # esplicita (anche se vuota)
+        when = (a.completed_at or a.created_at)
+        when_d = when.date() if when else None
+        for inv in overdue_invoices:
+            if when_d is None or (inv.due_date and inv.due_date < when_d):
+                delivered.add(inv.id)
+    return delivered
+
+
 # ── Backfill una-tantum dello storico ───────────────────────────────
 
 def backfill_action_invoices(session: Session) -> Dict[str, Any]:

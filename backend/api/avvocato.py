@@ -20,19 +20,22 @@ import re
 import zipfile
 import logging
 from datetime import date, datetime
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy import func, case
 from sqlalchemy.orm import Session
 
 from backend.database import (
-    get_session, Customer, Invoice, RecoveryAction,
+    get_session, Customer, Invoice, RecoveryAction, RecoveryActionInvoice,
 )
 from backend.engine.overdue import overdue_clause
 from backend.engine.cases import get_open_case
 from backend.engine.action_invoices import (
-    per_invoice_sollecito_stats, per_invoice_actions,
+    per_invoice_sollecito_stats, per_invoice_actions, set_action_invoices,
+    delivered_invoice_ids,
 )
 from backend.api.recovery import _build_invoice_pdf
 
@@ -74,6 +77,22 @@ def _lat1(s) -> str:
     return str(s if s is not None else "").encode("latin-1", "replace").decode("latin-1")
 
 
+class HandoverBody(BaseModel):
+    # Fatture da consegnare all'avvocato: le SCEGLIE l'operatore (decisione
+    # owner). Vuoto = tutte le scadute non ancora consegnate (legacy).
+    invoice_ids: List[int] = []
+
+
+def _parse_ids(raw: Optional[str]) -> Optional[List[int]]:
+    """'12,15,20' → [12, 15, 20]; None/vuoto → None (= nessun filtro)."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return sorted({int(x) for x in raw.split(",") if x.strip()})
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invoice_ids non validi")
+
+
 def _debt_clause():
     """Debito PERSEGUIBILE (= is_overdue_unpaid in SQL): scaduto, non pagato,
     NON contestato. Le contestate non vanno né nel totale che decide la soglia
@@ -81,14 +100,27 @@ def _debt_clause():
     return overdue_clause() & (Invoice.status != "disputed")
 
 
-def _case_delivered_to_lawyer(session: Session, case) -> bool:
-    """La pratica APERTA ha un'azione 'lawyer' COMPLETATA = consegnata."""
+def _lawyer_actions(session: Session, case):
+    """Azioni 'lawyer' COMPLETATE non annullate della pratica (= consegne)."""
     return session.query(RecoveryAction).filter(
         RecoveryAction.case_id == case.id,
         RecoveryAction.action_type == "lawyer",
         RecoveryAction.completed_at.isnot(None),
         RecoveryAction.cancelled.isnot(True),
-    ).first() is not None
+    ).all()
+
+
+def _delivered_invoice_ids(session: Session, case, overdue_invoices) -> set:
+    """Vedi engine.action_invoices.delivered_invoice_ids (unica definizione)."""
+    return delivered_invoice_ids(session, case, overdue_invoices)
+
+
+def _case_delivered_to_lawyer(session: Session, case) -> bool:
+    """Compat: TUTTE le scadute del ciclo aperto sono consegnate."""
+    overdue = _overdue_invoices(session, case.customer_id)
+    if not overdue:
+        return False
+    return {i.id for i in overdue} <= _delivered_invoice_ids(session, case, overdue)
 
 
 def _overdue_invoices(session: Session, customer_id: int):
@@ -148,8 +180,23 @@ def _candidate_rows(session: Session):
         # NB: NON si esclude per recovery_status=='lawyer' — è solo lo STADIO
         # (impostato appena esiste il todo legale pianificato dopo il 2°
         # sollecito): escludere per stato svuoterebbe la lista.
-        if _case_delivered_to_lawyer(session, case_obj):
-            continue
+        overdue_invs = _overdue_invoices(session, cust.id)
+        overdue_ids = [i.id for i in overdue_invs]
+        delivered = _delivered_invoice_ids(session, case_obj, overdue_invs)
+        undelivered = [i for i in overdue_invs if i.id not in delivered]
+        if not undelivered:
+            continue  # tutto il ciclo è già dal legale
+        # Lista fatture PER-FATTURA: l'operatore sceglie quali consegnare.
+        inv_stats = per_invoice_sollecito_stats(session, overdue_ids)
+        inv_rows = [{
+            "id": i.id,
+            "invoice_number": i.invoice_number,
+            "amount_due": float(i.amount_due or 0),
+            "due_date": i.due_date.isoformat() if i.due_date else None,
+            "days_overdue": int(i.days_overdue or 0),
+            "sollecito_count": inv_stats.get(i.id, {}).get("count", 0),
+            "delivered": i.id in delivered,
+        } for i in overdue_invs]
         # Contatti FRESCHI del ciclo corrente (NON gli ereditati): servono
         # entrambi i solleciti in QUESTA pratica, e l'ultimo sollecito dev'essere
         # di questo ciclo — così un caso riaperto con soli contatti ereditati non
@@ -179,6 +226,8 @@ def _candidate_rows(session: Session):
             "days_since_last_sollecito": days_since,
             "ready": days_since is None or days_since >= LAWYER_GRACE_DAYS,
             "recovery_status": cust.recovery_status,
+            "invoices": inv_rows,
+            "undelivered_total": float(sum(i.amount_due or 0 for i in undelivered)),
         })
     rows.sort(key=lambda r: r["total_overdue"], reverse=True)
     return rows
@@ -196,7 +245,7 @@ def list_candidates(session: Session = Depends(get_session)):
     }
 
 
-def _build_dossier_pdf(customer, invoices, actions, per_invoice=None):
+def _build_dossier_pdf(customer, invoices, actions, per_invoice=None, context=None):
     """Dossier legale: intestazione + tabella fatture (con date) + stato
     solleciti PER FATTURA (con note che viaggiano col debito) + timeline
     attività complessiva + totale. fpdf2, stesso stile del riepilogativo.
@@ -235,7 +284,7 @@ def _build_dossier_pdf(customer, invoices, actions, per_invoice=None):
 
     # Fatture scadute
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, "Fatture scadute", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8, "Fatture affidate con il presente dossier", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(1)
     pdf.set_font("Helvetica", "B", 9)
     pdf.set_fill_color(240, 240, 240)
@@ -255,10 +304,31 @@ def _build_dossier_pdf(customer, invoices, actions, per_invoice=None):
         pdf.cell(widths[4], 7, str(inv.days_overdue or 0), border=1, align="C")
         pdf.ln()
     pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(widths[0], 9, "TOTALE", border=1, fill=True, align="R")
+    pdf.cell(widths[0], 9, "TOTALE AFFIDATO", border=1, fill=True, align="R")
     pdf.cell(widths[1], 9, f"{total:,.2f}".replace(",", "."), border=1, fill=True, align="R")
     pdf.cell(widths[2] + widths[3] + widths[4], 9, "EUR", border=1, fill=True, align="L")
-    pdf.ln(12)
+    pdf.ln(10)
+
+    # Perimetro ESPLICITO (documento legale): il dossier può essere PARZIALE
+    # (l'operatore sceglie le fatture). Il legale deve sapere cosa resta fuori.
+    if context is not None:
+        od = context.get("others_delivered") or []
+        oo = context.get("others_open") or []
+        pdf.set_font("Helvetica", "I", 9)
+        if not od and not oo:
+            pdf.multi_cell(0, 5, "Il presente dossier comprende tutte le fatture scadute del cliente.",
+                           new_x="LMARGIN", new_y="NEXT")
+        else:
+            def _eur(xs):
+                return f"{sum(float(i.amount_due) for i in xs):,.2f}".replace(",", ".")
+            line = (f"Altre fatture scadute del cliente NON comprese nel presente dossier: "
+                    f"{len(od) + len(oo)} per EUR {_eur(od + oo)}")
+            if od:
+                line += f" - di cui gia' affidate al legale con dossier precedenti: {len(od)} per EUR {_eur(od)}"
+            if oo:
+                line += f" - di cui ancora in sollecito: {len(oo)} per EUR {_eur(oo)}"
+            pdf.multi_cell(0, 5, _lat1(line), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(4)
 
     # Stato solleciti PER FATTURA — il soggetto del recupero è la fattura: per
     # ognuna, quanti solleciti ha ricevuto, l'ultimo quando, e le note delle
@@ -298,27 +368,58 @@ def _build_dossier_pdf(customer, invoices, actions, per_invoice=None):
         pdf.cell(0, 6, "Nessuna attività registrata.", new_x="LMARGIN", new_y="NEXT")
     else:
         pdf.set_font("Helvetica", "B", 9)
-        aw = [30, 45, 60, 23]  # Data, Attività, Canale, Esito
-        for i, h in enumerate(["Data", "Attività", "Canale", "Esito"]):
+        # Storia COMPLETA della diligenza (anche su fatture non in questo
+        # dossier): la colonna "Fatture" dice a cosa si riferisce ogni riga.
+        aw = [22, 34, 40, 18, 76]  # Data, Attività, Canale, Esito, Fatture
+        for i, h in enumerate(["Data", "Attività", "Canale", "Esito", "Fatture"]):
             pdf.cell(aw[i], 8, h, border=1, fill=True, align="C")
         pdf.ln()
-        pdf.set_font("Helvetica", "", 9)
+        pdf.set_font("Helvetica", "", 8)
+        numbers = (context or {}).get("numbers") or {}
         for a in actions:
             when = a.completed_at or a.created_at or a.scheduled_date
             when_s = when.strftime("%d/%m/%Y") if when else "-"
+            if a.invoice_ids:
+                cited = ", ".join(numbers.get(i, str(i)) for i in a.invoice_ids)
+            elif a.invoice_ids is None and a.action_type == "lawyer" and a.completed_at:
+                cited = "tutte le scadute alla data"
+            else:
+                cited = "-"
             pdf.cell(aw[0], 7, when_s, border=1, align="C")
-            pdf.cell(aw[1], 7, _lat1(ACTION_LABELS.get(a.action_type, a.action_type or "-"))[:26], border=1, align="L")
-            pdf.cell(aw[2], 7, _lat1(CHANNEL_LABELS.get(a.channel, a.channel or "-"))[:34], border=1, align="L")
-            pdf.cell(aw[3], 7, _lat1(a.outcome or "-")[:13], border=1, align="L")
+            pdf.cell(aw[1], 7, _lat1(ACTION_LABELS.get(a.action_type, a.action_type or "-"))[:22], border=1, align="L")
+            pdf.cell(aw[2], 7, _lat1(CHANNEL_LABELS.get(a.channel, a.channel or "-"))[:26], border=1, align="L")
+            pdf.cell(aw[3], 7, _lat1(a.outcome or "-")[:11], border=1, align="L")
+            pdf.cell(aw[4], 7, _lat1(cited)[:52], border=1, align="L")
             pdf.ln()
 
     return pdf.output()
 
 
-def _customer_dossier_files(session: Session, customer):
+def _customer_dossier_files(session: Session, customer, invoice_ids=None):
     """Ritorna [(filename, bytes)] del dossier del cliente: il PDF dossier +
-    i PDF delle singole fatture scadute."""
-    invoices = _overdue_invoices(session, customer.id)
+    i PDF delle singole fatture scadute. Se `invoice_ids` è dato, il dossier
+    copre SOLO quelle fatture (scelta dell'operatore)."""
+    all_overdue = _overdue_invoices(session, customer.id)
+    invoices = all_overdue
+    if invoice_ids is not None:
+        wanted = set(invoice_ids)
+        invoices = [i for i in all_overdue if i.id in wanted]
+    # Contesto per il legale: cosa NON è in questo dossier (già affidato /
+    # ancora in sollecito) + numeri di fattura per la colonna "Fatture".
+    case_open = get_open_case(session, customer.id)
+    delivered = _delivered_invoice_ids(session, case_open, all_overdue) if case_open else set()
+    in_pack = {i.id for i in invoices}
+    others = [i for i in all_overdue if i.id not in in_pack]
+    numbers = {
+        i.id: i.invoice_number
+        for i in session.query(Invoice.id, Invoice.invoice_number)
+        .filter(Invoice.customer_id == customer.id).all()
+    }
+    context = {
+        "others_delivered": [i for i in others if i.id in delivered],
+        "others_open": [i for i in others if i.id not in delivered],
+        "numbers": numbers,
+    }
     actions = (
         session.query(RecoveryAction)
         .filter(
@@ -350,7 +451,7 @@ def _customer_dossier_files(session: Session, customer):
         session.rollback()
         per_invoice = {}
     files = [(f"dossier_{_safe(customer.ragione_sociale)}.pdf",
-              bytes(_build_dossier_pdf(customer, invoices, actions, per_invoice)))]
+              bytes(_build_dossier_pdf(customer, invoices, actions, per_invoice, context)))]
     for inv in invoices:
         # Resiliente: il PDF singola fattura riusa il builder di recovery.py
         # (font core = latin-1); un carattere fuori latin-1 nel nome non deve
@@ -365,12 +466,26 @@ def _customer_dossier_files(session: Session, customer):
 
 
 @router.get("/customers/{customer_id}/dossier-zip")
-def dossier_zip(customer_id: int, session: Session = Depends(get_session)):
-    """ZIP del dossier di UN cliente: dossier PDF + PDF delle fatture."""
+def dossier_zip(
+    customer_id: int,
+    invoice_ids: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    """ZIP del dossier di UN cliente: dossier PDF + PDF delle fatture.
+    `invoice_ids` (csv) = solo le fatture scelte dall'operatore."""
     customer = session.query(Customer).filter(Customer.id == customer_id).first()
     if not customer:
         raise HTTPException(status_code=404, detail="Cliente non trovato")
-    files = _customer_dossier_files(session, customer)
+    sel = _parse_ids(invoice_ids)
+    if sel is not None:
+        overdue_ids = {i.id for i in _overdue_invoices(session, customer_id)}
+        unknown = [i for i in sel if i not in overdue_ids]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Fatture non scadute o non del cliente: {unknown}",
+            )
+    files = _customer_dossier_files(session, customer, sel)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in files:
@@ -392,6 +507,7 @@ def dossier_zip_all(session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Nessun candidato")
     buf = io.BytesIO()
     errors = 0
+    skipped = []
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for r in rows:
             customer = session.query(Customer).filter(Customer.id == r["id"]).first()
@@ -403,14 +519,33 @@ def dossier_zip_all(session: Session = Depends(get_session)):
             folder = f"{customer.id}_{_safe(customer.ragione_sociale)}"
             # Resiliente: un cliente che fa fallire la generazione (dati sporchi)
             # non deve affossare l'intero pacchetto — si salta e si prosegue.
+            # Selezione di default per "prepara tutti": SOLO le fatture non
+            # ancora consegnate con almeno 2 solleciti propri (mature). Niente
+            # fallback: al legale non si spedisce una fattura mai sollecitata.
+            # Chi non ha fatture mature si salta e lo si DICHIARA (SALTATI.txt:
+            # niente scarti silenziosi); l'operatore può scegliere a mano.
+            sel = [i["id"] for i in r["invoices"]
+                   if not i["delivered"] and i["sollecito_count"] >= 2]
+            if not sel:
+                skipped.append(
+                    f"{customer.id} - {customer.ragione_sociale}: nessuna fattura "
+                    "non consegnata con almeno 2 solleciti (scegli a mano dalla lista)"
+                )
+                continue
             try:
-                for name, data in _customer_dossier_files(session, customer):
+                for name, data in _customer_dossier_files(session, customer, sel):
                     zf.writestr(f"{folder}/{name}", data)
             except Exception:
                 errors += 1
                 logger.exception("Dossier fallito per cliente %s (%s)", customer.id, folder)
+        if skipped:
+            zf.writestr("SALTATI.txt", _lat1(
+                "Clienti candidati SENZA fatture mature (>=2 solleciti) non consegnate: "
+                "nessun dossier generato in automatico.\n\n" + "\n".join(skipped) + "\n"))
     if errors:
         logger.warning("dossier-zip-all: %d dossier saltati per errore", errors)
+    if skipped:
+        logger.info("dossier-zip-all: %d clienti senza fatture mature (SALTATI.txt)", len(skipped))
     buf.seek(0)
     stamp = date.today().strftime("%Y%m%d")
     return StreamingResponse(
@@ -420,10 +555,20 @@ def dossier_zip_all(session: Session = Depends(get_session)):
 
 
 @router.post("/customers/{customer_id}/handover")
-def handover_to_lawyer(customer_id: int, session: Session = Depends(get_session)):
-    """Segna il cliente come CONSEGNATO all'avvocato: registra un'azione
-    'lawyer' datata + stato legale → esce dalla lista candidati. Idempotente:
-    se è già dall'avvocato, no-op."""
+def handover_to_lawyer(
+    customer_id: int,
+    body: Optional[HandoverBody] = None,
+    session: Session = Depends(get_session),
+):
+    """Segna le fatture SCELTE come CONSEGNATE all'avvocato (per-fattura).
+
+    Registra un'azione 'lawyer' COMPLETATA che CITA le fatture consegnate
+    (invoice_ids + tabella di join). Il cliente resta candidato finché ha
+    scadute non ancora consegnate (caso Ferro: le vecchie al legale, le nuove
+    restano in sollecito). Quando TUTTO il ciclo è consegnato → stato legale.
+    Body vuoto = tutte le scadute non consegnate (legacy). Idempotente: le
+    fatture già consegnate si ignorano.
+    """
     customer = session.query(Customer).filter(
         Customer.id == customer_id,
         Customer.merged_into.is_(None),
@@ -439,26 +584,81 @@ def handover_to_lawyer(customer_id: int, session: Session = Depends(get_session)
             status_code=409,
             detail="Nessuna pratica aperta per questo cliente: aggiorna la lista",
         )
-    # Idempotenza: "consegnato" = la pratica APERTA ha già un'azione 'lawyer'
-    # COMPLETATA (non lo stadio, non un handover di un ciclo passato).
-    if _case_delivered_to_lawyer(session, case_open):
-        return {"customer_id": customer_id, "already": True, "recovery_status": customer.recovery_status}
+    overdue_objs = _overdue_invoices(session, customer_id)
+    overdue_ids = [i.id for i in overdue_objs]
+    delivered = _delivered_invoice_ids(session, case_open, overdue_objs)
+    # Body ASSENTE = legacy "tutte le non consegnate"; una lista VUOTA
+    # esplicita contraddice "l'operatore sceglie" → rifiutata.
+    if body is not None and not body.invoice_ids:
+        raise HTTPException(status_code=400, detail="Seleziona almeno una fattura da consegnare")
+    requested = sorted(set(body.invoice_ids)) if body else []
+    unknown = [i for i in requested if i not in overdue_ids]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fatture non scadute o non del cliente: {unknown}",
+        )
+    target = requested or overdue_ids
+    to_deliver = [i for i in target if i not in delivered]
+    if not to_deliver:
+        return {
+            "customer_id": customer_id, "already": True,
+            "delivered": sorted(delivered), "remaining": 0,
+            "recovery_status": customer.recovery_status,
+        }
     try:
         now = datetime.utcnow()
-        session.add(RecoveryAction(
+        action = RecoveryAction(
             customer_id=customer_id,
             case_id=case_open.id,
             action_type="lawyer",
             completed_at=now,
             outcome="handover",
-            notes="Documentazione consegnata all'avvocato",
-        ))
-        customer.recovery_status = "lawyer"
-        customer.next_action_type = None
-        customer.next_action_date = None
+            invoice_ids=to_deliver,
+            notes=f"Documentazione consegnata all'avvocato ({len(to_deliver)} fatture)",
+        )
+        session.add(action)
+        session.flush()
+        set_action_invoices(session, action.id, to_deliver)
+        # La pagina Avvocato È il flusso di consegna: i todo legali pendenti
+        # (auto-pianificati dopo il 2° sollecito) sono ridondanti e, se
+        # completati dopo una consegna PARZIALE, consegnerebbero il resto in
+        # modo implicito → si annullano.
+        pending_lawyer = session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == case_open.id,
+            RecoveryAction.action_type == "lawyer",
+            RecoveryAction.completed_at.is_(None),
+            RecoveryAction.cancelled.isnot(True),
+        ).all()
+        for p in pending_lawyer:
+            p.cancelled = True
+            p.cancelled_reason = f"superseded_by_handover:{action.id}"
+        session.flush()
+        all_delivered = delivered | set(to_deliver)
+        remaining = [i for i in overdue_ids if i not in all_delivered]
+        if not remaining:
+            # Tutto il ciclo è dal legale: stato legale, niente altre azioni.
+            customer.recovery_status = "lawyer"
+            customer.next_action_type = None
+            customer.next_action_date = None
+        else:
+            # Consegna parziale: il prossimo passo è il primo todo ancora
+            # pendente (se c'è); lo stato resta quello del sollecito.
+            nxt = session.query(RecoveryAction).filter(
+                RecoveryAction.case_id == case_open.id,
+                RecoveryAction.completed_at.is_(None),
+                RecoveryAction.cancelled.isnot(True),
+                RecoveryAction.scheduled_date.isnot(None),
+            ).order_by(RecoveryAction.scheduled_date.asc()).first()
+            customer.next_action_date = nxt.scheduled_date if nxt else None
+            customer.next_action_type = nxt.action_type if nxt else None
         customer.updated_at = now
         session.commit()
-        return {"customer_id": customer_id, "already": False, "recovery_status": "lawyer"}
+        return {
+            "customer_id": customer_id, "already": False,
+            "delivered": sorted(to_deliver), "remaining": len(remaining),
+            "recovery_status": customer.recovery_status,
+        }
     except Exception as e:
         logger.error(f"Errore handover avvocato: {e}", exc_info=True)
         session.rollback()
