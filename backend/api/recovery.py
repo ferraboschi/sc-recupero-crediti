@@ -197,6 +197,15 @@ def register_sollecito(
         # (existing_today.invoice_ids) è una scrittura da proteggere.
         own_invoice_ids = {inv.id for inv in customer.invoices}
         unknown = [i for i in body.invoice_ids if i not in own_invoice_ids]
+        not_workable = [
+            inv.id for inv in customer.invoices
+            if inv.id in set(body.invoice_ids) and not is_overdue_unpaid(inv)
+        ]
+        if not_workable:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Fatture non sollecitabili (pagate, contestate o in incasso): {not_workable}",
+            )
         if unknown:
             raise HTTPException(
                 status_code=400,

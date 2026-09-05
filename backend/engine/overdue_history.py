@@ -24,7 +24,7 @@ from sqlalchemy import func
 from backend.database import Customer, Invoice, OverdueSnapshot, SyncState
 from backend.engine.overdue import (
     OVERDUE_BUCKETS, bucket_expr,
-    compute_overdue_buckets, compute_recuperato_certo,
+    compute_overdue_buckets, compute_recuperato_certo, compute_in_incasso_assegni,
     first_recovery_action_subquery, recovered_invoice_clause,
 )
 from backend.engine.cases import business_day_start
@@ -63,6 +63,7 @@ def record_overdue_snapshot(session):
     """
     buckets = compute_overdue_buckets(session)
     rec_fatture, rec_importo = compute_recuperato_certo(session)
+    ass_fatture, ass_importo = compute_in_incasso_assegni(session)
     today = business_day_start().date()
 
     snap = (
@@ -83,14 +84,18 @@ def record_overdue_snapshot(session):
     snap.esclusi = buckets["esclusi"]["importo"]
     snap.contestati = buckets["contestati"]["importo"]
     snap.lavorabile = buckets["lavorabile"]["importo"]
+    snap.in_incasso = buckets["in_incasso"]["importo"]
     snap.recuperato_certo = round(rec_importo, 2)
+    snap.recuperato_assegni = round(ass_importo, 2)
 
     snap.scaduto_totale_fatture = buckets["scaduto_totale"]["fatture"]
     snap.non_abbinati_fatture = buckets["non_abbinati"]["fatture"]
     snap.esclusi_fatture = buckets["esclusi"]["fatture"]
     snap.contestati_fatture = buckets["contestati"]["fatture"]
     snap.lavorabile_fatture = buckets["lavorabile"]["fatture"]
+    snap.in_incasso_fatture = buckets["in_incasso"]["fatture"]
     snap.recuperato_certo_fatture = rec_fatture
+    snap.recuperato_assegni_fatture = ass_fatture
 
     session.commit()
     logger.info(
@@ -252,12 +257,14 @@ def backfill_overdue_history(session, days: int = HISTORY_BACKFILL_DAYS) -> dict
             esclusi=importi["esclusi"],
             contestati=importi["contestati"],
             lavorabile=importi["lavorabile"],
+            in_incasso=importi.get("in_incasso", 0.0),
             recuperato_certo=round(rec_importo, 2),
             scaduto_totale_fatture=sum(fatture.values()),
             non_abbinati_fatture=fatture["non_abbinati"],
             esclusi_fatture=fatture["esclusi"],
             contestati_fatture=fatture["contestati"],
             lavorabile_fatture=fatture["lavorabile"],
+            in_incasso_fatture=fatture.get("in_incasso", 0),
             recuperato_certo_fatture=rec_fatture,
         ))
         created += 1

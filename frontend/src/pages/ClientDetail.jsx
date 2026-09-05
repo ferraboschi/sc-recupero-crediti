@@ -172,6 +172,8 @@ export default function ClientDetail() {
   // Selezione mista (fatture a stadi diversi): quale stadio sto scrivendo
   const [messageStage, setMessageStage] = useState(null)
   useEffect(() => { setMessageStage(null) }, [selectedInvoices])
+  // Assegno in mano (Fase 3): form inline per fattura {invoiceId, expected, note}
+  const [assegnoForm, setAssegnoForm] = useState(null)
   const [phoneEdit, setPhoneEdit] = useState(null)
   const [updatingInvoice, setUpdatingInvoice] = useState(null)
   const [showAllInvoices, setShowAllInvoices] = useState(false)
@@ -229,7 +231,7 @@ export default function ClientDetail() {
       setData(response.data)
       const items = response.data.invoices?.items || []
       const overdueIds = items
-        .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid')
+        .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && !inv.in_incasso)
         .map(inv => inv.id)
       setSelectedInvoices(new Set(overdueIds))
       // Semina le "verificate a mano" dal backend: senza, un hard-reload
@@ -718,7 +720,7 @@ export default function ClientDetail() {
   const selectAllOverdue = () => {
     if (!data?.invoices?.items) return
     const overdueIds = data.invoices.items
-      .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid')
+      .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && !inv.in_incasso)
       .map(inv => inv.id)
     setSelectedInvoices(new Set(overdueIds))
   }
@@ -864,6 +866,43 @@ export default function ClientDetail() {
       // Il messaggio è GIÀ partito: l'errore di registrazione non può
       // essere silenzioso, altrimenti numerazione e tono si corrompono.
       setSollecitoError({ channel, invoiceIds, detail: err.response?.data?.detail })
+    }
+  }
+
+  // ── Assegno in mano (decisioni owner): stato PER-FATTURA scritto solo qui.
+  const submitAssegno = async () => {
+    if (!assegnoForm) return
+    try {
+      await client.post(`/positions/${assegnoForm.invoiceId}/assegno`, {
+        expected_date: assegnoForm.expected || null,
+        note: assegnoForm.note || null,
+      })
+      setAssegnoForm(null)
+      await fetchData()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Errore nella registrazione dell\'assegno')
+    }
+  }
+  const markInsoluto = async (inv) => {
+    if (!window.confirm(
+      `ASSEGNO INSOLUTO sulla fattura ${inv.invoice_number}?\n\n`
+      + 'La fattura torna SUBITO scaduta e lavorabile, la pratica si riapre con lo storico dei solleciti '
+      + 'e il recuperato viene stornato. La riga resta segnalata in rosso.'
+    )) return
+    try {
+      await client.post(`/positions/${inv.id}/assegno/insoluto`, {})
+      await fetchData()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Errore nella registrazione dell\'insoluto')
+    }
+  }
+  const cancelAssegno = async (inv) => {
+    if (!window.confirm(`Annullare la registrazione dell'assegno su ${inv.invoice_number}?\n\nSolo se registrata per errore: la fattura torna scaduta senza allarme.`)) return
+    try {
+      await client.delete(`/positions/${inv.id}/assegno`)
+      await fetchData()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Errore nell\'annullamento')
     }
   }
 
@@ -1955,6 +1994,8 @@ export default function ClientDetail() {
                   className={`
                     ${inv.status === 'paid' ? 'bg-accent-green/5 opacity-60' : ''}
                     ${inv.days_overdue > 0 && inv.status !== 'paid' ? 'bg-accent-red/5' : ''}
+                    ${inv.bounced_at && inv.status !== 'paid' ? 'bg-accent-red/15 ring-2 ring-inset ring-accent-red/60' : ''}
+                    ${inv.in_incasso ? 'bg-accent-teal/5' : ''}
                     ${selectedInvoices.has(inv.id) ? 'ring-2 ring-inset ring-accent-teal/30' : ''}
                     hover:bg-dark-cardHover transition-colors
                   `}
@@ -1965,7 +2006,7 @@ export default function ClientDetail() {
                       checked={selectedInvoices.has(inv.id)}
                       onChange={() => toggleInvoiceSelection(inv.id)}
                       className="rounded border-dark-border bg-dark-bg"
-                      disabled={inv.status === 'paid'}
+                      disabled={inv.status === 'paid' || !!inv.in_incasso}
                     />
                   </td>
                   <td className="px-3 py-3 text-sm font-medium text-txt-primary">{inv.invoice_number}</td>
@@ -2052,6 +2093,33 @@ export default function ClientDetail() {
                       <div className="mt-1 text-[11px] text-accent-green/80">
                         Pagata{inv.paid_at ? ` · ${formatDate(inv.paid_at)}` : ''}
                       </div>
+                    ) : inv.bounced_at ? (
+                      <div className="mt-1">
+                        <span
+                          className="inline-block text-[10px] font-bold px-1.5 py-0.5 rounded bg-accent-red text-dark-bg"
+                          title={`Assegno tornato insoluto il ${formatDate(inv.bounced_at)}${inv.bounced_note ? ' · ' + inv.bounced_note : ''}. La fattura è tornata scaduta e la pratica riaperta.`}
+                        >
+                          ⚠ ASSEGNO INSOLUTO · {formatDate(inv.bounced_at)}
+                        </span>
+                      </div>
+                    ) : (!inv.payment_pending && inv.payment_pending_at && (inv.days_overdue || 0) > 0) ? (
+                      <div className="mt-1">
+                        <span
+                          className="inline-block text-[10px] font-bold px-1.5 py-0.5 rounded bg-accent-amber/25 text-accent-amber"
+                          title={inv.bounced_note || 'Pagata con assegno, poi riaperta su FatturaPro: verificare se l\'assegno è tornato insoluto'}
+                        >
+                          ⚠ RIAPERTA DOPO ASSEGNO · verificare insoluto
+                        </span>
+                      </div>
+                    ) : inv.in_incasso ? (
+                      <div className="mt-1">
+                        <span
+                          className={`inline-block text-[10px] px-1.5 py-0.5 rounded ${inv.pending_overdue ? 'bg-accent-amber/20 text-accent-amber' : 'bg-accent-teal/15 text-accent-teal'}`}
+                          title={`Assegno registrato il ${formatDate(inv.payment_pending_at)}${inv.payment_pending_note ? ' · ' + inv.payment_pending_note : ''}. Fuori dai solleciti finché non è incassato (FatturaPro la vede ancora aperta).`}
+                        >
+                          In incasso · assegno{inv.payment_pending_expected ? ` · atteso ${formatDate(inv.payment_pending_expected)}` : ''}{inv.pending_overdue ? ' · OLTRE LA DATA' : ''}
+                        </span>
+                      </div>
                     ) : (inv.missing_streak || 0) >= 1 ? (
                       <div className="mt-1">
                         <span
@@ -2076,8 +2144,81 @@ export default function ClientDetail() {
                     >
                       {singlePdfLoading === inv.id ? '...' : 'PDF'}
                     </button>
+                    {/* Assegno in mano: azioni sulla riga della fattura */}
+                    {inv.status !== 'paid' && !inv.in_incasso && ((inv.days_overdue || 0) > 0 || inv.bounced_at) && (
+                      <button
+                        onClick={() => setAssegnoForm(assegnoForm?.invoiceId === inv.id ? null : { invoiceId: inv.id, expected: '', note: '' })}
+                        className="ml-1 px-2 py-1 bg-accent-teal/15 text-accent-teal rounded text-xs font-medium hover:bg-accent-teal/25 transition-colors"
+                        title={inv.bounced_at ? 'Registra un NUOVO assegno (azzera l\'allarme insoluto)' : 'Pagata con assegno da incassare'}
+                      >
+                        {inv.bounced_at ? 'Nuovo assegno' : 'Assegno'}
+                      </button>
+                    )}
+                    {!inv.in_incasso && !inv.payment_pending && inv.payment_pending_at && !inv.bounced_at && inv.status !== 'paid' && (inv.days_overdue || 0) > 0 && (
+                      <button
+                        onClick={() => markInsoluto(inv)}
+                        className="ml-1 px-2 py-1 bg-accent-red/15 text-accent-red rounded text-xs font-bold hover:bg-accent-red/25 transition-colors"
+                        title="Conferma: l'assegno è tornato insoluto"
+                      >
+                        Insoluto
+                      </button>
+                    )}
+                    {inv.in_incasso && (
+                      <>
+                        <button
+                          onClick={() => markInsoluto(inv)}
+                          className="ml-1 px-2 py-1 bg-accent-red/15 text-accent-red rounded text-xs font-bold hover:bg-accent-red/25 transition-colors"
+                          title="L'assegno è tornato indietro: la fattura torna scaduta SUBITO"
+                        >
+                          Insoluto
+                        </button>
+                        <button
+                          onClick={() => cancelAssegno(inv)}
+                          className="ml-1 px-2 py-1 bg-dark-surface text-txt-muted rounded text-xs hover:text-txt-primary transition-colors"
+                          title="Annulla la registrazione (solo se fatta per errore)"
+                        >
+                          Annulla
+                        </button>
+                      </>
+                    )}
                   </td>
                 </tr>
+                {assegnoForm?.invoiceId === inv.id && (
+                  <tr key={`${inv.id}-assegno`} className="bg-dark-surface/40">
+                    <td colSpan={11} className="px-3 pb-3">
+                      <div className="flex items-end gap-3 flex-wrap pt-2">
+                        <div className="text-xs text-txt-secondary">
+                          Pagata con <strong className="text-txt-primary">assegno</strong> da incassare — Fatt. {inv.invoice_number} · {formatCurrency(inv.amount_due)}
+                        </div>
+                        <label className="text-xs text-txt-muted">
+                          Incasso previsto
+                          <input
+                            type="date"
+                            value={assegnoForm.expected}
+                            onChange={e => setAssegnoForm({ ...assegnoForm, expected: e.target.value })}
+                            className="ml-2 px-2 py-1 rounded bg-dark-bg border border-dark-border text-sm text-txt-primary"
+                          />
+                        </label>
+                        <label className="text-xs text-txt-muted flex-1 min-w-[16rem]">
+                          Nota
+                          <input
+                            type="text"
+                            value={assegnoForm.note}
+                            placeholder="es. assegno n. 123, verrà incassato il …"
+                            onChange={e => setAssegnoForm({ ...assegnoForm, note: e.target.value })}
+                            className="ml-2 w-full max-w-md px-2 py-1 rounded bg-dark-bg border border-dark-border text-sm text-txt-primary"
+                          />
+                        </label>
+                        <button onClick={submitAssegno} className="sc-btn-primary text-xs">Registra assegno</button>
+                        <button onClick={() => setAssegnoForm(null)} className="sc-btn-secondary text-xs">Chiudi</button>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-txt-muted">
+                        La fattura esce dai solleciti e va in «In incasso (assegni)»; conta come recuperato dalla registrazione.
+                        L'importo dovuto NON viene azzerato e FatturaPro non viene toccato: quando l'assegno è incassato la fattura diventa pagata da sola.
+                      </p>
+                    </td>
+                  </tr>
+                )}
                 {openVerify.has(inv.id) && inv.verification && (
                   <tr key={`${inv.id}-verify`} className="bg-dark-surface/40">
                     <td colSpan={11} className="px-3 pb-3">

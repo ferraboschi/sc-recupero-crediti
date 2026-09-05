@@ -41,6 +41,8 @@ const SORT_OPTIONS = [
   { value: 'name', label: 'Nome A-Z' },
 ]
 
+const fmtEur = (v) => new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(v || 0)
+
 export default function Dashboard() {
   const navigate = useNavigate()
   const [loading, setLoading] = useState(true)
@@ -315,6 +317,55 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
+      {/* ASSEGNI (Fase 3, decisione owner): un INSOLUTO è un reato → allarme
+          forte in cima al cruscotto; oltre-data = attenzione. */}
+      {data?.assegni?.insoluti?.fatture > 0 && (
+        <div className="sc-card p-4 border-2 border-accent-red bg-accent-red/10">
+          <p className="text-sm font-bold text-accent-red">
+            ⚠ {data.assegni.insoluti.fatture} ASSEGN{data.assegni.insoluti.fatture === 1 ? 'O INSOLUTO' : 'I INSOLUTI'} · {fmtEur(data.assegni.insoluti.importo)}
+          </p>
+          <p className="text-xs text-txt-secondary mt-1">
+            La fattura è tornata scaduta e la pratica è stata riaperta con lo storico dei solleciti. Verificare subito.
+          </p>
+          <ul className="mt-2 text-xs text-txt-primary space-y-0.5">
+            {(data.assegni.insoluti.items || []).map(i => (
+              <li key={i.invoice_id}>
+                <button type="button" onClick={() => navigate(`/customers/${i.customer_id}`)} className="underline hover:text-accent-red">
+                  {i.ragione_sociale || 'cliente'}
+                </button>
+                {' '}· Fatt. {i.invoice_number} · {fmtEur(i.amount_due)} · insoluto il {i.bounced_at ? new Date(i.bounced_at).toLocaleDateString('it-IT') : '—'}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {data?.assegni?.sospetti?.fatture > 0 && (
+    <div className="sc-card p-4 border-2 border-accent-amber bg-accent-amber/10">
+      <p className="text-sm font-bold text-accent-amber">
+        ⚠ {data.assegni.sospetti.fatture} fattur{data.assegni.sospetti.fatture === 1 ? 'a pagata' : 'e pagate'} con assegno e riapert{data.assegni.sospetti.fatture === 1 ? 'a' : 'e'} su FatturaPro: verificare insoluto
+      </p>
+      <ul className="mt-2 text-xs text-txt-primary space-y-0.5">
+        {(data.assegni.sospetti.items || []).map(i => (
+          <li key={i.invoice_id}>
+            <button type="button" onClick={() => navigate(`/customers/${i.customer_id}`)} className="underline hover:text-accent-amber">
+              {i.ragione_sociale || 'cliente'}
+            </button>
+            {' '}· Fatt. {i.invoice_number} · {fmtEur(i.amount_due)}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )}
+  {data?.assegni?.in_incasso?.fatture > 0 && (
+    <p className="text-xs text-txt-muted -mt-3">
+      In incasso (assegni): {data.assegni.in_incasso.fatture} fattur{data.assegni.in_incasso.fatture === 1 ? 'a' : 'e'} · {fmtEur(data.assegni.in_incasso.importo)} — comprese nello scaduto totale, fuori dal lavorabile.
+    </p>
+  )}
+  {data?.assegni?.oltre_data_prevista > 0 && (
+        <div className="sc-card p-3 border border-accent-amber/60 bg-accent-amber/10 text-xs text-accent-amber">
+          {data.assegni.oltre_data_prevista} assegn{data.assegni.oltre_data_prevista === 1 ? 'o' : 'i'} oltre la data di incasso prevista e non ancora pagat{data.assegni.oltre_data_prevista === 1 ? 'o' : 'i'} su FatturaPro: verificare l'incasso.
+        </div>
+      )}
       {/* Search Bar */}
       <div className="sc-card p-4">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">

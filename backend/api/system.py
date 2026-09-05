@@ -58,6 +58,45 @@ def get_system_status():
             RecoveryCase.status == "open"
         ).scalar() or 0
 
+        # Assegni (Fase 3): un INSOLUTO è un reato → allerta critica; un
+        # assegno oltre la data di incasso prevista → attenzione.
+        try:
+            from backend.engine.overdue import in_incasso_clause
+            insoluti = session.query(func.count(Invoice.id)).filter(
+                Invoice.bounced_at.isnot(None), Invoice.status != "paid"
+            ).scalar() or 0
+            if insoluti:
+                alerts.append({
+                    "level": "critical",
+                    "component": "assegni",
+                    "message": f"{insoluti} assegn{'o' if insoluti == 1 else 'i'} INSOLUT{'O' if insoluti == 1 else 'I'}: fattura tornata scaduta, verificare subito",
+                })
+            sospetti = session.query(func.count(Invoice.id)).filter(
+                Invoice.status != "paid", Invoice.days_overdue > 0,
+                Invoice.payment_pending.is_(None), Invoice.payment_pending_at.isnot(None),
+                Invoice.bounced_at.is_(None),
+            ).scalar() or 0
+            if sospetti:
+                alerts.append({
+                    "level": "critical",
+                    "component": "assegni",
+                    "message": f"{sospetti} fattur{'a' if sospetti == 1 else 'e'} pagat{'a' if sospetti == 1 else 'e'} con assegno e RIAPERT{'A' if sospetti == 1 else 'E'} su FatturaPro: verificare insoluto",
+                })
+            oltre = session.query(func.count(Invoice.id)).filter(
+                in_incasso_clause(), Invoice.status != "paid",
+                Invoice.payment_pending_expected.isnot(None),
+                Invoice.payment_pending_expected < datetime.utcnow().date(),
+            ).scalar() or 0
+            if oltre:
+                alerts.append({
+                    "level": "warning",
+                    "component": "assegni",
+                    "message": f"{oltre} assegn{'o' if oltre == 1 else 'i'} oltre la data di incasso prevista e non ancora pagat{'o' if oltre == 1 else 'i'} su FatturaPro",
+                })
+        except Exception as e:  # colonne non ancora migrate: degrado grazioso
+            logger.warning(f"Alert assegni non disponibili: {e}")
+            session.rollback()
+
         customers_shopify = session.query(func.count(Customer.id)).filter(
             Customer.source == "shopify",
             Customer.merged_into.is_(None),

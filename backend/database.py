@@ -159,6 +159,20 @@ class Invoice(Base):
     # abbinamento dubbio/critico e lo considera ok. Valorizzato = esce dai
     # problemi dell'audit (a meno di include_reviewed).
     audit_reviewed_at = Column(DateTime, nullable=True)
+    # ── Assegno in mano (decisione owner, Fase 3) — scritto SOLO dall'operatore,
+    # MAI dall'importatore. Non azzera amount_due, non scrive su FatturaPro.
+    # In incasso = payment_pending valorizzato E bounced_at NULL: esce dal
+    # LAVORABILE (stop solleciti) ma resta nell'UNIVERSO in un bucket dedicato.
+    payment_pending = Column(String, nullable=True)          # 'assegno'
+    payment_pending_at = Column(DateTime, nullable=True)     # registrazione
+    payment_pending_expected = Column(Date, nullable=True)   # incasso previsto
+    payment_pending_note = Column(Text, nullable=True)
+    payment_pending_amount = Column(Float, nullable=True)    # residuo alla registrazione
+    # Insoluto (reato): l'assegno è tornato indietro → la fattura torna
+    # scaduta SUBITO, con allarme. bounced_at resta valorizzato finché non si
+    # registra un nuovo assegno o la fattura viene pagata.
+    bounced_at = Column(DateTime, nullable=True)
+    bounced_note = Column(Text, nullable=True)
     # Data di pagamento VERA: scritta nel momento in cui il sync marca la
     # fattura 'paid', azzerata se la fattura riapre. Da non confondere con
     # updated_at (onupdate: cambia a ogni modifica di riga, non è una data
@@ -333,6 +347,8 @@ class OverdueSnapshot(Base):
     esclusi = Column(Float, nullable=False, default=0.0)
     contestati = Column(Float, nullable=False, default=0.0)
     lavorabile = Column(Float, nullable=False, default=0.0)
+    # Bucket 'in incasso (assegni)': dentro l'universo, fuori dal lavorabile.
+    in_incasso = Column(Float, nullable=False, default=0.0)
     # Recuperato certo, CUMULATO (pagato dopo il primo sollecito, a residuo)
     recuperato_certo = Column(Float, nullable=False, default=0.0)
 
@@ -342,6 +358,11 @@ class OverdueSnapshot(Base):
     esclusi_fatture = Column(Integer, nullable=False, default=0)
     contestati_fatture = Column(Integer, nullable=False, default=0)
     lavorabile_fatture = Column(Integer, nullable=False, default=0)
+    in_incasso_fatture = Column(Integer, nullable=False, default=0)
+    # Sotto-voce recuperato 'in incasso da assegni' (Q2 owner): la serie storica
+    # porta anche questa, separata dalla cassa (recuperato_certo resta cassa).
+    recuperato_assegni = Column(Float, nullable=False, default=0.0)
+    recuperato_assegni_fatture = Column(Integer, nullable=False, default=0)
     recuperato_certo_fatture = Column(Integer, nullable=False, default=0)
 
     # STIMA vs realtà: le righe ricostruite dal backfill storico (proiezione
@@ -477,6 +498,24 @@ def _run_migrations(engine):
         "ALTER TABLE customers ADD COLUMN merged_into INTEGER",
         "CREATE INDEX IF NOT EXISTS ix_customers_merged_into "
         "ON customers (merged_into)",
+        # Assegno in mano (Fase 3): colonne additive per-fattura, scritte solo
+        # dall'operatore. Snapshot: il nuovo bucket 'in_incasso' deve esistere
+        # anche nella serie storica (identità scaduto_totale = Σ bucket).
+        "ALTER TABLE invoices ADD COLUMN payment_pending VARCHAR",
+        "ALTER TABLE invoices ADD COLUMN payment_pending_at TIMESTAMP",
+        "ALTER TABLE invoices ADD COLUMN payment_pending_expected DATE",
+        "ALTER TABLE invoices ADD COLUMN payment_pending_note TEXT",
+        "ALTER TABLE invoices ADD COLUMN payment_pending_amount DOUBLE PRECISION",
+        "ALTER TABLE invoices ADD COLUMN bounced_at TIMESTAMP",
+        "ALTER TABLE invoices ADD COLUMN bounced_note TEXT",
+        "ALTER TABLE overdue_snapshots ADD COLUMN in_incasso DOUBLE PRECISION DEFAULT 0",
+        "ALTER TABLE overdue_snapshots ADD COLUMN in_incasso_fatture INTEGER DEFAULT 0",
+        "UPDATE overdue_snapshots SET in_incasso = 0 WHERE in_incasso IS NULL",
+        "UPDATE overdue_snapshots SET in_incasso_fatture = 0 WHERE in_incasso_fatture IS NULL",
+        "ALTER TABLE overdue_snapshots ADD COLUMN recuperato_assegni DOUBLE PRECISION DEFAULT 0",
+        "ALTER TABLE overdue_snapshots ADD COLUMN recuperato_assegni_fatture INTEGER DEFAULT 0",
+        "UPDATE overdue_snapshots SET recuperato_assegni = 0 WHERE recuperato_assegni IS NULL",
+        "UPDATE overdue_snapshots SET recuperato_assegni_fatture = 0 WHERE recuperato_assegni_fatture IS NULL",
     ]
     try:
         raw = engine.raw_connection()

@@ -37,7 +37,10 @@ from backend.database import Invoice, Customer, RecoveryAction
 # 3. contestati — fatto su una SINGOLA fattura: se il cliente è già escluso,
 #    che una sua fattura sia contestata non cambia nulla.
 # 4. lavorabile — quel che resta: esattamente ciò che il motore lavora.
-OVERDUE_BUCKETS = ("non_abbinati", "esclusi", "contestati", "lavorabile")
+# 3b. in_incasso — pagata con ASSEGNO registrato dall'operatore, in attesa di
+#    incasso e NON insoluta: il credito esiste ancora (FatturaPro la vede
+#    aperta) ma non si insegue. Resta nell'universo, esce dal lavorabile.
+OVERDUE_BUCKETS = ("non_abbinati", "esclusi", "contestati", "in_incasso", "lavorabile")
 
 # Stati pratica di un cliente lavorabile (la cache su Customer.recovery_status).
 # `sconosciuto` raccoglie NULL e valori imprevisti: senza di lui la somma
@@ -52,9 +55,34 @@ CASE_STAGES = (
 RECOVERY_ACTION_TYPES = ("first_contact", "second_contact", "lawyer")
 
 
+def is_in_incasso(inv: Invoice) -> bool:
+    """Assegno in mano NON insoluto su fattura NON pagata: fuori dal lavorabile,
+    dentro l'universo. `status != paid` sta QUI (definizione unica): il sync
+    che marca pagata per assenza non deve essere ricordato da ogni consumer."""
+    return (
+        inv.status != "paid"
+        and bool(getattr(inv, "payment_pending", None))
+        and getattr(inv, "bounced_at", None) is None
+    )
+
+
+def in_incasso_clause():
+    """Gemello SQL di is_in_incasso."""
+    return (
+        (Invoice.status != "paid")
+        & Invoice.payment_pending.isnot(None)
+        & Invoice.bounced_at.is_(None)
+    )
+
+
 def is_overdue_unpaid(inv: Invoice) -> bool:
-    """Fattura che tiene viva una pratica: scaduta, non pagata, non contestata."""
-    return inv.status not in ("paid", "disputed") and (inv.days_overdue or 0) > 0
+    """Fattura che tiene viva una pratica: scaduta, non pagata, non contestata,
+    non in incasso (assegno in mano)."""
+    return (
+        inv.status not in ("paid", "disputed")
+        and (inv.days_overdue or 0) > 0
+        and not is_in_incasso(inv)
+    )
 
 
 def overdue_clause():
@@ -73,6 +101,7 @@ def workable_clause():
         & Invoice.customer_id.isnot(None)
         & (Invoice.status != "disputed")
         & Customer.excluded.isnot(True)
+        & ~in_incasso_clause()
     )
 
 
@@ -89,6 +118,7 @@ def bucket_expr():
         (Invoice.customer_id.is_(None), "non_abbinati"),
         (Customer.excluded.is_(True), "esclusi"),
         (Invoice.status == "disputed", "contestati"),
+        (in_incasso_clause(), "in_incasso"),
         else_="lavorabile",
     )
 
@@ -118,7 +148,7 @@ def compute_overdue_buckets(session) -> dict:
          "contestati":     {...}, "lavorabile": {...}}
 
     L'identità vale per costruzione (bucket_expr assegna ogni riga a un solo
-    ramo): scaduto_totale == non_abbinati + esclusi + contestati + lavorabile.
+    ramo): scaduto_totale == non_abbinati + esclusi + contestati + in_incasso + lavorabile.
     """
     rows = (
         session.query(
@@ -243,3 +273,37 @@ def compute_recuperato_certo(session):
         .one()
     )
     return int(certo[0] or 0), float(certo[1] or 0.0)
+
+
+def compute_in_incasso_assegni(session):
+    """Recuperato "in incasso da assegni": assegni in mano (non insoluti, non
+    ancora pagati su FatturaPro) registrati DOPO il primo sollecito, su fatture
+    emesse PRIMA (stessa attribuzione del certo). Somma del residuo alla
+    registrazione. È la sotto-voce del recuperato decisa dall'owner (Q2):
+    conta dalla registrazione, ma NON si mescola alla cassa vera; lo storno
+    all'insoluto è automatico (bounced_at → esce dalla clausola).
+    Ritorna (fatture, importo).
+    """
+    first_action = first_recovery_action_subquery(session)
+    # Importo = residuo VIVO (amount_due, riscritto dal sync): lo stesso che
+    # la cascata mette nel bucket e che il "certo" contabilizzerà all'incasso
+    # (amount_due_at_paid). payment_pending_amount resta come audit. Stessa
+    # gerarchia della cascata: solo scadute, non contestate, cliente attivo.
+    row = (
+        session.query(
+            func.count(Invoice.id),
+            func.sum(func.coalesce(Invoice.amount_due, 0.0)),
+        )
+        .join(first_action, Invoice.customer_id == first_action.c.customer_id)
+        .join(Customer, Invoice.customer_id == Customer.id)
+        .filter(
+            in_incasso_clause(),
+            overdue_clause(),
+            Invoice.status != "disputed",
+            Customer.excluded.isnot(True),
+            Invoice.payment_pending_at >= first_action.c.first_action,
+            recovered_invoice_clause(first_action),
+        )
+        .one()
+    )
+    return int(row[0] or 0), float(row[1] or 0.0)

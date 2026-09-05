@@ -13,6 +13,7 @@ from backend.database import (
 from backend.engine.overdue import (
     overdue_clause, workable_clause, stage_expr,
     compute_overdue_buckets, compute_recuperato_certo,
+    compute_in_incasso_assegni, in_incasso_clause,
     first_recovery_action_subquery, recovered_invoice_clause,
     OVERDUE_BUCKETS, CASE_STAGES, RECOVERY_ACTION_TYPES,
 )
@@ -60,6 +61,7 @@ def get_dashboard(session: Session = Depends(get_session)):
         ).scalar() or 0
 
         return {
+            "assegni": _assegni_summary(session),
             "total_scaduto": float(total_scaduto),
             "total_fatture_scadute": total_fatture_scadute,
             "total_clienti_scaduti": total_clienti_scaduti,
@@ -656,7 +658,7 @@ def get_riconciliazione(session: Session = Depends(get_session)):
     Qui c'è UNA popolazione (l'universo dello scaduto) divisa in categorie
     MUTUAMENTE ESCLUSIVE, e vale l'identità:
 
-        scaduto_totale == non_abbinati + esclusi + contestati + lavorabile
+        scaduto_totale == non_abbinati + esclusi + contestati + in_incasso + lavorabile
 
     L'esclusività è strutturale, non aritmetica: un CASE SQL (bucket_expr)
     assegna ogni riga a un solo ramo. Le condizioni si sovrappongono nella
@@ -720,6 +722,15 @@ def get_riconciliazione(session: Session = Depends(get_session)):
                 "label": "Contestati",
                 "descrizione": "Fatture contestate: il motore non le sollecita.",
             },
+            "in_incasso": {
+                **per_bucket["in_incasso"],
+                "label": "In incasso (assegni)",
+                "descrizione": (
+                    "Pagate con assegno da incassare: il credito esiste ancora "
+                    "(FatturaPro le vede aperte) ma non si insegue. Un insoluto "
+                    "le riporta subito nel lavorabile."
+                ),
+            },
             "lavorabile": {
                 **per_bucket["lavorabile"],
                 "label": "Lavorabile",
@@ -774,15 +785,18 @@ def get_evoluzione(
                 "data": s.date.isoformat(),
                 "scaduto_totale": s.scaduto_totale,
                 "non_abbinati": s.non_abbinati,
+                "in_incasso": float(getattr(s, "in_incasso", 0.0) or 0.0),
                 "esclusi": s.esclusi,
                 "contestati": s.contestati,
                 "lavorabile": s.lavorabile,
                 "recuperato_certo": s.recuperato_certo,
+                "recuperato_assegni": float(getattr(s, "recuperato_assegni", 0.0) or 0.0),
                 # bool() copre i NULL delle righe pre-ALTER sul DB live
                 "stimato": bool(s.estimated),
                 "fatture": {
                     "scaduto_totale": s.scaduto_totale_fatture,
                     "non_abbinati": s.non_abbinati_fatture,
+                    "in_incasso": int(getattr(s, "in_incasso_fatture", 0) or 0),
                     "esclusi": s.esclusi_fatture,
                     "contestati": s.contestati_fatture,
                     "lavorabile": s.lavorabile_fatture,
@@ -819,6 +833,10 @@ def _recuperato(session: Session) -> dict:
     # Definizione condivisa con lo snapshot storico (engine/overdue.py): il
     # "recuperato" della serie storica e quello della cascata sono lo stesso.
     certo_fatture, certo_importo = compute_recuperato_certo(session)
+    # Sotto-voce decisa dall'owner (Q2): l'assegno in mano conta come
+    # recuperato DALLA REGISTRAZIONE, ma separato dalla cassa vera; lo storno
+    # all'insoluto è automatico (esce dalla clausola).
+    assegni_fatture, assegni_importo = compute_in_incasso_assegni(session)
 
     # Stimato: SOLO le righe senza paid_at (mai sovrapposto al certo), emesse
     # prima del sollecito come il certo (5c: stessa clausola condivisa).
@@ -838,6 +856,22 @@ def _recuperato(session: Session) -> dict:
     )
 
     return {
+        "in_incasso_assegni": {
+            "fatture": assegni_fatture,
+            "importo": round(assegni_importo, 2),
+            "stimato": False,
+            "label": "In incasso da assegni",
+            "nota": (
+                "Assegni ricevuti dopo il sollecito, in attesa di incasso: contano "
+                "dalla registrazione (decisione owner) ma NON sono cassa. Un "
+                "insoluto li storna automaticamente."
+            ),
+        },
+        "totale": {
+            "fatture": certo_fatture + assegni_fatture,
+            "importo": round(certo_importo + assegni_importo, 2),
+            "label": "Recuperato (incassato + in incasso da assegni)",
+        },
         "certo": {
             "fatture": certo_fatture,
             "importo": round(certo_importo, 2),
@@ -1084,3 +1118,68 @@ def get_incassato_per_anno(session: Session = Depends(get_session)):
     except Exception as e:
         logger.error(f"Error fetching incassato data: {e}", exc_info=True)
         raise
+
+
+def _assegni_summary(session: Session) -> dict:
+    """Assegni in mano / insoluti per il cruscotto (allerta forte sugli
+    insoluti: sono un reato, decisione owner)."""
+    today = date.today()
+    empty = {"in_incasso": {"fatture": 0, "importo": 0.0}, "oltre_data_prevista": 0,
+             "insoluti": {"fatture": 0, "importo": 0.0, "items": []}}
+    try:
+        # Stessa gerarchia della cascata: scadute, non contestate, cliente attivo.
+        base = (
+            session.query(Invoice)
+            .join(Customer, Invoice.customer_id == Customer.id)
+            .filter(in_incasso_clause(), overdue_clause(),
+                    Invoice.status != "disputed", Customer.excluded.isnot(True))
+        )
+        in_incasso = base.with_entities(func.count(Invoice.id), func.sum(Invoice.amount_due)).one()
+        oltre = (
+            base.filter(Invoice.payment_pending_expected.isnot(None),
+                        Invoice.payment_pending_expected < today)
+            .with_entities(func.count(Invoice.id)).scalar() or 0
+        )
+        ins_q = session.query(Invoice).filter(Invoice.bounced_at.isnot(None), Invoice.status != "paid")
+        ins_tot = ins_q.with_entities(func.count(Invoice.id), func.sum(Invoice.amount_due)).one()
+        insoluti_rows = (
+            session.query(Invoice, Customer.ragione_sociale)
+            .outerjoin(Customer, Invoice.customer_id == Customer.id)
+            .filter(Invoice.bounced_at.isnot(None), Invoice.status != "paid")
+            .order_by(Invoice.bounced_at.desc()).limit(20).all()
+        )
+        # Sospetti: riaperte su FatturaPro DOPO un pagamento con assegno (segnalate
+        # dal sync, non ancora confermate insolute dall'operatore).
+        sosp_rows = (
+            session.query(Invoice, Customer.ragione_sociale)
+            .outerjoin(Customer, Invoice.customer_id == Customer.id)
+            .filter(overdue_clause(), Invoice.payment_pending.is_(None),
+                    Invoice.payment_pending_at.isnot(None), Invoice.bounced_at.is_(None))
+            .order_by(Invoice.payment_pending_at.desc()).limit(20).all()
+        )
+    except Exception as e:  # colonne non ancora migrate: il cruscotto non deve cadere
+        logger.warning(f"assegni summary non disponibile: {e}")
+        session.rollback()
+        return empty
+    return {
+        "in_incasso": {"fatture": int(in_incasso[0] or 0), "importo": round(float(in_incasso[1] or 0), 2)},
+        "oltre_data_prevista": int(oltre),
+        "sospetti": {
+            "fatture": len(sosp_rows),
+            "items": [{
+                "invoice_id": i.id, "invoice_number": i.invoice_number,
+                "customer_id": i.customer_id, "ragione_sociale": rs,
+                "amount_due": float(i.amount_due),
+            } for i, rs in sosp_rows],
+        },
+        "insoluti": {
+            "fatture": int(ins_tot[0] or 0),
+            "importo": round(float(ins_tot[1] or 0), 2),
+            "items": [{
+                "invoice_id": i.id, "invoice_number": i.invoice_number,
+                "customer_id": i.customer_id, "ragione_sociale": rs,
+                "amount_due": float(i.amount_due),
+                "bounced_at": i.bounced_at.isoformat() if i.bounced_at else None,
+            } for i, rs in insoluti_rows],
+        },
+    }

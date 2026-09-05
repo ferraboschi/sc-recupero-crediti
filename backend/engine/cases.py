@@ -45,7 +45,7 @@ from backend.database import (
 # Definizione unica di "scaduto" — vive in engine/overdue.py perché la
 # condividono motore e KPI. Ri-esportata qui: è da qui che la importano
 # gli 11 punti del motore.
-from backend.engine.overdue import is_overdue_unpaid  # noqa: F401
+from backend.engine.overdue import is_overdue_unpaid, is_in_incasso  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +285,7 @@ def _find_reopenable_case(session: Session, customer: Customer) -> Optional[Reco
     ).order_by(RecoveryCase.closed_at.desc().nullslast()).all()
     cutoff = datetime.utcnow() - timedelta(days=REOPEN_PAID_WINDOW_DAYS)
     for case in candidates:
-        if case.closed_reason == "no_overdue":
+        if case.closed_reason in ("no_overdue", "in_incasso"):
             return case
         if case.closed_reason == "paid" and case.closed_at and case.closed_at >= cutoff:
             return case
@@ -320,6 +320,7 @@ def close_case(session: Session, case: RecoveryCase, reason: str) -> None:
     note_by_reason = {
         "paid": "annullata: pratica chiusa a saldo",
         "no_overdue": "sospesa: nessuna fattura scaduta residua",
+        "in_incasso": "sospesa: fatture coperte da assegno in attesa di incasso",
         "resolved": "annullata: restano solo fatture contestate",
         "archived": "annullata: pratica archiviata",
         "excluded": "annullata: cliente escluso",
@@ -548,6 +549,9 @@ def update_case_lifecycle(session: Session, allow_close: bool = True) -> Dict[st
                     reason = "paid"
                 elif non_paid and all(inv.status == "disputed" for inv in non_paid):
                     reason = "resolved"
+                elif non_paid and any(is_in_incasso(inv) for inv in non_paid) and all(
+                        is_in_incasso(inv) or inv.status == "disputed" for inv in non_paid):
+                    reason = "in_incasso"
                 else:
                     reason = "no_overdue"
                 close_case(session, open_case, reason)
@@ -805,3 +809,46 @@ def resplit_status_if_needed() -> Optional[Dict[str, Any]]:
         return None
     finally:
         session.close()
+def refresh_customer_lifecycle(session: Session, customer: Customer) -> Optional[RecoveryCase]:
+    """Lifecycle di UN cliente, stesse regole della passata completa: apre /
+    riapre / aggancia se ci sono scadute lavorabili, chiude se non ne restano.
+    Usato dagli endpoint che cambiano lo stato di UNA fattura (assegno in mano,
+    insoluto) per non aspettare il prossimo sync. Ritorna la pratica aperta.
+    """
+    open_case = get_open_case(session, customer.id)
+    if customer.excluded:
+        if open_case:
+            close_case(session, open_case, "excluded")
+        return None
+    archived_ids = _archived_case_ids(session)
+    overdue = [
+        inv for inv in customer.invoices
+        if is_overdue_unpaid(inv) and inv.case_id not in archived_ids
+        and not (inv.case_id and inv.case is not None and inv.case.customer_id != customer.id)
+    ]
+    if overdue:
+        if not open_case:
+            reopenable = _find_reopenable_case(session, customer)
+            open_case = reopen_case(session, reopenable) if reopenable else open_new_case(session, customer)
+        for inv in overdue:
+            if inv.case_id != open_case.id and (
+                inv.case_id is None or (inv.case is not None and inv.case.status == "closed")
+            ):
+                inv.case_id = open_case.id
+        session.flush()
+        _refresh_customer_status(session, customer, open_case)
+        return open_case
+    if open_case:
+        attached = session.query(Invoice).filter(Invoice.case_id == open_case.id).all()
+        non_paid = [inv for inv in attached if inv.status != "paid"]
+        if attached and not non_paid:
+            reason = "paid"
+        elif non_paid and all(inv.status == "disputed" for inv in non_paid):
+            reason = "resolved"
+        elif non_paid and any(is_in_incasso(inv) for inv in non_paid) and all(
+                is_in_incasso(inv) or inv.status == "disputed" for inv in non_paid):
+            reason = "in_incasso"
+        else:
+            reason = "no_overdue"
+        close_case(session, open_case, reason)
+    return None
