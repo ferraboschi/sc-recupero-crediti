@@ -38,12 +38,21 @@ def _inv(s, cust, num, amount, days_overdue=30, status="open"):
 
 
 def _contact(s, cust, case, atype, days_ago=0):
+    """Contatto completato che CITA le scadute del cliente (modello
+    fattura-centrico: un sollecito cita sempre le fatture; lo storico legacy
+    è collegato dal backfill)."""
+    from backend.engine.action_invoices import set_action_invoices
     when = datetime.combine(date.today() - timedelta(days=days_ago), time(12, 0))
+    ids = [i.id for i in s.query(Invoice).filter(
+        Invoice.customer_id == cust.id, Invoice.status != "paid").all()]
     a = RecoveryAction(
         customer_id=cust.id, case_id=case.id, action_type=atype,
         completed_at=when, created_at=when, channel="whatsapp_copy",
+        invoice_ids=ids,
     )
     s.add(a)
+    s.flush()
+    set_action_invoices(s, a.id, ids)
     s.commit()
     return a
 

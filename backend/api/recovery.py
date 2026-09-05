@@ -23,7 +23,7 @@ from backend.engine.cases import (
     get_open_case, is_overdue_unpaid, schedule_next_action, close_case,
     _refresh_customer_status,
 )
-from backend.engine.action_invoices import set_action_invoices
+from backend.engine.action_invoices import set_action_invoices, delivered_invoice_ids
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -626,11 +626,33 @@ def complete_action(
 
             if case:
                 if action.action_type in CONTACT_TYPES:
+                    # Contatto registrato A MANO (telefonata/email) senza
+                    # fatture citate: riguardava l'intero debito → cita le
+                    # scadute del momento (esplicito, come il backfill), così
+                    # il conteggio PER-FATTURA lo vede.
+                    if action.invoice_ids is None:
+                        cited = [inv.id for inv in customer.invoices if is_overdue_unpaid(inv)]
+                        action.invoice_ids = cited
+                        session.flush()
+                        set_action_invoices(session, action.id, cited)
                     n = contact_count(session, case)
                     customer.recovery_status = "first_contact" if n <= 1 else "second_contact"
                     next_action = schedule_next_action(session, customer, case, n)
-                else:  # lawyer completato → follow-up legale +30gg
-                    customer.recovery_status = "lawyer"
+                else:  # lawyer completato → consegna ESPLICITA + follow-up +30gg
+                    # Le fatture consegnate si scrivono SEMPRE (invoice_ids +
+                    # join): quelle scadute non ancora consegnate. Mai più
+                    # dedotte a posteriori.
+                    overdue_objs = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
+                    already = delivered_invoice_ids(session, case, overdue_objs)
+                    # PRIMA chiusura legale della pratica = consegna di tutte
+                    # le scadute. Se esiste già una consegna, questo è un
+                    # FOLLOW-UP: non consegna nulla di nuovo ([] esplicito).
+                    to_deliver = [] if already else [inv.id for inv in overdue_objs]
+                    action.invoice_ids = to_deliver
+                    session.flush()
+                    set_action_invoices(session, action.id, to_deliver)
+                    if all(inv.id in (already | set(to_deliver)) for inv in overdue_objs):
+                        customer.recovery_status = "lawyer"
                     next_date = date.today() + timedelta(days=30)
                     next_action = RecoveryAction(
                         customer_id=customer_id,

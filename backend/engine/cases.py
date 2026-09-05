@@ -333,9 +333,21 @@ def close_case(session: Session, case: RecoveryCase, reason: str) -> None:
 
 
 def _refresh_customer_status(session: Session, customer: Customer, case: RecoveryCase) -> None:
-    """Ricava lo stato-cache del cliente dal contenuto della pratica."""
+    """Ricava lo stato-cache del cliente dal contenuto della pratica.
+
+    'lawyer' SOLO se TUTTE le scadute sono state consegnate al legale (azioni
+    'lawyer' completate che le citano — vedi engine.action_invoices); un todo
+    legale PENDENTE o una consegna PARZIALE non sono "dal legale". NB: i
+    bucket per stadio della riconciliazione sono keyed su questo campo
+    (engine/overdue.py): il totale non cambia, cambia la ripartizione.
+    """
+    from backend.engine.action_invoices import delivered_invoice_ids
     n = contact_count(session, case)
-    if _case_has_lawyer_actions(session, case):
+    overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
+    all_delivered = bool(overdue) and (
+        {i.id for i in overdue} <= delivered_invoice_ids(session, case, overdue)
+    )
+    if all_delivered:
         customer.recovery_status = "lawyer"
     elif n >= 2:
         customer.recovery_status = "second_contact"
