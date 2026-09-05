@@ -251,6 +251,9 @@ def test_resplit_marks_moved_customers(test_db_session, giugno_settembre, monkey
     cust, (g1, g2, s) = giugno_settembre
     cust.recovery_status = "lawyer"  # stato stantio (nessuna consegna)
     test_db_session.commit()
+    from backend.database import SyncState
+    test_db_session.add(SyncState(key="action_invoices_backfill", result={"done": True}))
+    test_db_session.commit()
     monkeypatch.setattr("backend.database.get_session_direct", lambda: test_db_session)
     # get_session_direct è importato lazy dentro la funzione → patchare il modulo database
     orig_close = test_db_session.close
@@ -263,3 +266,81 @@ def test_resplit_marks_moved_customers(test_db_session, giugno_settembre, monkey
     assert any(l.entity_id == cust.id and l.details["from"] == "lawyer" for l in logs)
     assert cases_mod.resplit_status_if_needed() == {"skipped": True}
     monkeypatch.setattr(test_db_session, "close", orig_close)
+
+
+def test_followup_lawyer_todo_kept_while_delivered_unpaid(test_client, test_db_session, giugno_settembre):
+    """B1: le vecchie sono state CONSEGNATE (impagate) e c'è il follow-up
+    avvocato; un 1° sollecito sulla nuova NON lo annulla."""
+    cust, (g1, g2, s) = giugno_settembre
+    case = ensure_open_case(test_db_session, cust)
+    test_client.post(f"/api/avvocato/customers/{cust.id}/handover", json={"invoice_ids": [g1.id, g2.id]})
+    fu = RecoveryAction(customer_id=cust.id, case_id=case.id, action_type="lawyer",
+                        scheduled_date=date.today() + timedelta(days=20),
+                        notes="Auto-pianificata: follow-up avvocato")
+    test_db_session.add(fu); test_db_session.commit()
+    _post(test_client, cust.id, [s.id])
+    test_db_session.refresh(fu)
+    assert fu.cancelled is not True
+    test_db_session.refresh(cust)
+    assert cust.next_action_type == "lawyer"
+
+
+def test_complete_action_uses_per_invoice_n(test_client, test_db_session, giugno_settembre):
+    """M1: completare un contatto manuale da Attività non riporta il contatore
+    di pratica nella progressione: n per-fattura e nessun todo legale doppio."""
+    cust, (g1, g2, s) = giugno_settembre
+    case = ensure_open_case(test_db_session, cust)
+    g1.status = "paid"; g2.status = "paid"
+    stale = RecoveryAction(customer_id=cust.id, case_id=case.id, action_type="lawyer",
+                           scheduled_date=date.today() - timedelta(days=1),
+                           notes="Auto-pianificata dopo il 2° contatto")
+    todo = RecoveryAction(customer_id=cust.id, case_id=case.id, action_type="first_contact",
+                          scheduled_date=date.today())
+    test_db_session.add_all([stale, todo]); test_db_session.commit()
+    r = test_client.put(f"/api/recovery/customers/{cust.id}/actions/{todo.id}/complete",
+                        params={"outcome": "contacted"})
+    assert r.status_code == 200
+    test_db_session.refresh(stale)
+    assert stale.cancelled is True and stale.cancelled_reason == f"superseded_by_sollecito:{todo.id}"
+    lawyer_todos = test_db_session.query(RecoveryAction).filter_by(
+        case_id=case.id, action_type="lawyer", completed_at=None, cancelled=False).count()
+    assert lawyer_todos == 0
+    test_db_session.refresh(cust)
+    assert cust.recovery_status == "first_contact" and cust.next_action_type == "second_contact"
+
+
+def test_explicit_empty_cited_does_not_poison(test_db_session, giugno_settembre):
+    """M2: un contatto con invoice_ids=[] esplicito non è 'legacy'."""
+    from backend.engine.cases import _has_unlinked_contacts
+    cust, (g1, g2, s) = giugno_settembre
+    case = ensure_open_case(test_db_session, cust)
+    test_db_session.add(RecoveryAction(customer_id=cust.id, case_id=case.id, action_type="first_contact",
+                                       completed_at=datetime.utcnow(), invoice_ids=[]))
+    test_db_session.commit()
+    assert _has_unlinked_contacts(test_db_session, case) is False
+
+
+def test_undo_restores_stale_cancelled_todo(test_client, test_db_session, giugno_settembre):
+    """M3: l'undo del sollecito ripristina il todo legale che aveva annullato."""
+    cust, (g1, g2, s) = giugno_settembre
+    case = ensure_open_case(test_db_session, cust)
+    g1.status = "paid"; g2.status = "paid"
+    stale = RecoveryAction(customer_id=cust.id, case_id=case.id, action_type="lawyer",
+                           scheduled_date=date.today() - timedelta(days=1),
+                           notes="Auto-pianificata dopo il 2° contatto")
+    test_db_session.add(stale); test_db_session.commit()
+    r = _post(test_client, cust.id, [s.id])
+    test_db_session.refresh(stale)
+    assert stale.cancelled is True
+    u = test_client.delete(f"/api/recovery/customers/{cust.id}/solleciti/{r['action_id']}").json()
+    assert u["restored_pending"] >= 1
+    test_db_session.refresh(stale)
+    assert stale.cancelled is False
+
+
+def test_resplit_waits_for_join_backfill(test_db_session, giugno_settembre, monkeypatch):
+    """M4: senza il marker del backfill azione↔fattura il resplit si rimanda."""
+    from backend.engine import cases as cases_mod
+    monkeypatch.setattr("backend.database.get_session_direct", lambda: test_db_session)
+    monkeypatch.setattr(test_db_session, "close", lambda: None)
+    assert cases_mod.resplit_status_if_needed() == {"skipped": "waiting_join_backfill"}

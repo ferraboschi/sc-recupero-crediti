@@ -746,8 +746,11 @@ export default function ClientDetail() {
   const groupTotal = (st) => (stageGroups[st] || []).reduce((s, inv) => s + (inv.amount_due || 0), 0)
   const isMixed = (stageGroups.first.length > 0 && stageGroups.second.length > 0)
     || (stageGroups.today.length > 0 && (stageGroups.first.length + stageGroups.second.length) > 0)
+  // Stadio attivo: la scelta dell'operatore, altrimenti il primo gruppo NON
+  // vuoto (mai un gruppo vuoto: i pulsanti resterebbero muti).
+  const firstNonEmpty = stageGroups.first.length > 0 ? 'first' : 'second'
   const activeStage = isMixed
-    ? (messageStage || 'first')
+    ? ((messageStage && stageGroups[messageStage]?.length > 0) ? messageStage : firstNonEmpty)
     : (stageGroups.second.length > 0 ? 'second' : 'first')
   const activeGroup = stageGroups[activeStage]
 
@@ -2144,6 +2147,8 @@ export default function ClientDetail() {
                 </button>
                 <button
                   onClick={handleCopyWhatsApp}
+                  disabled={activeGroup.length === 0}
+                  title={activeGroup.length === 0 ? "Nessuna fattura da sollecitare: quelle selezionate sono già state sollecitate oggi" : ""}
                   className={`sc-btn-secondary text-sm font-bold transition-colors ${
                     copiedWhatsApp ? 'border-accent-green text-accent-green' : ''
                   }`}
@@ -2153,6 +2158,8 @@ export default function ClientDetail() {
                 {whatsappNumber ? (
                   <button
                     onClick={handleWhatsAppSend}
+                    disabled={activeGroup.length === 0}
+                    title={activeGroup.length === 0 ? "Nessuna fattura da sollecitare: quelle selezionate sono già state sollecitate oggi" : ""}
                     className="px-4 py-2 bg-accent-green text-dark-bg rounded-lg text-sm font-bold hover:brightness-110"
                   >
                     WhatsApp
@@ -2563,9 +2570,10 @@ export default function ClientDetail() {
               >
                 {promemoria ? '...' : 'Promemoria'}
               </button>
-              {stagePicker}
               <button
                 onClick={handleCopyWhatsApp}
+                disabled={activeGroup.length === 0}
+                title={activeGroup.length === 0 ? "Nessuna fattura da sollecitare: quelle selezionate sono già state sollecitate oggi" : ""}
                 className={`sc-btn-secondary text-sm font-medium transition-colors ${
                   copiedWhatsApp ? 'border-accent-green text-accent-green' : ''
                 }`}
@@ -2575,6 +2583,8 @@ export default function ClientDetail() {
               {whatsappNumber && (
                 <button
                   onClick={handleWhatsAppSend}
+                  disabled={activeGroup.length === 0}
+                  title={activeGroup.length === 0 ? "Nessuna fattura da sollecitare: quelle selezionate sono già state sollecitate oggi" : ""}
                   className="px-4 py-2 bg-accent-green text-dark-bg rounded-lg text-sm font-medium hover:brightness-110"
                 >
                   WhatsApp

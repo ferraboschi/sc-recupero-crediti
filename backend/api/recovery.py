@@ -251,6 +251,8 @@ def register_sollecito(
             existing = next(a for a in todays if set(a.invoice_ids or []) & set(already))
             prev_all = per_invoice_sollecito_stats(session, existing.invoice_ids or [])
             n_existing = min((prev_all.get(i, {}).get("count", 1) for i in (existing.invoice_ids or [])), default=1) + inherited
+            if _has_unlinked_contacts(session, case):
+                n_existing = max(n_existing, contact_count(session, case))
             return {
                 "registered": True,
                 "already_registered_today": True,
@@ -291,6 +293,11 @@ def register_sollecito(
             set_action_invoices(session, existing_today.id, merged)
             session.flush()
             _refresh_customer_status(session, customer, case)
+            session.add(ActivityLog(
+                action="sollecito_merge", entity_type="recovery_action", entity_id=existing_today.id,
+                details={"customer": customer.ragione_sociale, "case_id": case.id,
+                         "added_invoice_ids": cited_ids, "sollecito_n": n},
+            ))
             session.commit()
             return {
                 "registered": True,
@@ -337,7 +344,7 @@ def register_sollecito(
             p.cancelled = True
             p.cancelled_reason = f"superseded_by_sollecito:{action.id}"
 
-        next_action = schedule_next_action(session, customer, case, n)
+        next_action = schedule_next_action(session, customer, case, n, superseded_by=action.id)
         # Stato cliente = rollup PER-FATTURA (il peggiore fra le scadute): un
         # 1° sollecito sulla fattura nuova NON retrocede un cliente che è già
         # al 2° sulle vecchie. flush prima: il refresh legge i todo dal DB.
@@ -697,8 +704,20 @@ def complete_action(
                         action.invoice_ids = cited
                         session.flush()
                         set_action_invoices(session, action.id, cited)
-                    n = contact_count(session, case)
-                    next_action = schedule_next_action(session, customer, case, n)
+                    session.flush()  # righe di join visibili anche senza autoflush
+                    # n PER-FATTURA, esattamente come register_sollecito (le
+                    # fatture citate hanno già la riga di questo contatto):
+                    # stadio più basso citato + ereditati; rete legacy.
+                    ids = list(action.invoice_ids or [])
+                    inherited = case.inherited_contacts or 0
+                    if ids:
+                        prev = per_invoice_sollecito_stats(session, ids)
+                        n = min((prev.get(i, {}).get("count", 1) for i in ids), default=1) + inherited
+                    else:
+                        n = contact_count(session, case)
+                    if _has_unlinked_contacts(session, case):
+                        n = max(n, contact_count(session, case))
+                    next_action = schedule_next_action(session, customer, case, n, superseded_by=action.id)
                     # Stato cliente = rollup PER-FATTURA (non il contatore di
                     # pratica): altrimenti il prossimo refresh lo cambierebbe.
                     session.flush()

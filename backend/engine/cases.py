@@ -103,7 +103,7 @@ def contact_count(session: Session, case: RecoveryCase) -> int:
 def _has_unlinked_contacts(session: Session, case: RecoveryCase) -> bool:
     """La pratica ha contatti completati NON collegati a fatture (righe di
     join assenti = storico pre-tabella)? Solo allora vale la rete legacy."""
-    acts = session.query(RecoveryAction.id).filter(
+    acts = session.query(RecoveryAction.id, RecoveryAction.invoice_ids).filter(
         RecoveryAction.case_id == case.id,
         RecoveryAction.action_type.in_(CONTACT_TYPES),
         RecoveryAction.completed_at.isnot(None),
@@ -114,7 +114,10 @@ def _has_unlinked_contacts(session: Session, case: RecoveryCase) -> bool:
     ids = [a[0] for a in acts]
     linked = {r[0] for r in session.query(RecoveryActionInvoice.action_id)
               .filter(RecoveryActionInvoice.action_id.in_(ids)).all()}
-    return any(i not in linked for i in ids)
+    # Legacy = invoice_ids NULL (colonna assente all'epoca) E nessuna riga di
+    # join. Un [] ESPLICITO ("non ha citato nulla", es. contatto completato
+    # senza scadute) NON è legacy e non deve avvelenare la pratica.
+    return any(inv_ids is None and aid not in linked for aid, inv_ids in acts)
 
 
 def _case_has_lawyer_actions(session: Session, case: RecoveryCase) -> bool:
@@ -407,6 +410,7 @@ def schedule_next_action(
     case: RecoveryCase,
     contacts_done: int,
     scheduled_date: Optional[date] = None,
+    superseded_by: Optional[int] = None,
 ) -> Optional[RecoveryAction]:
     """Pianifica la prossima azione dopo un contatto — UNICA fonte della
     progressione (+7 → second, +14 → lawyer, +30 → follow-up lawyer).
@@ -432,15 +436,23 @@ def schedule_next_action(
         delivered = delivered_invoice_ids(session, case, overdue) if overdue else set()
         stats = per_invoice_sollecito_stats(session, [i.id for i in overdue if i.id not in delivered])
         mature = any(v["count"] + (case.inherited_contacts or 0) >= 2 for v in stats.values())
-        # Solo un todo AUTO-pianificato può essere stantio: uno creato a mano
-        # dall'operatore è una decisione e blocca sempre la pianificazione.
-        auto_planned = (pending_lawyer.notes or "").startswith("Auto-pianificata")
-        if not auto_planned or mature or _has_unlinked_contacts(session, case):
+        # È stantio SOLO il todo "Auto-pianificata dopo il N° contatto" quando
+        # NESSUNA fattura lo giustifica più: niente scadute mature non
+        # consegnate E niente fatture CONSEGNATE ancora impagate (il follow-up
+        # avvocato esiste proprio per quelle). Un todo creato a mano è una
+        # decisione dell'operatore e blocca sempre.
+        auto_planned = (pending_lawyer.notes or "").startswith("Auto-pianificata dopo il")
+        if (not auto_planned or mature or delivered
+                or _has_unlinked_contacts(session, case)):
             customer.next_action_date = pending_lawyer.scheduled_date
             customer.next_action_type = "lawyer"
             return None
         pending_lawyer.cancelled = True
-        pending_lawyer.cancelled_reason = "superseded_by_sollecito:stale"
+        # Stesso formato del supersede dei contatti: l'undo del sollecito che
+        # lo ha soppiantato lo ripristina.
+        pending_lawyer.cancelled_reason = (
+            f"superseded_by_sollecito:{superseded_by}" if superseded_by else "superseded_by_sollecito:stale"
+        )
         pending_lawyer.notes = f"{pending_lawyer.notes} | annullato: le fatture del passaggio legale sono state pagate" if pending_lawyer.notes else "annullato: le fatture del passaggio legale sono state pagate"
 
     next_type, delta_days = PROGRESSION.get(contacts_done, PROGRESSION["default"])
@@ -750,6 +762,14 @@ def resplit_status_if_needed() -> Optional[Dict[str, Any]]:
         marker = session.query(SyncState).filter_by(key="status_resplit_v1").first()
         if marker and (marker.result or {}).get("done"):
             return {"skipped": True}
+        # Vincolo: il rollup per-fattura ha senso solo DOPO il backfill della
+        # tabella di join; se non è (ancora) completato si rimanda al prossimo
+        # avvio, altrimenti si demolirebbero stati corretti (es. 'lawyer' con
+        # handover moderno) sulla base di righe di join assenti.
+        jb = session.query(SyncState).filter_by(key="action_invoices_backfill").first()
+        if not (jb and (jb.result or {}).get("done")):
+            logger.info("Status resplit rimandato: backfill azione↔fattura non completato")
+            return {"skipped": "waiting_join_backfill"}
         moved = []
         cases = session.query(RecoveryCase).filter(RecoveryCase.status == "open").all()
         for case in cases:
