@@ -394,6 +394,18 @@ def _refresh_customer_status(session: Session, customer: Customer, case: Recover
     else:
         customer.recovery_status = "idle"
 
+    # Un'ATTESA decisa dall'operatore (todo 'wait' pendente) non va
+    # sovrascritta dal rollup: resta "In attesa" finché il todo è pendente.
+    if customer.recovery_status != "lawyer":
+        wait_pending = session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == case.id,
+            RecoveryAction.action_type == "wait",
+            RecoveryAction.completed_at.is_(None),
+            RecoveryAction.cancelled.isnot(True),
+        ).first()
+        if wait_pending:
+            customer.recovery_status = "waiting"
+
     next_pending = session.query(RecoveryAction).filter(
         RecoveryAction.case_id == case.id,
         RecoveryAction.completed_at.is_(None),
@@ -753,7 +765,8 @@ def run_backfill_if_needed() -> Optional[Dict[str, Any]]:
 
 
 def resplit_status_if_needed() -> Optional[Dict[str, Any]]:
-    """Una-tantum al primo avvio dopo il deploy del rollup per-fattura: ricalcola
+    """Una-tantum al primo avvio dopo il deploy del rollup per-fattura (v2: rispetta
+    l'attesa decisa dall'operatore): ricalcola
     lo stato di TUTTE le pratiche aperte e registra ogni spostamento in
     ActivityLog ('status_resplit', vecchio → nuovo). I bucket per stadio della
     riconciliazione sono keyed sullo stato: così il salto nei tile è UN evento
@@ -763,7 +776,7 @@ def resplit_status_if_needed() -> Optional[Dict[str, Any]]:
     from backend.database import get_session_direct
     session = get_session_direct()
     try:
-        marker = session.query(SyncState).filter_by(key="status_resplit_v1").first()
+        marker = session.query(SyncState).filter_by(key="status_resplit_v2").first()
         if marker and (marker.result or {}).get("done"):
             return {"skipped": True}
         # Vincolo: il rollup per-fattura ha senso solo DOPO il backfill della
@@ -793,7 +806,7 @@ def resplit_status_if_needed() -> Optional[Dict[str, Any]]:
                 ))
         now = datetime.utcnow()
         if not marker:
-            marker = SyncState(key="status_resplit_v1")
+            marker = SyncState(key="status_resplit_v2")
             session.add(marker)
         marker.last_sync = now
         marker.result = {"done": True, "cases": len(cases), "moved": len(moved)}
