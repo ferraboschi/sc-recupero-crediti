@@ -809,6 +809,8 @@ def resplit_status_if_needed() -> Optional[Dict[str, Any]]:
         return None
     finally:
         session.close()
+
+
 def refresh_customer_lifecycle(session: Session, customer: Customer) -> Optional[RecoveryCase]:
     """Lifecycle di UN cliente, stesse regole della passata completa: apre /
     riapre / aggancia se ci sono scadute lavorabili, chiude se non ne restano.
