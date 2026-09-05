@@ -1335,6 +1335,8 @@ def update_action_notes(
     ).first()
     if not action:
         raise HTTPException(status_code=404, detail="Azione non trovata")
+    if action.cancelled:
+        raise HTTPException(status_code=409, detail="Azione annullata: la nota non si modifica")
     try:
         old = action.notes
         action.notes = (body.notes or "").strip() or None

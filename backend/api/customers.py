@@ -760,11 +760,11 @@ def get_customer_detail(
         # Stadio di avanzamento PER FATTURA + gruppi per stadio (Fase 4):
         # definizione unica in engine/stages.py. Degrado grazioso.
         try:
-            stage_info = build_stage_groups(session, customer, get_open_case(session, customer_id))
+            stage_info = build_stage_groups(session, customer, get_open_case(session, customer_id), today_ids=today_ids)
         except Exception as e:
             logger.warning(f"stage groups non disponibili: {e}")
             session.rollback()
-            stage_info = {"invoices": {}, "groups": [], "client_actions": [], "pending": []}
+            stage_info = {"invoices": {}, "labels": {}, "groups": [], "client_actions": [], "pending": []}
 
         invoice_list = [
             {
@@ -778,7 +778,7 @@ def get_customer_detail(
                 ),
                 "sollecito_today": inv.id in today_ids,
                 "stage": stage_info["invoices"].get(inv.id),
-                "stage_label": STAGE_LABELS.get(stage_info["invoices"].get(inv.id)),
+                "stage_label": stage_info.get("labels", {}).get(inv.id) or STAGE_LABELS.get(stage_info["invoices"].get(inv.id)),
                 "amount": float(inv.amount),
                 "amount_due": float(inv.amount_due),
                 "issue_date": inv.issue_date.isoformat() if inv.issue_date else None,

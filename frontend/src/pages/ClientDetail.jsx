@@ -168,7 +168,6 @@ export default function ClientDetail() {
   const [actionNotes, setActionNotes] = useState('')
   const [showNoteInput, setShowNoteInput] = useState(false)
   const [pdfLoading, setPdfLoading] = useState(false)
-  const [singlePdfLoading, setSinglePdfLoading] = useState(null)
   const [selectedInvoices, setSelectedInvoices] = useState(new Set())
   const [phoneEdit, setPhoneEdit] = useState(null)
   const [updatingInvoice, setUpdatingInvoice] = useState(null)
@@ -179,7 +178,6 @@ export default function ClientDetail() {
   const [neighbors, setNeighbors] = useState({ prev_id: null, next_id: null, position: null, total: null })
   const [completingAction, setCompletingAction] = useState(null)
   const [selectedOutcome, setSelectedOutcome] = useState('')
-  const [copiedWhatsApp, setCopiedWhatsApp] = useState(false)
   const [editingDateActionId, setEditingDateActionId] = useState(null)
   const [editingDateValue, setEditingDateValue] = useState('')
   const [promemoria, setPromemoria] = useState(false)
@@ -227,7 +225,7 @@ export default function ClientDetail() {
       setData(response.data)
       const items = response.data.invoices?.items || []
       const overdueIds = items
-        .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && !inv.in_incasso)
+        .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && inv.status !== 'disputed' && !inv.in_incasso && !inv.suspect_bounce)
         .map(inv => inv.id)
       setSelectedInvoices(new Set(overdueIds))
       // Semina le "verificate a mano" dal backend: senza, un hard-reload
@@ -660,27 +658,6 @@ export default function ClientDetail() {
     }
   }
 
-  const handleDownloadSinglePdf = async (invoiceId, invoiceNumber) => {
-    setSinglePdfLoading(invoiceId)
-    try {
-      const response = await client.get(`/recovery/invoices/${invoiceId}/pdf`, {
-        responseType: 'blob',
-      })
-      const url = window.URL.createObjectURL(new Blob([response.data]))
-      const link = document.createElement('a')
-      link.href = url
-      link.setAttribute('download', `fattura_${invoiceNumber?.replace(/\//g, '_')}.pdf`)
-      document.body.appendChild(link)
-      link.click()
-      link.remove()
-      window.URL.revokeObjectURL(url)
-    } catch (err) {
-      console.error('Error downloading single PDF:', err)
-      alert('Errore nella generazione del PDF')
-    } finally {
-      setSinglePdfLoading(null)
-    }
-  }
 
   const handlePhoneUpdate = async () => {
     if (!phoneEdit && phoneEdit !== '') return
@@ -716,7 +693,7 @@ export default function ClientDetail() {
   const selectAllOverdue = () => {
     if (!data?.invoices?.items) return
     const overdueIds = data.invoices.items
-      .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && !inv.in_incasso)
+      .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && inv.status !== 'disputed' && !inv.in_incasso && !inv.suspect_bounce)
       .map(inv => inv.id)
     setSelectedInvoices(new Set(overdueIds))
   }
@@ -724,8 +701,11 @@ export default function ClientDetail() {
   // Il SOGGETTO è la FATTURA: il messaggio si costruisce per un GRUPPO di
   // fatture allo stesso stadio (sezione "Azioni di recupero"), con il tono
   // del gruppo: 'first' = cordiale (mai sollecitate), 'second' = perentorio.
+  // Le righe dei gruppi sono "magre": il messaggio (scadenza reale, ordine
+  // Shopify) e le azioni assegno vogliono l'oggetto fattura COMPLETO.
+  const fullInvoice = (i) => (data?.invoices?.items || []).find(x => x.id === i.id) || i
   const buildWhatsAppMessage = (groupInvoices, tone) => {
-    const selected = groupInvoices || []
+    const selected = (groupInvoices || []).map(fullInvoice)
     if (!data || selected.length === 0) return ''
     const totalSelected = selected.reduce((sum, inv) => sum + inv.amount_due, 0)
     const isSecondContact = tone === 'second'
@@ -814,9 +794,42 @@ export default function ClientDetail() {
       for (const id of ids) {
         await client.post(`/positions/${id}/assegno`, { expected_date: expected || null, note: note || null })
       }
-      await fetchData()
     } catch (err) {
       alert(err.response?.data?.detail || 'Errore nella registrazione dell\'assegno')
+    } finally {
+      await fetchData()  // anche a metà: lo stato reale, non quello immaginato
+    }
+  }
+  // Insoluto / annulla su PIÙ fatture: una conferma sola, refresh garantito
+  const markInsolutoMany = async (invs) => {
+    const list = invs.map(fullInvoice)
+    if (!list.length) return
+    if (!window.confirm(
+      `ASSEGNO INSOLUTO su ${list.length} fattur${list.length === 1 ? 'a' : 'e'} (${list.map(i => i.invoice_number).join(', ')})?\n\n`
+      + 'Le fatture tornano SUBITO scadute e lavorabili, la pratica si riapre con lo storico dei solleciti '
+      + '(salvo pratica archiviata: resta archiviata, con l\'allarme) e il recuperato viene stornato.'
+    )) return
+    try {
+      for (const i of list) await client.post(`/positions/${i.id}/assegno/insoluto`, {})
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Errore nella registrazione dell\'insoluto')
+    } finally {
+      await fetchData()
+    }
+  }
+  const cancelAssegnoMany = async (invs) => {
+    const list = invs.map(fullInvoice)
+    if (!list.length) return
+    const suspect = list.every(i => i.suspect_bounce)
+    if (!window.confirm(suspect
+      ? `Confermi che la riapertura su FatturaPro di ${list.map(i => i.invoice_number).join(', ')} NON è un assegno insoluto?\n\nIl sospetto viene rimosso; le fatture restano semplicemente scadute.`
+      : `Annullare la registrazione dell'assegno su ${list.map(i => i.invoice_number).join(', ')}?\n\nSolo se registrata per errore: le fatture tornano scadute senza allarme.`)) return
+    try {
+      for (const i of list) await client.delete(`/positions/${i.id}/assegno`)
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Errore nell\'annullamento')
+    } finally {
+      await fetchData()
     }
   }
   // Nota di GRUPPO: cita le fatture selezionate e viaggia con loro fino al dossier
@@ -836,8 +849,27 @@ export default function ClientDetail() {
       alert(err.response?.data?.detail || 'Errore nella modifica della nota')
     }
   }
-  const handoverGroup = async (ids) => {
-    if (!window.confirm(`Consegnare ${ids.length} fattur${ids.length === 1 ? 'a' : 'e'} all'avvocato?\n\nLe altre restano in sollecito. Assicurati di aver scaricato il dossier dalla sezione Avvocato.`)) return
+  // Telefonata (o altro contatto fuori WhatsApp) SU UN GRUPPO: cita le fatture
+  // selezionate e la registra come contatto COMPLETATO ora (numerazione
+  // per-fattura del backend), senza far salire di stadio le altre.
+  const registerCallGroup = async (ids, tone, notes) => {
+    try {
+      const created = await client.post(`/recovery/customers/${customerId}/actions`, {
+        action_type: tone === 'first' ? 'first_contact' : 'second_contact',
+        invoice_ids: ids, notes: notes || null,
+      })
+      await client.put(`/recovery/customers/${customerId}/actions/${created.data.id}/complete`, null, { params: { outcome: 'contacted' } })
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Errore nella registrazione del contatto')
+    } finally {
+      await fetchData()
+    }
+  }
+  const handoverGroup = async (ids, invs = []) => {
+    const immature = invs.filter(i => (i.sollecito_count || 0) < 2).map(i => i.invoice_number)
+    if (!window.confirm(`Consegnare ${ids.length} fattur${ids.length === 1 ? 'a' : 'e'} all'avvocato?\n\n`
+      + (immature.length ? `ATTENZIONE: ${immature.join(', ')} ${immature.length === 1 ? 'ha' : 'hanno'} meno di 2 solleciti.\n` : '')
+      + 'Le altre restano in sollecito. Assicurati di aver scaricato il dossier dalla sezione Avvocato.')) return
     try {
       await client.post(`/avvocato/customers/${customerId}/handover`, { invoice_ids: ids })
       await fetchData()
@@ -906,8 +938,6 @@ export default function ClientDetail() {
     }
     try {
       await navigator.clipboard.writeText(message)
-      setCopiedWhatsApp(true)
-      setTimeout(() => setCopiedWhatsApp(false), 2000)
     } catch {
       const textarea = document.createElement('textarea')
       textarea.value = message
@@ -915,8 +945,6 @@ export default function ClientDetail() {
       textarea.select()
       document.execCommand('copy')
       document.body.removeChild(textarea)
-      setCopiedWhatsApp(true)
-      setTimeout(() => setCopiedWhatsApp(false), 2000)
     }
     registerSollecito('whatsapp_copy', (groupInvoices || []).map(i => i.id))
     return true
@@ -2251,15 +2279,17 @@ export default function ClientDetail() {
           onCopy={handleCopyWhatsApp}
           onWhatsApp={handleWhatsAppSend}
           onHandover={handoverGroup}
+          onRegisterCall={registerCallGroup}
           onAssegno={registerAssegno}
-          onInsoluto={markInsoluto}
-          onCancelAssegno={cancelAssegno}
+          onInsolutoMany={markInsolutoMany}
+          onCancelAssegnoMany={cancelAssegnoMany}
           onAddNote={addGroupNote}
           onEditNote={editActionNotes}
         />
 
         <div className="mt-6 pt-4 border-t border-dark-border">
-          <p className="text-xs font-semibold text-txt-label uppercase tracking-wider mb-3">Azioni sul cliente</p>
+          <p className="text-xs font-semibold text-txt-label uppercase tracking-wider mb-1">Azioni sul cliente (non legate a fatture)</p>
+          <p className="text-[11px] text-txt-muted mb-3">Attesa, archiviazione, todo legale, note generali. I solleciti e le telefonate si registrano sopra, nel gruppo di fatture.</p>
         </div>
 
         {/* Lawyer suggestion banner */}
@@ -2284,18 +2314,6 @@ export default function ClientDetail() {
         {/* REGISTRA AZIONE */}
         <div className="mb-4">
           <div className="flex flex-wrap gap-3 items-center">
-            {data.recovery_status !== 'lawyer' && data.recovery_status !== 'archived' && (
-              <button
-                onClick={() => {
-                  const actionType = contactActionCount === 0 ? 'first_contact' : 'second_contact'
-                  handleAction(actionType)
-                }}
-                disabled={actionLoading}
-                className="px-6 py-3 bg-accent-teal text-dark-bg rounded-lg text-sm font-bold hover:brightness-110 disabled:opacity-50 flex items-center gap-2 shadow-sm"
-              >
-                {actionLoading ? '...' : `REGISTRA ${nextActionLabel} AZIONE`}
-              </button>
-            )}
             <button
               onClick={() => handleAction('lawyer')}
               disabled={actionLoading}

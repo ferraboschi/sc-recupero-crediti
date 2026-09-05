@@ -64,16 +64,24 @@ export default function AzioniPerGruppo({
   groups = [], clientActions = [], pendingActions = [],
   selectedInvoices, toggleInvoiceSelection, setSelectedInvoices,
   hasPhone, formatCurrency, formatDate,
-  onCopy, onWhatsApp, onHandover, onAssegno, onInsoluto, onCancelAssegno, onAddNote, onEditNote,
+  onCopy, onWhatsApp, onHandover, onAssegno, onInsolutoMany, onCancelAssegnoMany, onAddNote, onEditNote, onRegisterCall,
 }) {
   const [collapsed, setCollapsed] = useState(() => new Set(groups.filter(g => !g.tone).map(g => g.stage)))
   const [assegnoForm, setAssegnoForm] = useState(null)  // { stage, expected, note }
   const [noteForm, setNoteForm] = useState(null)        // { stage, text }
+  const [callForm, setCallForm] = useState(null)        // { stage, text }
   const [copiedStage, setCopiedStage] = useState(null)
   const [busy, setBusy] = useState(null)
 
   const selIn = (g) => g.invoices.filter(i => selectedInvoices.has(i.id))
   const selIds = (g) => selIn(g).map(i => i.id)
+  // Le fatture GIÀ sollecitate oggi non si rimandano: il messaggio va solo alle
+  // altre; se sono tutte "di oggi" si può RI-copiare il messaggio odierno (stesso
+  // tono di oggi, il backend non registra nulla di nuovo).
+  const sendable = (g) => selIn(g).filter(i => !i.sollecito_today)
+  const recopy = (g) => selIn(g).length > 0 && sendable(g).length === 0
+  const msgInvoices = (g) => recopy(g) ? selIn(g) : sendable(g)
+  const msgTone = (g) => recopy(g) ? (selIn(g)[0]?.recopy_tone || g.tone) : g.tone
   const selTotal = (g) => selIn(g).reduce((s, i) => s + (i.amount_due || 0), 0)
   const allSelected = (g) => g.invoices.length > 0 && g.invoices.every(i => selectedInvoices.has(i.id))
   const toggleAll = (g) => setSelectedInvoices(prev => {
@@ -130,6 +138,9 @@ export default function AzioniPerGruppo({
                       <input type="checkbox" checked={selectedInvoices.has(i.id)} onChange={() => toggleInvoiceSelection(i.id)} className="rounded border-dark-border bg-dark-bg" />
                       <span className="font-medium">{i.invoice_number}</span>
                       <span className="text-txt-muted">{formatCurrency(i.amount_due)} · +{i.days_overdue}gg</span>
+                      {i.sollecito_today && (
+                        <span className="sc-badge bg-dark-surface text-txt-muted" title="Già sollecitata oggi: non si rimanda">già oggi</span>
+                      )}
                     </label>
                   ))}
                 </div>
@@ -159,12 +170,48 @@ export default function AzioniPerGruppo({
                             <span className="text-xs text-txt-muted" title="Questa azione citava anche fatture oggi in un altro stadio">{a.cited_in_group} di {a.cited_total} fatture citate</span>
                           ) : null}
                         </div>
-                        <NoteInline action={a} onSave={onEditNote} />
+                        <NoteInline key={`${a.id}:${a.notes || ''}`} action={a} onSave={onEditNote} />
                       </div>
                     ))}
                   </div>
                 )}
 
+                {/* Pulsanti per stadio — agiscono sulle fatture SELEZIONATE del gruppo */}
+                <div className="flex items-center gap-2 flex-wrap pt-1">
+                  <span className="text-xs text-txt-muted mr-1">{n} selezionat{n === 1 ? 'a' : 'e'} · {formatCurrency(selTotal(g))}</span>
+                  {g.tone && (
+                    <>
+                      <button
+                        disabled={msgInvoices(g).length === 0}
+                        onClick={() => run('copy', async () => { if (await onCopy({ ...g, tone: msgTone(g) }, msgInvoices(g))) { setCopiedStage(g.stage); setTimeout(() => setCopiedStage(null), 2000) } })}
+                        className={`sc-btn-secondary text-xs font-bold min-w-[12rem] ${copiedStage === g.stage ? 'border-accent-green text-accent-green' : ''}`}
+                        title={recopy(g) ? 'Ricopia il messaggio già inviato oggi (non viene registrato un nuovo sollecito)' : msgTone(g) === 'first' ? 'Messaggio cordiale: è il PRIMO sollecito per queste fatture' : 'Messaggio perentorio: queste fatture sono già state sollecitate'}
+                      >
+                        {copiedStage === g.stage ? 'Copiato!' : recopy(g) ? 'Ricopia messaggio di oggi' : (msgTone(g) === 'first' ? 'Copia 1° sollecito' : `Copia sollecito n. ${g.next_n || ''}`)}
+                      </button>
+                      {hasPhone && (
+                        <button disabled={msgInvoices(g).length === 0} onClick={() => run('wa', async () => onWhatsApp({ ...g, tone: msgTone(g) }, msgInvoices(g)))} className="px-3 py-1.5 bg-accent-green text-dark-bg rounded-lg text-xs font-bold hover:brightness-110 disabled:opacity-50">WhatsApp</button>
+                      )}
+                      <button disabled={n === 0} onClick={() => setCallForm(callForm?.stage === g.stage ? null : { stage: g.stage, text: '' })} className="sc-btn-secondary text-xs" title="Contatto fuori WhatsApp (telefonata, email): registrato come sollecito sulle fatture selezionate">Registra telefonata</button>
+                      <button disabled={n === 0} onClick={() => run('ho', async () => onHandover(selIds(g), selIn(g)))} className="px-3 py-1.5 bg-accent-red/15 text-accent-red rounded-lg text-xs font-bold hover:bg-accent-red/25 disabled:opacity-50" title="Consegna le fatture selezionate all'avvocato">Consegna all'avvocato</button>
+                    </>
+                  )}
+                  {(g.tone || g.stage === 'lawyer') && g.stage !== 'in_incasso' && (
+                    <button disabled={n === 0} onClick={() => setAssegnoForm(assegnoForm?.stage === g.stage ? null : { stage: g.stage, expected: '', note: '' })} className="px-3 py-1.5 bg-accent-teal/15 text-accent-teal rounded-lg text-xs font-medium hover:bg-accent-teal/25 disabled:opacity-50" title="Pagate con assegno da incassare">
+                      {(g.stage === 'insoluto' || g.stage === 'sospetto') ? 'Nuovo assegno' : 'Assegno'}
+                    </button>
+                  )}
+                  {(g.stage === 'in_incasso' || g.stage === 'sospetto') && (
+                    <button disabled={n === 0} onClick={() => run('ins', async () => onInsolutoMany(selIn(g)))} className="px-3 py-1.5 bg-accent-red/15 text-accent-red rounded-lg text-xs font-bold hover:bg-accent-red/25 disabled:opacity-50" title="L'assegno è tornato indietro: la fattura torna scaduta SUBITO">Insoluto</button>
+                  )}
+                  {g.stage === 'in_incasso' && (
+                    <button disabled={n === 0} onClick={() => run('canc', async () => onCancelAssegnoMany(selIn(g)))} className="px-3 py-1.5 bg-dark-surface text-txt-muted rounded-lg text-xs hover:text-txt-primary disabled:opacity-50" title="Annulla la registrazione (solo se fatta per errore)">Annulla assegno</button>
+                  )}
+                  {g.stage === 'sospetto' && (
+                    <button disabled={n === 0} onClick={() => run('canc', async () => onCancelAssegnoMany(selIn(g)))} className="px-3 py-1.5 bg-dark-surface text-txt-muted rounded-lg text-xs hover:text-txt-primary disabled:opacity-50" title="La riapertura su FatturaPro non è un insoluto (es. nota di credito)">Non è insoluto</button>
+                  )}
+                  <button disabled={n === 0} onClick={() => setNoteForm(noteForm?.stage === g.stage ? null : { stage: g.stage, text: '' })} className="sc-btn-secondary text-xs">+ Nota</button>
+                </div>
                 {/* Form assegno (gruppo) */}
                 {assegnoForm?.stage === g.stage && (
                   <div className="flex items-end gap-3 flex-wrap p-3 rounded-lg bg-dark-bg/60 border border-dark-border">
@@ -196,41 +243,16 @@ export default function AzioniPerGruppo({
                   </div>
                 )}
 
-                {/* Pulsanti per stadio — agiscono sulle fatture SELEZIONATE del gruppo */}
-                <div className="flex items-center gap-2 flex-wrap pt-1">
-                  <span className="text-xs text-txt-muted mr-1">{n} selezionat{n === 1 ? 'a' : 'e'} · {formatCurrency(selTotal(g))}</span>
-                  {g.tone && (
-                    <>
-                      <button
-                        disabled={n === 0}
-                        onClick={() => run('copy', async () => { if (await onCopy(g, selIn(g))) { setCopiedStage(g.stage); setTimeout(() => setCopiedStage(null), 2000) } })}
-                        className={`sc-btn-secondary text-xs font-bold ${copiedStage === g.stage ? 'border-accent-green text-accent-green' : ''}`}
-                        title={g.tone === 'first' ? 'Messaggio cordiale (1° sollecito) per le fatture selezionate' : 'Messaggio perentorio (sollecito successivo) per le fatture selezionate'}
-                      >
-                        {copiedStage === g.stage ? 'Copiato!' : `Copia messaggio ${g.tone === 'first' ? '1°' : '2°'}`}
-                      </button>
-                      {hasPhone && (
-                        <button disabled={n === 0} onClick={() => run('wa', async () => onWhatsApp(g, selIn(g)))} className="px-3 py-1.5 bg-accent-green text-dark-bg rounded-lg text-xs font-bold hover:brightness-110 disabled:opacity-50">WhatsApp</button>
-                      )}
-                      <button disabled={n === 0} onClick={() => run('ho', async () => onHandover(selIds(g)))} className="px-3 py-1.5 bg-accent-red/15 text-accent-red rounded-lg text-xs font-bold hover:bg-accent-red/25 disabled:opacity-50" title="Consegna le fatture selezionate all'avvocato">Consegna all'avvocato</button>
-                    </>
-                  )}
-                  {(g.tone || g.stage === 'lawyer') && g.stage !== 'in_incasso' && (
-                    <button disabled={n === 0} onClick={() => setAssegnoForm(assegnoForm?.stage === g.stage ? null : { stage: g.stage, expected: '', note: '' })} className="px-3 py-1.5 bg-accent-teal/15 text-accent-teal rounded-lg text-xs font-medium hover:bg-accent-teal/25 disabled:opacity-50" title="Pagate con assegno da incassare">
-                      {(g.stage === 'insoluto' || g.stage === 'sospetto') ? 'Nuovo assegno' : 'Assegno'}
-                    </button>
-                  )}
-                  {(g.stage === 'in_incasso' || g.stage === 'sospetto') && (
-                    <button disabled={n === 0} onClick={() => run('ins', async () => { for (const i of selIn(g)) await onInsoluto(i) })} className="px-3 py-1.5 bg-accent-red/15 text-accent-red rounded-lg text-xs font-bold hover:bg-accent-red/25 disabled:opacity-50" title="L'assegno è tornato indietro: la fattura torna scaduta SUBITO">Insoluto</button>
-                  )}
-                  {g.stage === 'in_incasso' && (
-                    <button disabled={n === 0} onClick={() => run('canc', async () => { for (const i of selIn(g)) await onCancelAssegno(i) })} className="px-3 py-1.5 bg-dark-surface text-txt-muted rounded-lg text-xs hover:text-txt-primary disabled:opacity-50" title="Annulla la registrazione (solo se fatta per errore)">Annulla assegno</button>
-                  )}
-                  {g.stage === 'sospetto' && (
-                    <button disabled={n === 0} onClick={() => run('canc', async () => { for (const i of selIn(g)) await onCancelAssegno(i) })} className="px-3 py-1.5 bg-dark-surface text-txt-muted rounded-lg text-xs hover:text-txt-primary disabled:opacity-50" title="La riapertura su FatturaPro non è un insoluto (es. nota di credito)">Non è insoluto</button>
-                  )}
-                  <button disabled={n === 0} onClick={() => setNoteForm(noteForm?.stage === g.stage ? null : { stage: g.stage, text: '' })} className="sc-btn-secondary text-xs">+ Nota</button>
-                </div>
+                {/* Form telefonata (gruppo) */}
+                {callForm?.stage === g.stage && (
+                  <div className="flex items-start gap-2 p-3 rounded-lg bg-dark-bg/60 border border-dark-border">
+                    <textarea value={callForm.text} onChange={e => setCallForm({ ...callForm, text: e.target.value })} rows={2} autoFocus
+                      placeholder={`Esito della telefonata su ${n} fattur${n === 1 ? 'a' : 'e'} selezionat${n === 1 ? 'a' : 'e'} (registrata come sollecito n. ${g.next_n || ''})`}
+                      className="flex-1 text-sm px-2 py-1 rounded bg-dark-bg border border-dark-border text-txt-primary" />
+                    <button disabled={n === 0 || busy === 'call'} onClick={() => run('call', async () => { await onRegisterCall(selIds(g), g.tone, callForm.text.trim()); setCallForm(null) })} className="sc-btn-primary text-xs">Registra</button>
+                    <button onClick={() => setCallForm(null)} className="sc-btn-secondary text-xs">Annulla</button>
+                  </div>
+                )}
               </div>
             )}
           </div>
