@@ -17,7 +17,7 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import Session
 
 from backend.database import (
@@ -113,9 +113,12 @@ def per_invoice_actions(
         .join(RecoveryAction, RecoveryAction.id == RecoveryActionInvoice.action_id)
         .filter(
             RecoveryActionInvoice.invoice_id.in_(invoice_ids),
-            RecoveryAction.action_type.in_(CONTACT_TYPES),
-            RecoveryAction.completed_at.isnot(None),
             RecoveryAction.cancelled.isnot(True),
+            or_(
+                and_(RecoveryAction.action_type.in_(CONTACT_TYPES),
+                     RecoveryAction.completed_at.isnot(None)),
+                RecoveryAction.action_type == "note",  # le note di gruppo viaggiano col debito
+            ),
         )
         .order_by(RecoveryAction.created_at.asc())
         .all()
