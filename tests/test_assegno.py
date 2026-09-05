@@ -331,3 +331,33 @@ def test_case_closes_with_in_incasso_reason(test_client, test_db_session, okasan
     test_client.post(f"/api/positions/{b.id}/assegno", json={})
     test_db_session.refresh(case)
     assert case.status == "closed" and case.closed_reason == "in_incasso"
+
+
+def test_suspect_dismiss_and_count(test_client, test_db_session, okasan):
+    """Seconda review: il sospetto si SMENTISCE (Non è insoluto) e il conteggio
+    dei sospetti non è limitato a 20."""
+    cust, a, b, case = okasan
+    today = date.today()
+    for k in range(21):
+        inv = Invoice(invoice_number=f"FT-S{k}", amount=10.0, amount_due=10.0,
+                      issue_date=today - timedelta(days=60), due_date=today - timedelta(days=30),
+                      days_overdue=30, status="open", customer_id=cust.id, source_platform="fatturapro",
+                      payment_pending=None, payment_pending_at=datetime.utcnow() - timedelta(days=5))
+        test_db_session.add(inv)
+    test_db_session.commit()
+    dash = test_client.get("/api/dashboard").json()
+    assert dash["assegni"]["sospetti"]["fatture"] == 21
+    sid = test_db_session.query(Invoice).filter_by(invoice_number="FT-S0").first().id
+    det = test_client.get(f"/api/customers/{cust.id}").json()
+    assert next(i for i in det["invoices"]["items"] if i["id"] == sid)["suspect_bounce"] is True
+    r = test_client.delete(f"/api/positions/{sid}/assegno")
+    assert r.status_code == 200
+    assert test_client.get("/api/dashboard").json()["assegni"]["sospetti"]["fatture"] == 20
+
+
+def test_assegno_rejects_orphan(test_client, test_db_session):
+    inv = Invoice(invoice_number="FT-ORF", amount=100.0, amount_due=100.0,
+                  issue_date=date.today() - timedelta(days=60), due_date=date.today() - timedelta(days=30),
+                  days_overdue=30, status="open", customer_id=None, source_platform="fatturapro")
+    test_db_session.add(inv); test_db_session.commit()
+    assert test_client.post(f"/api/positions/{inv.id}/assegno", json={}).status_code == 409

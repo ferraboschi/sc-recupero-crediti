@@ -15,6 +15,7 @@ from backend.database import (
 )
 from backend.engine.cases import get_open_case, contact_count, business_day_start, _has_unlinked_contacts
 from backend.engine.action_invoices import per_invoice_sollecito_stats
+from backend.engine.overdue import is_suspect_bounce
 from backend.engine.verify import verify_invoice_customer
 from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
 from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
@@ -784,6 +785,7 @@ def get_customer_detail(
                 "bounced_at": inv.bounced_at.isoformat() if inv.bounced_at else None,
                 "bounced_note": inv.bounced_note,
                 "in_incasso": bool(inv.payment_pending) and inv.bounced_at is None and inv.status != "paid",
+                "suspect_bounce": is_suspect_bounce(inv),
                 "pending_overdue": bool(
                     inv.payment_pending and inv.bounced_at is None and inv.status != "paid"
                     and inv.payment_pending_expected and inv.payment_pending_expected < date.today()

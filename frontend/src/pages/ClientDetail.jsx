@@ -231,7 +231,7 @@ export default function ClientDetail() {
       setData(response.data)
       const items = response.data.invoices?.items || []
       const overdueIds = items
-        .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && !inv.in_incasso)
+        .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && !inv.in_incasso && !inv.suspect_bounce)
         .map(inv => inv.id)
       setSelectedInvoices(new Set(overdueIds))
       // Semina le "verificate a mano" dal backend: senza, un hard-reload
@@ -720,7 +720,7 @@ export default function ClientDetail() {
   const selectAllOverdue = () => {
     if (!data?.invoices?.items) return
     const overdueIds = data.invoices.items
-      .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && !inv.in_incasso)
+      .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && !inv.in_incasso && !inv.suspect_bounce)
       .map(inv => inv.id)
     setSelectedInvoices(new Set(overdueIds))
   }
@@ -887,7 +887,7 @@ export default function ClientDetail() {
     if (!window.confirm(
       `ASSEGNO INSOLUTO sulla fattura ${inv.invoice_number}?\n\n`
       + 'La fattura torna SUBITO scaduta e lavorabile, la pratica si riapre con lo storico dei solleciti '
-      + 'e il recuperato viene stornato. La riga resta segnalata in rosso.'
+      + '(salvo pratica archiviata: resta archiviata, con l\'allarme) e il recuperato viene stornato. La riga resta segnalata in rosso.'
     )) return
     try {
       await client.post(`/positions/${inv.id}/assegno/insoluto`, {})
@@ -897,7 +897,9 @@ export default function ClientDetail() {
     }
   }
   const cancelAssegno = async (inv) => {
-    if (!window.confirm(`Annullare la registrazione dell'assegno su ${inv.invoice_number}?\n\nSolo se registrata per errore: la fattura torna scaduta senza allarme.`)) return
+    if (!window.confirm(inv.suspect_bounce
+      ? `Confermi che la riapertura di ${inv.invoice_number} su FatturaPro NON è un assegno insoluto?\n\nIl sospetto viene rimosso; la fattura resta semplicemente scaduta.`
+      : `Annullare la registrazione dell'assegno su ${inv.invoice_number}?\n\nSolo se registrata per errore: la fattura torna scaduta senza allarme.`)) return
     try {
       await client.delete(`/positions/${inv.id}/assegno`)
       await fetchData()
@@ -2102,7 +2104,7 @@ export default function ClientDetail() {
                           ⚠ ASSEGNO INSOLUTO · {formatDate(inv.bounced_at)}
                         </span>
                       </div>
-                    ) : (!inv.payment_pending && inv.payment_pending_at && (inv.days_overdue || 0) > 0) ? (
+                    ) : inv.suspect_bounce ? (
                       <div className="mt-1">
                         <span
                           className="inline-block text-[10px] font-bold px-1.5 py-0.5 rounded bg-accent-amber/25 text-accent-amber"
@@ -2149,19 +2151,28 @@ export default function ClientDetail() {
                       <button
                         onClick={() => setAssegnoForm(assegnoForm?.invoiceId === inv.id ? null : { invoiceId: inv.id, expected: '', note: '' })}
                         className="ml-1 px-2 py-1 bg-accent-teal/15 text-accent-teal rounded text-xs font-medium hover:bg-accent-teal/25 transition-colors"
-                        title={inv.bounced_at ? 'Registra un NUOVO assegno (azzera l\'allarme insoluto)' : 'Pagata con assegno da incassare'}
+                        title={(inv.bounced_at || inv.suspect_bounce) ? 'Registra un NUOVO assegno (azzera l\'allarme)' : 'Pagata con assegno da incassare'}
                       >
-                        {inv.bounced_at ? 'Nuovo assegno' : 'Assegno'}
+                        {(inv.bounced_at || inv.suspect_bounce) ? 'Nuovo assegno' : 'Assegno'}
                       </button>
                     )}
-                    {!inv.in_incasso && !inv.payment_pending && inv.payment_pending_at && !inv.bounced_at && inv.status !== 'paid' && (inv.days_overdue || 0) > 0 && (
-                      <button
-                        onClick={() => markInsoluto(inv)}
-                        className="ml-1 px-2 py-1 bg-accent-red/15 text-accent-red rounded text-xs font-bold hover:bg-accent-red/25 transition-colors"
-                        title="Conferma: l'assegno è tornato insoluto"
-                      >
-                        Insoluto
-                      </button>
+                    {inv.suspect_bounce && (
+                      <>
+                        <button
+                          onClick={() => markInsoluto(inv)}
+                          className="ml-1 px-2 py-1 bg-accent-red/15 text-accent-red rounded text-xs font-bold hover:bg-accent-red/25 transition-colors"
+                          title="Conferma: l'assegno è tornato insoluto"
+                        >
+                          Insoluto
+                        </button>
+                        <button
+                          onClick={() => cancelAssegno(inv)}
+                          className="ml-1 px-2 py-1 bg-dark-surface text-txt-muted rounded text-xs hover:text-txt-primary transition-colors"
+                          title="Smentisci il sospetto: la riapertura su FatturaPro non è un insoluto (es. nota di credito)"
+                        >
+                          Non è insoluto
+                        </button>
+                      </>
                     )}
                     {inv.in_incasso && (
                       <>

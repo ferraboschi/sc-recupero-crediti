@@ -436,7 +436,8 @@ def _customer_dossier_files(session: Session, customer, invoice_ids=None):
     # deve saperlo (perimetro esplicito).
     in_incasso = (
         session.query(Invoice)
-        .filter(Invoice.customer_id == customer.id, overdue_clause(), in_incasso_clause())
+        .filter(Invoice.customer_id == customer.id, overdue_clause(), in_incasso_clause(),
+                Invoice.status != "disputed")
         .all()
     )
     context = {

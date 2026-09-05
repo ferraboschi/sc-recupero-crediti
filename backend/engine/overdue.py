@@ -75,6 +75,29 @@ def in_incasso_clause():
     )
 
 
+def is_suspect_bounce(inv: Invoice) -> bool:
+    """SOSPETTO insoluto: pagata con assegno (registrazione presente), poi
+    confermata pagata e RIAPERTA su FatturaPro (payment_pending azzerato dal
+    sync alla conferma), non ancora confermata insoluta né smentita."""
+    return (
+        inv.status != "paid"
+        and (inv.days_overdue or 0) > 0
+        and getattr(inv, "payment_pending", None) is None
+        and getattr(inv, "payment_pending_at", None) is not None
+        and getattr(inv, "bounced_at", None) is None
+    )
+
+
+def suspect_bounce_clause():
+    """Gemello SQL di is_suspect_bounce."""
+    return (
+        overdue_clause()
+        & Invoice.payment_pending.is_(None)
+        & Invoice.payment_pending_at.isnot(None)
+        & Invoice.bounced_at.is_(None)
+    )
+
+
 def is_overdue_unpaid(inv: Invoice) -> bool:
     """Fattura che tiene viva una pratica: scaduta, non pagata, non contestata,
     non in incasso (assegno in mano)."""

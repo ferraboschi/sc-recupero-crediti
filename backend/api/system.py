@@ -71,11 +71,8 @@ def get_system_status():
                     "component": "assegni",
                     "message": f"{insoluti} assegn{'o' if insoluti == 1 else 'i'} INSOLUT{'O' if insoluti == 1 else 'I'}: fattura tornata scaduta, verificare subito",
                 })
-            sospetti = session.query(func.count(Invoice.id)).filter(
-                Invoice.status != "paid", Invoice.days_overdue > 0,
-                Invoice.payment_pending.is_(None), Invoice.payment_pending_at.isnot(None),
-                Invoice.bounced_at.is_(None),
-            ).scalar() or 0
+            from backend.engine.overdue import suspect_bounce_clause
+            sospetti = session.query(func.count(Invoice.id)).filter(suspect_bounce_clause()).scalar() or 0
             if sospetti:
                 alerts.append({
                     "level": "critical",

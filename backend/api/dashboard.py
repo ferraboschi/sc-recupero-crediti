@@ -13,7 +13,7 @@ from backend.database import (
 from backend.engine.overdue import (
     overdue_clause, workable_clause, stage_expr,
     compute_overdue_buckets, compute_recuperato_certo,
-    compute_in_incasso_assegni, in_incasso_clause,
+    compute_in_incasso_assegni, in_incasso_clause, suspect_bounce_clause,
     first_recovery_action_subquery, recovered_invoice_clause,
     OVERDUE_BUCKETS, CASE_STAGES, RECOVERY_ACTION_TYPES,
 )
@@ -1150,11 +1150,11 @@ def _assegni_summary(session: Session) -> dict:
         )
         # Sospetti: riaperte su FatturaPro DOPO un pagamento con assegno (segnalate
         # dal sync, non ancora confermate insolute dall'operatore).
+        sosp_tot = session.query(func.count(Invoice.id)).filter(suspect_bounce_clause()).scalar() or 0
         sosp_rows = (
             session.query(Invoice, Customer.ragione_sociale)
             .outerjoin(Customer, Invoice.customer_id == Customer.id)
-            .filter(overdue_clause(), Invoice.payment_pending.is_(None),
-                    Invoice.payment_pending_at.isnot(None), Invoice.bounced_at.is_(None))
+            .filter(suspect_bounce_clause())
             .order_by(Invoice.payment_pending_at.desc()).limit(20).all()
         )
     except Exception as e:  # colonne non ancora migrate: il cruscotto non deve cadere
@@ -1165,7 +1165,7 @@ def _assegni_summary(session: Session) -> dict:
         "in_incasso": {"fatture": int(in_incasso[0] or 0), "importo": round(float(in_incasso[1] or 0), 2)},
         "oltre_data_prevista": int(oltre),
         "sospetti": {
-            "fatture": len(sosp_rows),
+            "fatture": int(sosp_tot),
             "items": [{
                 "invoice_id": i.id, "invoice_number": i.invoice_number,
                 "customer_id": i.customer_id, "ragione_sociale": rs,
