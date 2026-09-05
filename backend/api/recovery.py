@@ -23,7 +23,9 @@ from backend.engine.cases import (
     get_open_case, is_overdue_unpaid, schedule_next_action, close_case,
     _refresh_customer_status,
 )
-from backend.engine.action_invoices import set_action_invoices, delivered_invoice_ids
+from backend.engine.action_invoices import (
+    set_action_invoices, delivered_invoice_ids, per_invoice_sollecito_stats,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -217,15 +219,34 @@ def register_sollecito(
         today = date.today()
         now = datetime.utcnow()
 
-        # Dedup: già registrato un sollecito WhatsApp oggi per questa pratica?
+        # Numerazione PER-FATTURA: il numero del sollecito è quello delle
+        # fatture citate — stadio più basso fra loro + 1, così la tonalità più
+        # gentile vale per il gruppo (una fattura nuova riceve il SUO 1°
+        # sollecito anche se il cliente è già al 2° su altre). Il frontend
+        # raggruppa la selezione per stadio: un messaggio per stadio.
+        prev = per_invoice_sollecito_stats(session, cited_ids)
+        min_prev = min((prev.get(i, {}).get("count", 0) for i in cited_ids), default=0)
+        n = min_prev + 1
+        action_type = "first_contact" if n == 1 else "second_contact"
+
+        # Dedup: già registrato oggi un sollecito WhatsApp DELLO STESSO STADIO
+        # per questa pratica? Due stadi diversi nello stesso giorno (1° per la
+        # fattura nuova, 2° per le vecchie) sono DUE solleciti distinti.
         # "Oggi" = giornata lavorativa italiana (il server gira in UTC).
         start_of_day = business_day_start()
-        existing_today = session.query(RecoveryAction).filter(
+        todays = session.query(RecoveryAction).filter(
             RecoveryAction.case_id == case.id,
             RecoveryAction.channel.in_(WHATSAPP_CHANNELS),
             RecoveryAction.completed_at >= start_of_day,
             RecoveryAction.cancelled.isnot(True),
-        ).order_by(RecoveryAction.completed_at.desc()).first()
+        ).order_by(RecoveryAction.completed_at.desc()).all()
+        # 1) STESSA FATTURA, stesso giorno = stesso sollecito (un ri-copy per
+        #    un refuso non deve far salire la fattura di stadio in un giorno);
+        # 2) altrimenti stesso STADIO oggi → si unisce a quel sollecito.
+        cited_set = set(cited_ids)
+        existing_today = next(
+            (a for a in todays if cited_set & set(a.invoice_ids or [])), None
+        ) or next((a for a in todays if a.action_type == action_type), None)
 
         if existing_today:
             merged = sorted(set((existing_today.invoice_ids or []) + cited_ids))
@@ -233,13 +254,12 @@ def register_sollecito(
             # Dual-write della tabella di join: le fatture appena aggiunte
             # dal secondo copy odierno ereditano lo stesso sollecito.
             set_action_invoices(session, existing_today.id, merged)
-            n = contact_count(session, case)
             session.commit()
             return {
                 "registered": True,
                 "already_registered_today": True,
                 "action_id": existing_today.id,
-                "sollecito_n": n,
+                "sollecito_n": 1 if existing_today.action_type == "first_contact" else n,
                 "next_action": {
                     "action_type": customer.next_action_type,
                     "scheduled_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
@@ -254,9 +274,6 @@ def register_sollecito(
             RecoveryAction.cancelled.isnot(True),
         ).all()
 
-        n_before = contact_count(session, case)
-        n = n_before + 1
-        action_type = "first_contact" if n == 1 else "second_contact"
         channel_label = "Copia Messaggio" if body.channel == "whatsapp_copy" else "link WhatsApp"
 
         action = RecoveryAction(
@@ -280,8 +297,12 @@ def register_sollecito(
             p.cancelled = True
             p.cancelled_reason = f"superseded_by_sollecito:{action.id}"
 
-        customer.recovery_status = "first_contact" if n == 1 else "second_contact"
         next_action = schedule_next_action(session, customer, case, n)
+        # Stato cliente = rollup PER-FATTURA (il peggiore fra le scadute): un
+        # 1° sollecito sulla fattura nuova NON retrocede un cliente che è già
+        # al 2° sulle vecchie. flush prima: il refresh legge i todo dal DB.
+        session.flush()
+        _refresh_customer_status(session, customer, case)
 
         session.add(ActivityLog(
             action="sollecito",

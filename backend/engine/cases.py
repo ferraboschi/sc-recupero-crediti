@@ -341,12 +341,19 @@ def _refresh_customer_status(session: Session, customer: Customer, case: Recover
     bucket per stadio della riconciliazione sono keyed su questo campo
     (engine/overdue.py): il totale non cambia, cambia la ripartizione.
     """
-    from backend.engine.action_invoices import delivered_invoice_ids
-    n = contact_count(session, case)
+    from backend.engine.action_invoices import (
+        delivered_invoice_ids, per_invoice_sollecito_stats,
+    )
     overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
     all_delivered = bool(overdue) and (
         {i.id for i in overdue} <= delivered_invoice_ids(session, case, overdue)
     )
+    # Stadio = il PEGGIORE fra le scadute (max solleciti ricevuti da UNA
+    # fattura, tabella di join). Rete di sicurezza legacy: se nessuna scaduta
+    # ha righe di join (storico pre-tabella non collegato) si usa il contatore
+    # di pratica, per non retrocedere un cliente davvero sollecitato.
+    stats = per_invoice_sollecito_stats(session, [i.id for i in overdue]) if overdue else {}
+    n = max((v["count"] for v in stats.values()), default=0) if stats else contact_count(session, case)
     if all_delivered:
         customer.recovery_status = "lawyer"
     elif n >= 2:

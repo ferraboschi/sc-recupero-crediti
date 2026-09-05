@@ -169,6 +169,8 @@ export default function ClientDetail() {
   const [pdfLoading, setPdfLoading] = useState(false)
   const [singlePdfLoading, setSinglePdfLoading] = useState(null)
   const [selectedInvoices, setSelectedInvoices] = useState(new Set())
+  // Selezione mista (fatture a stadi diversi): quale stadio sto scrivendo
+  const [messageStage, setMessageStage] = useState(null)
   const [phoneEdit, setPhoneEdit] = useState(null)
   const [updatingInvoice, setUpdatingInvoice] = useState(null)
   const [showAllInvoices, setShowAllInvoices] = useState(false)
@@ -720,14 +722,51 @@ export default function ClientDetail() {
     setSelectedInvoices(new Set(overdueIds))
   }
 
+  // Il SOGGETTO è la FATTURA: il tono segue lo stadio della singola fattura
+  // (sollecito_count dalla tabella di join), non il contatore della pratica.
+  // La selezione si divide in due gruppi: mai sollecitate (→ 1°, cordiale) e
+  // già sollecitate (→ 2°, perentorio). Se la selezione è mista si manda UN
+  // messaggio per stadio; l'operatore sceglie con i chip.
+  const selectedInvoiceObjs = (data?.invoices?.items || []).filter(inv => selectedInvoices.has(inv.id))
+  const stageGroups = {
+    first: selectedInvoiceObjs.filter(inv => (inv.sollecito_count || 0) === 0),
+    second: selectedInvoiceObjs.filter(inv => (inv.sollecito_count || 0) >= 1),
+  }
+  const isMixed = stageGroups.first.length > 0 && stageGroups.second.length > 0
+  const activeStage = isMixed
+    ? (messageStage || 'first')
+    : (stageGroups.second.length > 0 ? 'second' : 'first')
+  const activeGroup = stageGroups[activeStage]
+
+  const stagePicker = isMixed ? (
+    <div
+      className="inline-flex items-center gap-1.5 text-xs text-txt-muted"
+      title="Fatture a stadi diversi: un messaggio per stadio, il tono segue la fattura"
+    >
+      <span>Messaggio per:</span>
+      {['first', 'second'].map(st => (
+        <button
+          key={st}
+          type="button"
+          onClick={() => setMessageStage(st)}
+          className={`sc-badge ${activeStage === st
+            ? 'bg-accent-teal/20 text-accent-teal ring-1 ring-accent-teal/40'
+            : 'bg-dark-surface text-txt-secondary hover:text-txt-primary'}`}
+        >
+          {st === 'first' ? '1° sollecito' : '2° sollecito'} · {stageGroups[st].length} fatt.
+        </button>
+      ))}
+    </div>
+  ) : null
+
   const buildWhatsAppMessage = () => {
-    if (!data || selectedInvoices.size === 0) return ''
-    const selected = (data.invoices?.items || []).filter(inv => selectedInvoices.has(inv.id))
+    if (!data || activeGroup.length === 0) return ''
+    const selected = activeGroup
     const totalSelected = selected.reduce((sum, inv) => sum + inv.amount_due, 0)
 
-    // Tono dal conteggio contatti della PRATICA (non dallo stato storico del
-    // cliente): dopo un saldo completo la pratica nuova riparte cordiale.
-    const isSecondContact = (data.case?.contact_count || 0) >= 1
+    // Tono dallo STADIO delle fatture del gruppo (per-fattura): dopo un saldo
+    // completo, o per una fattura nuova, si riparte cordiale.
+    const isSecondContact = activeStage === 'second'
 
     let msg = ''
 
@@ -785,7 +824,8 @@ export default function ClientDetail() {
   const registerSollecito = async (channel) => {
     // Cliente escluso: il copy resta possibile ma non è un sollecito
     if (data?.excluded) return
-    const invoiceIds = [...selectedInvoices]
+    // Si registra il sollecito SOLO per il gruppo del messaggio copiato
+    const invoiceIds = activeGroup.map(inv => inv.id)
     try {
       const res = await client.post(`/recovery/customers/${customerId}/solleciti`, {
         invoice_ids: invoiceIds,
@@ -2079,6 +2119,7 @@ export default function ClientDetail() {
                 >
                   {promemoria ? '...' : 'Scarica Promemoria'}
                 </button>
+                {stagePicker}
                 <button
                   onClick={handleCopyWhatsApp}
                   className={`sc-btn-secondary text-sm font-bold transition-colors ${
@@ -2500,6 +2541,7 @@ export default function ClientDetail() {
               >
                 {promemoria ? '...' : 'Promemoria'}
               </button>
+              {stagePicker}
               <button
                 onClick={handleCopyWhatsApp}
                 className={`sc-btn-secondary text-sm font-medium transition-colors ${
