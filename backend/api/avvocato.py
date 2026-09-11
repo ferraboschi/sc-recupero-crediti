@@ -55,6 +55,7 @@ ACTION_LABELS = {
     "second_contact": "2° sollecito",
     "lawyer": "Passaggio all'avvocato",
     "wait": "Attesa",
+    "reminder": "Promemoria pre-scadenza",
     "note": "Nota",
     "archive": "Archiviazione",
 }

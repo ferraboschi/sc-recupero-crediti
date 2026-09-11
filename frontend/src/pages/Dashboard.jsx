@@ -11,6 +11,7 @@ const ACTION_LABELS = {
   lawyer: 'Avvocato',
   archive: 'Archivia',
   wait: 'Attendi',
+  reminder: 'Promemoria pre-scadenza',
   idle: 'Da Gestire',
   waiting: 'In Attesa',
   note: 'Nota',
@@ -22,6 +23,7 @@ const ACTION_BADGE_COLORS = {
   lawyer: 'badge-disputed',
   archive: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
   wait: 'badge-promised',
+  reminder: 'badge-open',
   idle: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
   waiting: 'badge-promised',
 }

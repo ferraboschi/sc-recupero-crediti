@@ -565,8 +565,12 @@ def create_action(
     - archive: Mark as unrecoverable, no next action
     - wait: Postpone next action by 30 days
     - note: Just add a note, no status change
+    - reminder: PROMEMORIA PRE-SCADENZA su fatture NON ancora scadute — un todo
+      che scatta PRIMA del termine (default 3 giorni prima) per evitare che
+      la fattura diventi scaduta. Vive FUORI dalla pratica (non è un atto di
+      recupero) e non tocca lo stato del cliente.
     """
-    valid_types = ["first_contact", "second_contact", "lawyer", "archive", "wait", "note"]
+    valid_types = ["first_contact", "second_contact", "lawyer", "archive", "wait", "note", "reminder"]
     if action.action_type not in valid_types:
         raise HTTPException(
             status_code=400,
@@ -581,10 +585,56 @@ def create_action(
         today = date.today()
         scheduled = date.fromisoformat(action.scheduled_date) if action.scheduled_date else None
 
+        if action.action_type == "reminder":
+            if not action.invoice_ids:
+                raise HTTPException(status_code=400, detail="Il promemoria deve citare almeno una fattura")
+            own_by_id = {inv.id: inv for inv in customer.invoices}
+            unknown = [i for i in action.invoice_ids if i not in own_by_id]
+            if unknown:
+                raise HTTPException(status_code=400, detail=f"Fatture non appartenenti al cliente {customer.id}: {unknown}")
+            targets = [own_by_id[i] for i in sorted(set(action.invoice_ids))]
+            bad = [
+                inv.invoice_number for inv in targets
+                if inv.status in ("paid", "disputed") or (inv.days_overdue or 0) > 0 or not inv.due_date
+            ]
+            if bad:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Il promemoria vale solo per fatture non pagate e NON ancora scadute: {bad}",
+                )
+            first_due = min(inv.due_date for inv in targets)
+            if scheduled is None:
+                scheduled = max(today, first_due - timedelta(days=3))
+            if scheduled < today:
+                raise HTTPException(status_code=400, detail="La data del promemoria non può essere nel passato")
+            if scheduled >= first_due:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Il promemoria deve precedere la scadenza ({first_due.strftime('%d/%m/%Y')})",
+                )
+            # Un promemoria pendente per la stessa fattura: si modifica la
+            # data di quello, non se ne crea un secondo.
+            pending_reminders = session.query(RecoveryAction).filter(
+                RecoveryAction.customer_id == customer_id,
+                RecoveryAction.action_type == "reminder",
+                RecoveryAction.completed_at.is_(None),
+                RecoveryAction.cancelled.isnot(True),
+            ).all()
+            for p in pending_reminders:
+                clash = set(p.invoice_ids or []) & {inv.id for inv in targets}
+                if clash:
+                    nums = [own_by_id[i].invoice_number for i in sorted(clash)]
+                    when = p.scheduled_date.strftime('%d/%m/%Y') if p.scheduled_date else "N/D"
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Esiste già un promemoria per il {when} su {nums}: modificane la data dalla Pratica",
+                    )
+
         # Aggancio alla pratica aperta (creata se il cliente ha scadute).
-        # Le note non c'entrano col ciclo di recupero e restano senza pratica.
+        # Le note non c'entrano col ciclo di recupero e restano senza pratica;
+        # i promemoria pre-scadenza nemmeno (la fattura non è scaduta).
         case = None
-        if action.action_type != "note":
+        if action.action_type not in ("note", "reminder"):
             overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
             if overdue and not customer.excluded:
                 case = ensure_open_case(session, customer)
@@ -669,7 +719,7 @@ def create_action(
             customer.recovery_status = "waiting"
             customer.next_action_date = scheduled or (today + timedelta(days=30))
             # Keep same next_action_type
-        # "note" doesn't change status
+        # "note" e "reminder" non cambiano lo stato
 
         customer.updated_at = datetime.utcnow()
         session.commit()

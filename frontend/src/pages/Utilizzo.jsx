@@ -11,6 +11,8 @@ const ACTION_LABELS = {
 const CHANNEL_LABELS = {
   whatsapp_copy: 'Copia Messaggio',
   whatsapp_link: 'Link WhatsApp',
+  email_copy: 'Email',
+  phone: 'Telefono',
 }
 
 // "2026-08-19" -> "Martedi 19 agosto 2026" (giorno di calendario italiano,

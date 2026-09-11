@@ -8,6 +8,7 @@ const ACTION_LABELS = {
   lawyer: 'Avvocato',
   archive: 'Archiviato',
   wait: 'In Attesa',
+  reminder: 'Promemoria pre-scadenza',
   idle: 'Da Gestire',
   waiting: 'In Attesa',
 }
