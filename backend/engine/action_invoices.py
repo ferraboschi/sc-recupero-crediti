@@ -311,3 +311,45 @@ def run_backfill_action_invoices_if_needed() -> Optional[Dict[str, Any]]:
         return None
     finally:
         session.close()
+
+
+def per_invoice_history(session: Session, invoice_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+    """{invoice_id: [{"n", "action_type", "date", "channel", "notes"}, ...]} in
+    ordine cronologico — il REGISTRO della singola fattura (Fase 5): solleciti
+    (con l'ordinale n. 1, 2, … PER QUELLA fattura), consegna al legale, note che
+    la citano. Una query sola per tutte le fatture chieste."""
+    if not invoice_ids:
+        return {}
+    rows = (
+        session.query(RecoveryActionInvoice.invoice_id, RecoveryAction)
+        .join(RecoveryAction, RecoveryAction.id == RecoveryActionInvoice.action_id)
+        .filter(
+            RecoveryActionInvoice.invoice_id.in_(invoice_ids),
+            RecoveryAction.cancelled.isnot(True),
+            or_(
+                and_(RecoveryAction.action_type.in_(CONTACT_TYPES + ("lawyer",)),
+                     RecoveryAction.completed_at.isnot(None)),
+                RecoveryAction.action_type == "note",
+            ),
+        )
+        .order_by(RecoveryAction.completed_at.asc().nullslast(), RecoveryAction.created_at.asc())
+        .all()
+    )
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    counters: Dict[int, int] = {}
+    for inv_id, a in rows:
+        n = None
+        if a.action_type in CONTACT_TYPES:
+            counters[inv_id] = counters.get(inv_id, 0) + 1
+            n = counters[inv_id]
+        when = a.completed_at or a.created_at
+        out.setdefault(inv_id, []).append({
+            "action_id": a.id,
+            "n": n,
+            "action_type": a.action_type,
+            "date": when.isoformat() if when else None,
+            "channel": a.channel,
+            "outcome": a.outcome,
+            "notes": a.notes,
+        })
+    return out

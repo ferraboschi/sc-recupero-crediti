@@ -1038,6 +1038,7 @@ def get_position_detail(position_id: int, session: Session = Depends(get_session
             "due_date": position.due_date.isoformat() if position.due_date else None,
             "due_date_source": position.due_date_source or ("assumed" if position.due_date else None),
             "days_overdue": position.days_overdue,
+            "recovery_note": position.recovery_note,
             "payment_pending": position.payment_pending,
             "payment_pending_at": position.payment_pending_at.isoformat() if position.payment_pending_at else None,
             "payment_pending_expected": position.payment_pending_expected.isoformat() if position.payment_pending_expected else None,
@@ -1450,5 +1451,32 @@ def cancel_assegno(position_id: int, session: Session = Depends(get_session)):
         raise
     except Exception as e:
         logger.error(f"Errore annullamento assegno: {e}", exc_info=True)
+        session.rollback()
+        raise
+
+
+class InvoiceNoteBody(BaseModel):
+    note: Optional[str] = None
+
+
+@router.put("/{position_id}/note")
+def update_invoice_note(position_id: int, body: InvoiceNoteBody, session: Session = Depends(get_session)):
+    """Nota dell'operatore SULLA FATTURA (Fase 5): modificabile in riga nella
+    scheda cliente, viaggia nel dossier avvocato. Non tocca stato né cifre."""
+    position = session.query(Invoice).filter(Invoice.id == position_id).first()
+    if not position:
+        raise HTTPException(status_code=404, detail="Position not found")
+    try:
+        old = position.recovery_note
+        position.recovery_note = (body.note or "").strip() or None
+        session.add(ActivityLog(
+            action="invoice_note_edited", entity_type="invoice", entity_id=position.id,
+            details={"invoice_number": position.invoice_number, "customer_id": position.customer_id,
+                     "old": old, "new": position.recovery_note},
+        ))
+        session.commit()
+        return {"id": position.id, "recovery_note": position.recovery_note}
+    except Exception as e:
+        logger.error(f"Errore modifica nota fattura: {e}", exc_info=True)
         session.rollback()
         raise

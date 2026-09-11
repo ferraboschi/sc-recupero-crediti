@@ -13,8 +13,8 @@ from backend.database import (
     get_session, Customer, Invoice, ActivityLog, RecoveryAction,
     CustomerAcceptedName,
 )
-from backend.engine.cases import get_open_case, contact_count, business_day_start, _has_unlinked_contacts
-from backend.engine.action_invoices import per_invoice_sollecito_stats
+from backend.engine.cases import get_open_case, contact_count, business_day_start, _has_unlinked_contacts, SOLLECITO_CHANNELS
+from backend.engine.action_invoices import per_invoice_sollecito_stats, per_invoice_history
 from backend.engine.overdue import is_suspect_bounce
 from backend.engine.stages import build_stage_groups, STAGE_LABELS
 from backend.engine.verify import verify_invoice_customer
@@ -749,7 +749,7 @@ def get_customer_detail(
                 session.query(RecoveryAction.invoice_ids)
                 .filter(
                     RecoveryAction.customer_id == customer_id,
-                    RecoveryAction.channel.in_(("whatsapp_copy", "whatsapp_link")),
+                    RecoveryAction.channel.in_(SOLLECITO_CHANNELS),
                     RecoveryAction.completed_at >= business_day_start(),
                     RecoveryAction.cancelled.isnot(True),
                 ).all()
@@ -757,6 +757,14 @@ def get_customer_detail(
                 today_ids |= set(row[0] or [])
         except Exception:
             session.rollback()
+        # REGISTRO per fattura (Fase 5): storia (solleciti con ordinale, canale,
+        # consegna, note) e ultimo canale/data. Una query, degrado grazioso.
+        try:
+            inv_history = per_invoice_history(session, [inv.id for inv in invoices])
+        except Exception as e:
+            logger.warning(f"per_invoice_history non disponibile: {e}")
+            session.rollback()
+            inv_history = {}
         # Stadio di avanzamento PER FATTURA + gruppi per stadio (Fase 4):
         # definizione unica in engine/stages.py. Degrado grazioso.
         try:
@@ -777,6 +785,10 @@ def get_customer_detail(
                     else None
                 ),
                 "sollecito_today": inv.id in today_ids,
+                "recovery_note": inv.recovery_note,
+                "history": inv_history.get(inv.id, []),
+                "last_channel": next((h["channel"] for h in reversed(inv_history.get(inv.id, [])) if h["channel"]), None),
+                "last_action_at": (inv_history.get(inv.id) or [{}])[-1].get("date"),
                 "stage": stage_info["invoices"].get(inv.id),
                 "stage_label": stage_info.get("labels", {}).get(inv.id) or STAGE_LABELS.get(stage_info["invoices"].get(inv.id)),
                 "amount": float(inv.amount),
@@ -902,7 +914,7 @@ def get_customer_detail(
                 session.query(func.count(RecoveryAction.id))
                 .filter(
                     RecoveryAction.case_id == open_case.id,
-                    RecoveryAction.channel.in_(["whatsapp_copy", "whatsapp_link"]),
+                    RecoveryAction.channel.in_(SOLLECITO_CHANNELS),
                     RecoveryAction.completed_at >= today_start,
                     RecoveryAction.cancelled.isnot(True),
                 )

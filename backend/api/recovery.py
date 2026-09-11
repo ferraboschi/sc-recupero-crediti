@@ -6,6 +6,7 @@ pratica, e alla chiusura (saldo) il ciclo riparte pulito.
 """
 
 import os
+import re
 import logging
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List
@@ -30,7 +31,8 @@ from backend.engine.action_invoices import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-WHATSAPP_CHANNELS = ("whatsapp_copy", "whatsapp_link")
+from backend.engine.cases import SOLLECITO_CHANNELS, CHANNEL_LABELS  # noqa: E402
+WHATSAPP_CHANNELS = SOLLECITO_CHANNELS  # compat: tutti i canali registrabili dalla scheda
 
 
 # --- Pydantic models ---
@@ -265,6 +267,13 @@ def register_sollecito(
         rest = [i for i in cited_ids if i not in today_ids]
         if not rest:
             existing = next(a for a in todays if set(a.invoice_ids or []) & set(already))
+            # Vince l'ULTIMO click: stesso giorno, stesse fatture → un solo
+            # sollecito, il canale registrato è quello dell'ultimo click.
+            if existing.channel != body.channel:
+                existing.channel = body.channel
+                if (existing.notes or "").startswith("Sollecito n."):
+                    existing.notes = re.sub(r" via [^(]+\(", f" via {CHANNEL_LABELS.get(body.channel, body.channel)} (", existing.notes, count=1)
+                session.commit()
             prev_all = per_invoice_sollecito_stats(session, existing.invoice_ids or [])
             n_existing = min((prev_all.get(i, {}).get("count", 1) for i in (existing.invoice_ids or [])), default=1) + inherited
             if _has_unlinked_contacts(session, case):
@@ -304,6 +313,7 @@ def register_sollecito(
         if existing_today:
             merged = sorted(set((existing_today.invoice_ids or []) + cited_ids))
             existing_today.invoice_ids = merged
+            existing_today.channel = body.channel  # vince l'ultimo click
             # Dual-write della tabella di join: le fatture appena aggiunte
             # dal secondo copy odierno ereditano lo stesso sollecito.
             set_action_invoices(session, existing_today.id, merged)
@@ -334,7 +344,7 @@ def register_sollecito(
             RecoveryAction.cancelled.isnot(True),
         ).all()
 
-        channel_label = "Copia Messaggio" if body.channel == "whatsapp_copy" else "link WhatsApp"
+        channel_label = CHANNEL_LABELS.get(body.channel, body.channel)
 
         action = RecoveryAction(
             customer_id=customer.id,
