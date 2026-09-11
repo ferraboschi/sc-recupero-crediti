@@ -11,6 +11,7 @@ const ACTION_LABELS = {
   lawyer: 'Avvocato',
   archive: 'Archivia',
   wait: 'Attendi',
+  reminder: 'Promemoria',
   idle: 'Da Gestire',
   waiting: 'In Attesa',
   note: 'Nota',
@@ -22,6 +23,7 @@ const ACTION_BADGE_COLORS = {
   lawyer: 'badge-disputed',
   archive: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
   wait: 'badge-promised',
+  reminder: 'bg-accent-teal/15 text-accent-teal',
   idle: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
   waiting: 'badge-promised',
 }
@@ -252,6 +254,12 @@ export default function Dashboard() {
           </span>
           {todo.partita_iva && (
             <span className="text-xs text-txt-muted font-mono">{todo.partita_iva}</span>
+          )}
+          {/* Promemoria pre-scadenza: l'oggetto è la fattura in scadenza */}
+          {todo.action_type === 'reminder' && (todo.invoices || []).length > 0 && (
+            <span className="text-xs text-accent-teal block truncate max-w-[320px]">
+              {todo.invoices.map(i => `${i.invoice_number} · ${formatCurrency(i.amount_due)} · scade ${i.due_date ? new Date(i.due_date + 'T00:00:00').toLocaleDateString('it-IT') : '—'}${i.status === 'paid' ? ' · già pagata' : ''}`).join(' | ')}
+            </span>
           )}
         </div>
       </div>

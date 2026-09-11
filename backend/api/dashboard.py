@@ -124,6 +124,27 @@ def search_dashboard(
         raise
 
 
+def _reminder_invoices(session: Session, actions) -> dict:
+    """{action_id: [{invoice_number, amount_due, due_date, status}]} per i
+    promemoria pre-scadenza: una query sola per tutte le fatture citate."""
+    reminders = [a for a in actions if a.action_type == "reminder" and a.invoice_ids]
+    if not reminders:
+        return {}
+    ids = sorted({i for a in reminders for i in a.invoice_ids})
+    rows = session.query(Invoice).filter(Invoice.id.in_(ids)).all()
+    by_id = {
+        inv.id: {
+            "id": inv.id,
+            "invoice_number": inv.invoice_number,
+            "amount_due": float(inv.amount_due or 0),
+            "due_date": inv.due_date.isoformat() if inv.due_date else None,
+            "status": inv.status,
+        }
+        for inv in rows
+    }
+    return {a.id: [by_id[i] for i in a.invoice_ids if i in by_id] for a in reminders}
+
+
 @router.get("/todos")
 def get_todos(session: Session = Depends(get_session)):
     """
@@ -201,6 +222,7 @@ def get_todos(session: Session = Depends(get_session)):
 
         todos = []
         seen_customer_ids = set()
+        reminder_invoices = _reminder_invoices(session, pending_actions)
 
         # Build action-based todos (NO extra queries — use pre-loaded stats)
         for action in pending_actions:
@@ -235,6 +257,9 @@ def get_todos(session: Session = Depends(get_session)):
                 "oldest_due_date": stats["oldest_due_date"],
                 "max_days_overdue": stats["max_days_overdue"],
                 "recovery_status": action.customer.recovery_status,
+                # Promemoria pre-scadenza: l'oggetto è la fattura in scadenza
+                # (numero, importo, data), non lo scaduto del cliente.
+                "invoices": reminder_invoices.get(action.id, []),
             })
 
         # Build idle-customer todos (need first contact)
@@ -345,6 +370,7 @@ def get_calendar(
 
         # Group by date
         by_date = {}
+        reminder_invoices = _reminder_invoices(session, actions)
         for a in actions:
             d = a.scheduled_date.isoformat()
             if d not in by_date:
@@ -362,6 +388,7 @@ def get_calendar(
                 "total_overdue": stats["total"],
                 "completed_at": a.completed_at.isoformat() if a.completed_at else None,
                 "outcome": a.outcome,
+                "invoices": reminder_invoices.get(a.id, []),
             })
 
         # Count overdue actions (scheduled before today, not completed)

@@ -318,12 +318,14 @@ def close_case(session: Session, case: RecoveryCase, reason: str) -> None:
 
     # Annulla le azioni pendenti della pratica E quelle orfane del cliente
     # (azioni registrate prima dell'introduzione delle pratiche).
-    # Le NOTE sono annotazioni, non todo: restano fuori.
+    # Le NOTE sono annotazioni, non todo: restano fuori. I PROMEMORIA
+    # pre-scadenza riguardano fatture NON scadute, non il ciclo di recupero:
+    # la chiusura della pratica (a saldo, archivio, assegno) non li tocca.
     pending = session.query(RecoveryAction).filter(
         RecoveryAction.customer_id == case.customer_id,
         RecoveryAction.completed_at.is_(None),
         RecoveryAction.cancelled.isnot(True),
-        RecoveryAction.action_type != "note",
+        RecoveryAction.action_type.notin_(("note", "reminder")),
         (RecoveryAction.case_id == case.id) | (RecoveryAction.case_id.is_(None)),
     ).all()
     note_by_reason = {
@@ -502,7 +504,7 @@ def update_case_lifecycle(session: Session, allow_close: bool = True) -> Dict[st
     la payment detection non è affidabile e chiudere pratiche (annullando i
     todo) sarebbe distruttivo. Aprire e agganciare resta sempre sicuro.
     """
-    stats = {"opened": 0, "reopened": 0, "closed": 0, "attached": 0, "detached": 0}
+    stats = {"opened": 0, "reopened": 0, "closed": 0, "attached": 0, "detached": 0, "reminders_settled": 0}
 
     # I clienti fusi (merged_into) non hanno più fatture proprie e non devono
     # generare/toccare pratiche: fuori dal ciclo.
@@ -518,6 +520,7 @@ def update_case_lifecycle(session: Session, allow_close: bool = True) -> Dict[st
     archived_ids = _archived_case_ids(session)
 
     for customer in customers:
+        stats["reminders_settled"] += settle_reminders(session, customer)
         try:
             open_case = open_cases.get(customer.id)
             overdue = [inv for inv in customer.invoices if is_overdue_unpaid(inv)]
@@ -730,6 +733,7 @@ def backfill_cases(session: Session) -> Dict[str, Any]:
                 RecoveryAction.customer_id == customer.id,
                 RecoveryAction.completed_at.is_(None),
                 RecoveryAction.cancelled.isnot(True),
+                RecoveryAction.action_type != "reminder",  # fuori dal ciclo
             ).all()
             for action in orphans:
                 action.cancelled = True
@@ -833,6 +837,36 @@ def resplit_status_if_needed() -> Optional[Dict[str, Any]]:
         session.close()
 
 
+def settle_reminders(session: Session, customer: Customer) -> int:
+    """Promemoria pre-scadenza pendenti le cui fatture sono state TUTTE
+    saldate nel frattempo: si chiudono da soli (completati con esito 'paid',
+    nota esplicita), così il todo non resta uno zombie nel cruscotto. Mai
+    cancellati: restano nel registro. Ritorna quanti ne ha chiusi."""
+    try:
+        pending = session.query(RecoveryAction).filter(
+            RecoveryAction.customer_id == customer.id,
+            RecoveryAction.action_type == "reminder",
+            RecoveryAction.completed_at.is_(None),
+            RecoveryAction.cancelled.isnot(True),
+        ).all()
+    except Exception as e:  # colonna/tabella non ancora pronte: mai bloccare il sync
+        logger.warning(f"settle_reminders non disponibile: {e}")
+        return 0
+    if not pending:
+        return 0
+    status_of = {inv.id: inv.status for inv in customer.invoices}
+    settled = 0
+    for a in pending:
+        cited = list(a.invoice_ids or [])
+        if cited and all(status_of.get(i) == "paid" for i in cited):
+            a.completed_at = datetime.utcnow()
+            a.outcome = "paid"
+            note = "chiuso automaticamente: fattura saldata prima della scadenza"
+            a.notes = f"{a.notes} | {note}" if a.notes else note
+            settled += 1
+    return settled
+
+
 def refresh_customer_lifecycle(session: Session, customer: Customer) -> Optional[RecoveryCase]:
     """Lifecycle di UN cliente, stesse regole della passata completa: apre /
     riapre / aggancia se ci sono scadute lavorabili, chiude se non ne restano.
@@ -840,6 +874,7 @@ def refresh_customer_lifecycle(session: Session, customer: Customer) -> Optional
     insoluto) per non aspettare il prossimo sync. Ritorna la pratica aperta.
     """
     open_case = get_open_case(session, customer.id)
+    settle_reminders(session, customer)
     if customer.excluded:
         if open_case:
             close_case(session, open_case, "excluded")

@@ -9,8 +9,12 @@ const ACTION_LABELS = {
   lawyer: 'Avvocato',
   archive: 'Archivia',
   wait: 'Attendi',
+  reminder: 'Promemoria pre-scadenza',
   note: 'Nota',
 }
+
+// Data locale YYYY-MM-DD (toISOString è UTC: alle 00:30 italiane darebbe ieri).
+const toISODateLocal = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 
 // Fattura su cui si può registrare un sollecito (stessa regola del backend,
 // is_overdue_unpaid): scaduta, non pagata, non contestata, non in incasso.
@@ -198,6 +202,11 @@ export default function ClientDetail() {
   const [openHistory, setOpenHistory] = useState(() => new Set())
   const [copiedChannel, setCopiedChannel] = useState(null)
   const [assegnoBar, setAssegnoBar] = useState(null)
+  // Fatture NON scadute: selezione propria, form del promemoria pre-scadenza
+  const [selectedUpcoming, setSelectedUpcoming] = useState(new Set())
+  const [reminderForm, setReminderForm] = useState(null)
+  const [copiedUpcoming, setCopiedUpcoming] = useState(false)
+  const [reminderSaving, setReminderSaving] = useState(false)
   const [invoiceSortBy, setInvoiceSortBy] = useState('due_date')
   const [invoiceSortOrder, setInvoiceSortOrder] = useState('asc')
   const [neighbors, setNeighbors] = useState({ prev_id: null, next_id: null, position: null, total: null })
@@ -252,6 +261,8 @@ export default function ClientDetail() {
       }
       setData(response.data)
       hasDataRef.current = true
+      setSelectedUpcoming(new Set())
+      setReminderForm(null)
       const items = response.data.invoices?.items || []
       const overdueIds = items
         .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && inv.status !== 'disputed' && !inv.in_incasso && !inv.suspect_bounce)
@@ -581,7 +592,7 @@ export default function ClientDetail() {
       const defaults = { first_contact: 7, second_contact: 14, lawyer: 30 }
       const d = new Date()
       d.setDate(d.getDate() + (defaults[actionType] || 7))
-      setScheduledDate(d.toISOString().split('T')[0])
+      setScheduledDate(toISODateLocal(d))
       setShowDatePicker(true)
       return
     }
@@ -755,6 +766,42 @@ export default function ClientDetail() {
     }
   }
   const toggleHistory = (id) => setOpenHistory(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n })
+
+  // PROMEMORIA PRE-SCADENZA (fatture non ancora scadute): un todo che scatta
+  // prima del termine, fuori dalla pratica. Le fatture citate viaggiano con
+  // l'azione (invoice_ids) così la riga mostra il suo promemoria.
+  const toggleUpcoming = (id) => setSelectedUpcoming(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n })
+  const openReminderForm = (invs) => {
+    const firstDue = invs.map(i => i.due_date).filter(Boolean).sort()[0]
+    const d = firstDue ? new Date(firstDue + 'T00:00:00') : new Date()
+    d.setDate(d.getDate() - 3)
+    const today = new Date(); today.setHours(0, 0, 0, 0)
+    const def = d < today ? today : d
+    setReminderForm({ date: toISODateLocal(def), note: '' })
+  }
+  const setReminder = async (invs) => {
+    if (reminderSaving) return
+    setReminderSaving(true)
+    try {
+      await client.post(`/recovery/customers/${customerId}/actions`, {
+        action_type: 'reminder',
+        scheduled_date: reminderForm.date || null,
+        notes: reminderForm.note || null,
+        invoice_ids: invs.map(i => i.id),
+      })
+      await fetchData()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Errore nella creazione del promemoria')
+    } finally {
+      setReminderSaving(false)
+    }
+  }
+  const copyUpcomingData = async (invs) => {
+    const ok = await copyText(buildInvoiceData(invs))
+    if (!ok) { alert('Copia negli appunti non riuscita. Riprova.'); return }
+    setCopiedUpcoming(true)
+    setTimeout(() => setCopiedUpcoming(false), 2000)
+  }
 
   // La sessione JWT dura 24h: se è scaduta, la registrazione del sollecito
   // fallirebbe DOPO l'invio del messaggio. Meglio bloccarsi prima di copiare.
@@ -986,6 +1033,22 @@ export default function ClientDetail() {
   const allUnpaid = data.invoices?.items?.filter(inv => inv.status !== 'paid') || []
   const paidInvoices = data.invoices?.items?.filter(inv => inv.status === 'paid') || []
   const totalPaid = paidInvoices.reduce((sum, inv) => sum + inv.amount, 0)
+  // Fatture NON scadute: da pagare ma ancora in termine (né pagate, né
+  // contestate, né in incasso). Non entrano nei solleciti: si può solo
+  // impostare un promemoria pre-scadenza o copiarne i dati.
+  const todayISO = toISODateLocal(new Date())
+  const upcomingInvoices = (data.invoices?.items || [])
+    .filter(inv => inv.status !== 'paid' && inv.status !== 'disputed' && !inv.in_incasso
+      && (inv.days_overdue || 0) <= 0 && (!inv.due_date || inv.due_date >= todayISO))
+    .sort((a, b) => (a.due_date || '9999-12-31').localeCompare(b.due_date || '9999-12-31'))
+  const daysToDue = (inv) => inv.due_date ? Math.round((new Date(inv.due_date + 'T00:00:00') - new Date(new Date().toDateString())) / 86400000) : null
+  // Promemoria possibile solo se c'è una scadenza e c'è ancora almeno un giorno prima.
+  const canRemind = (inv) => !!inv.due_date && daysToDue(inv) >= 1
+  const remindable = upcomingInvoices.filter(canRemind)
+  const upcomingSelected = upcomingInvoices.filter(i => selectedUpcoming.has(i.id))
+  const firstDueSel = upcomingSelected.map(i => i.due_date).filter(Boolean).sort()[0]
+  const maxReminderDate = firstDueSel ? toISODateLocal(new Date(new Date(firstDueSel + 'T00:00:00').getTime() - 86400000)) : undefined
+  const reminderOf = (invId) => (data.pending_actions || []).find(p => p.action_type === 'reminder' && (p.invoice_ids || []).includes(invId))
 
   // Righe GIALLE del semaforo che l'audit NON conta come problemi (verdict
   // ok ma livello warning: garanzia impossibile, non errore di abbinamento).
@@ -2098,7 +2161,7 @@ export default function ClientDetail() {
                           <div key={h.action_id} className="text-xs text-txt-secondary flex items-center gap-2 flex-wrap">
                             <span className="text-txt-muted w-20">{formatDate(h.date)}</span>
                             <span className="font-medium text-txt-primary">
-                              {h.action_type === 'note' ? 'Nota' : h.action_type === 'lawyer' ? "Consegnata all'avvocato" : `Sollecito n. ${h.n}`}
+                              {h.action_type === 'note' ? 'Nota' : h.action_type === 'lawyer' ? "Consegnata all'avvocato" : h.action_type === 'reminder' ? 'Promemoria pre-scadenza' : `Sollecito n. ${h.n}`}
                             </span>
                             {h.channel && <span className="px-1.5 py-0.5 rounded bg-accent-green/15 text-accent-green text-[10px]">{CHANNEL_LABELS[h.channel] || h.channel}</span>}
                             {h.legacy && <span className="text-[10px] text-txt-muted" title="Azione dello storico registrata sull'intero cliente, attribuita alle fatture già scadute a quella data">(storico)</span>}
@@ -2234,6 +2297,114 @@ export default function ClientDetail() {
         )}
       </div>
 
+      {/* SEZIONE FATTURE NON SCADUTE: da pagare, ancora in termine. Qui non
+          si sollecita: si imposta un PROMEMORIA che scatta prima della
+          scadenza (o si copiano i dati per un avviso di cortesia). */}
+      <div className="sc-card overflow-hidden">
+        <div className="sc-card-header">
+          <h2 className="text-base font-bold text-accent-blue">
+            Fatture non scadute ({upcomingInvoices.length})
+          </h2>
+          <span className="text-xs text-txt-muted">Da pagare, ancora in termine: seleziona → Promemoria per farti avvisare prima della scadenza</span>
+        </div>
+        {upcomingInvoices.length === 0 ? (
+          <p className="px-6 py-4 text-sm text-txt-muted">Nessuna fattura in scadenza.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-dark-surface border-b border-dark-border">
+                <tr>
+                  <th className="px-3 py-3 w-8">
+                    <input type="checkbox" checked={remindable.length > 0 && upcomingSelected.length === remindable.length}
+                      disabled={remindable.length === 0}
+                      onChange={() => setSelectedUpcoming(upcomingSelected.length === remindable.length ? new Set() : new Set(remindable.map(i => i.id)))}
+                      className="rounded border-dark-border bg-dark-bg" />
+                  </th>
+                  <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Fattura</th>
+                  <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Fonte</th>
+                  <th className="px-3 py-3 text-right text-xs font-semibold text-txt-label uppercase tracking-wider">Dovuto</th>
+                  <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Scadenza</th>
+                  <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Tra</th>
+                  <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider" title="Promemoria pre-scadenza impostato su questa fattura (si completa o si sposta dalla Pratica)">Promemoria</th>
+                  <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider">Stato</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-dark-border">
+                {upcomingInvoices.map(inv => {
+                  const rem = reminderOf(inv.id)
+                  const days = daysToDue(inv)
+                  return (
+                    <tr key={inv.id} className={`hover:bg-dark-surface/50 ${selectedUpcoming.has(inv.id) ? 'bg-accent-blue/5' : ''}`}>
+                      <td className="px-3 py-3">
+                        <input type="checkbox" checked={selectedUpcoming.has(inv.id)} disabled={!canRemind(inv)} onChange={() => toggleUpcoming(inv.id)} className="rounded border-dark-border bg-dark-bg disabled:opacity-40"
+                          title={!inv.due_date ? 'Senza scadenza: nessun promemoria possibile' : !canRemind(inv) ? 'Scade oggi: nessun promemoria possibile' : ''} />
+                      </td>
+                      <td className="px-3 py-3 text-sm font-medium text-txt-primary">{inv.invoice_number}</td>
+                      <td className="px-3 py-3 text-sm"><span className="sc-badge text-xs bg-accent-blue/15 text-accent-blue">{inv.source_platform === 'fatturapro' ? 'FPro' : inv.source_platform}</span></td>
+                      <td className="px-3 py-3 text-sm text-right font-medium text-txt-primary">{formatCurrency(inv.amount_due)}</td>
+                      <td className="px-3 py-3 text-sm text-txt-secondary">
+                        {formatDate(inv.due_date)}
+                        {inv.due_date_source && inv.due_date_source !== 'real' && <span className="ml-1 text-[10px] text-txt-muted">stimata</span>}
+                      </td>
+                      <td className="px-3 py-3 text-sm">
+                        {days === null ? <span className="text-txt-muted">—</span> : <span className={days <= 3 ? 'text-accent-amber font-medium' : 'text-txt-secondary'}>{days === 0 ? 'oggi' : `${days} gg`}</span>}
+                      </td>
+                      <td className="px-3 py-3 text-sm">
+                        {rem ? (
+                          <span className="sc-badge text-xs bg-accent-blue/15 text-accent-blue" title={rem.notes || ''}>Promemoria il {formatDate(rem.scheduled_date)}</span>
+                        ) : (
+                          <span className="text-txt-muted">—</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-3 text-sm text-center">
+                        <span className={`${INVOICE_STATUS_COLORS[inv.status] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'} sc-badge text-xs`}>{inv.status === 'open' ? 'Da pagare' : inv.status}</span>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {upcomingSelected.length > 0 && (
+          <div className="p-4 border-t border-dark-border bg-dark-surface/50">
+            <div className="flex items-center justify-between gap-4 flex-wrap">
+              <div className="text-sm text-txt-secondary">
+                {upcomingSelected.length === 1 ? '1 fattura selezionata' : `${upcomingSelected.length} fatture selezionate`} — {formatCurrency(upcomingSelected.reduce((sum, inv) => sum + (inv.amount_due || 0), 0))}
+              </div>
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                <button onClick={() => reminderForm ? setReminderForm(null) : openReminderForm(upcomingSelected)} className="px-4 py-2 bg-accent-blue text-dark-bg rounded-lg text-sm font-bold hover:brightness-110" title="Imposta un promemoria che scatta PRIMA della scadenza delle fatture selezionate">
+                  Promemoria
+                </button>
+                <button onClick={() => copyUpcomingData(upcomingSelected)} className={`sc-btn-secondary text-sm font-bold min-w-[7rem] ${copiedUpcoming ? 'border-accent-green text-accent-green' : ''}`} title="Copia i dati delle fatture selezionate (avviso di cortesia: NON è un sollecito e non viene registrato)">
+                  {copiedUpcoming ? 'Copiato!' : 'Copia dati'}
+                </button>
+              </div>
+            </div>
+            {reminderForm && (
+              <div className="mt-3 flex items-end gap-3 flex-wrap p-3 rounded-lg bg-dark-bg/60 border border-dark-border">
+                <div className="text-xs text-txt-secondary">
+                  Promemoria pre-scadenza — {upcomingSelected.length === 1 ? '1 fattura' : `${upcomingSelected.length} fatture`}{firstDueSel ? `, prima scadenza ${formatDate(firstDueSel)}: l'avviso deve precederla` : ''}
+                </div>
+                <label className="text-xs text-txt-muted">Avvisami il
+                  <input type="date" value={reminderForm.date} min={todayISO} max={maxReminderDate}
+                    onChange={e => setReminderForm({ ...reminderForm, date: e.target.value })}
+                    className="ml-2 px-2 py-1 rounded bg-dark-bg border border-dark-border text-sm text-txt-primary" />
+                </label>
+                <label className="text-xs text-txt-muted flex-1 min-w-[16rem]">Nota
+                  <input type="text" value={reminderForm.note} placeholder="es. chiamare per conferma del bonifico"
+                    onChange={e => setReminderForm({ ...reminderForm, note: e.target.value })}
+                    className="ml-2 w-full max-w-md px-2 py-1 rounded bg-dark-bg border border-dark-border text-sm text-txt-primary" />
+                </label>
+                <button onClick={() => setReminder(upcomingSelected)} disabled={!reminderForm.date || reminderSaving || (maxReminderDate && reminderForm.date > maxReminderDate)} className="sc-btn-primary text-xs disabled:opacity-50">{reminderSaving ? '...' : 'Imposta promemoria'}</button>
+                <button onClick={() => setReminderForm(null)} className="sc-btn-secondary text-xs">Chiudi</button>
+                <p className="w-full text-[11px] text-txt-muted">Il promemoria compare tra le attività del giorno scelto e nella Pratica qui sotto; la fattura NON viene sollecitata e lo stato del cliente non cambia.</p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* SEZIONE FATTURE PAGATE */}
       {paidInvoices.length > 0 && (
         <div className="sc-card overflow-hidden">
@@ -2331,7 +2502,9 @@ export default function ClientDetail() {
                     pianificata per {formatDate(p.scheduled_date)}
                   </span>
                 )}
-                {completingAction === p.id ? (
+                {p.action_type === 'reminder' ? (
+                  <button onClick={() => handleCompleteAction(p.id, 'contacted')} className="text-xs bg-accent-green/10 text-accent-green px-2 py-0.5 rounded border border-accent-green/20 hover:bg-accent-green/20" title="Cliente avvisato: chiude il promemoria">Fatto</button>
+                ) : completingAction === p.id ? (
                   <div className="flex items-center gap-1 flex-wrap">
                     {Object.entries(OUTCOME_LABELS).map(([key, label]) => (
                       <button key={key} onClick={() => handleCompleteAction(p.id, key)} className={`text-xs px-2 py-0.5 rounded border border-dark-border ${OUTCOME_COLORS[key] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'} hover:opacity-80`}>{label}</button>
@@ -2423,7 +2596,7 @@ export default function ClientDetail() {
                     onClick={() => {
                       const dt = new Date()
                       dt.setDate(dt.getDate() + d)
-                      setScheduledDate(dt.toISOString().split('T')[0])
+                      setScheduledDate(toISODateLocal(dt))
                     }}
                     className="px-3 py-2 rounded-lg text-xs font-medium bg-dark-surface text-txt-secondary hover:bg-dark-border transition-colors"
                   >

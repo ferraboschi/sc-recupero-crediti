@@ -342,7 +342,7 @@ def per_invoice_history(session: Session, invoices) -> Dict[int, List[Dict[str, 
             RecoveryActionInvoice.invoice_id.in_(invoice_ids),
             RecoveryAction.cancelled.isnot(True),
             or_(
-                and_(RecoveryAction.action_type.in_(CONTACT_TYPES + ("lawyer",)),
+                and_(RecoveryAction.action_type.in_(CONTACT_TYPES + ("lawyer", "reminder")),
                      RecoveryAction.completed_at.isnot(None)),
                 RecoveryAction.action_type == "note",
             ),

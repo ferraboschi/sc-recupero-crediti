@@ -8,6 +8,7 @@ const ACTION_LABELS = {
   lawyer: 'Avvocato',
   archive: 'Archiviato',
   wait: 'In Attesa',
+  reminder: 'Promemoria pre-scadenza',
   idle: 'Da Gestire',
   waiting: 'In Attesa',
 }
@@ -18,6 +19,7 @@ const STATUS_BADGE = {
   lawyer: 'badge-disputed',
   archived: 'bg-[rgba(148,163,184,0.15)] text-txt-muted',
   waiting: 'badge-promised',
+  reminder: 'bg-accent-teal/15 text-accent-teal',
 }
 
 const OUTCOME_LABELS = {

@@ -50,6 +50,7 @@ ACTION_LABELS = {
     "second_contact": "2° sollecito",
     "lawyer": "Passaggio all'avvocato",
     "wait": "Attesa",
+    "reminder": "Promemoria pre-scadenza",
     "note": "Nota",
     "archive": "Archiviazione",
 }
@@ -96,6 +97,7 @@ def _action_row(a: RecoveryAction, cited_in_group: Optional[int], cited_total: O
         "outcome": a.outcome,
         "notes": a.notes,
         "cancelled": bool(a.cancelled),
+        "invoice_ids": list(a.invoice_ids or []),
         "cited_in_group": cited_in_group,
         "cited_total": cited_total,
         "legacy_all": legacy_all,
