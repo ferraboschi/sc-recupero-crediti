@@ -869,7 +869,8 @@ export default function ClientDetail() {
   // soltanto. Stesso giorno, stesse fatture → un solo sollecito, vince
   // l'ultimo click (canale aggiornato dal backend).
   const registerChannel = async (channel) => {
-    const invs = selectedInvs()
+    // Stesso ordine della tabella (come la vede l'operatore), non quello del server
+    const invs = visibleInvoices.filter(i => selectedInvoices.has(i.id))
     if (invs.length === 0) return
     if (isTokenExpired()) {
       alert('Sessione scaduta: effettua di nuovo il login prima di continuare (il sollecito non verrebbe registrato).')
