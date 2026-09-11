@@ -32,7 +32,7 @@ from backend.database import (
     get_session, Customer, Invoice, RecoveryAction, RecoveryActionInvoice,
 )
 from backend.engine.overdue import overdue_clause, in_incasso_clause
-from backend.engine.cases import get_open_case
+from backend.engine.cases import get_open_case, CHANNEL_LABELS
 from backend.engine.action_invoices import (
     per_invoice_sollecito_stats, per_invoice_actions, set_action_invoices,
     delivered_invoice_ids,
@@ -57,12 +57,6 @@ ACTION_LABELS = {
     "wait": "Attesa",
     "note": "Nota",
     "archive": "Archiviazione",
-}
-CHANNEL_LABELS = {
-    "whatsapp_copy": "WhatsApp (messaggio copiato)",
-    "whatsapp_link": "WhatsApp (link)",
-    "phone": "Telefono",
-    "email": "Email",
 }
 
 

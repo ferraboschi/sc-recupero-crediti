@@ -21,6 +21,7 @@ from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import Session
 
 from backend.database import (
+    RecoveryCase,
     RecoveryAction, RecoveryActionInvoice, Invoice, SyncState,
 )
 from backend.engine.cases import CONTACT_TYPES
@@ -313,13 +314,27 @@ def run_backfill_action_invoices_if_needed() -> Optional[Dict[str, Any]]:
         session.close()
 
 
-def per_invoice_history(session: Session, invoice_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
-    """{invoice_id: [{"n", "action_type", "date", "channel", "notes"}, ...]} in
-    ordine cronologico — il REGISTRO della singola fattura (Fase 5): solleciti
-    (con l'ordinale n. 1, 2, … PER QUELLA fattura), consegna al legale, note che
-    la citano. Una query sola per tutte le fatture chieste."""
-    if not invoice_ids:
+def per_invoice_history(session: Session, invoices) -> Dict[int, List[Dict[str, Any]]]:
+    """{invoice_id: [{"n", "action_type", "date", "channel", "notes", "legacy"}, ...]}
+    in ordine cronologico — il REGISTRO della singola fattura (Fase 5).
+
+    Voci: solleciti (contatti completati) con l'ordinale n. 1, 2, … PER QUELLA
+    fattura, consegne al legale, note che la citano. `invoices` = oggetti
+    Invoice (servono case_id e due_date). Regole, le STESSE di register_sollecito
+    e del rollup, così il numero in riga non contraddice il toast:
+    - un'azione LEGACY (invoice_ids NULL e nessuna riga di join: storico
+      pre-tabella) valeva "tutto il cliente" → attribuita alle fatture della
+      sua pratica GIÀ SCADUTE a quella data (stesso proxy di
+      `delivered_invoice_ids`), marcata legacy=True;
+    - i contatti EREDITATI dalla pratica precedente (case.inherited_contacts)
+      spostano in avanti l'ordinale (il tono non riparte cordiale).
+    Ordine per data effettiva (completed_at, altrimenti created_at: le note non
+    hanno completed_at e NON devono finire in coda). Due query in tutto.
+    """
+    invoices = list(invoices or [])
+    if not invoices:
         return {}
+    invoice_ids = [inv.id for inv in invoices]
     rows = (
         session.query(RecoveryActionInvoice.invoice_id, RecoveryAction)
         .join(RecoveryAction, RecoveryAction.id == RecoveryActionInvoice.action_id)
@@ -332,24 +347,63 @@ def per_invoice_history(session: Session, invoice_ids: List[int]) -> Dict[int, L
                 RecoveryAction.action_type == "note",
             ),
         )
-        .order_by(RecoveryAction.completed_at.asc().nullslast(), RecoveryAction.created_at.asc())
         .all()
     )
-    out: Dict[int, List[Dict[str, Any]]] = {}
-    counters: Dict[int, int] = {}
+    entries: Dict[int, List[tuple]] = {}  # inv_id -> [(when, action, legacy)]
     for inv_id, a in rows:
-        n = None
-        if a.action_type in CONTACT_TYPES:
-            counters[inv_id] = counters.get(inv_id, 0) + 1
-            n = counters[inv_id]
-        when = a.completed_at or a.created_at
-        out.setdefault(inv_id, []).append({
-            "action_id": a.id,
-            "n": n,
-            "action_type": a.action_type,
-            "date": when.isoformat() if when else None,
-            "channel": a.channel,
-            "outcome": a.outcome,
-            "notes": a.notes,
-        })
+        entries.setdefault(inv_id, []).append((a.completed_at or a.created_at, a, False))
+
+    # Rete legacy per pratica: contatti/consegne completati senza fatture
+    # collegate → valgono per le fatture della pratica scadute a quella data.
+    case_ids = sorted({inv.case_id for inv in invoices if inv.case_id})
+    inherited_of: Dict[int, int] = {}
+    if case_ids:
+        for cid, inh in session.query(RecoveryCase.id, RecoveryCase.inherited_contacts).filter(
+            RecoveryCase.id.in_(case_ids)
+        ).all():
+            inherited_of[cid] = int(inh or 0)
+        legacy = (
+            session.query(RecoveryAction)
+            .filter(
+                RecoveryAction.case_id.in_(case_ids),
+                RecoveryAction.action_type.in_(CONTACT_TYPES + ("lawyer",)),
+                RecoveryAction.completed_at.isnot(None),
+                RecoveryAction.cancelled.isnot(True),
+            )
+            .all()
+        )
+        # invoice_ids è JSON: il None Python può essere salvato come 'null'
+        # JSON, non come NULL SQL → il filtro si fa in Python (come
+        # _has_unlinked_contacts). [] esplicito NON è legacy.
+        legacy = [a for a in legacy if a.invoice_ids is None]
+        if legacy:
+            linked = {r[0] for r in session.query(RecoveryActionInvoice.action_id)
+                      .filter(RecoveryActionInvoice.action_id.in_([a.id for a in legacy])).all()}
+            legacy = [a for a in legacy if a.id not in linked]
+        for a in legacy:
+            when = a.completed_at
+            for inv in invoices:
+                if inv.case_id == a.case_id and inv.due_date and inv.due_date < when.date():
+                    entries.setdefault(inv.id, []).append((when, a, True))
+
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    case_of = {inv.id: inv.case_id for inv in invoices}
+    for inv_id, items in entries.items():
+        items.sort(key=lambda t: (t[0] or datetime.min, t[1].id))
+        n = inherited_of.get(case_of.get(inv_id), 0)
+        for when, a, is_legacy in items:
+            ordinal = None
+            if a.action_type in CONTACT_TYPES:
+                n += 1
+                ordinal = n
+            out.setdefault(inv_id, []).append({
+                "action_id": a.id,
+                "n": ordinal,
+                "action_type": a.action_type,
+                "date": when.isoformat() if when else None,
+                "channel": a.channel,
+                "outcome": a.outcome,
+                "notes": a.notes,
+                "legacy": is_legacy,
+            })
     return out

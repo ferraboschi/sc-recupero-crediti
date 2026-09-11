@@ -17,6 +17,7 @@ from backend.engine.cases import get_open_case, contact_count, business_day_star
 from backend.engine.action_invoices import per_invoice_sollecito_stats, per_invoice_history
 from backend.engine.overdue import is_suspect_bounce
 from backend.engine.stages import build_stage_groups, STAGE_LABELS
+
 from backend.engine.verify import verify_invoice_customer
 from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
 from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
@@ -25,6 +26,12 @@ from backend.engine.piva import validate_piva
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _last_action(history):
+    """Ultima voce della storia che sia un'azione compiuta (sollecito o
+    consegna), non una nota."""
+    return next((h for h in reversed(history) if h.get("action_type") != "note"), {})
 
 
 def _accepted_name_dict(an: CustomerAcceptedName) -> dict:
@@ -760,7 +767,7 @@ def get_customer_detail(
         # REGISTRO per fattura (Fase 5): storia (solleciti con ordinale, canale,
         # consegna, note) e ultimo canale/data. Una query, degrado grazioso.
         try:
-            inv_history = per_invoice_history(session, [inv.id for inv in invoices])
+            inv_history = per_invoice_history(session, invoices)
         except Exception as e:
             logger.warning(f"per_invoice_history non disponibile: {e}")
             session.rollback()
@@ -787,8 +794,11 @@ def get_customer_detail(
                 "sollecito_today": inv.id in today_ids,
                 "recovery_note": inv.recovery_note,
                 "history": inv_history.get(inv.id, []),
-                "last_channel": next((h["channel"] for h in reversed(inv_history.get(inv.id, [])) if h["channel"]), None),
-                "last_action_at": (inv_history.get(inv.id) or [{}])[-1].get("date"),
+                # "Ultima azione" della riga = ultimo SOLLECITO o consegna al
+                # legale (le note non sono azioni compiute): data e canale dalla
+                # STESSA voce, mai da due voci diverse.
+                "last_channel": _last_action(inv_history.get(inv.id, [])).get("channel"),
+                "last_action_at": _last_action(inv_history.get(inv.id, [])).get("date"),
                 "stage": stage_info["invoices"].get(inv.id),
                 "stage_label": stage_info.get("labels", {}).get(inv.id) or STAGE_LABELS.get(stage_info["invoices"].get(inv.id)),
                 "amount": float(inv.amount),

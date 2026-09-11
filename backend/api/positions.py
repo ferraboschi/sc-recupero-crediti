@@ -1459,16 +1459,22 @@ class InvoiceNoteBody(BaseModel):
     note: Optional[str] = None
 
 
+INVOICE_NOTE_MAX = 2000
+
+
 @router.put("/{position_id}/note")
 def update_invoice_note(position_id: int, body: InvoiceNoteBody, session: Session = Depends(get_session)):
     """Nota dell'operatore SULLA FATTURA (Fase 5): modificabile in riga nella
     scheda cliente, viaggia nel dossier avvocato. Non tocca stato né cifre."""
+    note = (body.note or "").strip() or None
+    if note and len(note) > INVOICE_NOTE_MAX:
+        raise HTTPException(status_code=400, detail=f"Nota troppo lunga (max {INVOICE_NOTE_MAX} caratteri)")
     position = session.query(Invoice).filter(Invoice.id == position_id).first()
     if not position:
         raise HTTPException(status_code=404, detail="Position not found")
     try:
         old = position.recovery_note
-        position.recovery_note = (body.note or "").strip() or None
+        position.recovery_note = note
         session.add(ActivityLog(
             action="invoice_note_edited", entity_type="invoice", entity_id=position.id,
             details={"invoice_number": position.invoice_number, "customer_id": position.customer_id,
