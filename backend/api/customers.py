@@ -31,7 +31,7 @@ router = APIRouter()
 def _last_action(history):
     """Ultima voce della storia che sia un'azione compiuta (sollecito o
     consegna), non una nota."""
-    return next((h for h in reversed(history) if h.get("action_type") != "note"), {})
+    return next((h for h in reversed(history) if h.get("action_type") not in ("note", "reminder")), {})
 
 
 def _accepted_name_dict(an: CustomerAcceptedName) -> dict:

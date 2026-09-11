@@ -586,6 +586,8 @@ def create_action(
         scheduled = date.fromisoformat(action.scheduled_date) if action.scheduled_date else None
 
         if action.action_type == "reminder":
+            if customer.excluded:
+                raise HTTPException(status_code=409, detail="Cliente escluso dal recupero crediti: i promemoria non compaiono tra le attività")
             if not action.invoice_ids:
                 raise HTTPException(status_code=400, detail="Il promemoria deve citare almeno una fattura")
             own_by_id = {inv.id: inv for inv in customer.invoices}
@@ -593,9 +595,12 @@ def create_action(
             if unknown:
                 raise HTTPException(status_code=400, detail=f"Fatture non appartenenti al cliente {customer.id}: {unknown}")
             targets = [own_by_id[i] for i in sorted(set(action.invoice_ids))]
+            no_due = [inv.invoice_number for inv in targets if not inv.due_date]
+            if no_due:
+                raise HTTPException(status_code=400, detail=f"Fatture senza scadenza: nessun promemoria possibile {no_due}")
             bad = [
                 inv.invoice_number for inv in targets
-                if inv.status in ("paid", "disputed") or (inv.days_overdue or 0) > 0 or not inv.due_date
+                if inv.status in ("paid", "disputed") or (inv.days_overdue or 0) > 0 or inv.due_date <= today
             ]
             if bad:
                 raise HTTPException(
@@ -937,6 +942,29 @@ def reschedule_action(
         from datetime import date as date_type
         parsed_date = date_type.fromisoformat(new_date)
         old_date = action.scheduled_date
+
+        if action.action_type == "reminder":
+            # Il promemoria resta nella finestra [oggi, scadenza) delle sue
+            # fatture e NON guida la prossima azione della pratica.
+            today = date.today()
+            if parsed_date < today:
+                raise HTTPException(status_code=400, detail="La data del promemoria non può essere nel passato")
+            cited = {inv.id: inv for inv in customer.invoices if inv.id in set(action.invoice_ids or [])}
+            dues = [inv.due_date for inv in cited.values() if inv.due_date and inv.status != "paid"]
+            if dues and parsed_date >= min(dues):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Il promemoria deve precedere la scadenza ({min(dues).strftime('%d/%m/%Y')})",
+                )
+            action.scheduled_date = parsed_date
+            session.commit()
+            return {
+                "status": "ok",
+                "action_id": action_id,
+                "old_date": old_date.isoformat() if old_date else None,
+                "new_date": parsed_date.isoformat(),
+                "customer_next_action_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
+            }
 
         # Update the action's scheduled date
         action.scheduled_date = parsed_date

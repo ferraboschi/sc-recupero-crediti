@@ -84,7 +84,76 @@ def test_reminder_completed_enters_invoice_history(test_client, test_db_session,
     det = test_client.get(f"/api/customers/{cust.id}").json()
     inv = next(i for i in det["invoices"]["items"] if i["id"] == up.id)
     assert [h["action_type"] for h in inv["history"]] == ["reminder"]
-    assert inv["history"][0]["n"] is None and inv["last_action_at"] is not None
+    # nel registro sì, ma NON è l'"ultima azione" di recupero della riga
+    assert inv["history"][0]["n"] is None and inv["last_action_at"] is None
     assert not [p for p in det["pending_actions"] if p["action_type"] == "reminder"]
     test_db_session.refresh(cust)
     assert cust.recovery_status == "idle"
+
+
+# ── Trovati dalla review avversariale ───────────────────────────────────────
+
+def test_reminder_survives_case_close(test_client, test_db_session, cli):
+    """Il promemoria vive fuori dalla pratica: la chiusura a saldo (sync o
+    archivio) non lo annulla."""
+    from backend.engine.cases import ensure_open_case, update_case_lifecycle
+    cust, up, over = cli
+    ensure_open_case(test_db_session, cust); test_db_session.commit()
+    r = _post(test_client, cust.id, {"action_type": "reminder", "invoice_ids": [up.id]})
+    aid = r.json()["id"]
+    over.status = "paid"; over.amount_due = 0; over.days_overdue = 0
+    test_db_session.commit()
+    stats = update_case_lifecycle(test_db_session)
+    assert stats["closed"] == 1
+    act = test_db_session.query(RecoveryAction).get(aid)
+    assert act.cancelled is not True and act.completed_at is None
+    det = test_client.get(f"/api/customers/{cust.id}").json()
+    assert [p["action_type"] for p in det["pending_actions"]] == ["reminder"]
+
+
+def test_reminder_auto_settles_when_invoice_paid(test_client, test_db_session, cli):
+    """Fattura saldata prima della scadenza → il promemoria si chiude da solo
+    (completato, esito 'paid', nota), non resta uno zombie tra i todo."""
+    from backend.engine.cases import update_case_lifecycle
+    cust, up, over = cli
+    aid = _post(test_client, cust.id, {"action_type": "reminder", "invoice_ids": [up.id]}).json()["id"]
+    up.status = "paid"; up.amount_due = 0
+    test_db_session.commit()
+    stats = update_case_lifecycle(test_db_session)
+    assert stats["reminders_settled"] == 1
+    act = test_db_session.query(RecoveryAction).get(aid)
+    assert act.completed_at is not None and act.outcome == "paid" and "saldata" in act.notes
+    todos = test_client.get("/api/dashboard/todos").json()
+    flat = [t for group in todos.values() if isinstance(group, list) for t in group]
+    assert not [t for t in flat if t.get("action_type") == "reminder"]
+
+
+def test_reminder_reschedule_guarded_and_isolated(test_client, test_db_session, cli):
+    """Spostare il promemoria non tocca next_action_date del cliente e resta
+    nella finestra [oggi, scadenza)."""
+    cust, up, over = cli
+    today = date.today()
+    cust.next_action_date = today + timedelta(days=30); cust.next_action_type = "second_contact"
+    test_db_session.commit()
+    aid = _post(test_client, cust.id, {"action_type": "reminder", "invoice_ids": [up.id]}).json()["id"]
+    url = f"/api/recovery/customers/{cust.id}/actions/{aid}/reschedule"
+    r = test_client.patch(url, params={"new_date": (today + timedelta(days=2)).isoformat()})
+    assert r.status_code == 200, r.text
+    test_db_session.refresh(cust)
+    assert cust.next_action_date == today + timedelta(days=30)
+    assert test_client.patch(url, params={"new_date": (today + timedelta(days=10)).isoformat()}).status_code == 400
+    assert test_client.patch(url, params={"new_date": (today - timedelta(days=1)).isoformat()}).status_code == 400
+
+
+def test_reminder_excluded_customer_and_todo_payload(test_client, test_db_session, cli):
+    cust, up, over = cli
+    r = _post(test_client, cust.id, {"action_type": "reminder", "invoice_ids": [up.id],
+                                     "scheduled_date": (date.today() + timedelta(days=3)).isoformat()})
+    assert r.status_code == 200
+    todos = test_client.get("/api/dashboard/todos").json()
+    flat = [t for group in todos.values() if isinstance(group, list) for t in group]
+    t = next(t for t in flat if t.get("action_type") == "reminder")
+    assert t["invoices"][0]["invoice_number"] == "FT-UP" and t["invoices"][0]["amount_due"] == 454.27
+    cust.excluded = True; test_db_session.commit()
+    r = _post(test_client, cust.id, {"action_type": "reminder", "invoice_ids": [up.id]})
+    assert r.status_code == 409
