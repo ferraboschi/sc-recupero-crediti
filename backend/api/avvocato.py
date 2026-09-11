@@ -32,7 +32,7 @@ from backend.database import (
     get_session, Customer, Invoice, RecoveryAction, RecoveryActionInvoice,
 )
 from backend.engine.overdue import overdue_clause, in_incasso_clause
-from backend.engine.cases import get_open_case
+from backend.engine.cases import get_open_case, CHANNEL_LABELS
 from backend.engine.action_invoices import (
     per_invoice_sollecito_stats, per_invoice_actions, set_action_invoices,
     delivered_invoice_ids,
@@ -57,12 +57,6 @@ ACTION_LABELS = {
     "wait": "Attesa",
     "note": "Nota",
     "archive": "Archiviazione",
-}
-CHANNEL_LABELS = {
-    "whatsapp_copy": "WhatsApp (messaggio copiato)",
-    "whatsapp_link": "WhatsApp (link)",
-    "phone": "Telefono",
-    "email": "Email",
 }
 
 
@@ -363,6 +357,9 @@ def _build_dossier_pdf(customer, invoices, actions, per_invoice=None, context=No
                 head += f" (ultimo {last_s})"
             pdf.set_font("Helvetica", "B", 9)
             pdf.multi_cell(0, 6, _lat1(head), new_x="LMARGIN", new_y="NEXT")
+            if getattr(inv, "recovery_note", None):
+                pdf.set_font("Helvetica", "I", 8)
+                pdf.multi_cell(0, 5, _lat1(f"   Nota: {inv.recovery_note}"), new_x="LMARGIN", new_y="NEXT")
             pdf.set_font("Helvetica", "", 8)
             for a in info.get("actions", []):
                 when = a.completed_at or a.created_at or a.scheduled_date

@@ -173,6 +173,9 @@ class Invoice(Base):
     # registra un nuovo assegno o la fattura viene pagata.
     bounced_at = Column(DateTime, nullable=True)
     bounced_note = Column(Text, nullable=True)
+    # Nota dell'operatore SULLA FATTURA (registro per fattura, Fase 5):
+    # modificabile in riga, viaggia nel dossier avvocato.
+    recovery_note = Column(Text, nullable=True)
     # Data di pagamento VERA: scritta nel momento in cui il sync marca la
     # fattura 'paid', azzerata se la fattura riapre. Da non confondere con
     # updated_at (onupdate: cambia a ogni modifica di riga, non è una data
@@ -508,6 +511,7 @@ def _run_migrations(engine):
         "ALTER TABLE invoices ADD COLUMN payment_pending_amount DOUBLE PRECISION",
         "ALTER TABLE invoices ADD COLUMN bounced_at TIMESTAMP",
         "ALTER TABLE invoices ADD COLUMN bounced_note TEXT",
+        "ALTER TABLE invoices ADD COLUMN recovery_note TEXT",
         "ALTER TABLE overdue_snapshots ADD COLUMN in_incasso DOUBLE PRECISION DEFAULT 0",
         "ALTER TABLE overdue_snapshots ADD COLUMN in_incasso_fatture INTEGER DEFAULT 0",
         "UPDATE overdue_snapshots SET in_incasso = 0 WHERE in_incasso IS NULL",

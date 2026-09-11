@@ -6,6 +6,7 @@ pratica, e alla chiusura (saldo) il ciclo riparte pulito.
 """
 
 import os
+import re
 import logging
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List
@@ -30,7 +31,17 @@ from backend.engine.action_invoices import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-WHATSAPP_CHANNELS = ("whatsapp_copy", "whatsapp_link")
+from backend.engine.cases import SOLLECITO_CHANNELS, CHANNEL_LABELS  # noqa: E402
+WHATSAPP_CHANNELS = SOLLECITO_CHANNELS  # nome storico: oggi = tutti i canali di sollecito
+_AUTO_NOTE_RE = re.compile(r"Sollecito n\. \d+ via [^()]+ \(\d+ fattur\w*\)")
+
+
+def _relabel_auto_note(notes, channel):
+    """Aggiorna il canale nella nota SOLO se è ancora quella generata da noi;
+    una nota modificata dall'operatore resta intatta."""
+    if notes and _AUTO_NOTE_RE.fullmatch(notes.strip()):
+        return re.sub(r" via [^()]+ \(", f" via {CHANNEL_LABELS.get(channel, channel)} (", notes, count=1)
+    return notes  # compat: tutti i canali registrabili dalla scheda
 
 
 # --- Pydantic models ---
@@ -160,7 +171,7 @@ def register_sollecito(
     body: SollecitoCreate,
     session: Session = Depends(get_session),
 ):
-    """Registra un sollecito inviato via WhatsApp (Copia Messaggio).
+    """Registra un sollecito fatto dalla scheda (Email / WhatsApp / Telefono).
 
     - Crea un'azione di contatto COMPLETATA ora, agganciata alla pratica
       aperta (creata/riaperta se serve), con canale e fatture citate.
@@ -193,7 +204,11 @@ def register_sollecito(
             return {
                 "registered": False,
                 "reason": "no_overdue",
-                "message": "Nessuna fattura scaduta: messaggio copiato ma sollecito non registrato",
+                "message": (
+                    "Nessuna fattura scaduta: chiamata non registrata come sollecito"
+                    if body.channel == "phone"
+                    else "Nessuna fattura scaduta: dati copiati ma sollecito non registrato"
+                ),
             }
 
         # Le fatture citate devono essere DI questo cliente: un id estraneo
@@ -264,7 +279,26 @@ def register_sollecito(
         already = [i for i in cited_ids if i in today_ids]
         rest = [i for i in cited_ids if i not in today_ids]
         if not rest:
-            existing = next(a for a in todays if set(a.invoice_ids or []) & set(already))
+            touched = [a for a in todays if set(a.invoice_ids or []) & set(already)]
+            existing = touched[0]
+            # Vince l'ULTIMO click: stesso giorno, stesse fatture → un solo
+            # sollecito, il canale registrato è quello dell'ultimo click. Vale
+            # per OGNI azione odierna che cita quelle fatture (due stadi nello
+            # stesso giorno = due azioni, entrambe aggiornate). Il canale
+            # precedente resta nell'audit (mai buttare dati); la nota si
+            # riscrive SOLO se è ancora quella generata automaticamente — una
+            # nota scritta a mano non si tocca (il canale è un campo a sé).
+            changed = [a for a in touched if a.channel != body.channel]
+            for a in changed:
+                session.add(ActivityLog(
+                    action="sollecito_channel_changed", entity_type="recovery_action", entity_id=a.id,
+                    details={"customer": customer.ragione_sociale, "case_id": case.id,
+                             "from": a.channel, "to": body.channel, "invoice_ids": a.invoice_ids},
+                ))
+                a.channel = body.channel
+                a.notes = _relabel_auto_note(a.notes, body.channel)
+            if changed:
+                session.commit()
             prev_all = per_invoice_sollecito_stats(session, existing.invoice_ids or [])
             n_existing = min((prev_all.get(i, {}).get("count", 1) for i in (existing.invoice_ids or [])), default=1) + inherited
             if _has_unlinked_contacts(session, case):
@@ -304,6 +338,8 @@ def register_sollecito(
         if existing_today:
             merged = sorted(set((existing_today.invoice_ids or []) + cited_ids))
             existing_today.invoice_ids = merged
+            channel_from = existing_today.channel
+            existing_today.channel = body.channel  # vince l'ultimo click
             # Dual-write della tabella di join: le fatture appena aggiunte
             # dal secondo copy odierno ereditano lo stesso sollecito.
             set_action_invoices(session, existing_today.id, merged)
@@ -312,7 +348,8 @@ def register_sollecito(
             session.add(ActivityLog(
                 action="sollecito_merge", entity_type="recovery_action", entity_id=existing_today.id,
                 details={"customer": customer.ragione_sociale, "case_id": case.id,
-                         "added_invoice_ids": cited_ids, "sollecito_n": n},
+                         "added_invoice_ids": cited_ids, "sollecito_n": n,
+                         "channel_from": channel_from, "channel_to": body.channel},
             ))
             session.commit()
             return {
@@ -334,7 +371,7 @@ def register_sollecito(
             RecoveryAction.cancelled.isnot(True),
         ).all()
 
-        channel_label = "Copia Messaggio" if body.channel == "whatsapp_copy" else "link WhatsApp"
+        channel_label = CHANNEL_LABELS.get(body.channel, body.channel)
 
         action = RecoveryAction(
             customer_id=customer.id,
@@ -580,7 +617,7 @@ def create_action(
             if sollecito_today:
                 raise HTTPException(
                     status_code=409,
-                    detail="Sollecito già registrato oggi via WhatsApp (Copia Messaggio)",
+                    detail="Sollecito già registrato oggi dalla scheda (Email / WhatsApp / Telefono)",
                 )
 
         # Create the action record

@@ -67,6 +67,15 @@ def business_day_start(now_utc: Optional[datetime] = None) -> datetime:
 # (contano per numerazione e tono). lawyer/wait/archive/note non lo sono.
 CONTACT_TYPES = ("first_contact", "second_contact")
 
+# Canali con cui l'operatore registra un sollecito dalla scheda (Fase 5):
+# WhatsApp ed Email COPIANO i dati delle fatture, Telefono registra soltanto.
+# Il canale è memoria ("con questo cliente ho usato…"), non cambia numerazione.
+SOLLECITO_CHANNELS = ("whatsapp_copy", "whatsapp_link", "email_copy", "phone")
+CHANNEL_LABELS = {
+    "whatsapp_copy": "WhatsApp", "whatsapp_link": "WhatsApp",
+    "email_copy": "Email", "phone": "Telefono", "email": "Email",
+}
+
 # Giorni entro cui una pratica chiusa 'paid' viene riaperta se una sua
 # fattura torna scaduta (protegge dal flapping paid→open dello scraper).
 REOPEN_PAID_WINDOW_DAYS = 30

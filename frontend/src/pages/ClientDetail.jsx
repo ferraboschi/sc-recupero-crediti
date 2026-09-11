@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import client from '../api/client'
-import AzioniPerGruppo, { StageBadge } from '../components/AzioniPerGruppo'
+import StageBadge, { CHANNEL_LABELS } from '../components/StageBadge'
 
 const ACTION_LABELS = {
   first_contact: 'I Contatto',
@@ -12,13 +12,9 @@ const ACTION_LABELS = {
   note: 'Nota',
 }
 
-const ACTION_COLORS = {
-  first_contact: 'bg-accent-blue hover:brightness-110',
-  second_contact: 'bg-accent-amber hover:brightness-110',
-  lawyer: 'bg-accent-red hover:brightness-110',
-  archive: 'bg-slate-500 hover:brightness-110',
-  wait: 'bg-accent-purple hover:brightness-110',
-}
+// Fattura su cui si può registrare un sollecito (stessa regola del backend,
+// is_overdue_unpaid): scaduta, non pagata, non contestata, non in incasso.
+const isSollecitabile = (i) => i.status !== 'paid' && i.status !== 'disputed' && (i.days_overdue || 0) > 0 && !i.in_incasso
 
 const STATUS_LABELS = {
   idle: 'Da Gestire',
@@ -158,6 +154,32 @@ function VerifyDetail({ v }) {
   )
 }
 
+// Nota SULLA FATTURA, modificabile in riga (registro per fattura).
+function InvoiceNoteCell({ inv, onSave }) {
+  const [editing, setEditing] = useState(false)
+  const [value, setValue] = useState(inv.recovery_note || '')
+  const [busy, setBusy] = useState(false)
+  if (editing) {
+    return (
+      <div className="flex flex-col gap-1 w-48">
+        <textarea value={value} onChange={e => setValue(e.target.value)} rows={3} autoFocus maxLength={2000}
+          className="w-full text-xs px-2 py-1 rounded bg-dark-bg border border-dark-border text-txt-primary"
+          placeholder="Nota su questa fattura…" />
+        <div className="flex gap-1">
+          <button disabled={busy} onClick={async () => { setBusy(true); try { await onSave(inv.id, value); setEditing(false) } catch { /* errore già mostrato: l'editor resta aperto col testo */ } finally { setBusy(false) } }} className="sc-btn-primary text-[11px] px-2 py-1">Salva</button>
+          <button onClick={() => { setEditing(false); setValue(inv.recovery_note || '') }} className="sc-btn-secondary text-[11px] px-2 py-1">Annulla</button>
+        </div>
+      </div>
+    )
+  }
+  return (
+    <p className={`text-xs cursor-pointer hover:underline w-48 whitespace-pre-wrap ${inv.recovery_note ? 'text-txt-secondary' : 'text-txt-muted italic'}`}
+       onClick={() => setEditing(true)} title="Clicca per scrivere o modificare la nota di questa fattura">
+      {inv.recovery_note || 'aggiungi nota…'}
+    </p>
+  )
+}
+
 export default function ClientDetail() {
   const { customerId } = useParams()
   const navigate = useNavigate()
@@ -170,18 +192,19 @@ export default function ClientDetail() {
   const [pdfLoading, setPdfLoading] = useState(false)
   const [selectedInvoices, setSelectedInvoices] = useState(new Set())
   const [phoneEdit, setPhoneEdit] = useState(null)
-  const [updatingInvoice, setUpdatingInvoice] = useState(null)
   const [showAllInvoices, setShowAllInvoices] = useState(false)
   const [openVerify, setOpenVerify] = useState(() => new Set())
+  // Registro per fattura: storia apribile per riga; canale appena copiato; form assegno nella barra
+  const [openHistory, setOpenHistory] = useState(() => new Set())
+  const [copiedChannel, setCopiedChannel] = useState(null)
+  const [assegnoBar, setAssegnoBar] = useState(null)
   const [invoiceSortBy, setInvoiceSortBy] = useState('due_date')
   const [invoiceSortOrder, setInvoiceSortOrder] = useState('asc')
   const [neighbors, setNeighbors] = useState({ prev_id: null, next_id: null, position: null, total: null })
   const [completingAction, setCompletingAction] = useState(null)
-  const [selectedOutcome, setSelectedOutcome] = useState('')
   const [editingDateActionId, setEditingDateActionId] = useState(null)
   const [editingDateValue, setEditingDateValue] = useState('')
   const [promemoria, setPromemoria] = useState(false)
-  const [selectedWhatsAppPhone, setSelectedWhatsAppPhone] = useState(null)
   const [showDatePicker, setShowDatePicker] = useState(false)
   const [pendingActionType, setPendingActionType] = useState(null)
   const [scheduledDate, setScheduledDate] = useState('')
@@ -212,9 +235,14 @@ export default function ClientDetail() {
   const [renamePreview, setRenamePreview] = useState(null)
   const [renameLoadingId, setRenameLoadingId] = useState(null)
 
+  // Spinner SOLO al primo caricamento della scheda: rifare fetch dopo
+  // un'azione in riga (nota, sollecito) non deve smontare la pagina e
+  // riportare in cima (layout shift vietato).
+  const hasDataRef = useRef(false)
+  useEffect(() => { hasDataRef.current = false }, [customerId])
   const fetchData = useCallback(async () => {
     try {
-      setLoading(true)
+      if (!hasDataRef.current) setLoading(true)
       const response = await client.get(`/customers/${customerId}`)
       // Scheda fusa in un'altra (duplicato deduplicato): reindirizza alla
       // sopravvissuta invece di mostrare un profilo vuoto (link/bookmark vecchi).
@@ -223,6 +251,7 @@ export default function ClientDetail() {
         return
       }
       setData(response.data)
+      hasDataRef.current = true
       const items = response.data.invoices?.items || []
       const overdueIds = items
         .filter(inv => inv.days_overdue > 0 && inv.status !== 'paid' && inv.status !== 'disputed' && !inv.in_incasso && !inv.suspect_bounce)
@@ -586,7 +615,6 @@ export default function ClientDetail() {
         params: { outcome: outcome || undefined },
       })
       setCompletingAction(null)
-      setSelectedOutcome('')
       await fetchData()
     } catch (err) {
       console.error('Error completing action:', err)
@@ -698,62 +726,35 @@ export default function ClientDetail() {
     setSelectedInvoices(new Set(overdueIds))
   }
 
-  // Il SOGGETTO è la FATTURA: il messaggio si costruisce per un GRUPPO di
-  // fatture allo stesso stadio (sezione "Azioni di recupero"), con il tono
-  // del gruppo: 'first' = cordiale (mai sollecitate), 'second' = perentorio.
-  // Le righe dei gruppi sono "magre": il messaggio (scadenza reale, ordine
-  // Shopify) e le azioni assegno vogliono l'oggetto fattura COMPLETO.
-  const fullInvoice = (i) => (data?.invoices?.items || []).find(x => x.id === i.id) || i
-  const buildWhatsAppMessage = (groupInvoices, tone) => {
-    const selected = (groupInvoices || []).map(fullInvoice)
+  // Il SOGGETTO è la FATTURA. Nessun messaggio confezionato: Email / WhatsApp
+  // copiano SOLO i dati tecnici delle fatture selezionate (numero, emissione,
+  // scadenza, importo, totale, coordinate) — il testo lo scrive l'operatore.
+  // Il click registra il CANALE sulle fatture (memoria di come si è sollecitato).
+  const buildInvoiceData = (invs) => {
+    const selected = invs || []
     if (!data || selected.length === 0) return ''
-    const totalSelected = selected.reduce((sum, inv) => sum + inv.amount_due, 0)
-    const isSecondContact = tone === 'second'
-
-    let msg = ''
-
-    if (isSecondContact) {
-      // Secondo sollecito — tono perentorio
-      msg += `Spett.le ${data.ragione_sociale},\n\n`
-      msg += `nonostante il nostro precedente sollecito, risultano ancora non saldate le seguenti fatture:\n\n`
-    } else {
-      // Primo contatto — tono cordiale
-      msg += `Gentile ${data.ragione_sociale},\n\n`
-      msg += `le scriviamo per ricordarle che risultano in sospeso le seguenti fatture:\n\n`
-    }
-
-    selected.forEach(inv => {
+    const eur = (v) => new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(v || 0)
+    const dd = (v) => v ? new Date(v + 'T00:00:00').toLocaleDateString('it-IT') : '—'
+    const lines = selected.map(inv => {
       const orderRef = inv.shopify_order_number ? ` [Ordine ${inv.shopify_order_number}]` : ''
-      const importo = new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(inv.amount_due)
-      // Scadenza citata SOLO se reale: una scadenza stimata (emissione+30)
-      // asserita al cliente come vera è già stata fonte di contestazioni.
-      let dateRef = ''
-      if (inv.due_date && inv.due_date_source === 'real') {
-        dateRef = ` (scad. ${new Date(inv.due_date + 'T00:00:00').toLocaleDateString('it-IT')})`
-      } else if (inv.issue_date) {
-        dateRef = ` (del ${new Date(inv.issue_date + 'T00:00:00').toLocaleDateString('it-IT')})`
-      }
-      msg += `- Fatt. ${inv.invoice_number}${orderRef}: ${importo}${dateRef}\n`
+      // La scadenza si cita SOLO se reale: una stimata scritta al cliente
+      // come vera è già stata fonte di contestazioni (regola di sempre).
+      const scad = inv.due_date_source === 'real' && inv.due_date ? ` — scadenza ${dd(inv.due_date)}` : ''
+      return `Fattura ${inv.invoice_number}${orderRef} — emessa il ${dd(inv.issue_date)}${scad} — importo ${eur(inv.amount_due)}`
     })
-
-    msg += `\nTotale: ${new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(totalSelected)}\n\n`
-
-    if (isSecondContact) {
-      msg += `Vi informiamo che in assenza di pagamento entro 7 giorni, la pratica verrà automaticamente trasmessa al nostro studio legale per il recupero del credito, con aggravio di spese legali e interessi di mora a Vostro carico.\n\n`
-      msg += `IBAN: IT44N0200801671000105175151\nIntestatario: Sake Company srl\n\n`
-      msg += `Sake Company — Ufficio Amministrativo`
-    } else {
-      msg += `Coordinate bancarie:\nIBAN: IT44N0200801671000105175151\nIntestatario: Sake Company srl\nCausale: Saldo fatture ${data.ragione_sociale}\n\n`
-      msg += `La preghiamo di provvedere al saldo o contattarci per chiarimenti.\n\nGrazie,\nSake Company`
+    const total = selected.reduce((sum, inv) => sum + (inv.amount_due || 0), 0)
+    return `${lines.join('\n')}\nTotale: ${eur(total)}\nIBAN: IT44N0200801671000105175151 — Intestatario: Sake Company srl`
+  }
+  const updateInvoiceNote = async (invoiceId, note) => {
+    try {
+      await client.put(`/positions/${invoiceId}/note`, { note })
+      await fetchData()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Errore nel salvataggio della nota')
+      throw err
     }
-
-    return msg
   }
-
-  const getWhatsAppNumber = () => {
-    const raw = selectedWhatsAppPhone || data?.phone || ''
-    return raw.replace(/[^+\d]/g, '')
-  }
+  const toggleHistory = (id) => setOpenHistory(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n })
 
   // La sessione JWT dura 24h: se è scaduta, la registrazione del sollecito
   // fallirebbe DOPO l'invio del messaggio. Meglio bloccarsi prima di copiare.
@@ -764,8 +765,11 @@ export default function ClientDetail() {
   }
 
   const registerSollecito = async (channel, explicitIds = null) => {
-    // Cliente escluso: il copy resta possibile ma non è un sollecito
-    if (data?.excluded) return
+    // Cliente escluso: il copy resta possibile ma non è un sollecito — detto.
+    if (data?.excluded) {
+      setSollecitoToast({ registered: false, channel, message: 'Cliente escluso dal recupero crediti: nessun sollecito registrato.' })
+      return
+    }
     // Si registra il sollecito SOLO per il gruppo del messaggio copiato
     // (al retry si usano le fatture del messaggio USCITO, non la selezione attuale)
     const invoiceIds = explicitIds || []
@@ -775,7 +779,7 @@ export default function ClientDetail() {
         channel,
       })
       setSollecitoError(null)
-      setSollecitoToast(res.data)
+      setSollecitoToast({ ...res.data, channel })
       if (res.data.registered) {
         await fetchData()
       }
@@ -802,7 +806,7 @@ export default function ClientDetail() {
   }
   // Insoluto / annulla su PIÙ fatture: una conferma sola, refresh garantito
   const markInsolutoMany = async (invs) => {
-    const list = invs.map(fullInvoice)
+    const list = invs
     if (!list.length) return
     if (!window.confirm(
       `ASSEGNO INSOLUTO su ${list.length} fattur${list.length === 1 ? 'a' : 'e'} (${list.map(i => i.invoice_number).join(', ')})?\n\n`
@@ -818,7 +822,7 @@ export default function ClientDetail() {
     }
   }
   const cancelAssegnoMany = async (invs) => {
-    const list = invs.map(fullInvoice)
+    const list = invs
     if (!list.length) return
     const suspect = list.every(i => i.suspect_bounce)
     if (!window.confirm(suspect
@@ -828,39 +832,6 @@ export default function ClientDetail() {
       for (const i of list) await client.delete(`/positions/${i.id}/assegno`)
     } catch (err) {
       alert(err.response?.data?.detail || 'Errore nell\'annullamento')
-    } finally {
-      await fetchData()
-    }
-  }
-  // Nota di GRUPPO: cita le fatture selezionate e viaggia con loro fino al dossier
-  const addGroupNote = async (ids, text) => {
-    try {
-      await client.post(`/recovery/customers/${customerId}/actions`, { action_type: 'note', notes: text, invoice_ids: ids })
-      await fetchData()
-    } catch (err) {
-      alert(err.response?.data?.detail || 'Errore nel salvataggio della nota')
-    }
-  }
-  const editActionNotes = async (actionId, notes) => {
-    try {
-      await client.put(`/recovery/customers/${customerId}/actions/${actionId}/notes`, { notes })
-      await fetchData()
-    } catch (err) {
-      alert(err.response?.data?.detail || 'Errore nella modifica della nota')
-    }
-  }
-  // Telefonata (o altro contatto fuori WhatsApp) SU UN GRUPPO: cita le fatture
-  // selezionate e la registra come contatto COMPLETATO ora (numerazione
-  // per-fattura del backend), senza far salire di stadio le altre.
-  const registerCallGroup = async (ids, tone, notes) => {
-    try {
-      const created = await client.post(`/recovery/customers/${customerId}/actions`, {
-        action_type: tone === 'first' ? 'first_contact' : 'second_contact',
-        invoice_ids: ids, notes: notes || null,
-      })
-      await client.put(`/recovery/customers/${customerId}/actions/${created.data.id}/complete`, null, { params: { outcome: 'contacted' } })
-    } catch (err) {
-      alert(err.response?.data?.detail || 'Errore nella registrazione del contatto')
     } finally {
       await fetchData()
     }
@@ -877,31 +848,6 @@ export default function ClientDetail() {
       alert(err.response?.data?.detail || 'Errore nella consegna all\'avvocato')
     }
   }
-  const markInsoluto = async (inv) => {
-    if (!window.confirm(
-      `ASSEGNO INSOLUTO sulla fattura ${inv.invoice_number}?\n\n`
-      + 'La fattura torna SUBITO scaduta e lavorabile, la pratica si riapre con lo storico dei solleciti '
-      + '(salvo pratica archiviata: resta archiviata, con l\'allarme) e il recuperato viene stornato. La riga resta segnalata in rosso.'
-    )) return
-    try {
-      await client.post(`/positions/${inv.id}/assegno/insoluto`, {})
-      await fetchData()
-    } catch (err) {
-      alert(err.response?.data?.detail || 'Errore nella registrazione dell\'insoluto')
-    }
-  }
-  const cancelAssegno = async (inv) => {
-    if (!window.confirm(inv.suspect_bounce
-      ? `Confermi che la riapertura di ${inv.invoice_number} su FatturaPro NON è un assegno insoluto?\n\nIl sospetto viene rimosso; la fattura resta semplicemente scaduta.`
-      : `Annullare la registrazione dell'assegno su ${inv.invoice_number}?\n\nSolo se registrata per errore: la fattura torna scaduta senza allarme.`)) return
-    try {
-      await client.delete(`/positions/${inv.id}/assegno`)
-      await fetchData()
-    } catch (err) {
-      alert(err.response?.data?.detail || 'Errore nell\'annullamento')
-    }
-  }
-
   const handleUndoSollecito = async (actionId) => {
     try {
       await client.delete(`/recovery/customers/${customerId}/solleciti/${actionId}`)
@@ -913,41 +859,51 @@ export default function ClientDetail() {
     }
   }
 
-  const handleWhatsAppSend = (group, groupInvoices) => {
-    const number = getWhatsAppNumber()
-    if (!number) return
-    if (isTokenExpired()) {
-      alert('Sessione scaduta: effettua di nuovo il login prima di inviare (il sollecito non verrebbe registrato).')
-      window.location.reload()
-      return
-    }
-    const message = buildWhatsAppMessage(groupInvoices, group?.tone)
-    if (!message) return
-    const url = `https://wa.me/${number}?text=${encodeURIComponent(message)}`
-    window.open(url, '_blank')
-    registerSollecito('whatsapp_link', (groupInvoices || []).map(i => i.id))
-  }
-
-  const handleCopyWhatsApp = async (group, groupInvoices) => {
-    const message = buildWhatsAppMessage(groupInvoices, group?.tone)
-    if (!message) return
-    if (isTokenExpired()) {
-      alert('Sessione scaduta: effettua di nuovo il login prima di copiare (il sollecito non verrebbe registrato).')
-      window.location.reload()
-      return
-    }
+  const copyText = async (text) => {
     try {
-      await navigator.clipboard.writeText(message)
+      await navigator.clipboard.writeText(text)
+      return true
     } catch {
       const textarea = document.createElement('textarea')
-      textarea.value = message
+      textarea.value = text
+      textarea.setAttribute('readonly', '')
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
       document.body.appendChild(textarea)
       textarea.select()
-      document.execCommand('copy')
+      let ok = false
+      try { ok = document.execCommand('copy') } catch { ok = false }
       document.body.removeChild(textarea)
+      return ok
     }
-    registerSollecito('whatsapp_copy', (groupInvoices || []).map(i => i.id))
-    return true
+  }
+  // Email / WhatsApp: copia i dati e registra il canale. Telefono: registra
+  // soltanto. Stesso giorno, stesse fatture → un solo sollecito, vince
+  // l'ultimo click (canale aggiornato dal backend).
+  const registerChannel = async (channel) => {
+    // Stesso ordine della tabella (come la vede l'operatore) e SOLO le
+    // fatture sollecitabili: il backend rifiuta le altre, e a quel punto i
+    // dati sarebbero già copiati.
+    const invs = visibleInvoices.filter(i => selectedInvoices.has(i.id) && isSollecitabile(i))
+    if (invs.length === 0) {
+      alert('Nessuna fattura sollecitabile nella selezione: servono fatture scadute, non pagate, non contestate e non in incasso.')
+      return
+    }
+    if (isTokenExpired()) {
+      alert('Sessione scaduta: effettua di nuovo il login prima di continuare (il sollecito non verrebbe registrato).')
+      window.location.reload()
+      return
+    }
+    if (channel !== 'phone') {
+      const ok = await copyText(buildInvoiceData(invs))
+      if (!ok) {
+        alert('Copia negli appunti non riuscita: sollecito NON registrato. Riprova.')
+        return
+      }
+      setCopiedChannel(channel)
+      setTimeout(() => setCopiedChannel(null), 2000)
+    }
+    await registerSollecito(channel, invs.map(i => i.id))
   }
 
   // Stessa regola del backend (/positions/suggestions): fuzzy sotto 85,
@@ -994,10 +950,7 @@ export default function ClientDetail() {
     }
   }
 
-  const ACTION_NUMBER_LABELS = ['PRIMA', 'SECONDA', 'TERZA', 'QUARTA', 'QUINTA', 'SESTA', 'SETTIMA', 'OTTAVA', 'NONA', 'DECIMA']
   const contactActionCount = data?.contact_action_count || 0
-  const nextActionNumber = contactActionCount + 1
-  const nextActionLabel = ACTION_NUMBER_LABELS[contactActionCount] || `${nextActionNumber}ª`
   const shouldSuggestLawyer = contactActionCount >= 3
 
   const handleInvoiceSort = (field) => {
@@ -1033,7 +986,6 @@ export default function ClientDetail() {
   const allUnpaid = data.invoices?.items?.filter(inv => inv.status !== 'paid') || []
   const paidInvoices = data.invoices?.items?.filter(inv => inv.status === 'paid') || []
   const totalPaid = paidInvoices.reduce((sum, inv) => sum + inv.amount, 0)
-  const whatsappNumber = getWhatsAppNumber() || null
 
   // Righe GIALLE del semaforo che l'audit NON conta come problemi (verdict
   // ok ma livello warning: garanzia impossibile, non errore di abbinamento).
@@ -1069,6 +1021,9 @@ export default function ClientDetail() {
     if (valA > valB) return invoiceSortOrder === 'asc' ? 1 : -1
     return 0
   })
+  // Fatture selezionate nell'ordine della tabella: contesto di ogni pulsante della barra.
+  const selectedList = visibleInvoices.filter(i => selectedInvoices.has(i.id))
+  const canSollecitare = selectedList.some(isSollecitabile)
 
   const selectedTotal = (data.invoices?.items || [])
     .filter(inv => selectedInvoices.has(inv.id))
@@ -1138,9 +1093,9 @@ export default function ClientDetail() {
             </>
           ) : (
             <>
-              <p className="text-sm font-medium text-txt-primary">Messaggio copiato</p>
+              <p className="text-sm font-medium text-txt-primary">{sollecitoToast.channel === 'phone' ? 'Chiamata non registrata' : 'Dati copiati'}</p>
               <p className="text-xs text-txt-muted mt-1">
-                Nessuna fattura scaduta: promemoria di cortesia, sollecito non registrato.
+                {sollecitoToast.message || 'Nessuna fattura scaduta: promemoria di cortesia, sollecito non registrato.'}
               </p>
             </>
           )}
@@ -1215,17 +1170,6 @@ export default function ClientDetail() {
                         <div key={idx} className="flex items-center gap-2">
                           <span className="font-mono text-txt-primary">{p.number}</span>
                           <span className="text-xs px-1.5 py-0.5 rounded bg-dark-surface text-txt-muted">{p.label}</span>
-                          {p.number.replace(/[^+\d]/g, '') !== (selectedWhatsAppPhone || data.phone || '').replace(/[^+\d]/g, '') && (
-                            <button
-                              onClick={() => setSelectedWhatsAppPhone(p.number)}
-                              className="text-xs text-accent-green hover:underline"
-                            >
-                              Usa per WhatsApp
-                            </button>
-                          )}
-                          {p.number.replace(/[^+\d]/g, '') === (selectedWhatsAppPhone || data.phone || '').replace(/[^+\d]/g, '') && (
-                            <span className="text-xs text-accent-green font-medium">WhatsApp</span>
-                          )}
                         </div>
                       ))
                     ) : (
@@ -1976,6 +1920,8 @@ export default function ClientDetail() {
                   GG{invoiceSortArrow('days_overdue')}
                 </th>
                 <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider" title="Stato di avanzamento del recupero di QUESTA fattura (il soggetto è la fattura, non il cliente)">Avanzamento</th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider" title="Ultimo sollecito o consegna al legale registrati su questa fattura: data e canale (le note non contano)">Ultima azione</th>
+                <th className="px-3 py-3 text-left text-xs font-semibold text-txt-label uppercase tracking-wider" title="Nota dell'operatore su questa fattura (modificabile)">Nota</th>
                 <th className="px-3 py-3 text-center text-xs font-semibold text-txt-label uppercase tracking-wider">Stato</th>
               </tr>
             </thead>
@@ -1998,7 +1944,7 @@ export default function ClientDetail() {
                       checked={selectedInvoices.has(inv.id)}
                       onChange={() => toggleInvoiceSelection(inv.id)}
                       className="rounded border-dark-border bg-dark-bg"
-                      disabled={inv.status === 'paid' || !!inv.in_incasso}
+                      disabled={inv.status === 'paid'}
                     />
                   </td>
                   <td className="px-3 py-3 text-sm font-medium text-txt-primary">{inv.invoice_number}</td>
@@ -2058,15 +2004,36 @@ export default function ClientDetail() {
                     )}
                   </td>
                   <td className="px-3 py-3 text-sm text-center">
-                    {/* Stato di AVANZAMENTO della fattura (definizione unica
-                        nel server): nessun sollecito / 1° / 2° / avvocato /
-                        in incasso / insoluto. Le azioni stanno sotto, nella
-                        sezione "Azioni di recupero", per gruppo. */}
+                    {/* REGISTRO per fattura: stadio (definizione unica nel
+                        server) + storia apribile (solleciti con ordinale, canale,
+                        consegna, note). Le azioni stanno nella barra della selezione. */}
                     {inv.status === 'paid' ? (
                       <span className="text-txt-muted">—</span>
                     ) : (
-                      <StageBadge stage={inv.stage} label={inv.stage_label} />
+                      <div className="flex flex-col items-center gap-1">
+                        <StageBadge stage={inv.stage} label={inv.stage_label} />
+                        {(inv.history || []).length > 0 && (
+                          <button onClick={() => toggleHistory(inv.id)} className="text-[10px] text-txt-muted hover:text-txt-primary" title="Mostra la storia di questa fattura">
+                            {openHistory.has(inv.id) ? 'nascondi storia ▴' : 'storia ▾'}
+                          </button>
+                        )}
+                      </div>
                     )}
+                  </td>
+                  <td className="px-3 py-3 text-sm">
+                    {inv.last_action_at ? (
+                      <div className="flex flex-col">
+                        <span className="text-txt-secondary">{formatDate(inv.last_action_at)}</span>
+                        {inv.last_channel && (
+                          <span className="text-[10px] text-txt-muted">{CHANNEL_LABELS[inv.last_channel] || inv.last_channel}{inv.sollecito_today ? ' · oggi' : ''}</span>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="text-txt-muted">—</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-3 text-sm w-56">
+                    <InvoiceNoteCell key={`${inv.id}:${inv.recovery_note || ''}`} inv={inv} onSave={updateInvoiceNote} />
                   </td>
                   <td className="px-3 py-3 text-sm text-center">
                     <span className={`${INVOICE_STATUS_COLORS[inv.status] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'} sc-badge`}>
@@ -2122,9 +2089,29 @@ export default function ClientDetail() {
                     )}
                   </td>
                 </tr>
+                {openHistory.has(inv.id) && (
+                  <tr key={`${inv.id}-history`} className="bg-dark-surface/40">
+                    <td colSpan={12} className="px-3 pb-3 pt-1">
+                      <div className="text-[11px] text-txt-muted mb-1">Storia della fattura {inv.invoice_number}</div>
+                      <div className="border-l-2 border-dark-border pl-3 space-y-1">
+                        {(inv.history || []).map(h => (
+                          <div key={h.action_id} className="text-xs text-txt-secondary flex items-center gap-2 flex-wrap">
+                            <span className="text-txt-muted w-20">{formatDate(h.date)}</span>
+                            <span className="font-medium text-txt-primary">
+                              {h.action_type === 'note' ? 'Nota' : h.action_type === 'lawyer' ? "Consegnata all'avvocato" : `Sollecito n. ${h.n}`}
+                            </span>
+                            {h.channel && <span className="px-1.5 py-0.5 rounded bg-accent-green/15 text-accent-green text-[10px]">{CHANNEL_LABELS[h.channel] || h.channel}</span>}
+                            {h.legacy && <span className="text-[10px] text-txt-muted" title="Azione dello storico registrata sull'intero cliente, attribuita alle fatture già scadute a quella data">(storico)</span>}
+                            {h.action_type === 'note' && h.notes && <span className="text-txt-secondary">{h.notes}</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </td>
+                  </tr>
+                )}
                 {openVerify.has(inv.id) && inv.verification && (
                   <tr key={`${inv.id}-verify`} className="bg-dark-surface/40">
-                    <td colSpan={10} className="px-3 pb-3">
+                    <td colSpan={12} className="px-3 pb-3">
                       <VerifyDetail v={inv.verification} />
                       {/* Via d'uscita dal giallo: l'operatore che ha
                           controllato a mano lo registra qui (stesso
@@ -2171,7 +2158,19 @@ export default function ClientDetail() {
                   {selectedInvoices.size} fattur{selectedInvoices.size === 1 ? 'a' : 'e'} selezionat{selectedInvoices.size === 1 ? 'a' : 'e'} — {formatCurrency(selectedTotal)}
                 </p>
               </div>
-              <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                {/* Canale del sollecito: Email/WhatsApp copiano i DATI delle fatture
+                    selezionate e registrano il canale; Telefono registra soltanto. */}
+                <button onClick={() => registerChannel('email_copy')} disabled={!canSollecitare} className={`sc-btn-secondary text-sm font-bold min-w-[6.5rem] disabled:opacity-50 ${copiedChannel === 'email_copy' ? 'border-accent-green text-accent-green' : ''}`} title={canSollecitare ? 'Copia i dati delle fatture selezionate (solo quelle sollecitabili) e registra il sollecito via Email' : 'Nessuna fattura sollecitabile nella selezione'}>
+                  {copiedChannel === 'email_copy' ? 'Copiato!' : 'Email'}
+                </button>
+                <button onClick={() => registerChannel('whatsapp_copy')} disabled={!canSollecitare} className={`px-4 py-2 rounded-lg text-sm font-bold min-w-[7rem] disabled:opacity-50 ${copiedChannel === 'whatsapp_copy' ? 'bg-accent-green/30 text-accent-green' : 'bg-accent-green text-dark-bg hover:brightness-110'}`} title={canSollecitare ? 'Copia i dati delle fatture selezionate (solo quelle sollecitabili) e registra il sollecito via WhatsApp' : 'Nessuna fattura sollecitabile nella selezione'}>
+                  {copiedChannel === 'whatsapp_copy' ? 'Copiato!' : 'WhatsApp'}
+                </button>
+                <button onClick={() => registerChannel('phone')} disabled={!canSollecitare} className="sc-btn-secondary text-sm font-bold disabled:opacity-50" title={canSollecitare ? 'Registra un sollecito telefonico sulle fatture selezionate sollecitabili (non copia nulla)' : 'Nessuna fattura sollecitabile nella selezione'}>
+                  Telefono
+                </button>
+                <span className="w-px h-6 bg-dark-border mx-1" />
                 <button
                   onClick={handleDownloadInvoicesZip}
                   disabled={pdfLoading}
@@ -2186,16 +2185,51 @@ export default function ClientDetail() {
                 >
                   {promemoria ? '...' : 'Scarica Promemoria'}
                 </button>
-                {!whatsappNumber && (
-                  <button
-                    onClick={() => setPhoneEdit(data.phone || '')}
-                    className="px-4 py-2 bg-accent-amber text-dark-bg rounded-lg text-sm font-bold hover:brightness-110"
-                  >
-                    Aggiungi Tel
+                <span className="w-px h-6 bg-dark-border mx-1" />
+                {selectedList.some(i => !i.in_incasso && !i.suspect_bounce) && (
+                  <button onClick={() => setAssegnoBar(assegnoBar ? null : { expected: '', note: '' })} className="px-3 py-2 bg-accent-teal/15 text-accent-teal rounded-lg text-sm font-medium hover:bg-accent-teal/25" title="Pagate con assegno da incassare (fatture selezionate)">
+                    {selectedList.some(i => i.bounced_at) ? 'Nuovo assegno' : 'Assegno'}
                   </button>
                 )}
+                {selectedList.some(i => i.in_incasso || i.suspect_bounce) && (
+                  <button onClick={() => markInsolutoMany(selectedList.filter(i => i.in_incasso || i.suspect_bounce))} className="px-3 py-2 bg-accent-red/15 text-accent-red rounded-lg text-sm font-bold hover:bg-accent-red/25" title="L'assegno è tornato indietro: le fatture tornano scadute SUBITO">
+                    Insoluto
+                  </button>
+                )}
+                {selectedList.some(i => i.in_incasso) && (
+                  <button onClick={() => cancelAssegnoMany(selectedList.filter(i => i.in_incasso))} className="px-3 py-2 bg-dark-surface text-txt-muted rounded-lg text-sm hover:text-txt-primary" title="Annulla la registrazione dell'assegno (solo se fatta per errore)">
+                    Annulla assegno
+                  </button>
+                )}
+                {selectedList.some(i => i.suspect_bounce) && (
+                  <button onClick={() => cancelAssegnoMany(selectedList.filter(i => i.suspect_bounce))} className="px-3 py-2 bg-dark-surface text-txt-muted rounded-lg text-sm hover:text-txt-primary" title="La riapertura su FatturaPro non è un insoluto (es. nota di credito)">
+                    Non è insoluto
+                  </button>
+                )}
+                <button onClick={() => handoverGroup(selectedList.map(i => i.id), selectedList)} className="px-3 py-2 bg-accent-red text-dark-bg rounded-lg text-sm font-bold hover:brightness-110" title="Consegna le fatture selezionate all'avvocato">
+                  Consegna all'avvocato
+                </button>
               </div>
             </div>
+            {assegnoBar && (
+              <div className="mt-3 flex items-end gap-3 flex-wrap p-3 rounded-lg bg-dark-bg/60 border border-dark-border">
+                <div className="text-xs text-txt-secondary">
+                  Pagate con <strong className="text-txt-primary">assegno</strong> da incassare — {selectedList.filter(i => !i.in_incasso && !i.suspect_bounce).length === 1 ? '1 fattura selezionata' : `${selectedList.filter(i => !i.in_incasso && !i.suspect_bounce).length} fatture selezionate`}
+                </div>
+                <label className="text-xs text-txt-muted">Incasso previsto
+                  <input type="date" value={assegnoBar.expected} onChange={e => setAssegnoBar({ ...assegnoBar, expected: e.target.value })}
+                    className="ml-2 px-2 py-1 rounded bg-dark-bg border border-dark-border text-sm text-txt-primary" />
+                </label>
+                <label className="text-xs text-txt-muted flex-1 min-w-[16rem]">Nota
+                  <input type="text" value={assegnoBar.note} placeholder="es. assegno n. 123, verrà incassato il …"
+                    onChange={e => setAssegnoBar({ ...assegnoBar, note: e.target.value })}
+                    className="ml-2 w-full max-w-md px-2 py-1 rounded bg-dark-bg border border-dark-border text-sm text-txt-primary" />
+                </label>
+                <button onClick={async () => { await registerAssegno(selectedList.filter(i => !i.in_incasso && !i.suspect_bounce).map(i => i.id), assegnoBar.expected || null, assegnoBar.note || null); setAssegnoBar(null) }} className="sc-btn-primary text-xs">Registra assegno</button>
+                <button onClick={() => setAssegnoBar(null)} className="sc-btn-secondary text-xs">Chiudi</button>
+                <p className="w-full text-[11px] text-txt-muted">La fattura esce dai solleciti e va in «In incasso (assegni)»; l'importo dovuto NON viene azzerato e FatturaPro non viene toccato.</p>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -2251,45 +2285,12 @@ export default function ClientDetail() {
         </div>
       )}
 
-      {/* SEZIONE 2: AZIONI DI RECUPERO */}
+      {/* PRATICA: todo pendenti e azioni sul CLIENTE non legate a fatture.
+          Il registro (solleciti, canali, note) sta nelle righe delle fatture. */}
       <div className="sc-card p-6">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-base font-bold text-txt-primary">Azioni di Recupero</h2>
-          {contactActionCount > 0 && (
-            <span className="text-sm text-txt-muted">
-              Azioni registrate: <span className="font-bold text-txt-primary">{contactActionCount}</span>
-            </span>
-          )}
-        </div>
-
-        {/* FASE 4 — Azioni di recupero PER GRUPPO: il soggetto è la fattura.
-            Ogni blocco = fatture allo stesso stadio, la loro storia, le
-            azioni giuste per quello stadio. Tutte le azioni sulle fatture
-            stanno qui. */}
-        <AzioniPerGruppo
-          groups={data.stage_groups || []}
-          clientActions={data.client_actions || []}
-          pendingActions={data.pending_actions || []}
-          selectedInvoices={selectedInvoices}
-          toggleInvoiceSelection={toggleInvoiceSelection}
-          setSelectedInvoices={setSelectedInvoices}
-          hasPhone={!!whatsappNumber}
-          formatCurrency={formatCurrency}
-          formatDate={formatDate}
-          onCopy={handleCopyWhatsApp}
-          onWhatsApp={handleWhatsAppSend}
-          onHandover={handoverGroup}
-          onRegisterCall={registerCallGroup}
-          onAssegno={registerAssegno}
-          onInsolutoMany={markInsolutoMany}
-          onCancelAssegnoMany={cancelAssegnoMany}
-          onAddNote={addGroupNote}
-          onEditNote={editActionNotes}
-        />
-
-        <div className="mt-6 pt-4 border-t border-dark-border">
-          <p className="text-xs font-semibold text-txt-label uppercase tracking-wider mb-1">Azioni sul cliente (non legate a fatture)</p>
-          <p className="text-[11px] text-txt-muted mb-3">Attesa, archiviazione, todo legale, note generali. I solleciti e le telefonate si registrano sopra, nel gruppo di fatture.</p>
+        <div className="flex items-center justify-between mb-4 gap-4 flex-wrap">
+          <h2 className="text-base font-bold text-txt-primary">Pratica</h2>
+          <span className="text-xs text-txt-muted">I solleciti si registrano dalla tabella sopra (seleziona le fatture → Email / WhatsApp / Telefono).</span>
         </div>
 
         {/* Lawyer suggestion banner */}
@@ -2309,6 +2310,61 @@ export default function ClientDetail() {
               Passa ad Avvocato
             </button>
           </div>
+        )}
+
+
+        {/* Prossime azioni pianificate (todo della pratica) */}
+        {(data.pending_actions || []).length > 0 && (
+          <div className="mb-4 border-l-2 border-dark-border pl-4 space-y-2">
+            {(data.pending_actions || []).map(p => (
+              <div key={p.id} className="flex items-center gap-2 flex-wrap text-sm">
+                <span className="font-medium text-txt-primary">{p.label}</span>
+                {editingDateActionId === p.id ? (
+                  <>
+                    <input type="date" value={editingDateValue} onChange={(e) => setEditingDateValue(e.target.value)} className="text-xs bg-dark-surface border border-dark-border rounded px-2 py-1 text-txt-primary" autoFocus />
+                    <button onClick={() => handleRescheduleAction(p.id, editingDateValue)} disabled={!editingDateValue} className="text-xs bg-accent-teal/20 text-accent-teal px-2 py-0.5 rounded hover:bg-accent-teal/30 disabled:opacity-40">Salva</button>
+                    <button onClick={() => { setEditingDateActionId(null); setEditingDateValue('') }} className="text-xs text-txt-muted hover:text-txt-primary">Annulla</button>
+                  </>
+                ) : (
+                  <span className="text-xs text-accent-teal cursor-pointer hover:underline" title="Clicca per modificare la data"
+                        onClick={() => { setEditingDateActionId(p.id); setEditingDateValue(p.scheduled_date?.split('T')[0] || '') }}>
+                    pianificata per {formatDate(p.scheduled_date)}
+                  </span>
+                )}
+                {completingAction === p.id ? (
+                  <div className="flex items-center gap-1 flex-wrap">
+                    {Object.entries(OUTCOME_LABELS).map(([key, label]) => (
+                      <button key={key} onClick={() => handleCompleteAction(p.id, key)} className={`text-xs px-2 py-0.5 rounded border border-dark-border ${OUTCOME_COLORS[key] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'} hover:opacity-80`}>{label}</button>
+                    ))}
+                    <button onClick={() => setCompletingAction(null)} className="text-xs text-txt-muted ml-1">Annulla</button>
+                  </div>
+                ) : (
+                  <button onClick={() => setCompletingAction(p.id)} className="text-xs bg-accent-green/10 text-accent-green px-2 py-0.5 rounded border border-accent-green/20 hover:bg-accent-green/20">Completa</button>
+                )}
+                {p.notes && <span className="text-xs text-txt-muted">{p.notes}</span>}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Azioni sul CLIENTE già compiute (attese, archiviazioni, note, esiti
+            dei todo): senza elenco sarebbero dati invisibili. */}
+        {(data.client_actions || []).filter(a => !a.cancelled).length > 0 && (
+          <details className="mb-4 text-sm">
+            <summary className="cursor-pointer text-txt-secondary hover:text-txt-primary">
+              Azioni sul cliente ({(data.client_actions || []).filter(a => !a.cancelled).length})
+            </summary>
+            <div className="mt-2 border-l-2 border-dark-border pl-4 space-y-1 max-h-64 overflow-y-auto">
+              {[...(data.client_actions || [])].filter(a => !a.cancelled).reverse().map(a => (
+                <div key={a.id} className="flex items-center gap-2 flex-wrap text-xs">
+                  <span className="text-txt-muted w-20">{formatDate(a.completed_at || a.created_at)}</span>
+                  <span className="font-medium text-txt-primary">{a.label}</span>
+                  {a.outcome && <span className={`px-1.5 py-0.5 rounded ${OUTCOME_COLORS[a.outcome] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'}`}>{OUTCOME_LABELS[a.outcome] || a.outcome}</span>}
+                  {a.notes && <span className="text-txt-secondary">{a.notes}</span>}
+                </div>
+              ))}
+            </div>
+          </details>
         )}
 
         {/* REGISTRA AZIONE */}
@@ -2413,124 +2469,6 @@ export default function ClientDetail() {
           </div>
         )}
 
-        {/* Cronologia completa (tutte le azioni, todo pendenti da completare/ripianificare) */}
-        <details className="mt-6">
-          <summary className="cursor-pointer text-sm font-semibold text-txt-secondary hover:text-txt-primary">
-            Cronologia completa ({(data.recovery_actions || []).length} azioni)
-          </summary>
-        {data.recovery_actions && data.recovery_actions.length > 0 && (
-          <div className="mt-4 border-l-2 border-dark-border pl-4 space-y-3">
-            {data.recovery_actions.map(action => (
-              <div key={action.id} className={`relative ${action.cancelled ? 'opacity-50' : ''}`}>
-                <div className={`absolute -left-[21px] top-1 w-3 h-3 rounded-full border-2 border-dark-card ${
-                  action.cancelled ? 'bg-dark-border' : action.completed_at ? 'bg-accent-green' : 'bg-txt-muted'
-                }`}></div>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className={`text-sm font-medium text-txt-primary ${action.cancelled ? 'line-through' : ''}`}>
-                    {ACTION_LABELS[action.action_type] || action.action_type}
-                  </span>
-                  {/* Data di ESECUZIONE per le azioni fatte, di pianificazione
-                      per i todo: la data di creazione mostrata in passato
-                      faceva sembrare i solleciti molto più vecchi del reale */}
-                  <span className="text-xs text-txt-muted">
-                    {action.completed_at
-                      ? `eseguita il ${formatDate(action.completed_at)}`
-                      : action.scheduled_date
-                        ? `pianificata per ${formatDate(action.scheduled_date)}`
-                        : formatDate(action.created_at)}
-                  </span>
-                  {(action.channel === 'whatsapp_copy' || action.channel === 'whatsapp_link') && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-accent-green/15 text-accent-green">WhatsApp</span>
-                  )}
-                  {action.cancelled && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-dark-surface text-txt-muted">annullata</span>
-                  )}
-                  {action.completed_at && action.outcome && (
-                    <span className={`text-xs px-1.5 py-0.5 rounded ${OUTCOME_COLORS[action.outcome] || 'bg-accent-green/15 text-accent-green'}`}>
-                      {OUTCOME_LABELS[action.outcome] || action.outcome}
-                    </span>
-                  )}
-                  {action.completed_at && !action.outcome && (
-                    <span className="text-xs bg-accent-green/15 text-accent-green px-1.5 py-0.5 rounded">completata</span>
-                  )}
-                  {!action.completed_at && !action.cancelled && (
-                    <>
-                      {completingAction === action.id ? (
-                        <div className="flex items-center gap-1 flex-wrap">
-                          {Object.entries(OUTCOME_LABELS).map(([key, label]) => (
-                            <button
-                              key={key}
-                              onClick={() => handleCompleteAction(action.id, key)}
-                              className={`text-xs px-2 py-0.5 rounded border border-dark-border transition-colors ${
-                                OUTCOME_COLORS[key] || 'bg-[rgba(148,163,184,0.15)] text-txt-muted'
-                              } hover:opacity-80`}
-                            >
-                              {label}
-                            </button>
-                          ))}
-                          <button
-                            onClick={() => setCompletingAction(null)}
-                            className="text-xs text-txt-muted ml-1"
-                          >
-                            Annulla
-                          </button>
-                        </div>
-                      ) : (
-                        <button
-                          onClick={() => setCompletingAction(action.id)}
-                          className="text-xs bg-accent-green/10 text-accent-green px-2 py-0.5 rounded border border-accent-green/20 hover:bg-accent-green/20 transition-colors"
-                        >
-                          Completa
-                        </button>
-                      )}
-                    </>
-                  )}
-                </div>
-                {action.notes && (
-                  <p className="text-sm text-txt-muted mt-0.5">{action.notes}</p>
-                )}
-                {action.scheduled_date && action.action_type !== 'note' && (
-                  editingDateActionId === action.id ? (
-                    <div className="flex items-center gap-2 mt-1">
-                      <input
-                        type="date"
-                        value={editingDateValue}
-                        onChange={(e) => setEditingDateValue(e.target.value)}
-                        className="text-xs bg-dark-surface border border-dark-border rounded px-2 py-1 text-txt-primary"
-                        autoFocus
-                      />
-                      <button
-                        onClick={() => handleRescheduleAction(action.id, editingDateValue)}
-                        disabled={!editingDateValue}
-                        className="text-xs bg-accent-teal/20 text-accent-teal px-2 py-0.5 rounded hover:bg-accent-teal/30 disabled:opacity-40"
-                      >
-                        Salva
-                      </button>
-                      <button
-                        onClick={() => { setEditingDateActionId(null); setEditingDateValue('') }}
-                        className="text-xs text-txt-muted hover:text-txt-primary"
-                      >
-                        Annulla
-                      </button>
-                    </div>
-                  ) : (
-                    <p
-                      className="text-xs text-accent-teal mt-0.5 cursor-pointer hover:underline"
-                      onClick={() => {
-                        setEditingDateActionId(action.id)
-                        setEditingDateValue(action.scheduled_date?.split('T')[0] || '')
-                      }}
-                      title="Clicca per modificare la data"
-                    >
-                      Pianificata: {formatDate(action.scheduled_date)}
-                    </p>
-                  )
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-        </details>
       </div>
 
       {/* SEZIONE 3: RIEPILOGO */}
