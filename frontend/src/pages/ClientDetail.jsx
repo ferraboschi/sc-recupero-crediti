@@ -13,6 +13,9 @@ const ACTION_LABELS = {
   note: 'Nota',
 }
 
+// Data locale YYYY-MM-DD (toISOString è UTC: alle 00:30 italiane darebbe ieri).
+const toISODateLocal = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+
 // Fattura su cui si può registrare un sollecito (stessa regola del backend,
 // is_overdue_unpaid): scaduta, non pagata, non contestata, non in incasso.
 const isSollecitabile = (i) => i.status !== 'paid' && i.status !== 'disputed' && (i.days_overdue || 0) > 0 && !i.in_incasso
@@ -588,7 +591,7 @@ export default function ClientDetail() {
       const defaults = { first_contact: 7, second_contact: 14, lawyer: 30 }
       const d = new Date()
       d.setDate(d.getDate() + (defaults[actionType] || 7))
-      setScheduledDate(d.toISOString().split('T')[0])
+      setScheduledDate(toISODateLocal(d))
       setShowDatePicker(true)
       return
     }
@@ -773,7 +776,7 @@ export default function ClientDetail() {
     d.setDate(d.getDate() - 3)
     const today = new Date(); today.setHours(0, 0, 0, 0)
     const def = d < today ? today : d
-    setReminderForm({ date: def.toISOString().split('T')[0], note: '', firstDue })
+    setReminderForm({ date: toISODateLocal(def), note: '', firstDue })
   }
   const setReminder = async (invs) => {
     try {
@@ -2370,7 +2373,7 @@ export default function ClientDetail() {
                   Promemoria pre-scadenza — {upcomingSelected.length === 1 ? '1 fattura' : `${upcomingSelected.length} fatture`}{reminderForm.firstDue ? `, prima scadenza ${formatDate(reminderForm.firstDue)}` : ''}
                 </div>
                 <label className="text-xs text-txt-muted">Avvisami il
-                  <input type="date" value={reminderForm.date} min={new Date().toISOString().split('T')[0]} max={reminderForm.firstDue || undefined}
+                  <input type="date" value={reminderForm.date} min={toISODateLocal(new Date())} max={reminderForm.firstDue || undefined}
                     onChange={e => setReminderForm({ ...reminderForm, date: e.target.value })}
                     className="ml-2 px-2 py-1 rounded bg-dark-bg border border-dark-border text-sm text-txt-primary" />
                 </label>
@@ -2577,7 +2580,7 @@ export default function ClientDetail() {
                     onClick={() => {
                       const dt = new Date()
                       dt.setDate(dt.getDate() + d)
-                      setScheduledDate(dt.toISOString().split('T')[0])
+                      setScheduledDate(toISODateLocal(dt))
                     }}
                     className="px-3 py-2 rounded-lg text-xs font-medium bg-dark-surface text-txt-secondary hover:bg-dark-border transition-colors"
                   >
