@@ -104,7 +104,7 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
     void_pl: Dict[str, List[Any]] = {}
     for inv in platform_invoices:
         num = doc_key((inv.invoice_number or "").strip())
-        fp_num = fp_num_by_doc.get(str(inv.source_id or ""))
+        fp_num = fp_num_by_doc.get(str(inv.source_id or "")) if getattr(inv, "doc_id_verified", False) else None
         if fp_num and fp_num != num:
             renumber_from[inv.id] = (inv.invoice_number or "").strip()
             num = fp_num
@@ -117,8 +117,8 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
             # Due attive con lo stesso numero: "la" riga è quella il cui
             # doc_id coincide con FatturaPro; l'altra è un doppione.
             cur = active_pl[num]
-            cur_match = bool(fp and cur.source_id and str(cur.source_id) == str(fp.get("doc_id")))
-            new_match = bool(fp and inv.source_id and str(inv.source_id) == str(fp.get("doc_id")))
+            cur_match = bool(fp and cur.source_id and str(cur.source_id) == str(fp.get("doc_id")) and getattr(cur, "doc_id_verified", False))
+            new_match = bool(fp and inv.source_id and str(inv.source_id) == str(fp.get("doc_id")) and getattr(inv, "doc_id_verified", False))
             if new_match and not cur_match:
                 extra_active.append(cur)
                 active_pl[num] = inv
@@ -157,7 +157,8 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
             else:
                 verdict = "pagata_non_tracciata"
         else:
-            if fp.get("doc_id") and pl.source_id and str(fp.get("doc_id")) != str(pl.source_id):
+            if (fp.get("doc_id") and pl.source_id and str(fp.get("doc_id")) != str(pl.source_id)
+                    and getattr(pl, "doc_id_verified", False)):
                 verdict = "numero_riassegnato"
             elif pl.status == "paid" and (fp_saldo or 0) > 0:
                 verdict = "riaperta_su_fatturapro"

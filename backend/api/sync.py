@@ -27,6 +27,7 @@ from backend.database import (
 )
 from backend.connectors.fatturapro import FatturaProConnector
 from backend.engine.sdi import SDI_FINAL_OK, sdi_state_from_notifications
+from backend.database import RecoveryActionInvoice
 from backend.connectors.shopify import ShopifyConnector
 from backend.engine.matching import run_matching
 from backend.engine.cases import update_case_lifecycle
@@ -388,20 +389,86 @@ def _sync_invoices_task() -> dict:
                             by_doc[str(row_.source_id)] = row_
 
                 def _is_absent(known, fetched_numbers, doc_ids):
-                    """Presenza per IDENTITÀ: una riga con doc_id è presente solo
-                    se il suo documento è in lista (il numero può appartenere
-                    a un altro documento); senza doc_id vale il numero."""
-                    if known.source_id:
+                    """Presenza per IDENTITÀ solo per le righe col doc_id
+                    verificato (il numero può appartenere a un altro documento);
+                    per le righe storiche (doc_id fossile) vale il numero."""
+                    if known.source_id and known.doc_id_verified:
                         return str(known.source_id) not in doc_ids
                     return known.invoice_number not in fetched_numbers
 
+                adopted = {"n": 0, "released": 0, "dup_void": 0}
+
                 def _resolve(r):
-                    ex = by_doc.get(str(r.get("doc_id") or ""))
-                    if ex is not None:
-                        return ex
-                    return _find_existing(session, r["invoice_number"], r.get("doc_id"))
+                    """Riga della piattaforma per la riga FatturaPro (N, D).
+                    - doc_id VERIFICATO: identità = documento (owner di D);
+                    - righe storiche: identità = numero → chi ha il numero N
+                      ADOTTA D (il suo doc_id fossile viene rilasciato dall'eventuale
+                      altra riga storica che lo portava);
+                    - nessuna riga col numero: l'owner storico di D è lo stesso
+                      documento rinumerato (Cecconi 1609→1600)."""
+                    doc = str(r.get("doc_id") or "")
+                    num = r["invoice_number"]
+                    owner = by_doc.get(doc) if doc else None
+                    if owner is not None and owner.doc_id_verified:
+                        legacy_holder = session.query(Invoice).filter(
+                            Invoice.invoice_number == num, Invoice.source_platform == "fatturapro",
+                            Invoice.id != owner.id, Invoice.doc_id_verified.isnot(True),
+                            Invoice.status.notin_(("void", "paid")),
+                        ).order_by(Invoice.id.asc()).first()
+                        if (legacy_holder is not None
+                                and not session.query(RecoveryActionInvoice.action_id).filter(
+                                    RecoveryActionInvoice.invoice_id == owner.id).first()):
+                            # Doppione creato da un ciclo precedente (owner senza
+                            # storia) mentre la riga storica col numero porta i
+                            # solleciti: vince la storica, che adotta D.
+                            _void_invoice(session, owner, f"doppione di {num} creato per errore dal sync (stesso documento {doc})")
+                            session.flush()
+                            adopted["dup_void"] += 1
+                            by_doc.pop(doc, None)
+                            owner = None
+                        else:
+                            return owner
+                    holder = _find_existing(session, num, doc)
+                    if holder is not None and holder.status == "void" and doc and str(holder.source_id) == doc and not by_doc.get(doc):
+                        # la riga appena annullata come doppione non è un candidato
+                        holder = session.query(Invoice).filter(
+                            Invoice.invoice_number == num, Invoice.source_platform == "fatturapro",
+                            Invoice.status != "void",
+                        ).order_by(Invoice.id.asc()).first()
+                    if holder is not None:
+                        if holder.source_id and str(holder.source_id) == doc:
+                            if not holder.doc_id_verified:
+                                holder.doc_id_verified = True
+                            return holder
+                        if holder.doc_id_verified:
+                            return holder  # doc diverso e verificato: mismatch/taker (regole sotto)
+                        # Riga storica: adotta il doc attuale; il fossile lo
+                        # rilascia chi lo porta (altra riga storica).
+                        old_doc = holder.source_id
+                        if owner is not None and owner.id != holder.id and not owner.doc_id_verified:
+                            owner.source_id = None
+                            adopted["released"] += 1
+                            by_doc.pop(doc, None)
+                        if doc:
+                            holder.source_id = doc
+                            holder.doc_id_verified = True
+                            by_doc[doc] = holder
+                            adopted["n"] += 1
+                            session.add(ActivityLog(
+                                action="doc_id_adopted", entity_type="invoice", entity_id=holder.id,
+                                details={"invoice_number": num, "old_doc_id": old_doc, "new_doc_id": doc},
+                            ))
+                        return holder
+                    if owner is not None:
+                        return owner  # storico, numero libero: stesso documento rinumerato
+                    return None
 
                 existing_of = {id(r): _resolve(r) for r in raw_invoices}
+                fp["doc_id_adopted"] = adopted["n"]
+                fp["fossil_released"] = adopted["released"]
+                fp["dup_voided"] = adopted["dup_void"]
+                if adopted["dup_void"]:
+                    fp["voided"] += adopted["dup_void"]
 
                 def _doc_mismatch(ex, r):
                     """Stesso numero, documento diverso, E il documento vecchio
@@ -544,6 +611,7 @@ def _sync_invoices_task() -> dict:
                         ))
                         logger.info("Rinumerata da FatturaPro: %s → %s (doc %s)", existing.invoice_number, inv_num, existing.source_id)
                         existing.invoice_number = inv_num
+                        existing.doc_id_verified = True
                         fp["renumbered"] = fp.get("renumbered", 0) + 1
                         # Se col numero cambia anche il destinatario, l'abbinamento
                         # al cliente fatto col vecchio nome va ricontrollato: la
@@ -680,6 +748,7 @@ def _sync_invoices_task() -> dict:
                     if existing is not None and existing.source_id is None and inv.get("doc_id"):
                         # Riga storica senza identità: adotta il doc_id
                         existing.source_id = str(inv["doc_id"])
+                        existing.doc_id_verified = True
 
                     if existing:
                         existing.amount = inv.get("total", 0)
@@ -782,6 +851,7 @@ def _sync_invoices_task() -> dict:
                             source_id=inv.get("doc_id"),
                             sdi_state=new_state,
                             sdi_checked_at=datetime.utcnow() if new_state else None,
+                            doc_id_verified=True,
                         )
                         session.add(new_invoice)
                         created += 1

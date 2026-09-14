@@ -141,9 +141,13 @@ def _get(session, number, **flt):
 
 
 def _mk(session, number, **kw):
+    """Riga della piattaforma. Di default col doc_id VERIFICATO (regime
+    'identità = documento'); passare doc_id_verified=False per una riga storica
+    (doc_id fossile: vale il numero)."""
     inv = Invoice(invoice_number=number, amount=kw.pop("amount", 100.0), amount_due=kw.pop("amount_due", 100.0),
                   issue_date=kw.pop("issue_date", date(2026, 4, 1)), due_date=kw.pop("due_date", date(2026, 5, 1)),
-                  days_overdue=kw.pop("days_overdue", 30), source_platform="fatturapro", status=kw.pop("status", "open"), **kw)
+                  days_overdue=kw.pop("days_overdue", 30), source_platform="fatturapro", status=kw.pop("status", "open"),
+                  doc_id_verified=kw.pop("doc_id_verified", True), **kw)
     session.add(inv); session.commit()
     return inv
 
@@ -689,3 +693,72 @@ def test_manual_mark_paid_survives_draft_reappearance(monkeypatch, test_db_sessi
     test_db_session.add(ActivityLog(action="fatturapro_fix_mark_paid", entity_type="invoice", entity_id=inv.id, details={})); test_db_session.commit()
     r = _sync(monkeypatch, test_db_session, [_raw("MP/2026", "m", "draft", balance=100.0)])
     assert _get(test_db_session, "MP/2026").status == "paid" and r["voided"] == 0 and r.get("draft_on_paid") == 1
+
+
+# ── Righe STORICHE: doc_id fossile, identità = numero (migrazione) ─────────
+
+def test_legacy_row_adopts_current_doc_id_by_number(monkeypatch, test_db_session):
+    """Cecconi 1420 dal vivo: la riga storica porta il doc fossile 4546390 (riga
+    riscritta per numero dal vecchio sync); oggi il numero 1420 è il doc
+    4546517 → la riga ADOTTA il doc attuale, nessuna riga nuova, nessun
+    doppione, e da qui in poi l'identità è il documento."""
+    row_id = _mk(test_db_session, "2026/00001420/SAK - Fattura", source_id="4546390", doc_id_verified=False, amount=1044.66, amount_due=1044.66, customer_name_raw="CECCONI MARIO S.R.L.").id
+    r = _sync(monkeypatch, test_db_session, [_raw("2026/00001420/SAK - Fattura", "4546517", "notified", balance=1044.66, name="CECCONI MARIO S.R.L.")], notif={"4546517": ["RicevutaConsegna"]})
+    rows = test_db_session.query(Invoice).all()
+    assert len(rows) == 1 and rows[0].id == row_id
+    assert rows[0].source_id == "4546517" and rows[0].doc_id_verified is True and rows[0].sdi_state == "consegnata"
+    assert r["created"] == 0 and r["voided"] == 0 and r.get("doc_id_adopted") == 1 and r.get("renumbered", 0) == 0
+    assert test_db_session.query(ActivityLog).filter_by(action="doc_id_adopted").count() == 1
+
+
+def test_legacy_fossil_released_when_another_legacy_row_adopts_it(monkeypatch, test_db_session):
+    """Due righe storiche: A porta come fossile il doc che oggi ha il numero di B.
+    B lo adotta, A lo rilascia (source_id None) e poi adotta il suo."""
+    a_id = _mk(test_db_session, "A/2026", source_id="dB", doc_id_verified=False).id
+    b_id = _mk(test_db_session, "B/2026", source_id="dX", doc_id_verified=False).id
+    r = _sync(monkeypatch, test_db_session, [_raw("B/2026", "dB", "notified", balance=10.0), _raw("A/2026", "dA", "notified", balance=20.0)],
+              notif={"dB": ["RicevutaConsegna"], "dA": ["RicevutaConsegna"]})
+    a = test_db_session.query(Invoice).get(a_id); b = test_db_session.query(Invoice).get(b_id)
+    assert (b.source_id, b.doc_id_verified, b.amount_due) == ("dB", True, 10.0)
+    assert (a.source_id, a.doc_id_verified, a.amount_due) == ("dA", True, 20.0)
+    assert r.get("doc_id_adopted") == 2 and r.get("fossil_released") == 1 and r["created"] == 0 and r["voided"] == 0
+
+
+def test_legacy_renumbered_draft_without_number_holder(monkeypatch, test_db_session):
+    """Cecconi 1609 dal vivo: riga storica 'pagata per assenza' col doc 4607157;
+    oggi quel doc si chiama 1600 e nessuna riga ha il numero 1600 → è lo stesso
+    documento rinumerato: rinumerata, e (bozza con residuo) annullata."""
+    _mk(test_db_session, "2026/00001609/SAK - Fattura", source_id="4607157", doc_id_verified=False, status="paid", amount_due=0, days_overdue=0,
+        paid_at=datetime(2026, 9, 14), amount_due_at_paid=459.42, amount=459.42, customer_name_raw="CECCONI MARIO S.R.L.")
+    r = _sync(monkeypatch, test_db_session, [_raw("2026/00001600/SAK - Fattura", "4607157", "draft", balance=459.42, name="CECCONI MARIO S.R.L.")])
+    rows = test_db_session.query(Invoice).all()
+    assert len(rows) == 1
+    assert rows[0].invoice_number == "2026/00001600/SAK - Fattura" and rows[0].status == "void" and rows[0].paid_at is None
+    assert r["renumbered"] == 1 and r["voided"] == 1 and r["created"] == 0
+
+
+def test_duplicate_created_by_previous_cycle_is_voided_in_favour_of_legacy_holder(monkeypatch, test_db_session):
+    """Il ciclo precedente ha creato una riga nuova (verificata, senza storia)
+    per il numero N mentre la storica con quel numero portava un fossile: vince
+    la storica (ha i solleciti), che adotta il doc; il doppione si annulla."""
+    from backend.database import RecoveryAction, RecoveryActionInvoice as RAI
+    cust = Customer(ragione_sociale="Storica SRL"); test_db_session.add(cust); test_db_session.commit()
+    legacy_id = _mk(test_db_session, "N/2026", source_id="fossil", doc_id_verified=False, amount_due=100.0, customer_id=cust.id).id
+    act = RecoveryAction(customer_id=cust.id, action_type="first_contact", channel="whatsapp_copy", completed_at=datetime(2026, 9, 1), invoice_ids=[legacy_id])
+    test_db_session.add(act); test_db_session.commit(); test_db_session.add(RAI(action_id=act.id, invoice_id=legacy_id)); test_db_session.commit()
+    dup_id = _mk(test_db_session, "N/2026", source_id="real", doc_id_verified=True, amount_due=100.0, sdi_state="consegnata", customer_id=cust.id).id
+    r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "real", "notified", balance=90.0)])
+    legacy = test_db_session.query(Invoice).get(legacy_id); dup = test_db_session.query(Invoice).get(dup_id)
+    assert (legacy.source_id, legacy.doc_id_verified, legacy.status, legacy.amount_due) == ("real", True, "open", 90.0)
+    assert dup.status == "void" and "doppione" in dup.void_reason
+    assert r.get("dup_voided") == 1 and r["created"] == 0
+
+
+def test_legacy_absence_is_by_number(monkeypatch, test_db_session):
+    """Riga storica (fossile): assente solo se il NUMERO non è in lista."""
+    _mk(test_db_session, "L/2026", source_id="fossil", doc_id_verified=False, missing_streak=1)
+    _sync(monkeypatch, test_db_session, [_raw("L/2026", "real", None)])
+    assert _get(test_db_session, "L/2026").status == "open"  # numero presente → adotta, non assente
+    _mk(test_db_session, "M/2026", source_id="fossil2", doc_id_verified=False, missing_streak=1)
+    r = _sync(monkeypatch, test_db_session, [_raw("L/2026", "real", None)])
+    assert _get(test_db_session, "M/2026").status == "paid" and r["paid_detected"] == 1

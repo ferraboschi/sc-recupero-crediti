@@ -2010,6 +2010,7 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
                 customer_name_raw=fp.get("customer_name"), customer_id=customer_id,
                 source_platform="fatturapro", source_id=fp.get("doc_id"),
                 match_method="fatturapro_verify", sdi_state=state, sdi_checked_at=now,
+                doc_id_verified=True,
             )
             session.add(created)
             session.flush()
@@ -2020,7 +2021,12 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
         # insieme a qualunque correzione (tranne l'annullamento).
         if pl is not None and fp is not None and row.get("renumber_from") and fx.fix != "void":
             pl.invoice_number = (fp.get("invoice_number") or pl.invoice_number).strip()
+            pl.doc_id_verified = True
             pl.updated_at = now
+        if pl is not None and fp is not None and fx.fix in ("update_amount", "mark_paid", "reopen", "reactivate") and not pl.doc_id_verified:
+            # La correzione conferma che questa riga È il documento FatturaPro
+            pl.source_id = str(fp.get("doc_id") or pl.source_id or "")
+            pl.doc_id_verified = True
         if fx.fix == "renumber" and pl is not None and fp is not None:
             pl.amount = float(fp.get("total") or pl.amount or 0)
             pl.amount_due = float(fp.get("balance") or 0) if pl.status != "paid" else pl.amount_due
