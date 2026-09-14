@@ -177,6 +177,10 @@ def get_system_status():
                 "draft_guard_triggered": fp.get("draft_guard_triggered", 0),
                 "reassign_guard_triggered": fp.get("reassign_guard_triggered", 0),
                 "reassigned_on_paid": fp.get("reassigned_on_paid", 0),
+                "doc_id_adopted": fp.get("doc_id_adopted", 0),
+                "dup_voided": fp.get("dup_voided", 0),
+                "legacy_orphans": fp.get("legacy_orphans", 0),
+                "number_conflicts": fp.get("number_conflicts", 0),
             }
 
         cust_result = _sync_status.get("customers", {}).get("result")
@@ -425,6 +429,14 @@ def _summarize_sync_result(key: str, result: dict) -> str:
                 sdi_bits.append(f"{fp['number_taken_over']} numeri passati a documenti nuovi")
             if fp.get("reassign_skipped") or fp.get("draft_void_skipped") or fp.get("renumber_skipped"):
                 sdi_bits.append("righe in attesa per guardia")
+            if fp.get("doc_id_adopted"):
+                sdi_bits.append(f"{fp['doc_id_adopted']} doc adottati")
+            if fp.get("dup_voided"):
+                sdi_bits.append(f"{fp['dup_voided']} doppioni annullati")
+            if fp.get("legacy_orphans"):
+                sdi_bits.append(f"{fp['legacy_orphans']} orfane")
+            if fp.get("number_conflicts"):
+                sdi_bits.append(f"{fp['number_conflicts']} CONFLITTI da verificare dalla scheda cliente")
             if fp.get("draft_guard_triggered") or fp.get("reassign_guard_triggered") or fp.get("renumber_guard_triggered"):
                 sdi_bits.append("GUARDIA SDI SCATTATA")
             if sdi_bits:

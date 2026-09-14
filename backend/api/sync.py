@@ -27,6 +27,7 @@ from backend.database import (
 )
 from backend.connectors.fatturapro import FatturaProConnector
 from backend.engine.sdi import SDI_FINAL_OK, sdi_state_from_notifications
+from backend.database import RecoveryActionInvoice
 from backend.connectors.shopify import ShopifyConnector
 from backend.engine.matching import run_matching
 from backend.engine.cases import update_case_lifecycle
@@ -221,6 +222,14 @@ def _find_existing(session, invoice_number: str, doc_id=None):
     return (same or rows)[0]
 
 
+def _fp_number_phrase_sync(number: str) -> str:
+    """Frase di ricerca per numero su FatturaPro: il progressivo a 6+ cifre
+    ('2026/00001609/SAK - Fattura' → '00001609'), altrimenti il numero grezzo."""
+    import re as _re
+    m = _re.search(r"\d{6,}", number or "")
+    return m.group(0) if m else (number or "").strip()
+
+
 def _reactivate_invoice(inv, sdi_state: str) -> None:
     """Una annullata che FatturaPro ora presenta trasmessa e consegnata (la
     bozza è stata inviata): torna un credito aperto."""
@@ -388,36 +397,366 @@ def _sync_invoices_task() -> dict:
                             by_doc[str(row_.source_id)] = row_
 
                 def _is_absent(known, fetched_numbers, doc_ids):
-                    """Presenza per IDENTITÀ: una riga con doc_id è presente solo
-                    se il suo documento è in lista (il numero può appartenere
-                    a un altro documento); senza doc_id vale il numero."""
-                    if known.source_id:
+                    """Presenza per IDENTITÀ solo per le righe col doc_id
+                    verificato (il numero può appartenere a un altro documento);
+                    per le righe storiche (doc_id fossile) l'identità è numero +
+                    destinatario: se il numero in lista è di un altro
+                    destinatario, la riga è assente."""
+                    if known.source_id and known.doc_id_verified:
                         return str(known.source_id) not in doc_ids
-                    return known.invoice_number not in fetched_numbers
+                    if known.invoice_number not in fetched_numbers:
+                        return True
+                    fp_name = name_by_number.get(known.invoice_number)  # definito più sotto, usato a ciclo avviato
+                    return bool(fp_name) and not _same_recipient(known, fp_name)
+
+                # ── RISOLUZIONE come PIANO (nessuna scrittura qui: si applica
+                # dopo il pre-pass notifiche, così le chiamate HTTP non tengono
+                # lock sulle righe). Le decisioni usano una "vista" locale di
+                # source_id/verificato per restare coerenti riga dopo riga. ──
+                view_src = {}      # inv.id -> source_id pianificato (None = rilasciato)
+                view_ver = set()   # id pianificati come verificati
+                plan = {"adopt": [], "confirm": [], "release": [], "dupvoid": [], "orphan": [], "conflict": []}
+                planned_void = set()
+                planned_ids = set()
+
+                # Prefetch (niente query per riga): righe attive per numero e
+                # righe con storia.
+                fetched_numbers_all = [r["invoice_number"] for r in raw_invoices]
+                rows_by_number = {}
+                if fetched_numbers_all:
+                    for x in session.query(Invoice).filter(
+                        Invoice.invoice_number.in_(fetched_numbers_all), Invoice.source_platform == "fatturapro",
+                        Invoice.status != "void",
+                    ).order_by(Invoice.id.asc()).all():
+                        rows_by_number.setdefault(x.invoice_number, []).append(x)
+                all_ids = {x.id for xs in rows_by_number.values() for x in xs} | {x.id for x in by_doc.values()}
+                acted_ids = set()
+                if all_ids:
+                    acted_ids = {r_[0] for r_ in session.query(RecoveryActionInvoice.invoice_id).filter(
+                        RecoveryActionInvoice.invoice_id.in_(list(all_ids))).distinct().all()}
+                name_by_number = {r["invoice_number"]: (r.get("customer_name") or "") for r in raw_invoices}
+                fetched_numbers_set = set(name_by_number)
+                total_by_doc = {str(r["doc_id"]): float(r.get("total") or 0) for r in raw_invoices if r.get("doc_id")}
+                name_by_doc = {str(r["doc_id"]): (r.get("customer_name") or "") for r in raw_invoices if r.get("doc_id")}
+
+                def _same_document(inv, doc):
+                    """Un fossile VIVO è "lo stesso documento" della riga storica
+                    solo se anche l'IMPORTO coincide (Cecconi 1609: 459,42 =
+                    459,42). Con importi diversi la riga è un'altra fattura (il
+                    vecchio sync le ha solo riscritto il numero): segue il numero."""
+                    tot = total_by_doc.get(str(doc or ""))
+                    return tot is not None and abs(float(inv.amount or 0) - tot) < 0.005
+
+                def _src_of(inv):
+                    return view_src.get(inv.id, inv.source_id)
+
+                def _verified(inv):
+                    return inv.id in view_ver or bool(inv.doc_id_verified)
+
+                def _name_key(name):
+                    """Confronto del destinatario: maiuscole, spazi e punteggiatura
+                    ignorati ('S.R.L.' = 'SRL'), ma NON le forme giuridiche
+                    ('ROSSI SPA' ≠ 'ROSSI SRL')."""
+                    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+                def _same_recipient(inv, r):
+                    """Senza nome da una delle due parti non si può contraddire: vale."""
+                    a_ = _name_key(inv.customer_name_raw)
+                    b_ = _name_key(r.get("customer_name") if isinstance(r, dict) else r)
+                    if not a_ or not b_:
+                        return True
+                    return a_ == b_
+
+                def _has_history(inv):
+                    """Solleciti, assegno in mano, insoluto o note dell'operatore:
+                    una riga così non è mai un "doppione" da annullare."""
+                    return (inv.id in acted_ids or bool(inv.payment_pending) or inv.bounced_at is not None
+                            or bool((inv.recovery_note or "").strip()) or bool((inv.payment_pending_note or "").strip()))
+
+                def _number_rows(num):
+                    return [x for x in rows_by_number.get(num, []) if x.id not in planned_void]
 
                 def _resolve(r):
-                    ex = by_doc.get(str(r.get("doc_id") or ""))
-                    if ex is not None:
-                        return ex
-                    return _find_existing(session, r["invoice_number"], r.get("doc_id"))
+                    """Riga della piattaforma per la riga FatturaPro (N, D).
+                    - doc VERIFICATO e coincidente: identità = documento;
+                    - riga storica col numero N e STESSO destinatario: adotta D
+                      (l'eventuale altra storica che portava D come fossile lo
+                      rilascia, se non ha storia);
+                    - riga storica col numero N ma destinatario DIVERSO: per lei
+                      il numero non è più il suo (identità storica = numero +
+                      destinatario) → assente, regola storica; qui si crea il
+                      documento nuovo;
+                    - numero libero + owner storico di D con lo stesso
+                      destinatario: stesso documento rinumerato."""
+                    doc = str(r.get("doc_id") or "")
+                    num = r["invoice_number"]
+                    owner = by_doc.get(doc) if doc else None
+                    if owner is not None and owner.id in planned_void:
+                        owner = None
+                    rows_n = _number_rows(num)
+                    # Candidati holder: attive col numero, dello stesso destinatario
+                    # (una pagata di un altro destinatario non è mai holder né rivale).
+                    cands = [x for x in rows_n if _same_recipient(x, r) and x.id not in planned_ids]
+                    # Una PAGATA è holder solo se non c'è un'aperta col numero
+                    # (mai annullata come doppione, mai riaperta sopra un'aperta).
+                    unpaid_c = [x for x in cands if x.status != "paid"]
+                    if unpaid_c:
+                        cands = unpaid_c
+                    if owner is not None and _verified(owner) and str(_src_of(owner)) == doc:
+                        rivals = [x for x in cands if x.id != owner.id and _has_history(x) and x.status != "paid"]
+                        if rivals and not _has_history(owner):
+                            # Owner verificato senza storia accanto a una riga
+                            # col numero che la storia la porta: doppione.
+                            plan["dupvoid"].append((owner, num, doc))
+                            planned_void.add(owner.id)
+                            by_doc.pop(doc, None)
+                            cands = [x for x in cands if x.id != owner.id]
+                            owner = None
+                        else:
+                            if rivals:
+                                # Anche l'owner ha storia: nessuna scrittura
+                                # automatica, decide l'operatore.
+                                plan["conflict"].append((num, [owner.id] + [x.id for x in rivals]))
+                            planned_ids.add(owner.id)
+                            return owner
+                    if not cands:
+                        # Storiche col numero ma di ALTRO destinatario: orfane
+                        # (assenti per regola storica; si logga una volta).
+                        for x in rows_n:
+                            if not _verified(x) and x.status != "paid" and (x.missing_streak or 0) == 0:
+                                plan["orphan"].append((x, num, r.get("customer_name")))
+                        if (owner is not None and not _verified(owner) and _same_recipient(owner, r)
+                                and _same_document(owner, doc)
+                                and owner.id not in planned_ids
+                                and owner.invoice_number not in fetched_numbers_set):
+                            # Storico, numero libero, e il SUO numero non è più in
+                            # lista: stesso documento rinumerato (Cecconi 1609→1600).
+                            # Se invece il suo numero è ancora in lista, per lui vale
+                            # il numero (adotterà quel doc): qui entra una riga nuova.
+                            planned_ids.add(owner.id)
+                            return owner
+                        return None
+                    with_hist = [x for x in cands if _has_history(x)]
+                    holder = (with_hist or cands)[0]
+                    if len(with_hist) > 1:
+                        # Due righe con storia sullo stesso numero: nessuna
+                        # scrittura automatica, decide l'operatore (la verifica per
+                        # cliente le mostra come doppione).
+                        plan["conflict"].append((num, [x.id for x in with_hist]))
+                    for other in cands:
+                        if other.id != holder.id and other.id not in planned_void and not _has_history(other) and other.status != "paid":
+                            plan["dupvoid"].append((other, num, doc))
+                            planned_void.add(other.id)
+                            if str(_src_of(other)) == doc and by_doc.get(doc) is other:
+                                by_doc.pop(doc, None)
+                    planned_ids.add(holder.id)
+                    if doc and str(_src_of(holder)) == doc:
+                        if not _verified(holder):
+                            plan["confirm"].append(holder)
+                            view_ver.add(holder.id)
+                        return holder
+                    if _verified(holder):
+                        return holder  # doc diverso e verificato: mismatch/taker (regole sotto)
+                    old_doc = _src_of(holder)
+                    if doc:
+                        plan["adopt"].append((holder, doc, old_doc))
+                        view_src[holder.id] = doc
+                        view_ver.add(holder.id)
+                        if old_doc and by_doc.get(str(old_doc)) is holder:
+                            by_doc.pop(str(old_doc), None)
+                        by_doc[doc] = holder
+                    return holder
 
                 existing_of = {id(r): _resolve(r) for r in raw_invoices}
+
+                def _compute_owned():
+                    owned = {}   # doc -> (numero FatturaPro, riga holder o None se verrà creata)
+                    for r_ in raw_invoices:
+                        ex = existing_of[id(r_)]
+                        if ex is not None and _verified(ex) and _src_of(ex) and ex.id not in planned_void:
+                            owned[str(_src_of(ex))] = (r_["invoice_number"], ex)
+                        elif ex is None and r_.get("doc_id"):
+                            owned[str(r_["doc_id"])] = (r_["invoice_number"], None)
+                    for holder in plan["confirm"]:
+                        owned[str(holder.source_id)] = (holder.invoice_number, holder)
+                    for holder, doc, _ in plan["adopt"]:
+                        owned[doc] = (holder.invoice_number, holder)
+                    return owned
+
+                def _others_sharing(owned):
+                    if not owned:
+                        return []
+                    return session.query(Invoice).filter(
+                        Invoice.source_platform == "fatturapro", Invoice.status != "void",
+                        Invoice.source_id.in_(list(owned.keys())),
+                    ).all()
+
+                # Candidati "fantasma": pagate per assenza il cui fossile è vivo con
+                # STESSO importo e STESSO destinatario. Importi ricorrenti rendono
+                # ambiguo il caso: prima di annullare si chiede a FatturaPro se il
+                # loro NUMERO esiste ancora (incasso vero) o no (fantasma). La
+                # ricerca avviene nel pre-pass (HTTP prima delle scritture).
+                phantom_candidates = []
+                for other in _others_sharing(_compute_owned()):
+                    if (other.status == "paid" and other.paid_at is not None and not other.doc_id_verified
+                            and _same_document(other, other.source_id)
+                            and _same_recipient(other, name_by_doc.get(str(other.source_id)))):
+                        phantom_candidates.append(other)
+                if phantom_candidates:
+                    manual_ids = {r_[0] for r_ in session.query(ActivityLog.entity_id).filter(
+                        ActivityLog.entity_type == "invoice", ActivityLog.action == "fatturapro_fix_mark_paid",
+                        ActivityLog.entity_id.in_([o.id for o in phantom_candidates])).all()}
+                    phantom_candidates = [o for o in phantom_candidates if o.id not in manual_ids]
+                plan["number_exists"] = {}
+
+                def _apply_resolution_plan():
+                    """Scritture pianificate dalla risoluzione (dopo il pre-pass)."""
+                    n_adopt = n_rel = n_dup = n_orph = 0
+                    adopted_ids = {h.id for h, _, _ in plan["adopt"]}
+                    for holder in plan["confirm"]:
+                        holder.doc_id_verified = True
+                    for holder, doc, old_doc in plan["adopt"]:
+                        holder.source_id = doc
+                        holder.doc_id_verified = True
+                        # Lo stato SDI memorizzato era del documento fossile: si
+                        # ricontrolla sul documento adottato.
+                        holder.sdi_state = None
+                        holder.sdi_checked_at = None
+                        session.add(ActivityLog(
+                            action="doc_id_adopted", entity_type="invoice", entity_id=holder.id,
+                            details={"invoice_number": holder.invoice_number, "old_doc_id": old_doc, "new_doc_id": doc},
+                        ))
+                        n_adopt += 1
+                    # Chi altro porta un doc ora posseduto da una riga confermata /
+                    # adottata? Una 'pagata per assenza' col doc VIVO non era un
+                    # incasso; una storica senza storia rilascia il fossile; una
+                    # riga con storia non si tocca (conflitto per l'operatore).
+                    # Ogni riga verificata presente in lista "possiede" il suo doc:
+                    # il controllo vale a OGNI ciclo (non solo quando si conferma o
+                    # adotta), altrimenti una gemella con storia esce dal conflitto
+                    # e finisce pagata per assenza al ciclo dopo.
+                    owned = _compute_owned()
+                    conflict_ids = set()
+                    if owned:
+                        others = _others_sharing(owned)
+                        other_ids = [o.id for o in others]
+                        if other_ids:
+                            acted_ids.update(r_[0] for r_ in session.query(RecoveryActionInvoice.invoice_id).filter(
+                                RecoveryActionInvoice.invoice_id.in_(other_ids)).distinct().all())
+                        confirm_ids = {h.id for h in plan["confirm"]}
+                        for other in others:
+                            entry = owned.get(str(other.source_id))
+                            if entry is None:
+                                continue
+                            holder_num, holder = entry
+                            if (holder is not None and other.id == holder.id) or other.id in adopted_ids or other.id in planned_void:
+                                continue
+                            if other.doc_id_verified and other.id not in adopted_ids and other.id not in confirm_ids:
+                                continue  # verificata: se ne occupa il ciclo (mismatch/taker)
+                            manual = session.query(ActivityLog.id).filter(
+                                ActivityLog.entity_type == "invoice", ActivityLog.entity_id == other.id,
+                                ActivityLog.action == "fatturapro_fix_mark_paid").first() is not None
+                            same_doc = _same_document(other, other.source_id)
+                            same_rcpt = _same_recipient(other, name_by_doc.get(str(other.source_id)))
+                            if other.status == "paid":
+                                # Fantasma SOLO se: stesso importo, stesso destinatario e il
+                                # suo numero NON esiste più su FatturaPro (verificato nel
+                                # pre-pass). Numero ancora esistente = incasso vero. Esito
+                                # ignoto (ricerca fallita) = nessuna scrittura, si riprova.
+                                gone = plan["number_exists"].get(other.id)
+                                if other.paid_at is not None and not manual and same_doc and same_rcpt and gone is None:
+                                    continue  # esito ignoto: nessuna scrittura, si riprova al ciclo dopo
+                                if other.paid_at is not None and not manual and same_doc and same_rcpt and gone is False:
+                                    # Stesso numero-documento-importo di una riga viva:
+                                    # la 'pagata per assenza' era una rinumerazione
+                                    # (Cecconi 1609), non un incasso.
+                                    if _void_invoice(session, other, f"rinumerata su FatturaPro (documento {other.source_id} ora è la {holder_num}): la 'pagata per assenza' non era un incasso"):
+                                        fp["voided"] += 1
+                                    other.paid_at = None
+                                    other.amount_due_at_paid = None
+                                # Incasso legittimo (importo diverso) o manuale: resta
+                                # pagata, lascia solo il doc fossile.
+                                other.source_id = None
+                                n_rel += 1
+                                continue
+                            if _has_history(other) and same_doc and same_rcpt:
+                                # Stesso documento ma con storia: nessuna scrittura,
+                                # e finché il conflitto è aperto NON va pagata per
+                                # assenza (sarebbe un incasso inventato).
+                                plan["conflict"].append((holder_num, [holder.id if holder is not None else 0, other.id]))
+                                conflict_ids.add(other.id)
+                                continue
+                            absent_by_number = _is_absent(other, fetched_numbers_set, fp_doc_ids)
+                            if absent_by_number and same_doc and same_rcpt:
+                                # Gemella fossile senza storia: decide la payment
+                                # detection (stessa grazia della 'pagata': due assenze
+                                # → annullata come rinumerata). Nessuna scrittura qui.
+                                continue
+                            # Importo diverso: è un'altra fattura che il vecchio sync
+                            # ha solo rinominato per numero → lascia il fossile e
+                            # segue la regola del numero (assenza → pagata).
+                            released_doc = str(other.source_id or "")
+                            other.source_id = None
+                            session.add(ActivityLog(
+                                action="fossil_doc_id_released", entity_type="invoice", entity_id=other.id,
+                                details={"invoice_number": other.invoice_number, "doc_id": released_doc,
+                                         "adopted_by_number": holder_num},
+                            ))
+                            n_rel += 1
+                    for other, num, doc in plan["dupvoid"]:
+                        if _void_invoice(session, other, f"doppione di {num} creato per errore dal sync (documento {doc})"):
+                            fp["voided"] += 1
+                            n_dup += 1
+                    for row_, num, new_name in plan["orphan"]:
+                        session.add(ActivityLog(
+                            action="legacy_orphan", entity_type="invoice", entity_id=row_.id,
+                            details={"invoice_number": num, "fp_recipient": new_name, "customer_name_raw": row_.customer_name_raw,
+                                     "note": "il numero su FatturaPro appartiene a un altro destinatario: la riga storica segue la regola dell'assenza"},
+                        ))
+                        n_orph += 1
+                    seen_conflicts = set()
+                    for num, ids in plan["conflict"]:
+                        key = (num, tuple(sorted(ids)))
+                        if key in seen_conflicts:
+                            continue
+                        seen_conflicts.add(key)
+                        anchor = max(ids)  # la riga "in più" (di solito la gemella)
+                        already = session.query(ActivityLog.id).filter(
+                            ActivityLog.action == "invoice_number_conflict", ActivityLog.entity_id == anchor,
+                            ActivityLog.timestamp >= datetime.utcnow() - timedelta(hours=24),
+                        ).first()
+                        if already:
+                            continue  # già segnalato nelle ultime 24h: niente rumore
+                        session.add(ActivityLog(
+                            action="invoice_number_conflict", entity_type="invoice", entity_id=anchor,
+                            details={"invoice_number": num, "invoice_ids": ids,
+                                     "note": "più righe con storia sullo stesso numero/documento: nessuna scrittura automatica, verificare dalla scheda cliente"},
+                        ))
+                    plan["conflict_ids"] = conflict_ids
+                    fp["doc_id_adopted"] = n_adopt
+                    fp["doc_id_confirmed"] = len(plan["confirm"])
+                    fp["fossil_released"] = n_rel
+                    fp["dup_voided"] = n_dup
+                    fp["legacy_orphans"] = n_orph
+                    fp["number_conflicts"] = len(seen_conflicts)
 
                 def _doc_mismatch(ex, r):
                     """Stesso numero, documento diverso, E il documento vecchio
                     NON è più nella lista (se c'è ancora, verrà rinumerato dalla
-                    sua riga: non è un conflitto)."""
-                    return bool(ex is not None and r.get("doc_id") and ex.source_id
-                                and str(ex.source_id) != str(r["doc_id"])
-                                and str(ex.source_id) not in fp_doc_ids)
+                    sua riga: non è un conflitto). Usa la vista post-piano."""
+                    src = _src_of(ex) if ex is not None else None
+                    return bool(ex is not None and r.get("doc_id") and src
+                                and str(src) != str(r["doc_id"])
+                                and str(src) not in fp_doc_ids)
 
                 def _number_taken_over(ex, r):
                     """Stesso numero, documento diverso, ma il documento vecchio è
                     ancora nella lista sotto un altro numero: la riga vecchia
                     verrà rinumerata; questa riga è un documento NUOVO."""
-                    return bool(ex is not None and r.get("doc_id") and ex.source_id
-                                and str(ex.source_id) != str(r["doc_id"])
-                                and str(ex.source_id) in fp_doc_ids)
+                    src = _src_of(ex) if ex is not None else None
+                    return bool(ex is not None and r.get("doc_id") and src
+                                and str(src) != str(r["doc_id"])
+                                and str(src) in fp_doc_ids)
 
                 # ── Guardie anti-disastro (markup cambiato ≠ realtà cambiata) ──
                 # Conta le righe che VERREBBERO annullate: attive lette come
@@ -449,8 +788,7 @@ def _sync_invoices_task() -> dict:
                                 and ex.invoice_number != r["invoice_number"])
 
                 def _name_changed(ex, r):
-                    new_name = (r.get("customer_name") or "").strip().lower()
-                    return bool(new_name and (ex.customer_name_raw or "").strip().lower() != new_name)
+                    return not _same_recipient(ex, r)
 
                 renumber_name_changes = [r for r in raw_invoices if _renumber_case(r) and _name_changed(existing_of[id(r)], r)]
                 renumber_enabled = len(renumber_name_changes) <= RENUMBER_NAME_GUARD_ABS
@@ -500,7 +838,8 @@ def _sync_invoices_task() -> dict:
                         if r.get("fp_signature") != "notified":
                             continue
                         ex = existing_of[id(r)]
-                        if (ex is None or ex.sdi_state not in SDI_FINAL_OK
+                        adopted_now = any(h.id == ex.id for h, _, _ in plan["adopt"]) if ex is not None else False
+                        if (ex is None or ex.sdi_state not in SDI_FINAL_OK or adopted_now
                                 or _doc_mismatch(ex, r) or _number_taken_over(ex, r)):
                             _check(r.get("doc_id"))
                     # Assenti alla soglia di "pagata": una chiamata per
@@ -516,6 +855,45 @@ def _sync_invoices_task() -> dict:
                                     and known.sdi_state not in SDI_FINAL_OK):
                                 _check(known.source_id)
                 fp["sdi_checked"] = sdi_checks
+                # Numero dei candidati fantasma ancora su FatturaPro? (HTTP, cap 20)
+                search_fn = getattr(fatturapro, "search_documents", None)
+                import re as _re_num
+                # CANARY: la ricerca per numero deve trovare un documento PRESENTE
+                # in lista; se non lo trova (LIKE che non aggancia il formato,
+                # layout cambiato) ogni esito "assente" sarebbe un falso fantasma
+                # → in quel ciclo nessun esito è affidabile (nessuna scrittura).
+                search_trusted = bool(search_fn) and bool(phantom_candidates)
+                if search_trusted:
+                    canary = next((r_ for r_ in raw_invoices if _re_num.search(r"\d{6,}", r_.get("invoice_number") or "")), None)
+                    if canary is None:
+                        search_trusted = False
+                    else:
+                        try:
+                            c_found, c_ok = search_fn(_fp_number_phrase_sync(canary["invoice_number"]), column="documenti.NumeroSezionale")
+                        except Exception as e:
+                            logger.warning("Canary ricerca numero fallita: %s", e)
+                            c_found, c_ok = [], False
+                        search_trusted = c_ok and any(
+                            (f.get("invoice_number") or "").strip() == canary["invoice_number"].strip() for f in c_found)
+                        if not search_trusted:
+                            logger.error("SDI: la ricerca per numero su FatturaPro non trova un documento presente (%s): "
+                                         "nessun annullamento di fantasmi in questo ciclo", canary["invoice_number"])
+                            fp["number_search_untrusted"] = 1
+                for other in phantom_candidates[:20]:
+                    if not search_trusted or not _re_num.search(r"\d{6,}", other.invoice_number or ""):
+                        plan["number_exists"][other.id] = None  # ignoto: nessuna scrittura
+                        continue
+                    phrase = _fp_number_phrase_sync(other.invoice_number)
+                    try:
+                        found, ok = search_fn(phrase, column="documenti.NumeroSezionale")
+                    except Exception as e:
+                        logger.warning("Ricerca numero %s fallita: %s", other.invoice_number, e)
+                        found, ok = [], False
+                    exists = any((f.get("invoice_number") or "").strip() == (other.invoice_number or "").strip() for f in found)
+                    plan["number_exists"][other.id] = True if exists else (False if ok else None)
+                fp["phantom_checked"] = len(phantom_candidates[:20])
+                _apply_resolution_plan()
+                session.flush()
 
                 def _sdi_state_for(doc_id):
                     return sdi_by_doc.get(str(doc_id)) if doc_id else None
@@ -544,12 +922,13 @@ def _sync_invoices_task() -> dict:
                         ))
                         logger.info("Rinumerata da FatturaPro: %s → %s (doc %s)", existing.invoice_number, inv_num, existing.source_id)
                         existing.invoice_number = inv_num
+                        existing.doc_id_verified = True
                         fp["renumbered"] = fp.get("renumbered", 0) + 1
                         # Se col numero cambia anche il destinatario, l'abbinamento
                         # al cliente fatto col vecchio nome va ricontrollato: la
                         # riga torna all'audit (mai un cliente sbagliato in silenzio).
                         new_name = (inv.get("customer_name") or "").strip()
-                        if new_name and (existing.customer_name_raw or "").strip().lower() != new_name.lower():
+                        if new_name and not _same_recipient(existing, inv):
                             # Destinatario diverso: l'abbinamento fatto col vecchio
                             # nome non vale più. Si SCOLLEGA (il matching riabbina
                             # per P.IVA/nome), così il credito non resta nel dovuto
@@ -680,6 +1059,7 @@ def _sync_invoices_task() -> dict:
                     if existing is not None and existing.source_id is None and inv.get("doc_id"):
                         # Riga storica senza identità: adotta il doc_id
                         existing.source_id = str(inv["doc_id"])
+                        existing.doc_id_verified = True
 
                     if existing:
                         existing.amount = inv.get("total", 0)
@@ -782,6 +1162,7 @@ def _sync_invoices_task() -> dict:
                             source_id=inv.get("doc_id"),
                             sdi_state=new_state,
                             sdi_checked_at=datetime.utcnow() if new_state else None,
+                            doc_id_verified=True,
                         )
                         session.add(new_invoice)
                         created += 1
@@ -795,6 +1176,10 @@ def _sync_invoices_task() -> dict:
                         Invoice.source_platform == "fatturapro",
                         Invoice.status.notin_(("paid", "void")),
                     ).all()
+                    acted_absent = set()
+                    if known_fp_invoices:
+                        acted_absent = {r_[0] for r_ in session.query(RecoveryActionInvoice.invoice_id).filter(
+                            RecoveryActionInvoice.invoice_id.in_([k.id for k in known_fp_invoices])).distinct().all()}
 
                     # Ulteriore guardia: se il fetch copre meno della metà
                     # delle fatture aperte note, qualcosa non torna.
@@ -807,6 +1192,29 @@ def _sync_invoices_task() -> dict:
                         result["fatturapro"]["partial"] = True
                     else:
                         for known_inv in known_fp_invoices:
+                            if known_inv.id in plan.get("conflict_ids", set()):
+                                continue  # conflitto aperto: decide l'operatore, mai 'pagata' per assenza
+                            if (_is_absent(known_inv, fetched_invoice_numbers, fp_doc_ids)
+                                    and not known_inv.doc_id_verified and known_inv.source_id
+                                    and str(known_inv.source_id) in fp_doc_ids
+                                    and _same_document(known_inv, known_inv.source_id)
+                                    and _same_recipient(known_inv, name_by_doc.get(str(known_inv.source_id)))):
+                                # Storica assente il cui doc fossile è VIVO in lista con
+                                # lo STESSO importo (bozza/in elaborazione/non ancora
+                                # entrato): è quel documento, non un incasso. Con storia
+                                # resta in conflitto per l'operatore; senza storia si
+                                # annulla, con la stessa grazia della 'pagata'.
+                                if known_inv.id in acted_absent or _has_history(known_inv):
+                                    plan.setdefault("conflict_ids", set()).add(known_inv.id)
+                                    known_inv.missing_streak = 0
+                                    continue
+                                streak = (known_inv.missing_streak or 0) + 1
+                                if streak >= PAID_ABSENCE_STREAK:
+                                    if _void_invoice(session, known_inv, "rinumerata su FatturaPro: il numero è passato ad altri e il documento originario (stesso importo e destinatario) è ancora in lista — non incassata"):
+                                        fp["voided"] += 1
+                                else:
+                                    known_inv.missing_streak = streak
+                                continue
                             if _is_absent(known_inv, fetched_invoice_numbers, fp_doc_ids):
                                 # La "pagata" è un'inferenza per assenza: una
                                 # riga persa silenziosamente dal fetch non

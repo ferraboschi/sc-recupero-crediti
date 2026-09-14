@@ -1834,6 +1834,38 @@ def _fp_name_key(name) -> str:
     return " ".join((name or "").split()).strip().lower()
 
 
+def _action_counts(session, invoices) -> dict:
+    """{invoice_id: peso di 'storia'} per decidere, fra doppioni, chi la porta:
+    stesso predicato del sync (solleciti, assegno in mano, insoluto, note)."""
+    ids = [i.id for i in invoices]
+    if not ids:
+        return {}
+    from backend.database import RecoveryActionInvoice
+    rows = session.query(RecoveryActionInvoice.invoice_id, func.count(RecoveryActionInvoice.action_id)).filter(
+        RecoveryActionInvoice.invoice_id.in_(ids)).group_by(RecoveryActionInvoice.invoice_id).all()
+    out = {r[0]: int(r[1]) for r in rows}
+    for inv in invoices:
+        if (inv.payment_pending or inv.bounced_at is not None or (inv.recovery_note or "").strip()
+                or (inv.payment_pending_note or "").strip()):
+            out[inv.id] = out.get(inv.id, 0) + 100
+    return out
+
+
+def _drop_foreign_docs(session, customer_id, fp_rows):
+    """Documenti FatturaPro già posseduti (doc_id verificato) da una riga di un
+    ALTRO cliente: non si propongono qui (né import, né rinumerazione), se ne
+    occupa il sync/la scheda dell'altro cliente."""
+    ids = [str(r.get("doc_id")) for r in fp_rows if r.get("doc_id")]
+    if not ids:
+        return fp_rows, 0
+    taken = {str(x[0]) for x in session.query(Invoice.source_id).filter(
+        Invoice.source_platform == "fatturapro", Invoice.status != "void", Invoice.doc_id_verified.is_(True),
+        Invoice.source_id.in_(ids), or_(Invoice.customer_id != customer_id, Invoice.customer_id.is_(None)),
+    ).all()}
+    kept = [r for r in fp_rows if str(r.get("doc_id") or "") not in taken]
+    return kept, len(fp_rows) - len(kept)
+
+
 def _fp_number_phrase(number: str) -> str:
     """Frase di ricerca per numero su FatturaPro: il progressivo a 8 cifre
     ('2026/00001600/SAK - Fattura' → '00001600'), altrimenti il numero grezzo."""
@@ -1907,7 +1939,9 @@ def verify_fatturapro(customer_id: int, session: Session = Depends(get_session))
             connector.close()
         except Exception:
             pass
-    result = compare_documents(platform, fp_rows, complete=complete)
+    fp_rows, foreign = _drop_foreign_docs(session, customer_id, fp_rows)
+    result = compare_documents(platform, fp_rows, complete=complete, action_counts=_action_counts(session, platform))
+    result["foreign_docs"] = foreign
     session.add(ActivityLog(
         action="fatturapro_verify", entity_type="customer", entity_id=customer_id,
         details={"customer": customer.ragione_sociale, "names": names, "fp_rows": len(fp_rows),
@@ -1962,7 +1996,8 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             connector.close()
         except Exception:
             pass
-    verdict_rows = compare_documents(platform, fp_rows, complete=complete)["rows"]
+    fp_rows, _ = _drop_foreign_docs(session, customer_id, fp_rows)
+    verdict_rows = compare_documents(platform, fp_rows, complete=complete, action_counts=_action_counts(session, platform))["rows"]
     current = {r["key"]: r for r in verdict_rows}
     by_number = {}
     for r in verdict_rows:
@@ -2010,6 +2045,7 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
                 customer_name_raw=fp.get("customer_name"), customer_id=customer_id,
                 source_platform="fatturapro", source_id=fp.get("doc_id"),
                 match_method="fatturapro_verify", sdi_state=state, sdi_checked_at=now,
+                doc_id_verified=True,
             )
             session.add(created)
             session.flush()
@@ -2020,7 +2056,12 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
         # insieme a qualunque correzione (tranne l'annullamento).
         if pl is not None and fp is not None and row.get("renumber_from") and fx.fix != "void":
             pl.invoice_number = (fp.get("invoice_number") or pl.invoice_number).strip()
+            pl.doc_id_verified = True
             pl.updated_at = now
+        if pl is not None and fp is not None and fx.fix in ("update_amount", "mark_paid", "reopen", "reactivate") and not pl.doc_id_verified:
+            # La correzione conferma che questa riga È il documento FatturaPro
+            pl.source_id = str(fp.get("doc_id") or pl.source_id or "")
+            pl.doc_id_verified = True
         if fx.fix == "renumber" and pl is not None and fp is not None:
             pl.amount = float(fp.get("total") or pl.amount or 0)
             pl.amount_due = float(fp.get("balance") or 0) if pl.status != "paid" else pl.amount_due

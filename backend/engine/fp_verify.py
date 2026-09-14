@@ -23,6 +23,7 @@ VERDICT_LABELS = {
     "pagata_non_tracciata": "Saldata su FatturaPro, mai importata",
     "duplicato": "Doppione in piattaforma (documento diverso dallo stesso numero)",
     "rinumerata": "Rinumerata da FatturaPro (stesso documento, numero nuovo)",
+    "altro_destinatario": "Il numero su FatturaPro è intestato a un altro destinatario",
 }
 
 # Correzione proposta per ciascun verdetto (None = nessuna azione automatica).
@@ -68,7 +69,7 @@ def _natural_key(num: str):
 
 
 def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]],
-                      complete: bool = True) -> Dict[str, Any]:
+                      complete: bool = True, action_counts: Optional[Dict[int, int]] = None) -> Dict[str, Any]:
     """Confronta le fatture della piattaforma (oggetti Invoice, source
     fatturapro) con le righe FatturaPro dello stesso destinatario.
 
@@ -102,9 +103,17 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
     active_pl: Dict[str, Any] = {}
     extra_active: List[Any] = []  # doppioni attivi (stesso numero, documento diverso)
     void_pl: Dict[str, List[Any]] = {}
+    actions = action_counts or {}
+    # Numeri attivi in piattaforma: una riga STORICA il cui doc è su FatturaPro
+    # sotto un numero che nessuna riga ha è lo stesso documento rinumerato
+    # (stesso criterio del sync); se il numero è occupato, per la storica vale
+    # il numero (il suo doc_id è un fossile).
+    active_numbers = {doc_key((i.invoice_number or "").strip()) for i in platform_invoices if i.status != "void"}
     for inv in platform_invoices:
         num = doc_key((inv.invoice_number or "").strip())
         fp_num = fp_num_by_doc.get(str(inv.source_id or ""))
+        if fp_num and fp_num != num and not getattr(inv, "doc_id_verified", False) and fp_num in active_numbers:
+            fp_num = None
         if fp_num and fp_num != num:
             renumber_from[inv.id] = (inv.invoice_number or "").strip()
             num = fp_num
@@ -114,12 +123,15 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
             continue
         fp = by_num_fp.get(num)
         if num in active_pl:
-            # Due attive con lo stesso numero: "la" riga è quella il cui
-            # doc_id coincide con FatturaPro; l'altra è un doppione.
+            # Due attive con lo stesso numero: "la" riga è quella con i
+            # solleciti (stessa regola del sync), poi quella il cui doc_id
+            # verificato coincide con FatturaPro, poi la più vecchia.
             cur = active_pl[num]
-            cur_match = bool(fp and cur.source_id and str(cur.source_id) == str(fp.get("doc_id")))
-            new_match = bool(fp and inv.source_id and str(inv.source_id) == str(fp.get("doc_id")))
-            if new_match and not cur_match:
+
+            def _rank(x):
+                match = bool(fp and x.source_id and str(x.source_id) == str(fp.get("doc_id")) and getattr(x, "doc_id_verified", False))
+                return (-(actions.get(x.id, 0)), 0 if match else 1, x.id or 0)
+            if _rank(inv) < _rank(cur):
                 extra_active.append(cur)
                 active_pl[num] = inv
             else:
@@ -157,7 +169,14 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
             else:
                 verdict = "pagata_non_tracciata"
         else:
-            if fp.get("doc_id") and pl.source_id and str(fp.get("doc_id")) != str(pl.source_id):
+            pl_name = "".join(ch for ch in (pl.customer_name_raw or "").lower() if ch.isalnum())
+            fp_name = "".join(ch for ch in (fp.get("customer_name") or "").lower() if ch.isalnum())
+            same_doc_verified = bool(fp.get("doc_id") and pl.source_id and str(fp.get("doc_id")) == str(pl.source_id)
+                                     and getattr(pl, "doc_id_verified", False))
+            if pl_name and fp_name and pl_name != fp_name and not same_doc_verified:
+                verdict = "altro_destinatario"  # nessuna correzione automatica: decide l'operatore
+            elif (fp.get("doc_id") and pl.source_id and str(fp.get("doc_id")) != str(pl.source_id)
+                    and getattr(pl, "doc_id_verified", False)):
                 verdict = "numero_riassegnato"
             elif pl.status == "paid" and (fp_saldo or 0) > 0:
                 verdict = "riaperta_su_fatturapro"

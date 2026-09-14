@@ -187,6 +187,13 @@ class Invoice(Base):
     # trasmissione). Mai cancellata: resta per audit, fuori da ogni conteggio.
     voided_at = Column(DateTime, nullable=True)
     void_reason = Column(Text, nullable=True)
+    # True quando source_id (doc_id FatturaPro) è stato assegnato/confermato
+    # dal regime "identità = documento" (2026-09-14). Le righe storiche hanno
+    # un doc_id FOSSILE: il vecchio sync abbinava per numero e riscriveva
+    # nome/importi dalla riga che aveva quel numero, quindi per loro l'identità
+    # che l'operatore ha visto e sollecitato è il NUMERO: adottano il doc_id
+    # attuale al primo incontro.
+    doc_id_verified = Column(Boolean, default=False)
     # Data di pagamento VERA: scritta nel momento in cui il sync marca la
     # fattura 'paid', azzerata se la fattura riapre. Da non confondere con
     # updated_at (onupdate: cambia a ogni modifica di riga, non è una data
@@ -527,6 +534,7 @@ def _run_migrations(engine):
         "ALTER TABLE invoices ADD COLUMN sdi_checked_at TIMESTAMP",
         "ALTER TABLE invoices ADD COLUMN voided_at TIMESTAMP",
         "ALTER TABLE invoices ADD COLUMN void_reason TEXT",
+        "ALTER TABLE invoices ADD COLUMN doc_id_verified BOOLEAN DEFAULT FALSE",
         "ALTER TABLE overdue_snapshots ADD COLUMN in_incasso DOUBLE PRECISION DEFAULT 0",
         "ALTER TABLE overdue_snapshots ADD COLUMN in_incasso_fatture INTEGER DEFAULT 0",
         "UPDATE overdue_snapshots SET in_incasso = 0 WHERE in_incasso IS NULL",
