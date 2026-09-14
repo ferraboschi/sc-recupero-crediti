@@ -113,6 +113,14 @@ class FakeFP:
         FakeFP.calls.append(doc_id)
         return FakeFP.notif.get(str(doc_id))
 
+    existing_numbers = set()   # numeri che FatturaPro "conosce ancora" (ricerca per numero)
+    search_ok = True
+
+    def search_documents(self, phrase, limit=300, column="documenti.Destinatario"):
+        FakeFP.calls.append(("search", column, phrase))
+        hits = [{"invoice_number": n, "doc_id": "x", "total": 0.0, "balance": 0.0} for n in FakeFP.existing_numbers if phrase in n]
+        return hits, FakeFP.search_ok
+
     def close(self):
         pass
 
@@ -127,6 +135,9 @@ def _sync(monkeypatch, session, raw, notif=None):
     FakeFP.raw = raw
     FakeFP.notif = notif or {}
     FakeFP.calls = []
+    FakeFP.existing_numbers = getattr(FakeFP, "_next_existing", set())
+    FakeFP.search_ok = getattr(FakeFP, "_next_search_ok", True)
+    FakeFP._next_existing = set(); FakeFP._next_search_ok = True
     monkeypatch.setattr(sync_mod, "FatturaProConnector", FakeFP)
     monkeypatch.setattr(sync_mod, "get_session_direct", lambda: session)
     return sync_mod._sync_invoices_task()["fatturapro"]
@@ -1142,3 +1153,62 @@ def test_verify_flags_other_recipient_without_fix(test_db_session):
     beta = dict(_fp("0900", "G", 250.0, 250.0, "Consegnato")); beta["customer_name"] = "BETA SRL"
     res = compare_documents([pl], [beta])
     assert res["rows"][0]["verdict"] == "altro_destinatario" and res["rows"][0]["fix"] is None
+
+
+# ── Sesto giro: fantasmi confermati dal numero, grazia unica ────────────────
+
+def test_phantom_paid_confirmed_by_number_lookup(monkeypatch, test_db_session):
+    """M2: pagata per assenza con fossile vivo, stesso importo e destinatario:
+    - se FatturaPro conosce ancora il suo NUMERO → incasso vero, resta pagata;
+    - se la ricerca fallisce → nessuna scrittura (si riprova);
+    - se il numero non esiste più → fantasma, annullata (Cecconi 1609)."""
+    def scenario():
+        for x in test_db_session.query(Invoice).all():
+            test_db_session.delete(x)
+        for x in test_db_session.query(ActivityLog).all():
+            test_db_session.delete(x)
+        test_db_session.commit()
+        p = _mk(test_db_session, "2026/00001609/SAK - Fattura", source_id="D", doc_id_verified=False, status="paid", amount=459.42, amount_due=0, days_overdue=0,
+                paid_at=datetime(2026, 9, 14), amount_due_at_paid=459.42, customer_name_raw="CECCONI MARIO S.R.L.").id
+        _mk(test_db_session, "2026/00001600/SAK - Fattura", source_id="E", doc_id_verified=False, amount=459.42, amount_due=459.42, customer_name_raw="CECCONI MARIO S.R.L.")
+        return p
+    row = _raw("2026/00001600/SAK - Fattura", "D", "notified", balance=459.42, name="CECCONI MARIO S.R.L.")
+    # 1) numero ancora esistente su FatturaPro → incasso vero
+    p_id = scenario(); FakeFP._next_existing = {"2026/00001609/SAK - Fattura"}
+    r = _sync(monkeypatch, test_db_session, [row], notif={"D": ["RicevutaConsegna"]})
+    p = test_db_session.query(Invoice).get(p_id)
+    assert p.status == "paid" and p.paid_at is not None and p.source_id is None and r["voided"] == 0
+    assert ("search", "documenti.NumeroSezionale", "00001609") in FakeFP.calls
+    # 2) ricerca fallita → nessuna scrittura
+    p_id = scenario(); FakeFP._next_search_ok = False
+    r = _sync(monkeypatch, test_db_session, [row], notif={"D": ["RicevutaConsegna"]})
+    p = test_db_session.query(Invoice).get(p_id)
+    assert p.status == "paid" and p.source_id == "D" and r["voided"] == 0
+    # 3) numero sparito → fantasma
+    p_id = scenario()
+    r = _sync(monkeypatch, test_db_session, [row], notif={"D": ["RicevutaConsegna"]})
+    p = test_db_session.query(Invoice).get(p_id)
+    assert p.status == "void" and p.paid_at is None and r["voided"] == 1
+
+
+def test_phantom_paid_with_other_recipient_is_kept(monkeypatch, test_db_session):
+    p_id = _mk(test_db_session, "1609", source_id="D", doc_id_verified=False, status="paid", amount=100.0, amount_due=0, days_overdue=0,
+               paid_at=datetime(2026, 9, 14), customer_name_raw="ALFA SRL").id
+    _mk(test_db_session, "1600", source_id="E", doc_id_verified=False, amount=100.0, amount_due=100.0, customer_name_raw="BETA SRL")
+    r = _sync(monkeypatch, test_db_session, [_raw("1600", "D", "notified", balance=100.0, name="BETA SRL")], notif={"D": ["RicevutaConsegna"]})
+    p = test_db_session.query(Invoice).get(p_id)
+    assert p.status == "paid" and p.paid_at is not None and r["voided"] == 0
+
+
+def test_fossil_twin_grace_is_two_absences(monkeypatch, test_db_session):
+    """M1: gemella senza storia con streak 0 → al primo ciclo solo streak, al
+    secondo annullata (nessun doppio incremento)."""
+    l2 = _mk(test_db_session, "N2/2026", source_id="F", doc_id_verified=False, customer_name_raw="ACME SRL", amount=100.0, missing_streak=0).id
+    _mk(test_db_session, "N1/2026", source_id="E", doc_id_verified=False, customer_name_raw="ACME SRL", amount=100.0)
+    rows = [_raw("N1/2026", "F", "notified", balance=100.0, name="ACME SRL")]
+    r1 = _sync(monkeypatch, test_db_session, rows, notif={"F": ["RicevutaConsegna"]})
+    b = test_db_session.query(Invoice).get(l2)
+    assert b.status == "open" and b.missing_streak == 1 and r1["voided"] == 0
+    r2 = _sync(monkeypatch, test_db_session, rows)
+    b = test_db_session.query(Invoice).get(l2)
+    assert b.status == "void" and r2["voided"] == 1
