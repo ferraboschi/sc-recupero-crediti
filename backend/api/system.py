@@ -419,7 +419,13 @@ def _summarize_sync_result(key: str, result: dict) -> str:
                 sdi_bits.append(f"{fp['voided']} annullate")
             if fp.get("reactivated"):
                 sdi_bits.append(f"{fp['reactivated']} riattivate")
-            if fp.get("draft_guard_triggered") or fp.get("reassign_guard_triggered"):
+            if fp.get("renumbered"):
+                sdi_bits.append(f"{fp['renumbered']} rinumerate")
+            if fp.get("number_taken_over"):
+                sdi_bits.append(f"{fp['number_taken_over']} numeri passati a documenti nuovi")
+            if fp.get("reassign_skipped") or fp.get("draft_void_skipped") or fp.get("renumber_skipped"):
+                sdi_bits.append("righe in attesa per guardia")
+            if fp.get("draft_guard_triggered") or fp.get("reassign_guard_triggered") or fp.get("renumber_guard_triggered"):
                 sdi_bits.append("GUARDIA SDI SCATTATA")
             if sdi_bits:
                 summary += " · SDI: " + ", ".join(sdi_bits)

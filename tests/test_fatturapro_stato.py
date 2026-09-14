@@ -181,14 +181,28 @@ def test_existing_invoice_that_is_a_draft_gets_voided_not_counted(monkeypatch, t
     assert inv.status == "open" and inv.amount_due == 80.0 and inv.sdi_state == "consegnata" and r2["reactivated"] == 1
 
 
-def test_reassigned_number_voids_old_and_creates_new(monkeypatch, test_db_session):
-    _mk(test_db_session, "N/2026", source_id="10", amount=459.42, amount_due=459.42)
+def test_reassigned_number_without_evidence_goes_to_payment_detection(monkeypatch, test_db_session):
+    """Numero passato a un documento nuovo, documento vecchio NON più in lista e
+    senza evidenza di bozza: la riga vecchia NON si annulla (poteva essere
+    incassata) → payment detection per identità (doc_id); il nuovo entra."""
+    _mk(test_db_session, "N/2026", source_id="10", amount=459.42, amount_due=459.42, sdi_state="consegnata")
     r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "77", "notified", balance=120.0)], notif={"77": ["RicevutaConsegna"]})
     old = _get(test_db_session, "N/2026", source_id="10")
-    assert old.status == "void" and "riassegnato" in old.void_reason
-    new = test_db_session.query(Invoice).filter(Invoice.invoice_number == "N/2026", Invoice.status == "open").one()
-    assert new.source_id == "77" and new.amount_due == 120.0 and new.sdi_state == "consegnata"
-    assert r["voided"] == 1 and r["created"] == 1
+    assert old.status == "open" and old.missing_streak == 1 and r["voided"] == 0 and r["created"] == 1
+    new = _get(test_db_session, "N/2026", source_id="77")
+    assert new.amount_due == 120.0 and new.sdi_state == "consegnata"
+    # seconda assenza (per doc_id, anche se il NUMERO è ancora in lista) → pagata
+    _sync(monkeypatch, test_db_session, [_raw("N/2026", "77", "notified", balance=120.0)])
+    old = _get(test_db_session, "N/2026", source_id="10")
+    assert old.status == "paid" and old.amount_due_at_paid == 459.42
+
+
+def test_reassigned_number_with_draft_evidence_is_voided(monkeypatch, test_db_session):
+    _mk(test_db_session, "D/2026", source_id="10", sdi_state="draft")
+    r = _sync(monkeypatch, test_db_session, [_raw("D/2026", "77", "notified", balance=120.0)], notif={"77": ["RicevutaConsegna"]})
+    old = _get(test_db_session, "D/2026", source_id="10")
+    assert old.status == "void" and "riassegnato" in old.void_reason and r["voided"] == 1
+    assert _get(test_db_session, "D/2026", source_id="77").status == "open"
 
 
 def test_absent_draft_is_voided_never_paid(monkeypatch, test_db_session):
@@ -587,3 +601,91 @@ def test_find_existing_prefers_unpaid_active_row(test_db_session):
     openr = _mk(test_db_session, "X9/2026", source_id="o")
     assert _find_existing(test_db_session, "X9/2026", "zzz").id == openr.id
     assert _find_existing(test_db_session, "X9/2026", "p").id == paid.id
+
+
+# ── Rinumerazione di FatturaPro (identità = doc_id) ────────────────────────
+
+def test_sync_matches_by_doc_id_and_renumbers(monkeypatch, test_db_session):
+    """Cecconi dal vivo: doc 4607157 era '1609' (poi sparito → 'pagata'), oggi è
+    '1600'; il vecchio '1600' (doc 4606196) oggi è '1592' di un altro cliente."""
+    from backend.database import Customer as C
+    cec = C(ragione_sociale="CECCONI MARIO S.R.L."); bil = C(ragione_sociale="Billiken"); test_db_session.add_all([cec, bil]); test_db_session.commit()
+    _mk(test_db_session, "2026/00001609/SAK - Fattura", source_id="4607157", customer_id=cec.id, customer_name_raw="CECCONI MARIO S.R.L.",
+        status="paid", amount_due=0, days_overdue=0, paid_at=datetime(2026, 9, 14), amount_due_at_paid=459.42, amount=459.42)
+    _mk(test_db_session, "2026/00001600/SAK - Fattura", source_id="4606196", customer_id=cec.id, customer_name_raw="CECCONI MARIO S.R.L.", amount=459.42, amount_due=459.42)
+    r = _sync(monkeypatch, test_db_session, [
+        _raw("2026/00001600/SAK - Fattura", "4607157", "draft", balance=459.42, name="CECCONI MARIO S.R.L."),
+        _raw("2026/00001592/SAK - Fattura", "4606196", "sent", balance=410.71, name="Billiken di Okuda Atsushi"),
+    ])
+    rows = {x.source_id: x for x in test_db_session.query(Invoice).all()}
+    assert set(rows) == {"4607157", "4606196"}  # nessuna riga nuova, nessun doppione
+    a = rows["4607157"]; b = rows["4606196"]
+    assert a.invoice_number == "2026/00001600/SAK - Fattura" and a.status == "void" and a.paid_at is None and "rinumerazione" in a.void_reason
+    assert b.invoice_number == "2026/00001592/SAK - Fattura" and b.status == "open" and b.amount_due == 410.71 and b.sdi_state == "sent"
+    assert b.customer_name_raw.startswith("Billiken") and b.customer_id is None and b.case_id is None  # scollegata: riabbina il matching
+    assert r["renumbered"] == 2 and r["voided"] == 1 and r["created"] == 0
+    assert test_db_session.query(ActivityLog).filter_by(action="invoice_renumbered").count() == 2
+    assert test_db_session.query(ActivityLog).filter_by(action="invoice_customer_name_changed").count() == 1
+
+
+def test_number_taken_over_creates_new_row_without_void(monkeypatch, test_db_session):
+    """Il vecchio documento è ancora in lista (sotto altro numero) e il numero è
+    passato a un documento nuovo: si crea il nuovo, si rinumera il vecchio."""
+    _mk(test_db_session, "N1/2026", source_id="old", amount_due=10.0)
+    r = _sync(monkeypatch, test_db_session, [
+        _raw("N1/2026", "new", "notified", balance=50.0),
+        _raw("N0/2026", "old", "notified", balance=10.0),
+    ], notif={"new": ["RicevutaConsegna"], "old": ["RicevutaConsegna"]})
+    rows = {x.source_id: (x.invoice_number, x.status) for x in test_db_session.query(Invoice).all()}
+    assert rows == {"old": ("N0/2026", "open"), "new": ("N1/2026", "open")}
+    assert r["voided"] == 0 and r["created"] == 1 and r.get("number_taken_over") == 1 and r["renumbered"] == 1
+
+
+def test_verify_reports_renumbered_and_apply_renumbers(test_client, test_db_session, monkeypatch):
+    import backend.connectors.fatturapro as fpmod
+    monkeypatch.setattr(fpmod, "FatturaProConnector", FakeSearchFP)
+    cust = Customer(ragione_sociale="CECCONI MARIO S.R.L."); test_db_session.add(cust); test_db_session.commit()
+    inv = _mk(test_db_session, "2026/00001420/SAK - Fattura", customer_id=cust.id, source_id="4546390", amount=1044.66, amount_due=1044.66, customer_name_raw="CECCONI MARIO S.R.L.")
+    FakeSearchFP.rows = [_fp("2026/00001419/SAK - Fattura", "4546390", 1044.66, 1044.66, "Consegnato")]
+    FakeSearchFP.by_number = {}
+    r = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    assert len(r["rows"]) == 1
+    row = r["rows"][0]
+    assert row["verdict"] == "rinumerata" and row["fix"] == "renumber" and row["fix_safe"] is True
+    assert row["invoice_number"] == "2026/00001419/SAK - Fattura" and row["renumber_from"] == "2026/00001420/SAK - Fattura"
+    a = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro/apply", json={"fixes": [{"invoice_number": row["invoice_number"], "fix": "renumber", "key": row["key"]}]}).json()
+    assert [x["fix"] for x in a["applied"]] == ["renumber"]
+    test_db_session.expire_all()
+    assert test_db_session.query(Invoice).get(inv.id).invoice_number == "2026/00001419/SAK - Fattura"
+
+
+def test_zombie_row_paid_by_absence_even_if_number_still_listed(monkeypatch, test_db_session):
+    """Riga con doc_id sparito mentre il suo NUMERO è ancora in lista (preso da
+    un documento rinumerato): presenza = identità, non numero → pagata per
+    assenza dopo due cicli, mai doppione attivo perpetuo."""
+    _mk(test_db_session, "1000/2026", source_id="A", missing_streak=1)
+    _mk(test_db_session, "1001/2026", source_id="B", missing_streak=0)
+    rows = [_raw("1000/2026", "B", "notified", balance=10.0), _raw("1001/2026", "C", "notified", balance=20.0)]
+    _sync(monkeypatch, test_db_session, rows, notif={"B": ["RicevutaConsegna"], "C": ["RicevutaConsegna"]})
+    by = {x.source_id: x for x in test_db_session.query(Invoice).all()}
+    assert by["A"].status == "paid"  # assente per identità (streak 1+1)
+    assert by["B"].invoice_number == "1000/2026" and by["B"].status == "open"
+    assert by["C"].invoice_number == "1001/2026" and by["C"].status == "open"
+    assert sum(1 for x in by.values() if x.status == "open" and x.invoice_number == "1000/2026") == 1
+
+
+def test_renumber_guard_on_mass_name_changes(monkeypatch, test_db_session):
+    for i in range(8):
+        _mk(test_db_session, f"R{i}/2026", source_id=f"d{i}", customer_name_raw=f"CLIENTE {i}")
+    # sfasamento del parser: ogni riga porta il doc della riga accanto → 8 rinumerazioni con nome diverso
+    raw = [_raw(f"R{i}/2026", f"d{(i + 1) % 8}", "notified", name=f"CLIENTE {i}") for i in range(8)]
+    r = _sync(monkeypatch, test_db_session, raw, notif={f"d{i}": ["RicevutaConsegna"] for i in range(8)})
+    assert r.get("renumber_guard_triggered") == 8 and r.get("renumber_skipped") == 8
+    assert all(x.invoice_number == f"R{int(x.source_id[1:])}/2026" for x in test_db_session.query(Invoice).all())
+
+
+def test_manual_mark_paid_survives_draft_reappearance(monkeypatch, test_db_session):
+    inv = _mk(test_db_session, "MP/2026", source_id="m", status="paid", amount_due=0, days_overdue=0, paid_at=datetime(2026, 9, 1))
+    test_db_session.add(ActivityLog(action="fatturapro_fix_mark_paid", entity_type="invoice", entity_id=inv.id, details={})); test_db_session.commit()
+    r = _sync(monkeypatch, test_db_session, [_raw("MP/2026", "m", "draft", balance=100.0)])
+    assert _get(test_db_session, "MP/2026").status == "paid" and r["voided"] == 0 and r.get("draft_on_paid") == 1

@@ -22,6 +22,7 @@ VERDICT_LABELS = {
     "da_riattivare": "Valida su FatturaPro, annullata in piattaforma",
     "pagata_non_tracciata": "Saldata su FatturaPro, mai importata",
     "duplicato": "Doppione in piattaforma (documento diverso dallo stesso numero)",
+    "rinumerata": "Rinumerata da FatturaPro (stesso documento, numero nuovo)",
 }
 
 # Correzione proposta per ciascun verdetto (None = nessuna azione automatica).
@@ -36,11 +37,12 @@ VERDICT_FIX = {
     "riaperta_su_fatturapro": "reopen",
     "da_riattivare": "reactivate",
     "duplicato": "void",
+    "rinumerata": "renumber",
 }
 
 # Correzioni che si applicano senza confronto con lo stato attuale (non
 # distruttive): pre-selezionabili dalla UI. Le altre le spunta l'operatore.
-SAFE_FIXES = ("update_amount",)
+SAFE_FIXES = ("update_amount", "renumber")
 
 
 def fp_state_of(row: Dict[str, Any]) -> Optional[str]:
@@ -89,11 +91,23 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
         if num:
             by_num_fp[num] = r
             label_of.setdefault(num, raw)
+    # IDENTITÀ = doc_id: una riga della piattaforma il cui doc_id è su
+    # FatturaPro sotto un ALTRO numero è lo stesso documento rinumerato →
+    # si confronta col numero nuovo e si propone 'rinumerata'.
+    fp_num_by_doc: Dict[str, str] = {}
+    for r in fp_rows:
+        if r.get("doc_id") and (r.get("invoice_number") or "").strip():
+            fp_num_by_doc[str(r["doc_id"])] = doc_key((r.get("invoice_number") or "").strip())
+    renumber_from: Dict[int, str] = {}
     active_pl: Dict[str, Any] = {}
     extra_active: List[Any] = []  # doppioni attivi (stesso numero, documento diverso)
     void_pl: Dict[str, List[Any]] = {}
     for inv in platform_invoices:
         num = doc_key((inv.invoice_number or "").strip())
+        fp_num = fp_num_by_doc.get(str(inv.source_id or ""))
+        if fp_num and fp_num != num:
+            renumber_from[inv.id] = (inv.invoice_number or "").strip()
+            num = fp_num
         label_of.setdefault(num, (inv.invoice_number or "").strip())
         if inv.status == "void":
             void_pl.setdefault(num, []).append(inv)
@@ -151,9 +165,12 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
                 verdict = "pagata_su_fatturapro"
             elif fp_total is not None and abs(float(pl.amount or 0) - fp_total) > 0.005:
                 verdict = "importo_diverso"
+        if shown is not None and shown.id in renumber_from and verdict == "ok":
+            verdict = "rinumerata"
         fix = VERDICT_FIX.get(verdict)
         rows.append({
-            "invoice_number": label_of.get(num, num),
+            "invoice_number": (fp.get("invoice_number") or "").strip() if fp else label_of.get(num, num),
+            "renumber_from": renumber_from.get(shown.id) if shown is not None else None,
             "key": f"{num}#{shown.id if shown is not None else 'fp'}",
             "verdict": verdict,
             "verdict_label": VERDICT_LABELS.get(verdict, verdict),
