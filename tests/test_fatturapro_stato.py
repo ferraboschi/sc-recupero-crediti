@@ -721,7 +721,7 @@ def test_legacy_fossil_released_when_another_legacy_row_adopts_it(monkeypatch, t
     a = test_db_session.query(Invoice).get(a_id); b = test_db_session.query(Invoice).get(b_id)
     assert (b.source_id, b.doc_id_verified, b.amount_due) == ("dB", True, 10.0)
     assert (a.source_id, a.doc_id_verified, a.amount_due) == ("dA", True, 20.0)
-    assert r.get("doc_id_adopted") == 2 and r.get("fossil_released") == 1 and r["created"] == 0 and r["voided"] == 0
+    assert r.get("doc_id_adopted") == 2 and r["created"] == 0 and r["voided"] == 0
 
 
 def test_legacy_renumbered_draft_without_number_holder(monkeypatch, test_db_session):
@@ -791,9 +791,16 @@ def test_adoption_requires_same_recipient_else_orphan_and_new_row(monkeypatch, t
     old_id = _mk(test_db_session, "N/2026", source_id="fossil", doc_id_verified=False, customer_id=alfa_id, customer_name_raw="ALFA SRL").id
     r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "notified", balance=70.0, name="BETA SRL")], notif={"D": ["RicevutaConsegna"]})
     old = test_db_session.query(Invoice).get(old_id)
-    assert old.status == "void" and "BETA SRL" in old.void_reason and r.get("orphan_voided") == 1
+    # orfana: nessuna scrittura immediata, ma è ASSENTE (numero di altro destinatario) → streak
+    assert old.status == "open" and old.missing_streak == 1 and r.get("legacy_orphans") == 1 and r["voided"] == 0
+    assert test_db_session.query(ActivityLog).filter_by(action="legacy_orphan").count() == 1
     new = _get(test_db_session, "N/2026", source_id="D")
     assert new.customer_name_raw == "BETA SRL" and new.customer_id != alfa_id and new.doc_id_verified is True
+    # secondo ciclo: regola storica dell'assenza (pagata), una sola riga nuova, nessun loop
+    r2 = _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "notified", balance=70.0, name="BETA SRL")])
+    old = test_db_session.query(Invoice).get(old_id)
+    assert old.status == "paid" and r2["created"] == 0 and r2["voided"] == 0
+    assert test_db_session.query(Invoice).filter_by(invoice_number="N/2026").count() == 2
 
 
 def test_adoption_resets_sdi_state_and_rechecks(monkeypatch, test_db_session):
@@ -874,3 +881,99 @@ def test_verify_duplicates_follow_history_and_legacy_renumber(test_client, test_
     by = {(x["verdict"], (x.get("platform") or {}).get("id")): x for x in r["rows"]}
     assert ("ok", legacy.id) in by and ("duplicato", dup.id) in by
     assert ("rinumerata", ren.id) in by and by[("rinumerata", ren.id)]["invoice_number"] == "1600"
+
+
+# ── Review di secondo giro della migrazione ─────────────────────────────────
+
+def _act(session, inv_id, cust_id):
+    from backend.database import RecoveryAction, RecoveryActionInvoice as RAI
+    a = RecoveryAction(customer_id=cust_id, action_type="first_contact", channel="whatsapp_copy", completed_at=datetime(2026, 9, 1), invoice_ids=[inv_id])
+    session.add(a); session.commit(); session.add(RAI(action_id=a.id, invoice_id=inv_id)); session.commit()
+
+
+def test_paid_legacy_with_history_of_other_recipient_no_create_void_loop(monkeypatch, test_db_session):
+    """B1: storica PAGATA con solleciti di ALFA, numero N ora del doc D di BETA:
+    una sola riga nuova, stabile su 3 cicli (mai doppione/annullamento)."""
+    from backend.database import Customer as C
+    alfa = C(ragione_sociale="ALFA SRL"); test_db_session.add(alfa); test_db_session.commit(); alfa_id = alfa.id
+    paid_id = _mk(test_db_session, "N/2026", source_id="fossil", doc_id_verified=False, status="paid", amount_due=0, days_overdue=0,
+                  customer_id=alfa_id, customer_name_raw="ALFA SRL", paid_at=datetime(2026, 8, 1)).id
+    _act(test_db_session, paid_id, alfa_id)
+    for cycle in range(3):
+        r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "notified", balance=70.0, name="BETA SRL")], notif={"D": ["RicevutaConsegna"]})
+        assert r["voided"] == 0 and r["created"] == (1 if cycle == 0 else 0)
+    rows = test_db_session.query(Invoice).filter_by(invoice_number="N/2026").all()
+    assert sorted((x.status, x.source_id) for x in rows) == [("open", "D"), ("paid", "fossil")]
+    assert test_db_session.query(ActivityLog).filter_by(action="invoice_voided").count() == 0
+
+
+def test_doc_coincident_legacy_row_gets_verified(monkeypatch, test_db_session):
+    """M1: storica il cui fossile coincide col doc attuale → confermata (verificata)."""
+    _mk(test_db_session, "N/2026", source_id="D", doc_id_verified=False, customer_name_raw="ACME SRL")
+    r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "notified", balance=10.0)], notif={"D": ["RicevutaConsegna"]})
+    inv = _get(test_db_session, "N/2026")
+    assert inv.doc_id_verified is True and inv.sdi_state == "consegnata" and r.get("doc_id_confirmed") == 1
+
+
+def test_phantom_paid_sharing_doc_with_holder_is_voided(monkeypatch, test_db_session):
+    """M2: A ('1609', doc D, pagata per assenza) e B ('1600', doc D, storica aperta),
+    FP ('1600', D): B confermata, A annullata (non era un incasso)."""
+    a_id = _mk(test_db_session, "1609", source_id="D", doc_id_verified=False, status="paid", amount_due=0, days_overdue=0, paid_at=datetime(2026, 9, 14), customer_name_raw="CECCONI MARIO S.R.L.").id
+    b_id = _mk(test_db_session, "1600", source_id="D", doc_id_verified=False, customer_name_raw="CECCONI MARIO S.R.L.").id
+    r = _sync(monkeypatch, test_db_session, [_raw("1600", "D", "notified", balance=100.0, name="CECCONI MARIO S.R.L.")], notif={"D": ["RicevutaConsegna"]})
+    a = test_db_session.query(Invoice).get(a_id); b = test_db_session.query(Invoice).get(b_id)
+    assert (b.doc_id_verified, b.status) == (True, "open")
+    assert a.status == "void" and a.paid_at is None and a.source_id is None and r["voided"] == 1
+    assert len([x for x in test_db_session.query(Invoice).all() if x.status != "void" and x.source_id == "D"]) == 1
+
+
+def test_row_with_assegno_is_history_and_never_a_duplicate(monkeypatch, test_db_session):
+    """M3: storica con assegno in mano (senza righe azione) vs doppione con un
+    sollecito: la storica non viene mai annullata."""
+    from backend.database import Customer as C
+    c = C(ragione_sociale="ACME SRL"); test_db_session.add(c); test_db_session.commit(); cid = c.id
+    legacy_id = _mk(test_db_session, "N/2026", source_id="fossil", doc_id_verified=False, customer_id=cid, customer_name_raw="ACME SRL", payment_pending="assegno").id
+    dup_id = _mk(test_db_session, "N/2026", source_id="D", doc_id_verified=True, customer_id=cid, customer_name_raw="ACME SRL").id
+    _act(test_db_session, dup_id, cid)
+    r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "notified", balance=100.0, name="ACME SRL")], notif={"D": ["RicevutaConsegna"]})
+    legacy = test_db_session.query(Invoice).get(legacy_id); dup = test_db_session.query(Invoice).get(dup_id)
+    assert legacy.status == "open" and legacy.payment_pending == "assegno" and dup.status == "open"
+    assert r["voided"] == 0 and r.get("number_conflicts") == 1
+    assert test_db_session.query(ActivityLog).filter_by(action="invoice_number_conflict").count() == 1
+
+
+def test_recipient_comparison_ignores_punctuation_not_legal_form(monkeypatch, test_db_session):
+    """M4: 'CECCONI MARIO S.R.L.' = 'CECCONI MARIO SRL' (adotta); 'ROSSI SRL' ≠ 'ROSSI SPA'."""
+    _mk(test_db_session, "A/2026", source_id="fossil", doc_id_verified=False, customer_name_raw="CECCONI MARIO S.R.L.", payment_pending="assegno")
+    _mk(test_db_session, "B/2026", source_id="fossil2", doc_id_verified=False, customer_name_raw="ROSSI SRL")
+    r = _sync(monkeypatch, test_db_session, [
+        _raw("A/2026", "dA", "notified", balance=10.0, name="CECCONI MARIO SRL"),
+        _raw("B/2026", "dB", "notified", balance=20.0, name="ROSSI SPA"),
+    ], notif={"dA": ["RicevutaConsegna"], "dB": ["RicevutaConsegna"]})
+    a = _get(test_db_session, "A/2026"); b_old = _get(test_db_session, "B/2026", source_id="fossil2")
+    assert a.source_id == "dA" and a.payment_pending == "assegno" and r["voided"] == 0
+    assert b_old.missing_streak == 1 and _get(test_db_session, "B/2026", source_id="dB").customer_name_raw == "ROSSI SPA"
+
+
+def test_free_number_with_legacy_owner_of_other_recipient_is_not_renumbered(monkeypatch, test_db_session):
+    """M5: riga di X (assegno) col fossile D; FP (N, D) di BETA, numero libero:
+    la riga di X NON viene rinumerata/ripuntata; BETA entra come riga nuova."""
+    x_id = _mk(test_db_session, "OLD/2026", source_id="D", doc_id_verified=False, customer_name_raw="X SRL", payment_pending="assegno").id
+    r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "notified", balance=50.0, name="BETA SRL")], notif={"D": ["RicevutaConsegna"]})
+    x = test_db_session.query(Invoice).get(x_id)
+    assert x.invoice_number == "OLD/2026" and x.status == "open" and x.payment_pending == "assegno" and r.get("renumbered", 0) == 0
+    assert _get(test_db_session, "N/2026").customer_name_raw == "BETA SRL" and r["created"] == 1
+
+
+def test_two_rows_with_history_same_number_no_automatic_write(monkeypatch, test_db_session):
+    """M6: storica con solleciti + doppione con solleciti: nessuna riga rilasciata
+    né annullata; conflitto loggato; nessuno zombie (nessun doppio conteggio nuovo)."""
+    from backend.database import Customer as C
+    c = C(ragione_sociale="ACME SRL"); test_db_session.add(c); test_db_session.commit(); cid = c.id
+    l_id = _mk(test_db_session, "N/2026", source_id="fossil", doc_id_verified=False, customer_id=cid, customer_name_raw="ACME SRL").id
+    d_id = _mk(test_db_session, "N/2026", source_id="D", doc_id_verified=True, customer_id=cid, customer_name_raw="ACME SRL").id
+    _act(test_db_session, l_id, cid); _act(test_db_session, d_id, cid)
+    r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "notified", balance=90.0, name="ACME SRL")], notif={"D": ["RicevutaConsegna"]})
+    l = test_db_session.query(Invoice).get(l_id); d = test_db_session.query(Invoice).get(d_id)
+    assert l.status == "open" and d.status == "open" and l.source_id == "fossil" and d.source_id == "D"
+    assert r["voided"] == 0 and r.get("number_conflicts") == 1 and r.get("fossil_released", 0) == 0
