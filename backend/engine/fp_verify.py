@@ -23,6 +23,7 @@ VERDICT_LABELS = {
     "pagata_non_tracciata": "Saldata su FatturaPro, mai importata",
     "duplicato": "Doppione in piattaforma (documento diverso dallo stesso numero)",
     "rinumerata": "Rinumerata da FatturaPro (stesso documento, numero nuovo)",
+    "altro_destinatario": "Il numero su FatturaPro è intestato a un altro destinatario",
 }
 
 # Correzione proposta per ciascun verdetto (None = nessuna azione automatica).
@@ -168,7 +169,13 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
             else:
                 verdict = "pagata_non_tracciata"
         else:
-            if (fp.get("doc_id") and pl.source_id and str(fp.get("doc_id")) != str(pl.source_id)
+            pl_name = "".join(ch for ch in (pl.customer_name_raw or "").lower() if ch.isalnum())
+            fp_name = "".join(ch for ch in (fp.get("customer_name") or "").lower() if ch.isalnum())
+            same_doc_verified = bool(fp.get("doc_id") and pl.source_id and str(fp.get("doc_id")) == str(pl.source_id)
+                                     and getattr(pl, "doc_id_verified", False))
+            if pl_name and fp_name and pl_name != fp_name and not same_doc_verified:
+                verdict = "altro_destinatario"  # nessuna correzione automatica: decide l'operatore
+            elif (fp.get("doc_id") and pl.source_id and str(fp.get("doc_id")) != str(pl.source_id)
                     and getattr(pl, "doc_id_verified", False)):
                 verdict = "numero_riassegnato"
             elif pl.status == "paid" and (fp_saldo or 0) > 0:

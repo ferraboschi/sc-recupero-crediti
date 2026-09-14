@@ -1860,7 +1860,7 @@ def _drop_foreign_docs(session, customer_id, fp_rows):
         return fp_rows, 0
     taken = {str(x[0]) for x in session.query(Invoice.source_id).filter(
         Invoice.source_platform == "fatturapro", Invoice.status != "void", Invoice.doc_id_verified.is_(True),
-        Invoice.source_id.in_(ids), Invoice.customer_id != customer_id,
+        Invoice.source_id.in_(ids), or_(Invoice.customer_id != customer_id, Invoice.customer_id.is_(None)),
     ).all()}
     kept = [r for r in fp_rows if str(r.get("doc_id") or "") not in taken]
     return kept, len(fp_rows) - len(kept)
