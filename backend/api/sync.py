@@ -184,6 +184,24 @@ def _void_invoice(session, inv, reason: str, sdi_state: str = None) -> None:
     inv.updated_at = datetime.utcnow()
 
 
+def _find_existing(session, invoice_number: str, doc_id=None):
+    """Riga della piattaforma per un numero FatturaPro. Con lo stesso numero
+    possono convivere una riga ANNULLATA (documento vecchio) e una attiva:
+    vince l'attiva; fra le annullate quella con lo stesso doc_id (riattivabile).
+    Mai una scelta casuale (.first() senza ordine)."""
+    rows = session.query(Invoice).filter_by(
+        invoice_number=invoice_number, source_platform="fatturapro",
+    ).order_by(Invoice.id.asc()).all()
+    if not rows:
+        return None
+    active = [r for r in rows if r.status != "void"]
+    if active:
+        same = [r for r in active if doc_id and r.source_id and str(r.source_id) == str(doc_id)]
+        return (same or active)[0]
+    same = [r for r in rows if doc_id and r.source_id and str(r.source_id) == str(doc_id)]
+    return (same or rows)[0]
+
+
 def _reactivate_invoice(inv, sdi_state: str) -> None:
     """Una annullata che FatturaPro ora presenta trasmessa e consegnata (la
     bozza è stata inviata): torna un credito aperto."""
@@ -341,10 +359,7 @@ def _sync_invoices_task() -> dict:
                     if sig is None:
                         fp["signature_unknown"] += 1
 
-                    existing = session.query(Invoice).filter_by(
-                        invoice_number=inv_num,
-                        source_platform="fatturapro"
-                    ).first()
+                    existing = _find_existing(session, inv_num, inv.get("doc_id"))
 
                     # Numero RIASSEGNATO: stesso numero, documento diverso →
                     # il record esistente descrive un documento che non c'è

@@ -46,7 +46,8 @@ client.interceptors.response.use(
 
     cfg.__retryCount = cfg.__retryCount || 0
 
-    if (shouldRetry(error) && cfg.__retryCount < MAX_RETRIES) {
+    // noRetry: chiamate lunghe/non idempotenti (es. scraping FatturaPro)
+    if (!cfg.noRetry && shouldRetry(error) && cfg.__retryCount < MAX_RETRIES) {
       cfg.__retryCount += 1
       console.log(`[Retry ${cfg.__retryCount}/${MAX_RETRIES}] ${cfg.method?.toUpperCase()} ${cfg.url} — waiting ${RETRY_DELAY / 1000}s...`)
       await delay(RETRY_DELAY)

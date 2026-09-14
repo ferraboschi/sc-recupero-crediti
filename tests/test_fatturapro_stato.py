@@ -318,3 +318,63 @@ def test_verify_ignores_homonyms_and_duplicates_elsewhere(test_client, test_db_s
     _mk(test_db_session, "0600", customer_id=other.id, source_id="m", customer_name_raw="Rossi S.r.l.")
     a = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro/apply", json={"fixes": [{"invoice_number": "0600", "fix": "import"}]}).json()
     assert a["applied"] == [] and "già presente" in a["skipped"][0]["reason"]
+
+
+# ── Trovati dalla review avversariale (frontend/contratto) ──────────────────
+
+def test_sync_prefers_active_row_over_voided_duplicate(monkeypatch, test_db_session):
+    """Stesso numero: riga annullata (documento vecchio) + riga attiva (nuovo).
+    Il sync aggiorna l'ATTIVA e non crea un terzo duplicato."""
+    _mk(test_db_session, "DUP/2026", source_id="old", status="void", amount_due=0, days_overdue=0, sdi_state="draft")
+    _mk(test_db_session, "DUP/2026", source_id="new", amount_due=120.0, sdi_state="consegnata")
+    r = _sync(monkeypatch, test_db_session, [_raw("DUP/2026", "new", "notified", balance=100.0)])
+    rows = test_db_session.query(Invoice).filter_by(invoice_number="DUP/2026").order_by(Invoice.id).all()
+    assert [x.status for x in rows] == ["void", "open"] and rows[1].amount_due == 100.0
+    assert r["created"] == 0 and r["voided"] == 0
+
+
+def test_compare_with_void_duplicate_and_incomplete_list(test_db_session):
+    cust = Customer(ragione_sociale="Dup SRL"); test_db_session.add(cust); test_db_session.commit()
+    old = _mk(test_db_session, "0700", customer_id=cust.id, source_id="old", status="void", amount_due=0)
+    new = _mk(test_db_session, "0700", customer_id=cust.id, source_id="new", amount=50.0, amount_due=50.0)
+    other = _mk(test_db_session, "0701", customer_id=cust.id, source_id="x")
+    res = compare_documents([old, new, other], [_fp("0700", "new", 50.0, 50.0, "Consegnato")])
+    v = {r["invoice_number"]: r for r in res["rows"]}
+    assert v["0700"]["verdict"] == "ok" and v["0700"]["platform"]["id"] == new.id  # vince l'attiva
+    assert v["0701"]["verdict"] == "inesistente" and v["0701"]["fix"] == "void"
+    # lista incompleta: l'assenza non è una prova
+    res2 = compare_documents([old, new, other], [_fp("0700", "new", 50.0, 50.0, "Consegnato")], complete=False)
+    v2 = {r["invoice_number"]: r for r in res2["rows"]}
+    assert v2["0701"]["verdict"] == "non_verificabile" and v2["0701"]["fix"] is None
+    # solo annullata + documento valido con lo stesso doc_id → riattivabile
+    res3 = compare_documents([old], [_fp("0700", "old", 50.0, 50.0, "Consegnato")])
+    assert res3["rows"][0]["verdict"] == "da_riattivare" and res3["rows"][0]["fix_safe"] is False
+    # numero riassegnato → replace (mai loop void/reactivate)
+    res4 = compare_documents([new], [_fp("0700", "newer", 60.0, 60.0, "Consegnato")])
+    assert res4["rows"][0]["verdict"] == "numero_riassegnato" and res4["rows"][0]["fix"] == "replace"
+
+
+def test_apply_replace_and_incomplete_guard(test_client, test_db_session, monkeypatch):
+    import backend.connectors.fatturapro as fpmod
+    monkeypatch.setattr(fpmod, "FatturaProConnector", FakeSearchFP)
+    cust = Customer(ragione_sociale="CECCONI MARIO S.R.L."); test_db_session.add(cust); test_db_session.commit()
+    old = _mk(test_db_session, "1609", customer_id=cust.id, source_id="old", amount=459.42, amount_due=459.42,
+              customer_name_raw="CECCONI MARIO S.R.L.")
+    FakeSearchFP.rows = [_fp("1609", "newdoc", 300.0, 300.0, "Consegnato")]
+    r = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    assert r["rows"][0]["verdict"] == "numero_riassegnato" and r["rows"][0]["fix"] == "replace"
+    a = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro/apply", json={"fixes": [{"invoice_number": "1609", "fix": "replace"}]}).json()
+    assert [x["fix"] for x in a["applied"]] == ["replace"]
+    rows = test_db_session.query(Invoice).filter_by(invoice_number="1609").order_by(Invoice.id).all()
+    assert [(x.status, x.source_id) for x in rows] == [("void", "old"), ("open", "newdoc")]
+    assert rows[0].sdi_state is None  # niente stato del documento nuovo sulla riga vecchia
+    # ricerca fallita → nessun annullamento per assenza
+    class BrokenFP(FakeSearchFP):
+        def search_documents(self, phrase, limit=300):
+            return [], False
+    monkeypatch.setattr(fpmod, "FatturaProConnector", BrokenFP)
+    r2 = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    assert r2["complete"] is False
+    assert all(x["verdict"] == "non_verificabile" and x["fix"] is None for x in r2["rows"])
+    a2 = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro/apply", json={"fixes": [{"invoice_number": "1609", "fix": "void"}]}).json()
+    assert a2["applied"] == [] and a2["skipped"]

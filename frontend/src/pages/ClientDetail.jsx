@@ -17,8 +17,9 @@ const ACTION_LABELS = {
 const toISODateLocal = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 
 // Stato SDI (FatturaPro): si importano solo consegnata / mancata_consegna.
-const SDI_LABELS = { draft: 'Non trasmessa', sent: 'In elaborazione SDI', consegnata: 'Consegnata', mancata_consegna: 'Mancata consegna', scartata: 'Scartata' }
-const FP_FIX_LABELS = { import: 'Importa', void: 'Annulla in piattaforma', mark_paid: 'Segna pagata', reopen: 'Riapri', reactivate: 'Riattiva', update_amount: 'Aggiorna importo' }
+// Etichette di ripiego: il backend manda già sdi_label / state_label (fonte unica, engine/sdi.py).
+const SDI_LABELS = { draft: 'Non trasmessa (bozza)', sent: 'Trasmessa, in elaborazione', consegnata: 'Consegnata', mancata_consegna: 'Mancata consegna', scartata: 'Scartata dallo SDI' }
+const FP_FIX_LABELS = { import: 'Importa', replace: 'Annulla la vecchia e importa il documento nuovo', void: 'Annulla in piattaforma (esce da scaduto, dovuto e recuperato)', mark_paid: 'Segna pagata', reopen: 'Riapri', reactivate: 'Riattiva', update_amount: 'Aggiorna importo' }
 
 // Fattura su cui si può registrare un sollecito (stessa regola del backend,
 // is_overdue_unpaid): scaduta, non pagata, non contestata, non in incasso.
@@ -258,7 +259,7 @@ export default function ClientDetail() {
   // un'azione in riga (nota, sollecito) non deve smontare la pagina e
   // riportare in cima (layout shift vietato).
   const hasDataRef = useRef(false)
-  useEffect(() => { hasDataRef.current = false }, [customerId])
+  useEffect(() => { hasDataRef.current = false; setFpVerify(null); setFpFixSel(new Set()); setFpApplied(null) }, [customerId])
   const fetchData = useCallback(async () => {
     try {
       if (!hasDataRef.current) setLoading(true)
@@ -780,13 +781,17 @@ export default function ClientDetail() {
   // VERIFICA CON FATTURAPRO: confronta numeri, importi, saldi e stato SDI delle
   // fatture di QUESTO cliente con i documenti che FatturaPro gli intesta.
   // Solo lettura; le correzioni le sceglie l'operatore e si applicano a parte.
-  const runFpVerify = async () => {
+  // La chiamata fa login + ricerca su FatturaPro (scraping): timeout lungo e
+  // NESSUN retry automatico (ogni retry rifarebbe il login).
+  const runFpVerify = async ({ keepApplied = false } = {}) => {
     setFpVerifyLoading(true)
-    setFpApplied(null)
+    if (!keepApplied) setFpApplied(null)
     try {
-      const res = await client.post(`/customers/${customerId}/verify-fatturapro`)
+      const res = await client.post(`/customers/${customerId}/verify-fatturapro`, null, { timeout: 180000, noRetry: true })
       setFpVerify(res.data)
-      setFpFixSel(new Set((res.data.rows || []).filter(r => r.fix).map(r => r.invoice_number)))
+      // Pre-selezionate SOLO le correzioni non distruttive (importa, aggiorna
+      // importo); annulla / segna pagata / riapri / riattiva le spunta l'operatore.
+      setFpFixSel(new Set((res.data.rows || []).filter(r => r.fix && r.fix_safe).map(r => r.invoice_number)))
     } catch (err) {
       alert(err.response?.data?.detail || 'Verifica con FatturaPro non riuscita')
     } finally {
@@ -800,10 +805,10 @@ export default function ClientDetail() {
     if (!window.confirm(`Applicare ${fixes.length} correzion${fixes.length === 1 ? 'e' : 'i'} alle fatture di questo cliente?\n\nOgni correzione viene ricontrollata su FatturaPro al momento; le fatture annullate restano nell'archivio ma escono da scaduto e dovuto.`)) return
     setFpApplying(true)
     try {
-      const res = await client.post(`/customers/${customerId}/verify-fatturapro/apply`, { fixes })
+      const res = await client.post(`/customers/${customerId}/verify-fatturapro/apply`, { fixes }, { timeout: 180000, noRetry: true })
       setFpApplied(res.data)
       await fetchData()
-      await runFpVerify()
+      await runFpVerify({ keepApplied: true })
     } catch (err) {
       alert(err.response?.data?.detail || 'Errore nell\'applicare le correzioni')
     } finally {
@@ -2057,7 +2062,7 @@ export default function ClientDetail() {
                   <td className="px-3 py-3 text-sm font-medium text-txt-primary">
                     {inv.invoice_number}
                     {inv.sdi_state && !['consegnata', 'mancata_consegna'].includes(inv.sdi_state) && (
-                      <span className="ml-1 sc-badge text-[10px] bg-accent-amber/15 text-accent-amber" title="Stato SDI su FatturaPro: il documento non è definitivo">{SDI_LABELS[inv.sdi_state] || inv.sdi_state}</span>
+                      <span className="ml-1 sc-badge text-[10px] bg-accent-amber/15 text-accent-amber" title="Stato SDI su FatturaPro: il documento non è definitivo">{inv.sdi_label || SDI_LABELS[inv.sdi_state] || inv.sdi_state}</span>
                     )}
                   </td>
                   <td className="px-3 py-3 text-sm">
@@ -2346,80 +2351,6 @@ export default function ClientDetail() {
         )}
       </div>
 
-      {/* ALLINEAMENTO CON FATTURAPRO: verifica per cliente (numeri, importi,
-          saldi, stato SDI) e correzioni scelte dall'operatore. */}
-      <div className="sc-card p-6">
-        <div className="flex items-center justify-between gap-4 flex-wrap">
-          <div>
-            <h2 className="text-base font-bold text-txt-primary">Allineamento con FatturaPro</h2>
-            <p className="text-xs text-txt-muted mt-1">Confronta le fatture di questo cliente con i documenti che FatturaPro gli intesta: numeri, importi, saldi e stato SDI (si registrano solo le consegnate / non consegnate).</p>
-          </div>
-          <button onClick={runFpVerify} disabled={fpVerifyLoading} className="sc-btn-primary text-sm font-bold disabled:opacity-50">
-            {fpVerifyLoading ? 'Verifica in corso…' : 'Verifica con FatturaPro'}
-          </button>
-        </div>
-        {fpVerify && (
-          <div className="mt-4">
-            <div className="flex items-center gap-2 flex-wrap text-xs">
-              <span className="text-txt-muted">{fpVerify.fatturapro_documents} documenti su FatturaPro per «{(fpVerify.searched_names || []).join('», «')}»{fpVerify.complete ? '' : ' · lista NON completa: risultato parziale'}</span>
-              {Object.entries(fpVerify.summary || {}).map(([k, n]) => (
-                <span key={k} className={`sc-badge text-xs ${k === 'ok' ? 'bg-accent-green/15 text-accent-green' : 'bg-accent-amber/15 text-accent-amber'}`}>{(fpVerify.rows.find(r => r.verdict === k) || {}).verdict_label || k}: {n}</span>
-              ))}
-            </div>
-            {(fpVerify.rows || []).filter(r => r.verdict !== 'ok').length === 0 ? (
-              <p className="mt-3 text-sm text-accent-green">Tutto allineato: nessuna discrepanza con FatturaPro.</p>
-            ) : (
-              <div className="mt-3 overflow-x-auto">
-                <table className="w-full">
-                  <thead className="bg-dark-surface border-b border-dark-border">
-                    <tr>
-                      <th className="px-3 py-2 w-8"></th>
-                      <th className="px-3 py-2 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Fattura</th>
-                      <th className="px-3 py-2 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">FatturaPro</th>
-                      <th className="px-3 py-2 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Piattaforma</th>
-                      <th className="px-3 py-2 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Verdetto</th>
-                      <th className="px-3 py-2 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Correzione</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-dark-border">
-                    {(fpVerify.rows || []).filter(r => r.verdict !== 'ok').map(r => (
-                      <tr key={r.invoice_number} className="text-sm">
-                        <td className="px-3 py-2">
-                          {r.fix && <input type="checkbox" checked={fpFixSel.has(r.invoice_number)} onChange={() => setFpFixSel(prev => { const n = new Set(prev); if (n.has(r.invoice_number)) n.delete(r.invoice_number); else n.add(r.invoice_number); return n })} className="rounded border-dark-border bg-dark-bg" />}
-                        </td>
-                        <td className="px-3 py-2 font-medium text-txt-primary">{r.invoice_number}</td>
-                        <td className="px-3 py-2 text-txt-secondary">
-                          {r.fatturapro ? `${r.fatturapro.state_label || r.fatturapro.state || '?'} · tot. ${formatCurrency(r.fatturapro.total)} · saldo ${formatCurrency(r.fatturapro.balance)}${r.fatturapro.date ? ` · ${formatDate(r.fatturapro.date)}` : ''}` : <span className="text-accent-red">non presente</span>}
-                        </td>
-                        <td className="px-3 py-2 text-txt-secondary">
-                          {r.platform ? `${r.platform.status === 'paid' ? 'pagata' : r.platform.status === 'void' ? 'annullata' : 'aperta'} · imp. ${formatCurrency(r.platform.amount)} · residuo ${formatCurrency(r.platform.amount_due)}` : <span className="text-accent-amber">non presente</span>}
-                        </td>
-                        <td className="px-3 py-2"><span className="sc-badge text-xs bg-accent-amber/15 text-accent-amber">{r.verdict_label}</span></td>
-                        <td className="px-3 py-2 text-txt-secondary">{r.fix ? FP_FIX_LABELS[r.fix] || r.fix : '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <div className="mt-3 flex items-center gap-3 flex-wrap">
-                  <button onClick={applyFpFixes} disabled={fpApplying || (fpVerify.rows || []).filter(r => r.fix && fpFixSel.has(r.invoice_number)).length === 0} className="px-4 py-2 bg-accent-amber text-dark-bg rounded-lg text-sm font-bold hover:brightness-110 disabled:opacity-50">
-                    {fpApplying ? 'Applico…' : `Applica ${(fpVerify.rows || []).filter(r => r.fix && fpFixSel.has(r.invoice_number)).length} correzioni`}
-                  </button>
-                  <span className="text-[11px] text-txt-muted">Le fatture annullate restano in archivio (mai cancellate) ma escono da scaduto, dovuto e recuperato.</span>
-                </div>
-              </div>
-            )}
-            {fpApplied && (
-              <p className="mt-2 text-xs text-txt-secondary">Applicate: {fpApplied.applied.length}{fpApplied.skipped.length ? ` · saltate: ${fpApplied.skipped.map(x => `${x.invoice_number} (${x.reason})`).join(', ')}` : ''}</p>
-            )}
-          </div>
-        )}
-        {(data.invoices?.voided || []).length > 0 && (
-          <p className="mt-4 text-xs text-txt-muted">
-            {data.invoices.voided.length === 1 ? '1 fattura annullata' : `${data.invoices.voided.length} fatture annullate`} (non valide su FatturaPro, fuori da tutti i conteggi): {data.invoices.voided.map(v => `${v.invoice_number}${v.void_reason ? ` — ${v.void_reason}` : ''}`).join(' · ')}
-          </p>
-        )}
-      </div>
-
       {/* SEZIONE FATTURE NON SCADUTE: da pagare, ancora in termine. Qui non
           si sollecita: si imposta un PROMEMORIA che scatta prima della
           scadenza (o si copiano i dati per un avviso di cortesia). */}
@@ -2578,6 +2509,95 @@ export default function ClientDetail() {
           </div>
         </div>
       )}
+
+      {/* ALLINEAMENTO CON FATTURAPRO: verifica per cliente (numeri, importi,
+          saldi, stato SDI) e correzioni scelte dall'operatore. */}
+      <div className="sc-card p-6">
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <div>
+            <h2 className="text-base font-bold text-txt-primary">Allineamento con FatturaPro</h2>
+            <p className="text-xs text-txt-muted mt-1">Confronta le fatture di questo cliente con i documenti che FatturaPro gli intesta: numeri, importi, saldi e stato SDI (si registrano solo le consegnate / non consegnate).</p>
+          </div>
+          <button onClick={() => runFpVerify()} disabled={fpVerifyLoading} className="sc-btn-primary text-sm font-bold min-w-[13rem] disabled:opacity-50">
+            {fpVerifyLoading ? 'Verifica in corso…' : 'Verifica con FatturaPro'}
+          </button>
+        </div>
+        {fpVerify && (
+          <div className="mt-4">
+            {!fpVerify.complete && (
+              <div className="mb-3 p-3 rounded-lg border border-accent-amber/40 bg-accent-amber/10 text-sm text-accent-amber">
+                Lista FatturaPro incompleta o ricerca fallita: l'assenza di una fattura NON è una prova. Nessun annullamento per assenza viene proposto né accettato; riprova più tardi.
+              </div>
+            )}
+            <div className="flex items-center gap-2 flex-wrap text-xs">
+              <span className="text-txt-muted">{fpVerify.fatturapro_documents === 1 ? '1 documento' : `${fpVerify.fatturapro_documents} documenti`} su FatturaPro per «{(fpVerify.searched_names || []).join('», «')}»</span>
+              {Object.entries(fpVerify.summary || {}).map(([k, n]) => {
+                const row = (fpVerify.rows || []).find(r => r.verdict === k) || {}
+                const tone = k === 'ok' ? 'bg-accent-green/15 text-accent-green' : row.fix ? 'bg-accent-amber/15 text-accent-amber' : 'bg-[rgba(148,163,184,0.15)] text-txt-muted'
+                return <span key={k} className={`sc-badge text-xs ${tone}`}>{row.verdict_label || k}: {n}</span>
+              })}
+            </div>
+            {(fpVerify.rows || []).filter(r => r.verdict !== 'ok').length === 0 ? (
+              <p className="mt-3 text-sm text-accent-green">Tutto allineato: nessuna discrepanza con FatturaPro.</p>
+            ) : (
+              <div className="mt-3 overflow-x-auto">
+                <table className="w-full">
+                  <thead className="bg-dark-surface border-b border-dark-border">
+                    <tr>
+                      <th className="px-3 py-2 w-8"></th>
+                      <th className="px-3 py-2 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Fattura</th>
+                      <th className="px-3 py-2 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">FatturaPro</th>
+                      <th className="px-3 py-2 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Piattaforma</th>
+                      <th className="px-3 py-2 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Verdetto</th>
+                      <th className="px-3 py-2 text-left text-xs font-semibold text-txt-label uppercase tracking-wider">Correzione</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-dark-border">
+                    {(fpVerify.rows || []).filter(r => r.verdict !== 'ok').map(r => (
+                      <tr key={r.invoice_number} className="text-sm">
+                        <td className="px-3 py-2">
+                          {r.fix && !(r.verdict === 'inesistente' && !fpVerify.complete) && <input type="checkbox" checked={fpFixSel.has(r.invoice_number)} onChange={() => setFpFixSel(prev => { const n = new Set(prev); if (n.has(r.invoice_number)) n.delete(r.invoice_number); else n.add(r.invoice_number); return n })} className="rounded border-dark-border bg-dark-bg" />}
+                        </td>
+                        <td className="px-3 py-2 font-medium text-txt-primary">{r.invoice_number}</td>
+                        <td className="px-3 py-2 text-txt-secondary">
+                          {r.fatturapro ? `${r.fatturapro.state_label || r.fatturapro.state || '?'} · tot. ${formatCurrency(r.fatturapro.total)} · saldo ${formatCurrency(r.fatturapro.balance)}${r.fatturapro.date ? ` · ${formatDate(r.fatturapro.date)}` : ''}` : <span className="text-accent-red">non presente</span>}
+                        </td>
+                        <td className="px-3 py-2 text-txt-secondary">
+                          {r.platform ? `${r.platform.status === 'paid' ? 'pagata' : r.platform.status === 'void' ? 'annullata' : 'aperta'} · imp. ${formatCurrency(r.platform.amount)} · residuo ${formatCurrency(r.platform.amount_due)}` : <span className="text-accent-amber">non presente</span>}
+                        </td>
+                        <td className="px-3 py-2"><span className="sc-badge text-xs bg-accent-amber/15 text-accent-amber">{r.verdict_label}</span></td>
+                        <td className="px-3 py-2 text-txt-secondary">{r.fix ? FP_FIX_LABELS[r.fix] || r.fix : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div className="mt-3 flex items-center gap-3 flex-wrap">
+                  <button onClick={applyFpFixes} disabled={fpApplying || (fpVerify.rows || []).filter(r => r.fix && fpFixSel.has(r.invoice_number)).length === 0} className="px-4 py-2 bg-accent-amber text-dark-bg rounded-lg text-sm font-bold min-w-[12rem] hover:brightness-110 disabled:opacity-50">
+                    {fpApplying ? 'Applico…' : (() => { const n = (fpVerify.rows || []).filter(r => r.fix && fpFixSel.has(r.invoice_number)).length; return n === 1 ? 'Applica 1 correzione' : `Applica ${n} correzioni` })()}
+                  </button>
+                  <span className="text-[11px] text-txt-muted">Le fatture annullate restano in archivio (mai cancellate) ma escono da scaduto, dovuto e recuperato.</span>
+                </div>
+              </div>
+            )}
+            {fpApplied && (
+              <p className="mt-2 text-xs text-txt-secondary">
+                Correzioni applicate: {fpApplied.applied.length}{fpApplied.applied.length ? ` (${fpApplied.applied.map(x => x.invoice_number).join(', ')})` : ''}
+                {fpApplied.skipped.length ? ` · saltate: ${fpApplied.skipped.map(x => `${x.invoice_number} (${x.reason})`).join('; ')}` : ''}
+              </p>
+            )}
+          </div>
+        )}
+        {(data.invoices?.voided || []).length > 0 && (
+          <div className="mt-4">
+            <p className="text-xs text-txt-muted mb-1">{data.invoices.voided.length === 1 ? '1 fattura annullata' : `${data.invoices.voided.length} fatture annullate`} — non valide su FatturaPro, fuori da tutti i conteggi (mai cancellate):</p>
+            <ul className="text-xs text-txt-secondary space-y-0.5 border-l-2 border-dark-border pl-3">
+              {data.invoices.voided.map(v => (
+                <li key={v.id}><span className="font-medium text-txt-primary">{v.invoice_number}</span> · {formatCurrency(v.amount)}{v.issue_date ? ` · emessa ${formatDate(v.issue_date)}` : ''}{v.voided_at ? ` · annullata ${formatDate(v.voided_at)}` : ''}{v.void_reason ? ` — ${v.void_reason}` : ''}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
 
       {/* PRATICA: todo pendenti e azioni sul CLIENTE non legate a fatture.
           Il registro (solleciti, canali, note) sta nelle righe delle fatture. */}

@@ -24,7 +24,7 @@ from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
 from backend.engine.overdue import overdue_clause, RECOVERY_ACTION_TYPES
 from backend.engine.piva import validate_piva
 from backend.engine.fp_verify import compare_documents, fp_state_of
-from backend.engine.sdi import SDI_FINAL_OK
+from backend.engine.sdi import SDI_FINAL_OK, SDI_LABELS
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -801,6 +801,7 @@ def get_customer_detail(
                 "sollecito_today": inv.id in today_ids,
                 "recovery_note": inv.recovery_note,
                 "sdi_state": inv.sdi_state,
+                "sdi_label": SDI_LABELS.get(inv.sdi_state) if inv.sdi_state else None,
                 "history": inv_history.get(inv.id, []),
                 # "Ultima azione" della riga = ultimo SOLLECITO o consegna al
                 # legale (le note non sono azioni compiute): data e canale dalla
@@ -1863,7 +1864,7 @@ def verify_fatturapro(customer_id: int, session: Session = Depends(get_session))
     connector = FatturaProConnector()
     try:
         if not connector.login():
-            raise HTTPException(status_code=502, detail="FatturaPro non raggiungibile (login fallito)")
+            raise HTTPException(status_code=424, detail="FatturaPro non raggiungibile (login fallito): riprova più tardi")
         fp_rows, complete = _fp_rows_for_customer(connector, names)
     finally:
         try:
@@ -1872,8 +1873,8 @@ def verify_fatturapro(customer_id: int, session: Session = Depends(get_session))
             pass
     platform = session.query(Invoice).filter(
         Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
-    ).all()
-    result = compare_documents(platform, fp_rows)
+    ).order_by(Invoice.id.asc()).all()
+    result = compare_documents(platform, fp_rows, complete=complete)
     session.add(ActivityLog(
         action="fatturapro_verify", entity_type="customer", entity_id=customer_id,
         details={"customer": customer.ragione_sociale, "names": names, "fp_rows": len(fp_rows),
@@ -1916,7 +1917,7 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
     connector = FatturaProConnector()
     try:
         if not connector.login():
-            raise HTTPException(status_code=502, detail="FatturaPro non raggiungibile (login fallito)")
+            raise HTTPException(status_code=424, detail="FatturaPro non raggiungibile (login fallito): riprova più tardi")
         fp_rows, complete = _fp_rows_for_customer(connector, names)
     finally:
         try:
@@ -1925,9 +1926,9 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             pass
     platform = session.query(Invoice).filter(
         Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
-    ).all()
-    current = {r["invoice_number"]: r for r in compare_documents(platform, fp_rows)["rows"]}
-    by_num_pl = {(i.invoice_number or "").strip(): i for i in platform}
+    ).order_by(Invoice.id.asc()).all()
+    current = {r["invoice_number"]: r for r in compare_documents(platform, fp_rows, complete=complete)["rows"]}
+    by_id = {i.id: i for i in platform}
     by_num_fp = {(r.get("invoice_number") or "").strip(): r for r in fp_rows}
     applied, skipped = [], []
     now = datetime.utcnow()
@@ -1937,22 +1938,23 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
         if not row or row.get("fix") != fx.fix:
             skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "verdetto cambiato: ricontrolla"})
             continue
-        pl = by_num_pl.get(num)
+        # La riga della piattaforma su cui agire è QUELLA del verdetto (attiva,
+        # o l'annullata riattivabile), mai una scelta per numero.
+        pl = by_id.get((row.get("platform") or {}).get("id"))
         fp = by_num_fp.get(num)
-        if fx.fix == "import" and fp is not None and pl is None:
+
+        def _import_from_fp():
             state = fp_state_of(fp)
             if state not in SDI_FINAL_OK:
-                skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "non più valida su FatturaPro"})
-                continue
-            # Lo stesso numero su un ALTRO cliente (abbinamento diverso): non
-            # si duplica, si segnala.
+                return "non più valida su FatturaPro"
+            # Lo stesso numero ATTIVO su un altro cliente (abbinamento
+            # diverso): non si duplica, si segnala. Le annullate non contano.
             elsewhere = session.query(Invoice).filter(
                 Invoice.invoice_number == num, Invoice.source_platform == "fatturapro",
+                Invoice.status != "void",
             ).first()
             if elsewhere is not None:
-                skipped.append({"invoice_number": num, "fix": fx.fix,
-                                "reason": f"già presente in piattaforma sul cliente {elsewhere.customer_id}"})
-                continue
+                return f"già presente in piattaforma sul cliente {elsewhere.customer_id}"
             session.add(Invoice(
                 invoice_number=num, amount=float(fp.get("total") or 0), amount_due=float(fp.get("balance") or 0),
                 issue_date=fp.get("date"), due_date=fp.get("due_date"),
@@ -1961,7 +1963,27 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
                 source_platform="fatturapro", source_id=fp.get("doc_id"),
                 match_method="fatturapro_verify", sdi_state=state, sdi_checked_at=now,
             ))
+            return None
+
+        if fx.fix == "import" and fp is not None and pl is None:
+            why = _import_from_fp()
+            if why:
+                skipped.append({"invoice_number": num, "fix": fx.fix, "reason": why})
+                continue
+        elif fx.fix == "replace" and fp is not None and pl is not None:
+            # Numero riassegnato: la riga vecchia descrive un documento sparito
+            # (si annulla SENZA timbrarle lo stato del documento nuovo) e il
+            # documento nuovo entra come fattura a sé.
+            _void_invoice(session, pl, f"verifica FatturaPro: {row['verdict_label']} (documento {pl.source_id} → {fp.get('doc_id')})")
+            session.flush()
+            why = _import_from_fp()
+            if why:
+                skipped.append({"invoice_number": num, "fix": fx.fix, "reason": why})
+                continue
         elif fx.fix == "void" and pl is not None:
+            if row["verdict"] == "inesistente" and not complete:
+                skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "lista FatturaPro incompleta: l'assenza non è una prova"})
+                continue
             _void_invoice(session, pl, f"verifica FatturaPro: {row['verdict_label']}",
                           fp_state_of(fp) if fp else None)
         elif fx.fix == "mark_paid" and pl is not None:
@@ -1970,6 +1992,7 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             pl.status = "paid"
             pl.payment_pending = None
             pl.bounced_at = None
+            pl.bounced_note = None
             pl.amount_due = 0
             pl.days_overdue = 0
             pl.updated_at = now
@@ -1981,6 +2004,7 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             pl.updated_at = now
         elif fx.fix == "reactivate" and pl is not None and fp is not None:
             _reactivate_invoice(pl, fp_state_of(fp) or "consegnata")
+            pl.source_id = str(fp.get("doc_id") or pl.source_id or "")
             pl.amount = float(fp.get("total") or pl.amount or 0)
             pl.amount_due = float(fp.get("balance") or 0)
         elif fx.fix == "update_amount" and pl is not None and fp is not None:
@@ -2001,4 +2025,4 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
     session.refresh(customer)
     refresh_customer_lifecycle(session, customer)
     session.commit()
-    return {"applied": applied, "skipped": skipped}
+    return {"applied": applied, "skipped": skipped, "complete": complete}

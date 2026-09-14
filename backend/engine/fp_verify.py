@@ -3,6 +3,7 @@
 fatture della piattaforma e i documenti trovati su FatturaPro per quel
 destinatario. Le CORREZIONI proposte sono esplicite e le applica l'operatore.
 """
+import re
 from typing import Any, Dict, List, Optional
 
 from backend.engine.sdi import SDI_FINAL_OK, SDI_LABELS, sdi_state_from_label
@@ -11,6 +12,7 @@ VERDICT_LABELS = {
     "ok": "Allineata",
     "mancante": "Su FatturaPro ma non in piattaforma",
     "inesistente": "In piattaforma ma non su FatturaPro",
+    "non_verificabile": "Non trovata su FatturaPro (lista incompleta)",
     "non_valida": "Non trasmessa / scartata su FatturaPro",
     "numero_riassegnato": "Stesso numero, documento diverso",
     "importo_diverso": "Importo diverso",
@@ -21,16 +23,21 @@ VERDICT_LABELS = {
 }
 
 # Correzione proposta per ciascun verdetto (None = nessuna azione automatica).
+# 'replace' = annulla la riga vecchia (documento sparito) E importa il nuovo.
 VERDICT_FIX = {
     "mancante": "import",
     "inesistente": "void",
     "non_valida": "void",
-    "numero_riassegnato": "void",
+    "numero_riassegnato": "replace",
     "importo_diverso": "update_amount",
     "pagata_su_fatturapro": "mark_paid",
     "riaperta_su_fatturapro": "reopen",
     "da_riattivare": "reactivate",
 }
+
+# Correzioni che si applicano senza confronto con lo stato attuale (non
+# distruttive): pre-selezionabili dalla UI. Le altre le spunta l'operatore.
+SAFE_FIXES = ("import", "update_amount")
 
 
 def fp_state_of(row: Dict[str, Any]) -> Optional[str]:
@@ -49,9 +56,22 @@ def fp_state_of(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _natural_key(num: str):
+    """Ordina per anno e numero progressivo (non per stringa: '999' > '1000')."""
+    digits = [int(x) for x in re.findall(r"\d+", num or "")]
+    return (digits[0] if digits else 0, digits[1] if len(digits) > 1 else 0, num)
+
+
+def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]],
+                      complete: bool = True) -> Dict[str, Any]:
     """Confronta le fatture della piattaforma (oggetti Invoice, source
     fatturapro) con le righe FatturaPro dello stesso destinatario.
+
+    Le righe ANNULLATE (void) della piattaforma non sono crediti: contano solo
+    per proporre la riattivazione del loro stesso documento (doc_id uguale).
+    Con `complete=False` (ricerca FatturaPro incompleta o fallita) l'assenza
+    di un documento NON è una prova: niente verdetto 'inesistente', solo
+    'non_verificabile' senza correzione.
 
     Ritorna {"rows": [...], "summary": {verdetto: n}}: una riga per numero
     fattura, con i dati dei due lati, il verdetto e la correzione proposta.
@@ -61,36 +81,50 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
         num = (r.get("invoice_number") or "").strip()
         if num:
             by_num_fp[num] = r
-    by_num_pl: Dict[str, Any] = {}
+    active_pl: Dict[str, Any] = {}
+    void_pl: Dict[str, List[Any]] = {}
     for inv in platform_invoices:
-        by_num_pl[(inv.invoice_number or "").strip()] = inv
+        num = (inv.invoice_number or "").strip()
+        if inv.status == "void":
+            void_pl.setdefault(num, []).append(inv)
+        else:
+            # due attive con lo stesso numero non dovrebbero esistere: si
+            # tiene la più recente e si segnala nel verdetto della prima
+            if num in active_pl and (inv.id or 0) < (active_pl[num].id or 0):
+                continue
+            active_pl[num] = inv
 
     rows: List[Dict[str, Any]] = []
-    numbers = sorted(set(by_num_fp) | set(by_num_pl), reverse=True)
+    numbers = sorted(set(by_num_fp) | set(active_pl) | set(void_pl), key=_natural_key, reverse=True)
     for num in numbers:
         fp = by_num_fp.get(num)
-        pl = by_num_pl.get(num)
+        pl = active_pl.get(num)
+        voids = void_pl.get(num, [])
         fp_state = fp_state_of(fp) if fp else None
         fp_valid = fp is not None and fp_state in SDI_FINAL_OK
         fp_saldo = float(fp.get("balance") or 0) if fp else None
         fp_total = float(fp.get("total") or 0) if fp else None
         verdict = "ok"
+        shown = pl
         if fp is None:
-            verdict = "inesistente" if pl is not None and pl.status != "void" else "ok"
+            if pl is None:
+                continue  # solo annullate: nulla da fare
+            verdict = "inesistente" if complete else "non_verificabile"
+        elif not fp_valid:
+            verdict = "non_valida" if pl is not None else "ok"
+            if pl is None:
+                continue
         elif pl is None:
-            if fp_valid and (fp_saldo or 0) > 0:
-                verdict = "mancante"
-            elif fp_valid:
-                verdict = "pagata_non_tracciata"
-            else:
-                verdict = "ok"  # bozza/in elaborazione/scartata: giusto che non ci sia
-        else:
-            if not fp_valid:
-                verdict = "non_valida" if pl.status != "void" else "ok"
-            elif pl.status == "void":
+            same_doc = [v for v in voids if fp.get("doc_id") and v.source_id and str(v.source_id) == str(fp.get("doc_id"))]
+            if same_doc:
                 verdict = "da_riattivare"
-            elif (fp.get("doc_id") and pl.source_id
-                  and str(fp.get("doc_id")) != str(pl.source_id)):
+                shown = same_doc[0]
+            elif (fp_saldo or 0) > 0:
+                verdict = "mancante"
+            else:
+                verdict = "pagata_non_tracciata"
+        else:
+            if fp.get("doc_id") and pl.source_id and str(fp.get("doc_id")) != str(pl.source_id):
                 verdict = "numero_riassegnato"
             elif pl.status == "paid" and (fp_saldo or 0) > 0:
                 verdict = "riaperta_su_fatturapro"
@@ -98,13 +132,13 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
                 verdict = "pagata_su_fatturapro"
             elif fp_total is not None and abs(float(pl.amount or 0) - fp_total) > 0.005:
                 verdict = "importo_diverso"
-        if verdict == "ok" and pl is None:
-            continue  # documento FatturaPro non pertinente: niente da mostrare
+        fix = VERDICT_FIX.get(verdict)
         rows.append({
             "invoice_number": num,
             "verdict": verdict,
             "verdict_label": VERDICT_LABELS.get(verdict, verdict),
-            "fix": VERDICT_FIX.get(verdict),
+            "fix": fix,
+            "fix_safe": fix in SAFE_FIXES,
             "fatturapro": None if fp is None else {
                 "doc_id": fp.get("doc_id"),
                 "date": fp.get("date").isoformat() if fp.get("date") else None,
@@ -114,18 +148,18 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
                 "state_label": fp.get("fp_state_label") or SDI_LABELS.get(fp_state or "", None),
                 "customer_name": fp.get("customer_name"),
             },
-            "platform": None if pl is None else {
-                "id": pl.id,
-                "status": pl.status,
-                "amount": float(pl.amount or 0),
-                "amount_due": float(pl.amount_due or 0),
-                "source_id": pl.source_id,
-                "sdi_state": getattr(pl, "sdi_state", None),
-                "issue_date": pl.issue_date.isoformat() if pl.issue_date else None,
-                "due_date": pl.due_date.isoformat() if pl.due_date else None,
+            "platform": None if shown is None else {
+                "id": shown.id,
+                "status": shown.status,
+                "amount": float(shown.amount or 0),
+                "amount_due": float(shown.amount_due or 0),
+                "source_id": shown.source_id,
+                "sdi_state": getattr(shown, "sdi_state", None),
+                "issue_date": shown.issue_date.isoformat() if shown.issue_date else None,
+                "due_date": shown.due_date.isoformat() if shown.due_date else None,
             },
         })
     summary: Dict[str, int] = {}
     for r in rows:
         summary[r["verdict"]] = summary.get(r["verdict"], 0) + 1
-    return {"rows": rows, "summary": summary}
+    return {"rows": rows, "summary": summary, "complete": complete}
