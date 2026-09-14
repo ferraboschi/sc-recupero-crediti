@@ -1851,6 +1851,21 @@ def _action_counts(session, invoices) -> dict:
     return out
 
 
+def _drop_foreign_docs(session, customer_id, fp_rows):
+    """Documenti FatturaPro già posseduti (doc_id verificato) da una riga di un
+    ALTRO cliente: non si propongono qui (né import, né rinumerazione), se ne
+    occupa il sync/la scheda dell'altro cliente."""
+    ids = [str(r.get("doc_id")) for r in fp_rows if r.get("doc_id")]
+    if not ids:
+        return fp_rows, 0
+    taken = {str(x[0]) for x in session.query(Invoice.source_id).filter(
+        Invoice.source_platform == "fatturapro", Invoice.status != "void", Invoice.doc_id_verified.is_(True),
+        Invoice.source_id.in_(ids), Invoice.customer_id != customer_id,
+    ).all()}
+    kept = [r for r in fp_rows if str(r.get("doc_id") or "") not in taken]
+    return kept, len(fp_rows) - len(kept)
+
+
 def _fp_number_phrase(number: str) -> str:
     """Frase di ricerca per numero su FatturaPro: il progressivo a 8 cifre
     ('2026/00001600/SAK - Fattura' → '00001600'), altrimenti il numero grezzo."""
@@ -1924,7 +1939,9 @@ def verify_fatturapro(customer_id: int, session: Session = Depends(get_session))
             connector.close()
         except Exception:
             pass
+    fp_rows, foreign = _drop_foreign_docs(session, customer_id, fp_rows)
     result = compare_documents(platform, fp_rows, complete=complete, action_counts=_action_counts(session, platform))
+    result["foreign_docs"] = foreign
     session.add(ActivityLog(
         action="fatturapro_verify", entity_type="customer", entity_id=customer_id,
         details={"customer": customer.ragione_sociale, "names": names, "fp_rows": len(fp_rows),
@@ -1979,6 +1996,7 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             connector.close()
         except Exception:
             pass
+    fp_rows, _ = _drop_foreign_docs(session, customer_id, fp_rows)
     verdict_rows = compare_documents(platform, fp_rows, complete=complete, action_counts=_action_counts(session, platform))["rows"]
     current = {r["key"]: r for r in verdict_rows}
     by_number = {}

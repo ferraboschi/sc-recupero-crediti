@@ -338,10 +338,13 @@ def test_verify_ignores_homonyms_and_duplicates_elsewhere(test_client, test_db_s
     r = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
     nums = {x["invoice_number"] for x in r["rows"]}
     assert nums == {"0600"} and r["fatturapro_documents"] == 1  # omonimi e quasi-omonimi non entrano
-    # se un numero fosse già in piattaforma su un altro cliente, l'import non duplica
+    # se il documento è già posseduto (verificato) da un altro cliente, la verifica
+    # non lo propone (foreign_docs) e l'apply non lo importa
     _mk(test_db_session, "0600", customer_id=other.id, source_id="m", customer_name_raw="Rossi S.r.l.")
+    r2 = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    assert r2["foreign_docs"] == 1 and r2["rows"] == []
     a = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro/apply", json={"fixes": [{"invoice_number": "0600", "fix": "import"}]}).json()
-    assert a["applied"] == [] and "già presente" in a["skipped"][0]["reason"]
+    assert a["applied"] == [] and a["skipped"]
 
 
 # ── Trovati dalla review avversariale (frontend/contratto) ──────────────────
@@ -1048,3 +1051,50 @@ def test_legacy_owner_with_present_number_adopts_instead_of_renumber(monkeypatch
         l = test_db_session.query(Invoice).get(l_id)
         assert (l.invoice_number, l.source_id, l.doc_id_verified) == ("N/2026", "D", True)
         assert _get(test_db_session, "NX/2026").source_id == "F" and r["created"] == 1 and r["voided"] == 0
+
+
+# ── Quarto giro ─────────────────────────────────────────────────────────────
+
+def test_absent_legacy_with_live_fossil_doc_is_never_paid(monkeypatch, test_db_session):
+    """B1: L(N1,F1,ALFA); FP (N1,F2,BETA consegnata) + (N0,F1,ALFA BOZZA): F1 non
+    entra (bozza) ma è vivo → L non va mai 'pagata': senza storia annullata."""
+    l_id = _mk(test_db_session, "N1/2026", source_id="F1", doc_id_verified=False, customer_name_raw="ALFA SRL", missing_streak=1).id
+    r = _sync(monkeypatch, test_db_session, [_raw("N1/2026", "F2", "notified", balance=20.0, name="BETA SRL"), _raw("N0/2026", "F1", "draft", balance=10.0, name="ALFA SRL")],
+              notif={"F2": ["RicevutaConsegna"]})
+    l = test_db_session.query(Invoice).get(l_id)
+    assert l.status == "void" and l.paid_at is None and r["paid_detected"] == 0 and r["created"] == 1
+
+
+def test_absent_legacy_with_live_fossil_doc_and_history_stays_open_in_conflict(monkeypatch, test_db_session):
+    from backend.database import Customer as C
+    c = C(ragione_sociale="ALFA SRL"); test_db_session.add(c); test_db_session.commit(); cid = c.id
+    l_id = _mk(test_db_session, "N1/2026", source_id="F1", doc_id_verified=False, customer_name_raw="ALFA SRL", customer_id=cid, missing_streak=1).id
+    _act(test_db_session, l_id, cid)
+    for _ in range(2):
+        r = _sync(monkeypatch, test_db_session, [_raw("N1/2026", "F2", "notified", balance=20.0, name="BETA SRL"), _raw("N0/2026", "F1", "draft", balance=10.0, name="ALFA SRL")],
+                  notif={"F2": ["RicevutaConsegna"]})
+        l = test_db_session.query(Invoice).get(l_id)
+        assert l.status == "open" and r["paid_detected"] == 0 and r["voided"] == 0
+
+
+def test_paid_row_never_becomes_holder_over_open_nor_duplicate(monkeypatch, test_db_session):
+    """B2: P(N, Dold, pagata a MANO) + O(N, D, aperta creata da PR #35), FP (N, D):
+    O resta l'holder (confermata), P non viene né riaperta né annullata."""
+    p_id = _mk(test_db_session, "N/2026", source_id="Dold", doc_id_verified=False, status="paid", amount_due=0, days_overdue=0, paid_at=datetime(2026, 8, 1), customer_name_raw="ACME SRL").id
+    test_db_session.add(ActivityLog(action="fatturapro_fix_mark_paid", entity_type="invoice", entity_id=p_id, details={})); test_db_session.commit()
+    o_id = _mk(test_db_session, "N/2026", source_id="D", doc_id_verified=False, customer_name_raw="ACME SRL").id
+    r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "notified", balance=90.0, name="ACME SRL")], notif={"D": ["RicevutaConsegna"]})
+    p = test_db_session.query(Invoice).get(p_id); o = test_db_session.query(Invoice).get(o_id)
+    assert p.status == "paid" and p.paid_at is not None
+    assert (o.status, o.doc_id_verified, o.amount_due) == ("open", True, 90.0) and r["voided"] == 0
+
+
+def test_fossil_twin_resolved_in_same_cycle_as_creation(monkeypatch, test_db_session):
+    """M3: gemella orfana senza storia il cui doc entra come riga NUOVA in questo
+    ciclo: annullata subito (nessun ciclo di credito doppio)."""
+    l_id = _mk(test_db_session, "N2/2026", source_id="F", doc_id_verified=False, customer_name_raw="ALFA SRL", missing_streak=0).id
+    r = _sync(monkeypatch, test_db_session, [_raw("N2/2026", "G", "notified", balance=5.0, name="BETA SRL"), _raw("N1/2026", "F", "notified", balance=10.0, name="ALFA SRL")],
+              notif={"F": ["RicevutaConsegna"], "G": ["RicevutaConsegna"]})
+    l = test_db_session.query(Invoice).get(l_id)
+    assert l.status == "void" and r["created"] == 2 and r["paid_detected"] == 0
+    assert len([x for x in test_db_session.query(Invoice).all() if x.status != "void"]) == 2

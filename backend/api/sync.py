@@ -479,6 +479,11 @@ def _sync_invoices_task() -> dict:
                     # Candidati holder: attive col numero, dello stesso destinatario
                     # (una pagata di un altro destinatario non è mai holder né rivale).
                     cands = [x for x in rows_n if _same_recipient(x, r) and x.id not in planned_ids]
+                    # Una PAGATA è holder solo se non c'è un'aperta col numero
+                    # (mai annullata come doppione, mai riaperta sopra un'aperta).
+                    unpaid_c = [x for x in cands if x.status != "paid"]
+                    if unpaid_c:
+                        cands = unpaid_c
                     if owner is not None and _verified(owner) and str(_src_of(owner)) == doc:
                         rivals = [x for x in cands if x.id != owner.id and _has_history(x) and x.status != "paid"]
                         if rivals and not _has_history(owner):
@@ -520,7 +525,7 @@ def _sync_invoices_task() -> dict:
                         # cliente le mostra come doppione).
                         plan["conflict"].append((num, [x.id for x in with_hist]))
                     for other in cands:
-                        if other.id != holder.id and other.id not in planned_void and not _has_history(other):
+                        if other.id != holder.id and other.id not in planned_void and not _has_history(other) and other.status != "paid":
                             plan["dupvoid"].append((other, num, doc))
                             planned_void.add(other.id)
                             if str(_src_of(other)) == doc and by_doc.get(doc) is other:
@@ -571,14 +576,19 @@ def _sync_invoices_task() -> dict:
                     # il controllo vale a OGNI ciclo (non solo quando si conferma o
                     # adotta), altrimenti una gemella con storia esce dal conflitto
                     # e finisce pagata per assenza al ciclo dopo.
-                    owned = {}
-                    for ex in existing_of.values():
+                    owned = {}   # doc -> (numero FatturaPro, riga holder o None se verrà creata)
+                    for r_ in raw_invoices:
+                        ex = existing_of[id(r_)]
                         if ex is not None and _verified(ex) and _src_of(ex) and ex.id not in planned_void:
-                            owned[str(_src_of(ex))] = ex
+                            owned[str(_src_of(ex))] = (r_["invoice_number"], ex)
+                        elif ex is None and r_.get("doc_id"):
+                            # Documento che entrerà (o resterà fuori come bozza): le
+                            # gemelle fossili si risolvono comunque in questo ciclo.
+                            owned[str(r_["doc_id"])] = (r_["invoice_number"], None)
                     for holder in plan["confirm"]:
-                        owned[str(holder.source_id)] = holder
+                        owned[str(holder.source_id)] = (holder.invoice_number, holder)
                     for holder, doc, _ in plan["adopt"]:
-                        owned[doc] = holder
+                        owned[doc] = (holder.invoice_number, holder)
                     conflict_ids = set()
                     if owned:
                         others = session.query(Invoice).filter(
@@ -589,18 +599,22 @@ def _sync_invoices_task() -> dict:
                         if other_ids:
                             acted_ids.update(r_[0] for r_ in session.query(RecoveryActionInvoice.invoice_id).filter(
                                 RecoveryActionInvoice.invoice_id.in_(other_ids)).distinct().all())
+                        confirm_ids = {h.id for h in plan["confirm"]}
                         for other in others:
-                            holder = owned.get(str(other.source_id))
-                            if holder is None or other.id == holder.id or other.id in adopted_ids or other.id in planned_void:
+                            entry = owned.get(str(other.source_id))
+                            if entry is None:
                                 continue
-                            if other.doc_id_verified and other.id not in adopted_ids and other.id not in {h.id for h in plan["confirm"]}:
+                            holder_num, holder = entry
+                            if (holder is not None and other.id == holder.id) or other.id in adopted_ids or other.id in planned_void:
+                                continue
+                            if other.doc_id_verified and other.id not in adopted_ids and other.id not in confirm_ids:
                                 continue  # verificata: se ne occupa il ciclo (mismatch/taker)
                             manual = session.query(ActivityLog.id).filter(
                                 ActivityLog.entity_type == "invoice", ActivityLog.entity_id == other.id,
                                 ActivityLog.action == "fatturapro_fix_mark_paid").first() is not None
                             if other.status == "paid":
                                 if other.paid_at is not None and not manual:
-                                    if _void_invoice(session, other, f"rinumerata su FatturaPro (documento {other.source_id} ora è la {holder.invoice_number}): la 'pagata per assenza' non era un incasso"):
+                                    if _void_invoice(session, other, f"rinumerata su FatturaPro (documento {other.source_id} ora è la {holder_num}): la 'pagata per assenza' non era un incasso"):
                                         fp["voided"] += 1
                                     other.paid_at = None
                                     other.amount_due_at_paid = None
@@ -611,7 +625,7 @@ def _sync_invoices_task() -> dict:
                                 # Con storia: nessuna scrittura, ma finché il conflitto è
                                 # aperto NON va pagata per assenza (sarebbe un incasso
                                 # inventato): esclusa dalla payment detection.
-                                plan["conflict"].append((holder.invoice_number, [holder.id, other.id]))
+                                plan["conflict"].append((holder_num, [holder.id if holder is not None else 0, other.id]))
                                 conflict_ids.add(other.id)
                                 continue
                             absent_by_number = _is_absent(other, fetched_numbers_set, fp_doc_ids)
@@ -619,7 +633,7 @@ def _sync_invoices_task() -> dict:
                                 # Gemella fossile senza storia, il cui numero non è più
                                 # in lista mentre il documento è VIVO sotto l'holder: è
                                 # lo stesso documento rinumerato, non un credito a sé.
-                                if _void_invoice(session, other, f"rinumerata su FatturaPro (documento {other.source_id} ora è la {holder.invoice_number})"):
+                                if _void_invoice(session, other, f"rinumerata su FatturaPro (documento {other.source_id} ora è la {holder_num})"):
                                     fp["voided"] += 1
                                 other.source_id = None
                                 n_rel += 1
@@ -627,8 +641,8 @@ def _sync_invoices_task() -> dict:
                             other.source_id = None
                             session.add(ActivityLog(
                                 action="fossil_doc_id_released", entity_type="invoice", entity_id=other.id,
-                                details={"invoice_number": other.invoice_number, "doc_id": holder.source_id,
-                                         "adopted_by_number": holder.invoice_number},
+                                details={"invoice_number": other.invoice_number, "doc_id": str(other.source_id or ""),
+                                         "adopted_by_number": holder_num},
                             ))
                             n_rel += 1
                     for other, num, doc in plan["dupvoid"]:
@@ -648,14 +662,15 @@ def _sync_invoices_task() -> dict:
                         if key in seen_conflicts:
                             continue
                         seen_conflicts.add(key)
+                        anchor = max(ids)  # la riga "in più" (di solito la gemella)
                         already = session.query(ActivityLog.id).filter(
-                            ActivityLog.action == "invoice_number_conflict", ActivityLog.entity_id == ids[0],
+                            ActivityLog.action == "invoice_number_conflict", ActivityLog.entity_id == anchor,
                             ActivityLog.timestamp >= datetime.utcnow() - timedelta(hours=24),
                         ).first()
                         if already:
                             continue  # già segnalato nelle ultime 24h: niente rumore
                         session.add(ActivityLog(
-                            action="invoice_number_conflict", entity_type="invoice", entity_id=ids[0],
+                            action="invoice_number_conflict", entity_type="invoice", entity_id=anchor,
                             details={"invoice_number": num, "invoice_ids": ids,
                                      "note": "più righe con storia sullo stesso numero/documento: nessuna scrittura automatica, verificare dalla scheda cliente"},
                         ))
@@ -665,7 +680,7 @@ def _sync_invoices_task() -> dict:
                     fp["fossil_released"] = n_rel
                     fp["dup_voided"] = n_dup
                     fp["legacy_orphans"] = n_orph
-                    fp["number_conflicts"] = len(plan["conflict"])
+                    fp["number_conflicts"] = len(seen_conflicts)
 
                 def _doc_mismatch(ex, r):
                     """Stesso numero, documento diverso, E il documento vecchio
@@ -1080,6 +1095,20 @@ def _sync_invoices_task() -> dict:
                         for known_inv in known_fp_invoices:
                             if known_inv.id in plan.get("conflict_ids", set()):
                                 continue  # conflitto aperto: decide l'operatore, mai 'pagata' per assenza
+                            if (_is_absent(known_inv, fetched_invoice_numbers, fp_doc_ids)
+                                    and not known_inv.doc_id_verified and known_inv.source_id
+                                    and str(known_inv.source_id) in fp_doc_ids):
+                                # Storica assente (numero passato ad altri) il cui doc
+                                # fossile è VIVO in lista (bozza/in elaborazione/non
+                                # ancora entrato): non è un incasso. Senza storia si
+                                # annulla; con storia resta in conflitto per l'operatore.
+                                if _has_history(known_inv):
+                                    plan.setdefault("conflict_ids", set()).add(known_inv.id)
+                                    known_inv.missing_streak = 0
+                                    continue
+                                if _void_invoice(session, known_inv, "il numero è passato a un altro destinatario e il documento originario è ancora su FatturaPro: riga storica non riconducibile"):
+                                    fp["voided"] += 1
+                                continue
                             if _is_absent(known_inv, fetched_invoice_numbers, fp_doc_ids):
                                 # La "pagata" è un'inferenza per assenza: una
                                 # riga persa silenziosamente dal fetch non
