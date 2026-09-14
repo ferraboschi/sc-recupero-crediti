@@ -309,11 +309,12 @@ def test_verify_ignores_homonyms_and_duplicates_elsewhere(test_client, test_db_s
     other = Customer(ragione_sociale="ROSSI & C. SNC"); test_db_session.add(other); test_db_session.commit()
     _mk(test_db_session, "0500", customer_id=other.id, source_id="o", customer_name_raw="ROSSI & C. SNC")
     homonym = dict(_fp("0500", "o", 100.0, 100.0, "Consegnato")); homonym["customer_name"] = "ROSSI & C. SNC"
-    mine = dict(_fp("0600", "m", 200.0, 200.0, "Consegnato")); mine["customer_name"] = "Rossi S.r.l."
-    FakeSearchFP.rows = [homonym, mine]
+    mine = dict(_fp("0600", "m", 200.0, 200.0, "Consegnato")); mine["customer_name"] = "rossi  srl"  # solo maiuscole/spazi diversi
+    spa = dict(_fp("0650", "s", 100.0, 100.0, "Consegnato")); spa["customer_name"] = "ROSSI S.P.A."  # quasi-omonimo: fuori
+    FakeSearchFP.rows = [homonym, mine, spa]
     r = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
     nums = {x["invoice_number"] for x in r["rows"]}
-    assert nums == {"0600"} and r["fatturapro_documents"] == 1  # l'omonimo non entra
+    assert nums == {"0600"} and r["fatturapro_documents"] == 1  # omonimi e quasi-omonimi non entrano
     # se un numero fosse già in piattaforma su un altro cliente, l'import non duplica
     _mk(test_db_session, "0600", customer_id=other.id, source_id="m", customer_name_raw="Rossi S.r.l.")
     a = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro/apply", json={"fixes": [{"invoice_number": "0600", "fix": "import"}]}).json()
@@ -378,3 +379,110 @@ def test_apply_replace_and_incomplete_guard(test_client, test_db_session, monkey
     assert all(x["verdict"] == "non_verificabile" and x["fix"] is None for x in r2["rows"])
     a2 = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro/apply", json={"fixes": [{"invoice_number": "1609", "fix": "void"}]}).json()
     assert a2["applied"] == [] and a2["skipped"]
+
+
+# ── Trovati dalla review avversariale (backend) ─────────────────────────────
+
+def test_last_notification_wins_and_scartata_is_rechecked(monkeypatch, test_db_session):
+    assert sdi_state_from_notifications(["NotificaScarto", "RicevutaConsegna"]) == "consegnata"
+    assert sdi_state_from_notifications(["RicevutaConsegna", "NotificaScarto"]) == "scartata"
+    _mk(test_db_session, "RS/2026", source_id="9", sdi_state="scartata", status="void", amount_due=0, days_overdue=0)
+    r = _sync(monkeypatch, test_db_session, [_raw("RS/2026", "9", "notified", balance=70.0)], notif={"9": ["NotificaScarto", "RicevutaConsegna"]})
+    inv = _get(test_db_session, "RS/2026")
+    assert inv.status == "open" and inv.sdi_state == "consegnata" and inv.amount_due == 70.0 and r["reactivated"] == 1
+
+
+def test_absent_sent_is_paid_not_voided(monkeypatch, test_db_session):
+    """'sent' = assenza di notifiche, non prova di mancata consegna: una
+    fattura sparita in quello stato segue la regola storica (pagata)."""
+    _mk(test_db_session, "SENT/2026", source_id="1", sdi_state="sent", missing_streak=1)
+    r = _sync(monkeypatch, test_db_session, [_raw("OTHER/2026", "3", None)])
+    inv = _get(test_db_session, "SENT/2026")
+    assert inv.status == "paid" and r["paid_detected"] == 1 and r["voided"] == 0
+
+
+def test_empty_notifications_do_not_create_evidence(monkeypatch, test_db_session):
+    """Modale senza link ai messaggi SDI → [] → 'sent' (mai 'consegnata' né 'scartata')."""
+    conn = FatturaProConnector(); conn._authenticated = True; conn._documenti_key = "k"
+
+    class R:
+        url = "x"
+
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+    monkeypatch.setattr(conn.client, "post", lambda *a, **k: R('<ul><li>Documenti</li><li>Esito positivo</li></ul>'))
+    assert conn.fetch_sdi_notifications("1") == []
+    assert sdi_state_from_notifications([]) == "sent"
+
+
+def test_reassigned_number_never_voids_a_paid_row(monkeypatch, test_db_session):
+    _mk(test_db_session, "P/2026", source_id="old", status="paid", amount_due=0, days_overdue=0, paid_at=datetime(2026, 8, 1), amount_due_at_paid=100.0)
+    r = _sync(monkeypatch, test_db_session, [_raw("P/2026", "new", "notified", balance=55.0)], notif={"new": ["RicevutaConsegna"]})
+    rows = test_db_session.query(Invoice).filter_by(invoice_number="P/2026").order_by(Invoice.id).all()
+    assert [(x.status, x.source_id) for x in rows] == [("paid", "old"), ("open", "new")]
+    assert r["voided"] == 0 and r.get("reassigned_on_paid") == 1
+    assert test_db_session.query(ActivityLog).filter_by(action="numero_riassegnato_su_pagata").count() == 1
+
+
+def test_draft_guard_blocks_mass_void(monkeypatch, test_db_session):
+    """Se (quasi) tutta la lista è letta come bozza è cambiato il markup: in quel
+    ciclo la firma 'draft' non vale, nessun annullamento."""
+    for i in range(70):
+        _mk(test_db_session, f"G{i}/2026", source_id=str(i))
+    raw = [_raw(f"G{i}/2026", str(i), "draft") for i in range(70)]
+    r = _sync(monkeypatch, test_db_session, raw)
+    assert r["voided"] == 0 and r.get("draft_guard_triggered") == 70
+    assert test_db_session.query(Invoice).filter_by(status="void").count() == 0
+
+
+def test_verify_keeps_rows_known_by_doc_id_when_customer_renamed(test_client, test_db_session, monkeypatch):
+    """Cliente rinominato in anagrafica FatturaPro: le sue fatture (doc_id
+    noti) NON diventano 'inesistenti'."""
+    import backend.connectors.fatturapro as fpmod
+    monkeypatch.setattr(fpmod, "FatturaProConnector", FakeSearchFP)
+    cust = Customer(ragione_sociale="VECCHIO NOME SRL"); test_db_session.add(cust); test_db_session.commit()
+    _mk(test_db_session, "0900", customer_id=cust.id, source_id="d900", amount=100.0, customer_name_raw="VECCHIO NOME SRL")
+    renamed = dict(_fp("0900", "d900", 100.0, 100.0, "Consegnato")); renamed["customer_name"] = "VECCHIO NOME SRL IN LIQUIDAZIONE"
+    FakeSearchFP.rows = [renamed]
+    r = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    assert r["rows"][0]["verdict"] == "ok"
+
+
+def test_compare_flags_duplicate_active_rows(test_db_session):
+    cust = Customer(ragione_sociale="Dup2 SRL"); test_db_session.add(cust); test_db_session.commit()
+    a = _mk(test_db_session, "0800", customer_id=cust.id, source_id="a")
+    b = _mk(test_db_session, "0800", customer_id=cust.id, source_id="b")
+    res = compare_documents([a, b], [_fp("0800", "b", 100.0, 100.0, "Consegnato")])
+    v = {(r["verdict"], r["platform"]["id"]) for r in res["rows"]}
+    assert v == {("ok", b.id), ("duplicato", a.id)}
+    assert not any(r["fix_safe"] for r in res["rows"] if r["verdict"] == "duplicato")
+
+
+def test_search_documents_paginates(monkeypatch):
+    conn = FatturaProConnector(); conn._authenticated = True
+    header = HEADER_STATO
+    page1 = "<table>" + header + "".join(_row(f"P{i}", A_NOTIF, state="Consegnato", doc_id=str(i)) for i in range(3)) + "</table><input type='hidden' name='key' value='k2'>"
+    page2 = "<table>" + header + _row("P3", A_NOTIF, state="Consegnato", doc_id="3") + "</table>"
+
+    class R:
+        url = "x"
+
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+    calls = []
+    monkeypatch.setattr(conn.client, "get", lambda *a, **k: R("<table>" + header + "</table><input type='hidden' name='key' value='k1'><input type='hidden' name='instance' value='documenti'>"))
+
+    def fake_post(url, data=None, **kw):
+        calls.append(dict(data))
+        return R(page1 if data["xcrud[start]"] == "0" else page2)
+    monkeypatch.setattr(conn.client, "post", fake_post)
+    rows, complete = conn.search_documents("ACME", limit=3)
+    assert [r["invoice_number"] for r in rows] == ["P0", "P1", "P2", "P3"] and complete is True
+    assert [c["xcrud[start]"] for c in calls] == ["0", "3"] and calls[1]["xcrud[key]"] == "k2"
+    assert all(c["xcrud[search]"] == "1" and c["xcrud[phrase]"] == "ACME" for c in calls)

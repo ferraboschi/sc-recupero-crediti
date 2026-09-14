@@ -600,7 +600,7 @@ def create_action(
                 raise HTTPException(status_code=400, detail=f"Fatture senza scadenza: nessun promemoria possibile {no_due}")
             bad = [
                 inv.invoice_number for inv in targets
-                if inv.status in ("paid", "disputed") or (inv.days_overdue or 0) > 0 or inv.due_date <= today
+                if inv.status in ("paid", "disputed", "void") or (inv.days_overdue or 0) > 0 or inv.due_date <= today
             ]
             if bad:
                 raise HTTPException(
@@ -1018,7 +1018,7 @@ def generate_pdf_riepilogativo(
         # Get invoices
         query = session.query(Invoice).filter(
             Invoice.customer_id == customer_id,
-            Invoice.status != "paid",
+            Invoice.status.notin_(("paid", "void")),
         )
         if overdue_only:
             query = query.filter(Invoice.days_overdue > 0)

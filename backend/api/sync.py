@@ -151,6 +151,12 @@ def _persist_sync_status(key: str, result: dict):
 # Notifiche SDI interrogate per ciclo di sync (una chiamata per documento):
 # le fatture NUOVE hanno la precedenza, poi lo storico non ancora classificato.
 SDI_CHECKS_PER_RUN = 150
+# Guardia anti-disastro: se in un ciclo le righe lette come BOZZA superano
+# questa soglia (assoluta e in quota della lista), quasi certamente è cambiato
+# il markup di FatturaPro, non la realtà → in quel ciclo la firma 'draft' non
+# vale (nessun annullamento), si conta e si logga.
+DRAFT_GUARD_ABS = 60
+DRAFT_GUARD_SHARE = 0.15
 
 
 def _void_invoice(session, inv, reason: str, sdi_state: str = None) -> None:
@@ -337,6 +343,26 @@ def _sync_invoices_task() -> dict:
                 # e sono limitate per ciclo (le nuove prima).
                 fp = result["fatturapro"]
                 sdi_checks = 0
+                # Guardia anti-annullamento di massa (markup cambiato?)
+                n_draft = sum(1 for r in raw_invoices if r.get("fp_signature") == "draft")
+                draft_guard = n_draft > DRAFT_GUARD_ABS and n_draft > len(raw_invoices) * DRAFT_GUARD_SHARE
+                if draft_guard:
+                    logger.error(
+                        "SDI: %d righe su %d lette come BOZZA — sospetto cambio di layout "
+                        "FatturaPro: in questo ciclo la firma 'draft' NON vale (nessun annullamento)",
+                        n_draft, len(raw_invoices),
+                    )
+                    fp["draft_guard_triggered"] = n_draft
+                    for r in raw_invoices:
+                        if r.get("fp_signature") == "draft":
+                            r["fp_signature"] = None
+                # Le fatture NUOVE prima: il cap delle notifiche non deve
+                # consumarsi sullo storico lasciando fuori una fattura vera.
+                known_numbers = {
+                    n for (n,) in session.query(Invoice.invoice_number)
+                    .filter(Invoice.source_platform == "fatturapro").all()
+                }
+                raw_invoices = sorted(raw_invoices, key=lambda r: r.get("invoice_number") in known_numbers)
                 notif_fn = getattr(fatturapro, "fetch_sdi_notifications", None)
                 state_fn = sdi_state_from_notifications
 
@@ -367,11 +393,23 @@ def _sync_invoices_task() -> dict:
                     # come nuova.
                     if (existing is not None and inv.get("doc_id") and existing.source_id
                             and str(existing.source_id) != str(inv["doc_id"])):
-                        _void_invoice(
-                            session, existing,
-                            f"numero riassegnato su FatturaPro (documento {existing.source_id} → {inv['doc_id']})",
-                        )
-                        fp["voided"] += 1
+                        if existing.status == "paid":
+                            # Una PAGATA non si annulla in automatico (perderebbe il
+                            # recuperato): si segnala, decide l'operatore dalla
+                            # verifica per cliente. Il documento nuovo entra a sé.
+                            session.add(ActivityLog(
+                                action="numero_riassegnato_su_pagata", entity_type="invoice",
+                                entity_id=existing.id,
+                                details={"invoice_number": inv_num, "old_doc_id": existing.source_id,
+                                         "new_doc_id": inv["doc_id"], "customer_id": existing.customer_id},
+                            ))
+                            fp["reassigned_on_paid"] = fp.get("reassigned_on_paid", 0) + 1
+                        else:
+                            _void_invoice(
+                                session, existing,
+                                f"numero riassegnato su FatturaPro (documento {existing.source_id} → {inv['doc_id']})",
+                            )
+                            fp["voided"] += 1
                         existing = None
 
                     if existing is not None and sig == "draft":
@@ -389,7 +427,9 @@ def _sync_invoices_task() -> dict:
                         if sig == "sent":
                             if existing.sdi_state not in SDI_FINAL_OK:
                                 existing.sdi_state = "sent"
-                        elif existing.sdi_state not in SDI_FINAL_OK + ("scartata",):
+                        elif existing.sdi_state not in SDI_FINAL_OK:
+                            # Anche una 'scartata' si ricontrolla: corretta e
+                            # ritrasmessa (stesso doc_id) diventa consegnata.
                             st = _sdi_state_for(inv.get("doc_id") or existing.source_id)
                             if st:
                                 existing.sdi_state = st
@@ -543,9 +583,12 @@ def _sync_invoices_task() -> dict:
                                 # paid solo alla SECONDA assenza consecutiva
                                 # su fetch completi.
                                 streak = (known_inv.missing_streak or 0) + 1
-                                if streak >= PAID_ABSENCE_STREAK and known_inv.sdi_state in ("draft", "sent"):
-                                    # Sparita PRIMA di essere consegnata: è
-                                    # stata eliminata/corretta, non incassata.
+                                if streak >= PAID_ABSENCE_STREAK and known_inv.sdi_state == "draft":
+                                    # Sparita quando era ancora una BOZZA (evidenza
+                                    # positiva dalle azioni di riga): eliminata o
+                                    # corretta, non incassata. 'sent' NON basta: è
+                                    # assenza di notifiche, non prova di mancata
+                                    # consegna → resta la regola storica (pagata).
                                     _void_invoice(
                                         session, known_inv,
                                         "sparita da FatturaPro prima della consegna SDI (eliminata o corretta)",

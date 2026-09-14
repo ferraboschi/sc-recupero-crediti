@@ -179,7 +179,7 @@ def list_customers(
                 func.min(case((overdue_clause(), Invoice.due_date), else_=None)).label("earliest_due_date"),
                 func.max(case((overdue_clause(), Invoice.days_overdue), else_=None)).label("max_days_overdue"),
             )
-            .filter(Invoice.status != "paid", Invoice.customer_id.isnot(None))
+            .filter(Invoice.status.notin_(("paid", "void")), Invoice.customer_id.isnot(None))
             .group_by(Invoice.customer_id)
             .all()
         )
@@ -1827,22 +1827,31 @@ def _fp_search_names(session, customer) -> List[str]:
 
 
 def _fp_name_key(name) -> str:
-    return normalize_ragione_sociale(name or "") or (name or "").strip().lower()
+    """Chiave STRETTA (maiuscole/spazi ignorati, nient'altro): il filtro degli
+    omonimi deve escludere 'ROSSI S.P.A.' da 'ROSSI SRL', quindi non può usare
+    il normalizzatore tollerante del matching."""
+    return " ".join((name or "").split()).strip().lower()
 
 
-def _fp_rows_for_customer(connector, names) -> tuple:
+def _fp_rows_for_customer(connector, names, known_doc_ids=(), known_numbers=()) -> tuple:
     """Documenti FatturaPro del cliente. La ricerca di FatturaPro è un LIKE
-    sul destinatario ('ROSSI' trova anche 'ROSSI & C.'): si tengono SOLO le
-    righe il cui destinatario coincide con uno dei nomi cercati (normalizzati),
-    altrimenti si proporrebbe di importare fatture di un ALTRO cliente."""
+    sul destinatario ('ROSSI' trova anche 'ROSSI & C.'): si tengono le righe
+    il cui destinatario coincide ESATTAMENTE con uno dei nomi cercati, più
+    quelle già note al cliente per doc_id o numero (cliente rinominato in
+    anagrafica FatturaPro: non deve far sparire le sue fatture)."""
     wanted = {_fp_name_key(n) for n in names}
+    known_ids = {str(x) for x in known_doc_ids if x}
+    known_nums = {(x or "").strip() for x in known_numbers if x}
     rows: dict = {}
     complete = True
     for name in names:
         found, ok = connector.search_documents(name)
         complete = complete and ok
         for r in found:
-            if _fp_name_key(r.get("customer_name")) not in wanted:
+            same_name = _fp_name_key(r.get("customer_name")) in wanted
+            known = (str(r.get("doc_id") or "") in known_ids
+                     or (r.get("invoice_number") or "").strip() in known_nums)
+            if not same_name and not known:
                 continue
             key = str(r.get("doc_id") or r.get("invoice_number"))
             rows[key] = r
@@ -1861,19 +1870,20 @@ def verify_fatturapro(customer_id: int, session: Session = Depends(get_session))
     names = _fp_search_names(session, customer)
     if not names:
         raise HTTPException(status_code=400, detail="Cliente senza ragione sociale: impossibile cercarlo su FatturaPro")
+    platform = session.query(Invoice).filter(
+        Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
+    ).order_by(Invoice.id.asc()).all()
     connector = FatturaProConnector()
     try:
         if not connector.login():
             raise HTTPException(status_code=424, detail="FatturaPro non raggiungibile (login fallito): riprova più tardi")
-        fp_rows, complete = _fp_rows_for_customer(connector, names)
+        fp_rows, complete = _fp_rows_for_customer(
+            connector, names, [i.source_id for i in platform], [i.invoice_number for i in platform])
     finally:
         try:
             connector.close()
         except Exception:
             pass
-    platform = session.query(Invoice).filter(
-        Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
-    ).order_by(Invoice.id.asc()).all()
     result = compare_documents(platform, fp_rows, complete=complete)
     session.add(ActivityLog(
         action="fatturapro_verify", entity_type="customer", entity_id=customer_id,
@@ -1914,23 +1924,25 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
     if not body.fixes:
         raise HTTPException(status_code=400, detail="Nessuna correzione selezionata")
     names = _fp_search_names(session, customer)
+    platform = session.query(Invoice).filter(
+        Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
+    ).order_by(Invoice.id.asc()).all()
     connector = FatturaProConnector()
     try:
         if not connector.login():
             raise HTTPException(status_code=424, detail="FatturaPro non raggiungibile (login fallito): riprova più tardi")
-        fp_rows, complete = _fp_rows_for_customer(connector, names)
+        fp_rows, complete = _fp_rows_for_customer(
+            connector, names, [i.source_id for i in platform], [i.invoice_number for i in platform])
     finally:
         try:
             connector.close()
         except Exception:
             pass
-    platform = session.query(Invoice).filter(
-        Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
-    ).order_by(Invoice.id.asc()).all()
     current = {r["invoice_number"]: r for r in compare_documents(platform, fp_rows, complete=complete)["rows"]}
     by_id = {i.id: i for i in platform}
     by_num_fp = {(r.get("invoice_number") or "").strip(): r for r in fp_rows}
     applied, skipped = [], []
+    imported_ids = {}
     now = datetime.utcnow()
     for fx in body.fixes:
         num = fx.invoice_number.strip()
@@ -1955,14 +1967,17 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             ).first()
             if elsewhere is not None:
                 return f"già presente in piattaforma sul cliente {elsewhere.customer_id}"
-            session.add(Invoice(
+            created = Invoice(
                 invoice_number=num, amount=float(fp.get("total") or 0), amount_due=float(fp.get("balance") or 0),
                 issue_date=fp.get("date"), due_date=fp.get("due_date"),
                 due_date_source="real" if fp.get("due_date") else None,
                 customer_name_raw=fp.get("customer_name"), customer_id=customer_id,
                 source_platform="fatturapro", source_id=fp.get("doc_id"),
                 match_method="fatturapro_verify", sdi_state=state, sdi_checked_at=now,
-            ))
+            )
+            session.add(created)
+            session.flush()
+            imported_ids[num] = created.id
             return None
 
         if fx.fix == "import" and fp is not None and pl is None:
@@ -2007,6 +2022,12 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             pl.source_id = str(fp.get("doc_id") or pl.source_id or "")
             pl.amount = float(fp.get("total") or pl.amount or 0)
             pl.amount_due = float(fp.get("balance") or 0)
+            if pl.amount_due == 0:
+                # Già saldata su FatturaPro: riattivarla come aperta la farebbe
+                # marcare pagata due sync dopo con residuo 0 → pagata subito.
+                pl.status = "paid"
+                pl.paid_at = now
+                pl.amount_due_at_paid = 0
         elif fx.fix == "update_amount" and pl is not None and fp is not None:
             pl.amount = float(fp.get("total") or 0)
             pl.amount_due = float(fp.get("balance") or 0)
@@ -2017,7 +2038,7 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
         applied.append({"invoice_number": num, "fix": fx.fix})
         session.add(ActivityLog(
             action=f"fatturapro_fix_{fx.fix}", entity_type="invoice",
-            entity_id=pl.id if pl is not None else None,
+            entity_id=(pl.id if pl is not None else imported_ids.get(num)),
             details={"customer_id": customer_id, "invoice_number": num, "verdict": row["verdict"]},
         ))
     session.commit()

@@ -425,6 +425,10 @@ class FatturaProConnector:
 
         soup = BeautifulSoup(resp.text, "html.parser")
         new_key = soup.find("input", {"name": "key", "type": "hidden"})
+        if new_key and new_key.get("value"):
+            # La chiave ruota a ogni risposta (anche la sonda): l'ultima
+            # ricevuta è l'unica valida per la richiesta successiva.
+            self._documenti_key = new_key.get("value")
         return batch, (new_key.get("value") if new_key else None), drops, None
 
     @staticmethod
@@ -1311,33 +1315,51 @@ class FatturaProConnector:
             key, _ = self._xcrud_tokens(first.text)
             if not key:
                 return [], False
-            resp = self.client.post(
-                f"{self.base_url}/xcrud/xcrud_ajax.php",
-                data={
-                    "xcrud[key]": key,
-                    "xcrud[instance]": "documenti",
-                    "xcrud[task]": "list",
-                    "xcrud[orderby]": "documenti.NumeroSezionale",
-                    "xcrud[order]": "desc",
-                    "xcrud[start]": "0",
-                    "xcrud[limit]": str(limit),
-                    "xcrud[column]": "documenti.Destinatario",
-                    "xcrud[search]": "1",
-                    "xcrud[phrase]": phrase.strip(),
-                },
-                headers={
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": f"{self.base_url}/documenti.php",
-                },
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            if "xcrud-error" in resp.text or self._looks_like_auth_page(resp):
-                return [], False
-            rows = self._parse_invoice_table(resp.text, colmap)
-            # La riga di totale ("", "", "", tot, tot) è già scartata dal parser
-            # (numero/data vuoti). Lista troncata al limite = non completa.
-            return rows, len(rows) < limit
+            rows: List[Dict[str, Any]] = []
+            seen = set()
+            start = 0
+            for _ in range(10):  # 10 pagine × limit: nessun cliente ne ha di più
+                resp = self.client.post(
+                    f"{self.base_url}/xcrud/xcrud_ajax.php",
+                    data={
+                        "xcrud[key]": key,
+                        "xcrud[instance]": "documenti",
+                        "xcrud[task]": "list",
+                        "xcrud[orderby]": "documenti.NumeroSezionale",
+                        "xcrud[order]": "desc",
+                        "xcrud[start]": str(start),
+                        "xcrud[limit]": str(limit),
+                        "xcrud[column]": "documenti.Destinatario",
+                        "xcrud[search]": "1",
+                        "xcrud[phrase]": phrase.strip(),
+                    },
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": f"{self.base_url}/documenti.php",
+                    },
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                if "xcrud-error" in resp.text or self._looks_like_auth_page(resp):
+                    return rows, False
+                batch = self._parse_invoice_table(resp.text, colmap)
+                nk, _ = self._xcrud_tokens(resp.text)
+                if nk:
+                    key = nk
+                added = 0
+                for r in batch:
+                    k = str(r.get("doc_id") or r.get("invoice_number"))
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    rows.append(r)
+                    added += 1
+                # La riga di totale è già scartata dal parser (numero/data
+                # vuoti). Pagina più corta del limite = fine della lista.
+                if len(batch) < limit or added == 0:
+                    return rows, True
+                start += limit
+            return rows, False
         except Exception as e:
             logger.warning(f"Ricerca documenti FatturaPro fallita per {phrase!r}: {e}")
             return [], False
@@ -1398,19 +1420,18 @@ class FatturaProConnector:
         if new_key:
             self._documenti_key = new_key
         soup = BeautifulSoup(text, "html.parser")
+        # Solo i link ai messaggi SDI (displayMessaggioSDI.php?file=…): nessun
+        # ripiego sui <li> generici (nel modal c'è anche il menu del sito e
+        # un testo qualsiasi fabbricherebbe uno stato). Nessun link = nessuna
+        # notifica ancora ("sent"): non è un'evidenza di consegna né di scarto.
         names: List[str] = []
         for a in soup.find_all("a", href=True):
             href = a.get("href") or ""
-            if "MessaggioSDI" in href or "notific" in href.lower():
+            if "MessaggioSDI" in href:
                 names.append(a.get_text(strip=True))
                 m = re.search(r"file=([^&\"']+)", href)
                 if m:
                     names.append(m.group(1))
-        if not names:
-            for li in soup.find_all("li"):
-                t = li.get_text(strip=True)
-                if t:
-                    names.append(t)
         return names
 
     def _parse_currency(self, value_str: str) -> float:

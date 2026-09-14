@@ -252,7 +252,7 @@ def list_suggestions(session: Session = Depends(get_session)):
             .filter(
                 Invoice.customer_id.is_(None),
                 Invoice.suggested_customer_id.isnot(None),
-                Invoice.status != "paid",
+                Invoice.status.notin_(("paid", "void")),
             )
             .order_by(Invoice.suggested_score.desc().nullslast())
             .all()

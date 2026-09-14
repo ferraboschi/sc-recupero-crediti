@@ -53,7 +53,7 @@ def get_dashboard(session: Session = Depends(get_session)):
 
         # Total number of positions (excluding paid)
         total_positions = session.query(func.count(Invoice.id)).filter(
-            Invoice.status != "paid"
+            Invoice.status.notin_(("paid", "void"))
         ).scalar() or 0
 
         total_customers = session.query(func.count(Customer.id)).filter(

@@ -27,17 +27,22 @@ def sdi_state_from_notifications(names: Optional[Iterable[str]]) -> str:
     verrà corretto e ritrasmesso, il numero può cambiare); NE/EC esito, DT
     decorrenza termini → consegnata (il documento è arrivato). Nessuna
     notifica → sent (in elaborazione: non ancora definitivo)."""
-    blob = " ".join(str(n) for n in (names or [])).lower()
-    if "scarto" in blob or "_ns_" in blob:
-        return "scartata"
-    if "ricevutaconsegna" in blob or "_rc_" in blob:
-        return "consegnata"
-    if ("mancataconsegna" in blob or "_mc_" in blob
-            or "attestazionetrasmissione" in blob or "_at_" in blob):
-        return "mancata_consegna"
-    if "esito" in blob or "decorrenza" in blob or "_ne_" in blob or "_ec_" in blob or "_dt_" in blob:
-        return "consegnata"
-    return "sent"
+    # Le notifiche arrivano in ordine cronologico: un documento scartato, poi
+    # corretto e ritrasmesso (stesso doc_id) ha [NS, RC] → vale l'ULTIMA
+    # notifica decisiva, non la peggiore.
+    state = "sent"
+    for raw in (names or []):
+        n = str(raw).lower()
+        if "scarto" in n or "_ns_" in n:
+            state = "scartata"
+        elif "ricevutaconsegna" in n or "_rc_" in n:
+            state = "consegnata"
+        elif ("mancataconsegna" in n or "_mc_" in n
+              or "attestazionetrasmissione" in n or "_at_" in n):
+            state = "mancata_consegna"
+        elif "esito" in n or "decorrenza" in n or "_ne_" in n or "_ec_" in n or "_dt_" in n:
+            state = "consegnata"
+    return state
 
 
 def sdi_state_from_label(label: Optional[str]) -> Optional[str]:

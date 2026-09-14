@@ -20,6 +20,7 @@ VERDICT_LABELS = {
     "riaperta_su_fatturapro": "Aperta su FatturaPro, pagata in piattaforma",
     "da_riattivare": "Valida su FatturaPro, annullata in piattaforma",
     "pagata_non_tracciata": "Saldata su FatturaPro, mai importata",
+    "duplicato": "Doppione in piattaforma (documento diverso dallo stesso numero)",
 }
 
 # Correzione proposta per ciascun verdetto (None = nessuna azione automatica).
@@ -33,11 +34,12 @@ VERDICT_FIX = {
     "pagata_su_fatturapro": "mark_paid",
     "riaperta_su_fatturapro": "reopen",
     "da_riattivare": "reactivate",
+    "duplicato": "void",
 }
 
 # Correzioni che si applicano senza confronto con lo stato attuale (non
 # distruttive): pre-selezionabili dalla UI. Le altre le spunta l'operatore.
-SAFE_FIXES = ("import", "update_amount")
+SAFE_FIXES = ("update_amount",)
 
 
 def fp_state_of(row: Dict[str, Any]) -> Optional[str]:
@@ -82,17 +84,27 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
         if num:
             by_num_fp[num] = r
     active_pl: Dict[str, Any] = {}
+    extra_active: List[Any] = []  # doppioni attivi (stesso numero, documento diverso)
     void_pl: Dict[str, List[Any]] = {}
     for inv in platform_invoices:
         num = (inv.invoice_number or "").strip()
         if inv.status == "void":
             void_pl.setdefault(num, []).append(inv)
-        else:
-            # due attive con lo stesso numero non dovrebbero esistere: si
-            # tiene la più recente e si segnala nel verdetto della prima
-            if num in active_pl and (inv.id or 0) < (active_pl[num].id or 0):
-                continue
-            active_pl[num] = inv
+            continue
+        fp = by_num_fp.get(num)
+        if num in active_pl:
+            # Due attive con lo stesso numero: "la" riga è quella il cui
+            # doc_id coincide con FatturaPro; l'altra è un doppione.
+            cur = active_pl[num]
+            cur_match = bool(fp and cur.source_id and str(cur.source_id) == str(fp.get("doc_id")))
+            new_match = bool(fp and inv.source_id and str(inv.source_id) == str(fp.get("doc_id")))
+            if new_match and not cur_match:
+                extra_active.append(cur)
+                active_pl[num] = inv
+            else:
+                extra_active.append(inv)
+            continue
+        active_pl[num] = inv
 
     rows: List[Dict[str, Any]] = []
     numbers = sorted(set(by_num_fp) | set(active_pl) | set(void_pl), key=_natural_key, reverse=True)
@@ -157,6 +169,22 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
                 "sdi_state": getattr(shown, "sdi_state", None),
                 "issue_date": shown.issue_date.isoformat() if shown.issue_date else None,
                 "due_date": shown.due_date.isoformat() if shown.due_date else None,
+            },
+        })
+    for dup in extra_active:
+        rows.append({
+            "invoice_number": (dup.invoice_number or "").strip(),
+            "verdict": "duplicato",
+            "verdict_label": VERDICT_LABELS["duplicato"],
+            "fix": "void",
+            "fix_safe": False,
+            "fatturapro": None,
+            "platform": {
+                "id": dup.id, "status": dup.status, "amount": float(dup.amount or 0),
+                "amount_due": float(dup.amount_due or 0), "source_id": dup.source_id,
+                "sdi_state": getattr(dup, "sdi_state", None),
+                "issue_date": dup.issue_date.isoformat() if dup.issue_date else None,
+                "due_date": dup.due_date.isoformat() if dup.due_date else None,
             },
         })
     summary: Dict[str, int] = {}

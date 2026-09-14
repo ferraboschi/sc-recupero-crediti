@@ -101,7 +101,7 @@ def get_system_status():
         customers_auto = total_customers - customers_shopify
 
         invoices_open = session.query(func.count(Invoice.id)).filter(
-            Invoice.status != "paid"
+            Invoice.status.notin_(("paid", "void"))
         ).scalar() or 0
         invoices_paid = session.query(func.count(Invoice.id)).filter(
             Invoice.status == "paid"
@@ -229,7 +229,7 @@ def get_system_status():
 
         # Check: invoices with days_overdue = 0 but actually overdue
         stale_overdue = session.query(func.count(Invoice.id)).filter(
-            Invoice.status != "paid",
+            Invoice.status.notin_(("paid", "void")),
             Invoice.days_overdue == 0,
             Invoice.due_date.isnot(None),
             Invoice.due_date < date.today(),
