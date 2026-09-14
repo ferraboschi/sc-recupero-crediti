@@ -833,6 +833,7 @@ def test_release_of_fossil_from_paid_by_absence_row_voids_it(monkeypatch, test_d
     _mk(test_db_session, "2026/00001600/SAK - Fattura", source_id="4606196", doc_id_verified=False, amount=459.42, amount_due=459.42, customer_name_raw="CECCONI MARIO S.R.L.")
     _mk(test_db_session, "2026/00001609/SAK - Fattura", source_id="4607157", doc_id_verified=False, status="paid", amount_due=0, days_overdue=0,
         paid_at=datetime(2026, 9, 14), amount_due_at_paid=459.42, amount=459.42, customer_name_raw="CECCONI MARIO S.R.L.")
+    FakeFP._next_existing = {"2026/00001600/SAK - Fattura"}  # canary: il presente si trova, la 1609 no
     r = _sync(monkeypatch, test_db_session, [_raw("2026/00001600/SAK - Fattura", "4607157", "draft", balance=459.42, name="CECCONI MARIO S.R.L.")])
     rows = {x.invoice_number[-20:-14]: x for x in test_db_session.query(Invoice).all()}
     a = _get(test_db_session, "2026/00001600/SAK - Fattura"); b = _get(test_db_session, "2026/00001609/SAK - Fattura")
@@ -934,9 +935,20 @@ def test_phantom_paid_sharing_doc_with_holder_is_voided(monkeypatch, test_db_ses
     FP ('1600', D): B confermata, A annullata (non era un incasso)."""
     a_id = _mk(test_db_session, "1609", source_id="D", doc_id_verified=False, status="paid", amount_due=0, days_overdue=0, paid_at=datetime(2026, 9, 14), customer_name_raw="CECCONI MARIO S.R.L.").id
     b_id = _mk(test_db_session, "1600", source_id="D", doc_id_verified=False, customer_name_raw="CECCONI MARIO S.R.L.").id
+    # numeri senza progressivo a 6+ cifre: la ricerca per numero non è affidabile → nessuna scrittura
     r = _sync(monkeypatch, test_db_session, [_raw("1600", "D", "notified", balance=100.0, name="CECCONI MARIO S.R.L.")], notif={"D": ["RicevutaConsegna"]})
     a = test_db_session.query(Invoice).get(a_id); b = test_db_session.query(Invoice).get(b_id)
     assert (b.doc_id_verified, b.status) == (True, "open")
+    assert a.status == "paid" and a.source_id == "D" and r["voided"] == 0
+    # con numeri in formato FatturaPro (e canary ok) il fantasma si annulla
+    for x in test_db_session.query(Invoice).all():
+        test_db_session.delete(x)
+    test_db_session.commit()
+    a_id = _mk(test_db_session, "2026/00001609/SAK - Fattura", source_id="D", doc_id_verified=False, status="paid", amount_due=0, days_overdue=0, paid_at=datetime(2026, 9, 14), customer_name_raw="CECCONI MARIO S.R.L.").id
+    _mk(test_db_session, "2026/00001600/SAK - Fattura", source_id="D", doc_id_verified=False, customer_name_raw="CECCONI MARIO S.R.L.")
+    FakeFP._next_existing = {"2026/00001600/SAK - Fattura"}
+    r = _sync(monkeypatch, test_db_session, [_raw("2026/00001600/SAK - Fattura", "D", "notified", balance=100.0, name="CECCONI MARIO S.R.L.")], notif={"D": ["RicevutaConsegna"]})
+    a = test_db_session.query(Invoice).get(a_id)
     assert a.status == "void" and a.paid_at is None and a.source_id is None and r["voided"] == 1
     assert len([x for x in test_db_session.query(Invoice).all() if x.status != "void" and x.source_id == "D"]) == 1
 
@@ -1174,7 +1186,7 @@ def test_phantom_paid_confirmed_by_number_lookup(monkeypatch, test_db_session):
         return p
     row = _raw("2026/00001600/SAK - Fattura", "D", "notified", balance=459.42, name="CECCONI MARIO S.R.L.")
     # 1) numero ancora esistente su FatturaPro → incasso vero
-    p_id = scenario(); FakeFP._next_existing = {"2026/00001609/SAK - Fattura"}
+    p_id = scenario(); FakeFP._next_existing = {"2026/00001609/SAK - Fattura", "2026/00001600/SAK - Fattura"}
     r = _sync(monkeypatch, test_db_session, [row], notif={"D": ["RicevutaConsegna"]})
     p = test_db_session.query(Invoice).get(p_id)
     assert p.status == "paid" and p.paid_at is not None and p.source_id is None and r["voided"] == 0
@@ -1184,11 +1196,16 @@ def test_phantom_paid_confirmed_by_number_lookup(monkeypatch, test_db_session):
     r = _sync(monkeypatch, test_db_session, [row], notif={"D": ["RicevutaConsegna"]})
     p = test_db_session.query(Invoice).get(p_id)
     assert p.status == "paid" and p.source_id == "D" and r["voided"] == 0
-    # 3) numero sparito → fantasma
-    p_id = scenario()
+    # 3) numero sparito (ma la ricerca trova il documento presente = canary ok) → fantasma
+    p_id = scenario(); FakeFP._next_existing = {"2026/00001600/SAK - Fattura"}
     r = _sync(monkeypatch, test_db_session, [row], notif={"D": ["RicevutaConsegna"]})
     p = test_db_session.query(Invoice).get(p_id)
     assert p.status == "void" and p.paid_at is None and r["voided"] == 1
+    # 4) canary fallito (la ricerca non trova neppure il presente) → nessuna scrittura
+    p_id = scenario()
+    r = _sync(monkeypatch, test_db_session, [row], notif={"D": ["RicevutaConsegna"]})
+    p = test_db_session.query(Invoice).get(p_id)
+    assert p.status == "paid" and p.source_id == "D" and r["voided"] == 0 and r.get("number_search_untrusted") == 1
 
 
 def test_phantom_paid_with_other_recipient_is_kept(monkeypatch, test_db_session):

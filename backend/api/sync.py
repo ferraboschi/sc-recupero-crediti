@@ -602,6 +602,11 @@ def _sync_invoices_task() -> dict:
                             and _same_document(other, other.source_id)
                             and _same_recipient(other, name_by_doc.get(str(other.source_id)))):
                         phantom_candidates.append(other)
+                if phantom_candidates:
+                    manual_ids = {r_[0] for r_ in session.query(ActivityLog.entity_id).filter(
+                        ActivityLog.entity_type == "invoice", ActivityLog.action == "fatturapro_fix_mark_paid",
+                        ActivityLog.entity_id.in_([o.id for o in phantom_candidates])).all()}
+                    phantom_candidates = [o for o in phantom_candidates if o.id not in manual_ids]
                 plan["number_exists"] = {}
 
                 def _apply_resolution_plan():
@@ -690,10 +695,11 @@ def _sync_invoices_task() -> dict:
                             # Importo diverso: è un'altra fattura che il vecchio sync
                             # ha solo rinominato per numero → lascia il fossile e
                             # segue la regola del numero (assenza → pagata).
+                            released_doc = str(other.source_id or "")
                             other.source_id = None
                             session.add(ActivityLog(
                                 action="fossil_doc_id_released", entity_type="invoice", entity_id=other.id,
-                                details={"invoice_number": other.invoice_number, "doc_id": str(other.source_id or ""),
+                                details={"invoice_number": other.invoice_number, "doc_id": released_doc,
                                          "adopted_by_number": holder_num},
                             ))
                             n_rel += 1
@@ -851,9 +857,31 @@ def _sync_invoices_task() -> dict:
                 fp["sdi_checked"] = sdi_checks
                 # Numero dei candidati fantasma ancora su FatturaPro? (HTTP, cap 20)
                 search_fn = getattr(fatturapro, "search_documents", None)
+                import re as _re_num
+                # CANARY: la ricerca per numero deve trovare un documento PRESENTE
+                # in lista; se non lo trova (LIKE che non aggancia il formato,
+                # layout cambiato) ogni esito "assente" sarebbe un falso fantasma
+                # → in quel ciclo nessun esito è affidabile (nessuna scrittura).
+                search_trusted = bool(search_fn) and bool(phantom_candidates)
+                if search_trusted:
+                    canary = next((r_ for r_ in raw_invoices if _re_num.search(r"\d{6,}", r_.get("invoice_number") or "")), None)
+                    if canary is None:
+                        search_trusted = False
+                    else:
+                        try:
+                            c_found, c_ok = search_fn(_fp_number_phrase_sync(canary["invoice_number"]), column="documenti.NumeroSezionale")
+                        except Exception as e:
+                            logger.warning("Canary ricerca numero fallita: %s", e)
+                            c_found, c_ok = [], False
+                        search_trusted = c_ok and any(
+                            (f.get("invoice_number") or "").strip() == canary["invoice_number"].strip() for f in c_found)
+                        if not search_trusted:
+                            logger.error("SDI: la ricerca per numero su FatturaPro non trova un documento presente (%s): "
+                                         "nessun annullamento di fantasmi in questo ciclo", canary["invoice_number"])
+                            fp["number_search_untrusted"] = 1
                 for other in phantom_candidates[:20]:
-                    if not search_fn:
-                        plan["number_exists"][other.id] = False  # connettore senza ricerca (test): fantasma
+                    if not search_trusted or not _re_num.search(r"\d{6,}", other.invoice_number or ""):
+                        plan["number_exists"][other.id] = None  # ignoto: nessuna scrittura
                         continue
                     phrase = _fp_number_phrase_sync(other.invoice_number)
                     try:
