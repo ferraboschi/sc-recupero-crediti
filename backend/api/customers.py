@@ -1834,6 +1834,17 @@ def _fp_name_key(name) -> str:
     return " ".join((name or "").split()).strip().lower()
 
 
+def _action_counts(session, invoices) -> dict:
+    """{invoice_id: n azioni collegate} per decidere, fra doppioni, chi porta la storia."""
+    ids = [i.id for i in invoices]
+    if not ids:
+        return {}
+    from backend.database import RecoveryActionInvoice
+    rows = session.query(RecoveryActionInvoice.invoice_id, func.count(RecoveryActionInvoice.action_id)).filter(
+        RecoveryActionInvoice.invoice_id.in_(ids)).group_by(RecoveryActionInvoice.invoice_id).all()
+    return {r[0]: int(r[1]) for r in rows}
+
+
 def _fp_number_phrase(number: str) -> str:
     """Frase di ricerca per numero su FatturaPro: il progressivo a 8 cifre
     ('2026/00001600/SAK - Fattura' → '00001600'), altrimenti il numero grezzo."""
@@ -1907,7 +1918,7 @@ def verify_fatturapro(customer_id: int, session: Session = Depends(get_session))
             connector.close()
         except Exception:
             pass
-    result = compare_documents(platform, fp_rows, complete=complete)
+    result = compare_documents(platform, fp_rows, complete=complete, action_counts=_action_counts(session, platform))
     session.add(ActivityLog(
         action="fatturapro_verify", entity_type="customer", entity_id=customer_id,
         details={"customer": customer.ragione_sociale, "names": names, "fp_rows": len(fp_rows),
@@ -1962,7 +1973,7 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             connector.close()
         except Exception:
             pass
-    verdict_rows = compare_documents(platform, fp_rows, complete=complete)["rows"]
+    verdict_rows = compare_documents(platform, fp_rows, complete=complete, action_counts=_action_counts(session, platform))["rows"]
     current = {r["key"]: r for r in verdict_rows}
     by_number = {}
     for r in verdict_rows:

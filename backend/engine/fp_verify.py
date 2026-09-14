@@ -68,7 +68,7 @@ def _natural_key(num: str):
 
 
 def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]],
-                      complete: bool = True) -> Dict[str, Any]:
+                      complete: bool = True, action_counts: Optional[Dict[int, int]] = None) -> Dict[str, Any]:
     """Confronta le fatture della piattaforma (oggetti Invoice, source
     fatturapro) con le righe FatturaPro dello stesso destinatario.
 
@@ -102,9 +102,17 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
     active_pl: Dict[str, Any] = {}
     extra_active: List[Any] = []  # doppioni attivi (stesso numero, documento diverso)
     void_pl: Dict[str, List[Any]] = {}
+    actions = action_counts or {}
+    # Numeri attivi in piattaforma: una riga STORICA il cui doc è su FatturaPro
+    # sotto un numero che nessuna riga ha è lo stesso documento rinumerato
+    # (stesso criterio del sync); se il numero è occupato, per la storica vale
+    # il numero (il suo doc_id è un fossile).
+    active_numbers = {doc_key((i.invoice_number or "").strip()) for i in platform_invoices if i.status != "void"}
     for inv in platform_invoices:
         num = doc_key((inv.invoice_number or "").strip())
-        fp_num = fp_num_by_doc.get(str(inv.source_id or "")) if getattr(inv, "doc_id_verified", False) else None
+        fp_num = fp_num_by_doc.get(str(inv.source_id or ""))
+        if fp_num and fp_num != num and not getattr(inv, "doc_id_verified", False) and fp_num in active_numbers:
+            fp_num = None
         if fp_num and fp_num != num:
             renumber_from[inv.id] = (inv.invoice_number or "").strip()
             num = fp_num
@@ -114,12 +122,15 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
             continue
         fp = by_num_fp.get(num)
         if num in active_pl:
-            # Due attive con lo stesso numero: "la" riga è quella il cui
-            # doc_id coincide con FatturaPro; l'altra è un doppione.
+            # Due attive con lo stesso numero: "la" riga è quella con i
+            # solleciti (stessa regola del sync), poi quella il cui doc_id
+            # verificato coincide con FatturaPro, poi la più vecchia.
             cur = active_pl[num]
-            cur_match = bool(fp and cur.source_id and str(cur.source_id) == str(fp.get("doc_id")) and getattr(cur, "doc_id_verified", False))
-            new_match = bool(fp and inv.source_id and str(inv.source_id) == str(fp.get("doc_id")) and getattr(inv, "doc_id_verified", False))
-            if new_match and not cur_match:
+
+            def _rank(x):
+                match = bool(fp and x.source_id and str(x.source_id) == str(fp.get("doc_id")) and getattr(x, "doc_id_verified", False))
+                return (-(actions.get(x.id, 0)), 0 if match else 1, x.id or 0)
+            if _rank(inv) < _rank(cur):
                 extra_active.append(cur)
                 active_pl[num] = inv
             else:

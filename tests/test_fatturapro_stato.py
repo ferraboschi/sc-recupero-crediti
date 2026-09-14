@@ -762,3 +762,115 @@ def test_legacy_absence_is_by_number(monkeypatch, test_db_session):
     _mk(test_db_session, "M/2026", source_id="fossil2", doc_id_verified=False, missing_streak=1)
     r = _sync(monkeypatch, test_db_session, [_raw("L/2026", "real", None)])
     assert _get(test_db_session, "M/2026").status == "paid" and r["paid_detected"] == 1
+
+
+# ── Review della migrazione (piano dopo il pre-pass, destinatario, fossili) ──
+
+def test_stale_by_doc_after_adoption_does_not_void_a_legit_row(monkeypatch, test_db_session):
+    """B1: L ('N', fossile F) e L2 ('N2', fossile D = doc attuale di N). N adotta D;
+    quando arriva la riga (N2, D2) l'owner stantio di D non deve essere trattato
+    come doppione: L2 adotta D2, nessun annullamento."""
+    l_id = _mk(test_db_session, "N/2026", source_id="F", doc_id_verified=False, payment_pending="assegno", customer_name_raw="ACME SRL").id
+    l2_id = _mk(test_db_session, "N2/2026", source_id="D", doc_id_verified=False, payment_pending="assegno", customer_name_raw="ACME SRL").id
+    for order in (["N", "N2"], ["N2", "N"]):
+        rows = {"N": _raw("N/2026", "D", "notified", balance=10.0), "N2": _raw("N2/2026", "D2", "notified", balance=20.0)}
+        r = _sync(monkeypatch, test_db_session, [rows[k] for k in order], notif={"D": ["RicevutaConsegna"], "D2": ["RicevutaConsegna"]})
+        l = test_db_session.query(Invoice).get(l_id); l2 = test_db_session.query(Invoice).get(l2_id)
+        assert (l.source_id, l.status, l.payment_pending) == ("D", "open", "assegno")
+        assert (l2.source_id, l2.status, l2.payment_pending) == ("D2", "open", "assegno")
+        assert r["voided"] == 0 and r["created"] == 0
+        assert test_db_session.query(Invoice).count() == 2
+
+
+def test_adoption_requires_same_recipient_else_orphan_and_new_row(monkeypatch, test_db_session):
+    """M1: storica 'N' intestata ALFA; su FatturaPro 'N' è ora di BETA → la storica
+    non adotta (orfana, annullata), il documento di BETA entra come riga nuova."""
+    from backend.database import Customer as C
+    alfa = C(ragione_sociale="ALFA SRL"); test_db_session.add(alfa); test_db_session.commit()
+    alfa_id = alfa.id
+    old_id = _mk(test_db_session, "N/2026", source_id="fossil", doc_id_verified=False, customer_id=alfa_id, customer_name_raw="ALFA SRL").id
+    r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "notified", balance=70.0, name="BETA SRL")], notif={"D": ["RicevutaConsegna"]})
+    old = test_db_session.query(Invoice).get(old_id)
+    assert old.status == "void" and "BETA SRL" in old.void_reason and r.get("orphan_voided") == 1
+    new = _get(test_db_session, "N/2026", source_id="D")
+    assert new.customer_name_raw == "BETA SRL" and new.customer_id != alfa_id and new.doc_id_verified is True
+
+
+def test_adoption_resets_sdi_state_and_rechecks(monkeypatch, test_db_session):
+    """M3: lo stato SDI memorizzato era del documento fossile: all'adozione si
+    azzera e il pre-pass ricontrolla il documento adottato (bozza → annullata)."""
+    _mk(test_db_session, "N/2026", source_id="fossil", doc_id_verified=False, sdi_state="consegnata", customer_name_raw="ACME SRL")
+    r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "draft", balance=100.0)])
+    inv = _get(test_db_session, "N/2026")
+    assert inv.source_id == "D" and inv.status == "void" and inv.sdi_state == "draft" and r["voided"] == 1
+
+
+def test_release_of_fossil_from_paid_by_absence_row_voids_it(monkeypatch, test_db_session):
+    """Cecconi dal vivo con la riga 1600 storica: la 1609 'pagata per assenza'
+    porta come fossile il doc che oggi è la 1600 (adottato dalla storica 1600):
+    non era un incasso → annullata; nessuna riga nuova."""
+    _mk(test_db_session, "2026/00001600/SAK - Fattura", source_id="4606196", doc_id_verified=False, amount=459.42, amount_due=459.42, customer_name_raw="CECCONI MARIO S.R.L.")
+    _mk(test_db_session, "2026/00001609/SAK - Fattura", source_id="4607157", doc_id_verified=False, status="paid", amount_due=0, days_overdue=0,
+        paid_at=datetime(2026, 9, 14), amount_due_at_paid=459.42, amount=459.42, customer_name_raw="CECCONI MARIO S.R.L.")
+    r = _sync(monkeypatch, test_db_session, [_raw("2026/00001600/SAK - Fattura", "4607157", "draft", balance=459.42, name="CECCONI MARIO S.R.L.")])
+    rows = {x.invoice_number[-20:-14]: x for x in test_db_session.query(Invoice).all()}
+    a = _get(test_db_session, "2026/00001600/SAK - Fattura"); b = _get(test_db_session, "2026/00001609/SAK - Fattura")
+    assert (a.source_id, a.status, a.sdi_state) == ("4607157", "void", "draft")   # bozza adottata → annullata
+    assert b.status == "void" and b.paid_at is None and b.source_id is None and "rinumerata" in b.void_reason
+    assert r["created"] == 0 and r.get("fossil_released") == 1 and r["voided"] == 2 and len(rows) == 2
+
+
+def test_live_state_legacy_duplicates_resolved_by_history(monkeypatch, test_db_session):
+    """Stato live: doppione creato ieri (doc reale, NON verificato dopo la
+    migration) + storica coi solleciti e lo stesso numero → vince la storica."""
+    from backend.database import RecoveryAction, RecoveryActionInvoice as RAI
+    cust = Customer(ragione_sociale="Storica2 SRL"); test_db_session.add(cust); test_db_session.commit()
+    legacy_id = _mk(test_db_session, "N/2026", source_id="fossil", doc_id_verified=False, customer_id=cust.id, customer_name_raw="Storica2 SRL").id
+    act = RecoveryAction(customer_id=cust.id, action_type="first_contact", channel="whatsapp_copy", completed_at=datetime(2026, 9, 1), invoice_ids=[legacy_id])
+    test_db_session.add(act); test_db_session.commit(); test_db_session.add(RAI(action_id=act.id, invoice_id=legacy_id)); test_db_session.commit()
+    dup_id = _mk(test_db_session, "N/2026", source_id="real", doc_id_verified=False, customer_id=cust.id, customer_name_raw="Storica2 SRL").id
+    r = _sync(monkeypatch, test_db_session, [_raw("N/2026", "real", "notified", balance=90.0, name="Storica2 SRL")], notif={"real": ["RicevutaConsegna"]})
+    legacy = test_db_session.query(Invoice).get(legacy_id); dup = test_db_session.query(Invoice).get(dup_id)
+    assert (legacy.source_id, legacy.doc_id_verified, legacy.status, legacy.amount_due) == ("real", True, "open", 90.0)
+    assert dup.status == "void" and r.get("dup_voided") == 1
+
+
+def test_adoption_writes_happen_after_notification_prepass(monkeypatch, test_db_session):
+    from backend.api import sync as sync_mod
+    _mk(test_db_session, "N/2026", source_id="fossil", doc_id_verified=False, customer_name_raw="ACME SRL")
+    order = []
+    orig = FakeFP.fetch_sdi_notifications
+
+    def spy(self, doc_id):
+        order.append("http"); return orig(self, doc_id)
+    monkeypatch.setattr(FakeFP, "fetch_sdi_notifications", spy)
+    orig_add = test_db_session.add
+
+    def spy_add(obj):
+        if isinstance(obj, ActivityLog) and obj.action == "doc_id_adopted":
+            order.append("adopt")
+        return orig_add(obj)
+    monkeypatch.setattr(test_db_session, "add", spy_add)
+    _sync(monkeypatch, test_db_session, [_raw("N/2026", "D", "notified", balance=10.0)], notif={"D": ["RicevutaConsegna"]})
+    assert "http" in order and "adopt" in order and order.index("http") < order.index("adopt")
+
+
+def test_verify_duplicates_follow_history_and_legacy_renumber(test_client, test_db_session, monkeypatch):
+    """M4: la verifica per cliente decide come il sync: fra doppioni vince chi
+    ha i solleciti; una storica il cui doc è su FatturaPro sotto un numero
+    LIBERO è 'rinumerata'."""
+    import backend.connectors.fatturapro as fpmod
+    from backend.database import RecoveryAction, RecoveryActionInvoice as RAI
+    monkeypatch.setattr(fpmod, "FatturaProConnector", FakeSearchFP)
+    cust = Customer(ragione_sociale="CECCONI MARIO S.R.L."); test_db_session.add(cust); test_db_session.commit()
+    legacy = _mk(test_db_session, "0800", customer_id=cust.id, source_id="fossil", doc_id_verified=False, customer_name_raw="CECCONI MARIO S.R.L.")
+    act = RecoveryAction(customer_id=cust.id, action_type="first_contact", channel="whatsapp_copy", completed_at=datetime(2026, 9, 1), invoice_ids=[legacy.id])
+    test_db_session.add(act); test_db_session.commit(); test_db_session.add(RAI(action_id=act.id, invoice_id=legacy.id)); test_db_session.commit()
+    dup = _mk(test_db_session, "0800", customer_id=cust.id, source_id="real", doc_id_verified=True, customer_name_raw="CECCONI MARIO S.R.L.")
+    ren = _mk(test_db_session, "1609", customer_id=cust.id, source_id="4607157", doc_id_verified=False, customer_name_raw="CECCONI MARIO S.R.L.")
+    FakeSearchFP.rows = [_fp("0800", "real", 100.0, 100.0, "Consegnato"), _fp("1600", "4607157", 100.0, 100.0, "Consegnato")]
+    FakeSearchFP.by_number = {}
+    r = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    by = {(x["verdict"], (x.get("platform") or {}).get("id")): x for x in r["rows"]}
+    assert ("ok", legacy.id) in by and ("duplicato", dup.id) in by
+    assert ("rinumerata", ren.id) in by and by[("rinumerata", ren.id)]["invoice_number"] == "1600"
