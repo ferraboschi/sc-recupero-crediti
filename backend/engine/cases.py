@@ -568,7 +568,7 @@ def update_case_lifecycle(session: Session, allow_close: bool = True) -> Dict[st
                 attached = session.query(Invoice).filter(
                     Invoice.case_id == open_case.id
                 ).all()
-                non_paid = [inv for inv in attached if inv.status != "paid"]
+                non_paid = [inv for inv in attached if inv.status not in ("paid", "void")]
                 if attached and not non_paid:
                     reason = "paid"
                 elif non_paid and all(inv.status == "disputed" for inv in non_paid):
@@ -899,7 +899,7 @@ def refresh_customer_lifecycle(session: Session, customer: Customer) -> Optional
         return open_case
     if open_case:
         attached = session.query(Invoice).filter(Invoice.case_id == open_case.id).all()
-        non_paid = [inv for inv in attached if inv.status != "paid"]
+        non_paid = [inv for inv in attached if inv.status not in ("paid", "void")]
         if attached and not non_paid:
             reason = "paid"
         elif non_paid and all(inv.status == "disputed" for inv in non_paid):

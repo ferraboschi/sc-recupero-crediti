@@ -23,6 +23,8 @@ from backend.engine.normalizer import normalize_ragione_sociale, name_similarity
 from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
 from backend.engine.overdue import overdue_clause, RECOVERY_ACTION_TYPES
 from backend.engine.piva import validate_piva
+from backend.engine.fp_verify import compare_documents, fp_state_of
+from backend.engine.sdi import SDI_FINAL_OK
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -726,6 +728,11 @@ def get_customer_detail(
         invoices = session.query(Invoice).filter(
             Invoice.customer_id == customer_id
         ).order_by(Invoice.due_date.desc()).all()
+        # Le ANNULLATE (bozze/scartate/riassegnate su FatturaPro) non sono
+        # crediti: fuori da elenco, conteggi e totali, ma dichiarate a parte
+        # (nessun dato invisibile).
+        voided = [inv for inv in invoices if inv.status == "void"]
+        invoices = [inv for inv in invoices if inv.status != "void"]
 
         # Calculate totals excluding paid invoices
         total_amount = sum(inv.amount for inv in invoices if inv.status != "paid")
@@ -793,6 +800,7 @@ def get_customer_detail(
                 ),
                 "sollecito_today": inv.id in today_ids,
                 "recovery_note": inv.recovery_note,
+                "sdi_state": inv.sdi_state,
                 "history": inv_history.get(inv.id, []),
                 # "Ultima azione" della riga = ultimo SOLLECITO o consegna al
                 # legale (le note non sono azioni compiute): data e canale dalla
@@ -971,6 +979,12 @@ def get_customer_detail(
                 "total_due": float(total_due),
                 "count": len(invoices),
                 "items": invoice_list,
+                "voided": [{
+                    "id": v.id, "invoice_number": v.invoice_number, "amount": float(v.amount or 0),
+                    "issue_date": v.issue_date.isoformat() if v.issue_date else None,
+                    "sdi_state": v.sdi_state, "void_reason": v.void_reason,
+                    "voided_at": v.voided_at.isoformat() if v.voided_at else None,
+                } for v in voided],
             },
             "pending_suggestions": pending_suggestions,
             "recovery_actions": action_list,
@@ -1786,3 +1800,185 @@ def create_customer(
         logger.error(f"Error creating customer: {e}", exc_info=True)
         session.rollback()
         raise
+
+
+# ── Verifica allineamento con FatturaPro (per UN cliente) ────────────────
+
+def _fp_search_names(session, customer) -> List[str]:
+    """Nomi con cui cercare il cliente su FatturaPro: la ragione sociale e i
+    nomi grezzi con cui FatturaPro stesso ha intestato le sue fatture (match
+    esatto garantito)."""
+    names = []
+    seen = set()
+    raw = session.query(Invoice.customer_name_raw).filter(
+        Invoice.customer_id == customer.id, Invoice.source_platform == "fatturapro",
+        Invoice.customer_name_raw.isnot(None),
+    ).distinct().all()
+    for (n,) in raw:
+        k = (n or "").strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            names.append(n.strip())
+    k = (customer.ragione_sociale or "").strip().lower()
+    if k and k not in seen:
+        names.append(customer.ragione_sociale.strip())
+    return names
+
+
+def _fp_rows_for_customer(connector, names) -> tuple:
+    rows: dict = {}
+    complete = True
+    for name in names:
+        found, ok = connector.search_documents(name)
+        complete = complete and ok
+        for r in found:
+            key = str(r.get("doc_id") or r.get("invoice_number"))
+            rows[key] = r
+    return list(rows.values()), complete
+
+
+@router.post("/{customer_id}/verify-fatturapro")
+def verify_fatturapro(customer_id: int, session: Session = Depends(get_session)):
+    """Confronta le fatture del cliente con i documenti che FatturaPro
+    intesta a lui (lista completa, con stato SDI): numeri, importi, saldi,
+    stato. Solo lettura: le correzioni si applicano con /apply."""
+    from backend.connectors.fatturapro import FatturaProConnector
+    customer = session.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    names = _fp_search_names(session, customer)
+    if not names:
+        raise HTTPException(status_code=400, detail="Cliente senza ragione sociale: impossibile cercarlo su FatturaPro")
+    connector = FatturaProConnector()
+    try:
+        if not connector.login():
+            raise HTTPException(status_code=502, detail="FatturaPro non raggiungibile (login fallito)")
+        fp_rows, complete = _fp_rows_for_customer(connector, names)
+    finally:
+        try:
+            connector.close()
+        except Exception:
+            pass
+    platform = session.query(Invoice).filter(
+        Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
+    ).all()
+    result = compare_documents(platform, fp_rows)
+    session.add(ActivityLog(
+        action="fatturapro_verify", entity_type="customer", entity_id=customer_id,
+        details={"customer": customer.ragione_sociale, "names": names, "fp_rows": len(fp_rows),
+                 "complete": complete, "summary": result["summary"]},
+    ))
+    session.commit()
+    return {
+        "customer_id": customer_id,
+        "searched_names": names,
+        "fatturapro_documents": len(fp_rows),
+        "complete": complete,
+        "checked_at": datetime.utcnow().isoformat(),
+        **result,
+    }
+
+
+class FpFix(BaseModel):
+    invoice_number: str
+    fix: str  # import / void / mark_paid / reopen / reactivate / update_amount
+
+
+class FpApplyBody(BaseModel):
+    fixes: List[FpFix] = []
+
+
+@router.post("/{customer_id}/verify-fatturapro/apply")
+def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session = Depends(get_session)):
+    """Applica le correzioni scelte dall'operatore dopo la verifica. Ogni
+    correzione viene RIVERIFICATA contro FatturaPro al momento (lo stato può
+    essere cambiato): si applica solo se il verdetto è ancora quello."""
+    from backend.connectors.fatturapro import FatturaProConnector
+    from backend.api.sync import _void_invoice, _reactivate_invoice, _recalculate_days_overdue
+    from backend.engine.cases import refresh_customer_lifecycle
+    customer = session.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if not body.fixes:
+        raise HTTPException(status_code=400, detail="Nessuna correzione selezionata")
+    names = _fp_search_names(session, customer)
+    connector = FatturaProConnector()
+    try:
+        if not connector.login():
+            raise HTTPException(status_code=502, detail="FatturaPro non raggiungibile (login fallito)")
+        fp_rows, complete = _fp_rows_for_customer(connector, names)
+    finally:
+        try:
+            connector.close()
+        except Exception:
+            pass
+    platform = session.query(Invoice).filter(
+        Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
+    ).all()
+    current = {r["invoice_number"]: r for r in compare_documents(platform, fp_rows)["rows"]}
+    by_num_pl = {(i.invoice_number or "").strip(): i for i in platform}
+    by_num_fp = {(r.get("invoice_number") or "").strip(): r for r in fp_rows}
+    applied, skipped = [], []
+    now = datetime.utcnow()
+    for fx in body.fixes:
+        num = fx.invoice_number.strip()
+        row = current.get(num)
+        if not row or row.get("fix") != fx.fix:
+            skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "verdetto cambiato: ricontrolla"})
+            continue
+        pl = by_num_pl.get(num)
+        fp = by_num_fp.get(num)
+        if fx.fix == "import" and fp is not None and pl is None:
+            state = fp_state_of(fp)
+            if state not in SDI_FINAL_OK:
+                skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "non più valida su FatturaPro"})
+                continue
+            session.add(Invoice(
+                invoice_number=num, amount=float(fp.get("total") or 0), amount_due=float(fp.get("balance") or 0),
+                issue_date=fp.get("date"), due_date=fp.get("due_date"),
+                due_date_source="real" if fp.get("due_date") else None,
+                customer_name_raw=fp.get("customer_name"), customer_id=customer_id,
+                source_platform="fatturapro", source_id=fp.get("doc_id"),
+                match_method="fatturapro_verify", sdi_state=state, sdi_checked_at=now,
+            ))
+        elif fx.fix == "void" and pl is not None:
+            _void_invoice(session, pl, f"verifica FatturaPro: {row['verdict_label']}",
+                          fp_state_of(fp) if fp else None)
+        elif fx.fix == "mark_paid" and pl is not None:
+            pl.amount_due_at_paid = pl.amount_due
+            pl.paid_at = now
+            pl.status = "paid"
+            pl.payment_pending = None
+            pl.bounced_at = None
+            pl.amount_due = 0
+            pl.days_overdue = 0
+            pl.updated_at = now
+        elif fx.fix == "reopen" and pl is not None and fp is not None:
+            pl.status = "open"
+            pl.paid_at = None
+            pl.amount_due_at_paid = None
+            pl.amount_due = float(fp.get("balance") or 0)
+            pl.updated_at = now
+        elif fx.fix == "reactivate" and pl is not None and fp is not None:
+            _reactivate_invoice(pl, fp_state_of(fp) or "consegnata")
+            pl.amount = float(fp.get("total") or pl.amount or 0)
+            pl.amount_due = float(fp.get("balance") or 0)
+        elif fx.fix == "update_amount" and pl is not None and fp is not None:
+            pl.amount = float(fp.get("total") or 0)
+            pl.amount_due = float(fp.get("balance") or 0)
+            pl.updated_at = now
+        else:
+            skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "correzione non applicabile"})
+            continue
+        applied.append({"invoice_number": num, "fix": fx.fix})
+        session.add(ActivityLog(
+            action=f"fatturapro_fix_{fx.fix}", entity_type="invoice",
+            entity_id=pl.id if pl is not None else None,
+            details={"customer_id": customer_id, "invoice_number": num, "verdict": row["verdict"]},
+        ))
+    session.commit()
+    _recalculate_days_overdue(session)
+    session.refresh(customer)
+    refresh_customer_lifecycle(session, customer)
+    session.commit()
+    return {"applied": applied, "skipped": skipped}

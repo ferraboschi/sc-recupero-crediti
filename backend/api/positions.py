@@ -59,6 +59,9 @@ def list_positions(
         # Apply filters
         if status:
             query = query.filter(Invoice.status == status)
+        else:
+            # Le annullate (void) non sono crediti: si vedono solo chiedendole
+            query = query.filter(Invoice.status != "void")
 
         if exclude_status:
             query = query.filter(Invoice.status != exclude_status)

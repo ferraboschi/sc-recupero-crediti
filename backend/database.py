@@ -176,6 +176,17 @@ class Invoice(Base):
     # Nota dell'operatore SULLA FATTURA (registro per fattura, Fase 5):
     # modificabile in riga, viaggia nel dossier avvocato.
     recovery_note = Column(Text, nullable=True)
+    # Stato SDI del documento su FatturaPro (Fase stato): draft (non ancora
+    # trasmesso: modificabile/eliminabile, il numero può essere riassegnato),
+    # sent (trasmesso, nessuna notifica ancora), consegnata, mancata_consegna,
+    # scartata. Si importano SOLO consegnata / mancata_consegna (regola owner).
+    sdi_state = Column(String, nullable=True)
+    sdi_checked_at = Column(DateTime, nullable=True)
+    # status == "void": documento che NON esiste (più) come fattura valida su
+    # FatturaPro (bozza, scartato, numero riassegnato, eliminato prima della
+    # trasmissione). Mai cancellata: resta per audit, fuori da ogni conteggio.
+    voided_at = Column(DateTime, nullable=True)
+    void_reason = Column(Text, nullable=True)
     # Data di pagamento VERA: scritta nel momento in cui il sync marca la
     # fattura 'paid', azzerata se la fattura riapre. Da non confondere con
     # updated_at (onupdate: cambia a ogni modifica di riga, non è una data
@@ -512,6 +523,10 @@ def _run_migrations(engine):
         "ALTER TABLE invoices ADD COLUMN bounced_at TIMESTAMP",
         "ALTER TABLE invoices ADD COLUMN bounced_note TEXT",
         "ALTER TABLE invoices ADD COLUMN recovery_note TEXT",
+        "ALTER TABLE invoices ADD COLUMN sdi_state VARCHAR",
+        "ALTER TABLE invoices ADD COLUMN sdi_checked_at TIMESTAMP",
+        "ALTER TABLE invoices ADD COLUMN voided_at TIMESTAMP",
+        "ALTER TABLE invoices ADD COLUMN void_reason TEXT",
         "ALTER TABLE overdue_snapshots ADD COLUMN in_incasso DOUBLE PRECISION DEFAULT 0",
         "ALTER TABLE overdue_snapshots ADD COLUMN in_incasso_fatture INTEGER DEFAULT 0",
         "UPDATE overdue_snapshots SET in_incasso = 0 WHERE in_incasso IS NULL",

@@ -60,7 +60,7 @@ def is_in_incasso(inv: Invoice) -> bool:
     dentro l'universo. `status != paid` sta QUI (definizione unica): il sync
     che marca pagata per assenza non deve essere ricordato da ogni consumer."""
     return (
-        inv.status != "paid"
+        inv.status not in ("paid", "void")
         and bool(getattr(inv, "payment_pending", None))
         and getattr(inv, "bounced_at", None) is None
     )
@@ -69,7 +69,7 @@ def is_in_incasso(inv: Invoice) -> bool:
 def in_incasso_clause():
     """Gemello SQL di is_in_incasso."""
     return (
-        (Invoice.status != "paid")
+        Invoice.status.notin_(("paid", "void"))
         & Invoice.payment_pending.isnot(None)
         & Invoice.bounced_at.is_(None)
     )
@@ -80,7 +80,7 @@ def is_suspect_bounce(inv: Invoice) -> bool:
     confermata pagata e RIAPERTA su FatturaPro (payment_pending azzerato dal
     sync alla conferma), non ancora confermata insoluta né smentita."""
     return (
-        inv.status != "paid"
+        inv.status not in ("paid", "void")
         and (inv.days_overdue or 0) > 0
         and getattr(inv, "payment_pending", None) is None
         and getattr(inv, "payment_pending_at", None) is not None
@@ -102,15 +102,17 @@ def is_overdue_unpaid(inv: Invoice) -> bool:
     """Fattura che tiene viva una pratica: scaduta, non pagata, non contestata,
     non in incasso (assegno in mano)."""
     return (
-        inv.status not in ("paid", "disputed")
+        inv.status not in ("paid", "disputed", "void")
         and (inv.days_overdue or 0) > 0
         and not is_in_incasso(inv)
     )
 
 
 def overdue_clause():
-    """UNIVERSO: scaduta e non pagata. La cima della cascata."""
-    return (Invoice.status != "paid") & (Invoice.days_overdue > 0)
+    """UNIVERSO: scaduta e non pagata. La cima della cascata.
+    Le ANNULLATE (status void: bozze/scartate/riassegnate su FatturaPro) non
+    sono crediti: fuori dall'universo, non solo dal lavorabile."""
+    return Invoice.status.notin_(("paid", "void")) & (Invoice.days_overdue > 0)
 
 
 def workable_clause():
