@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
 from backend.config import config
+from backend.engine.sdi import SDI_FINAL_OK, sdi_state_from_notifications
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,7 @@ class FatturaProConnector:
         )
         self._xcrud_key: Optional[str] = None
         self._authenticated = False
+        self._documenti_key = None
         # Contatore righe-fattura scartate dall'ultimo _parse_invoice_table
         self._last_parse_drops = 0
 
@@ -423,6 +425,10 @@ class FatturaProConnector:
 
         soup = BeautifulSoup(resp.text, "html.parser")
         new_key = soup.find("input", {"name": "key", "type": "hidden"})
+        if new_key and new_key.get("value"):
+            # La chiave ruota a ogni risposta (anche la sonda): l'ultima
+            # ricevuta è l'unica valida per la richiesta successiva.
+            self._documenti_key = new_key.get("value")
         return batch, (new_key.get("value") if new_key else None), drops, None
 
     @staticmethod
@@ -563,6 +569,7 @@ class FatturaProConnector:
                 return all_invoices, dropped_rows > 0
 
             xcrud_key = key_input.get("value")
+            self._documenti_key = xcrud_key
 
             # ── La lista in una pagina sola ──
             # Una query, start=0, limite ampio: se il server lo onora, tutta la
@@ -585,6 +592,7 @@ class FatturaProConnector:
                 return all_invoices, True
             if new_key:
                 xcrud_key = new_key
+                self._documenti_key = new_key
 
             # ── La sonda: è DAVVERO tutta la lista? ──
             # Una pagina più corta del limite chiesto NON dimostra la fine
@@ -1109,6 +1117,10 @@ class FatturaProConnector:
                     colmap["totale"] = idx
                 elif "saldo" in text or "residuo" in text:
                     colmap["saldo"] = idx
+                elif text.strip() == "stato" or text.startswith("stato"):
+                    # Solo la lista COMPLETA (documenti.php) ha la colonna
+                    # Stato ("Inviabile" / "Inviato SDI" / "Consegnato" …).
+                    colmap["stato"] = idx
 
             required = {"documento", "data", "destinatario", "totale", "saldo"}
             if not required.issubset(colmap):
@@ -1204,8 +1216,16 @@ class FatturaProConnector:
                         "total": total,
                         "balance": balance,
                         "doc_id": doc_id,
-                        "source_platform": "fatturapro"
+                        "source_platform": "fatturapro",
+                        # Stato del documento dedotto dalle AZIONI di riga
+                        # (la lista non ha una colonna Stato): vedi
+                        # row_signature.
+                        "fp_signature": self.row_signature(row),
                     }
+
+                    # Stato SDI testuale, se la lista ha la colonna (lista completa)
+                    if "stato" in colmap and len(cells) > colmap["stato"]:
+                        invoice["fp_state_label"] = cells[colmap["stato"]].get_text(strip=True)
 
                     # Scadenza reale, se la lista ha la colonna
                     if "scadenza" in colmap and len(cells) > colmap["scadenza"]:
@@ -1230,6 +1250,192 @@ class FatturaProConnector:
             self._last_parse_drops += 1
             logger.error(f"Error parsing invoice table: {e}")
             return []
+
+    # ── Stato SDI del documento ─────────────────────────────────────────
+    # La lista "Da incassare" NON ha una colonna Stato, ma le azioni di riga
+    # lo rivelano (verificato sul FatturaPro reale, 2026-09-14):
+    #   - "Invia Documento" (data-action=invia_doc) + Modifica/Elimina → il
+    #     documento NON è stato trasmesso allo SDI: è una bozza, modificabile
+    #     ed eliminabile, e il suo numero può essere riassegnato → "draft";
+    #   - "Mostra Notifiche" (show_notifiche) / "Scarica Documento Firmato"
+    #     (get_fattura) → trasmesso e con notifiche SDI → "notified": le
+    #     notifiche dicono se è Consegnata (RC), Mancata consegna (MC) o
+    #     Scartata (NS);
+    #   - azioni presenti ma né Invia né Notifiche → trasmesso, in
+    #     elaborazione → "sent";
+    #   - nessuna azione nella riga (layout diverso / fixture) → None:
+    #     stato sconosciuto, il chiamante decide (compatibilità).
+    SIGNATURE_DRAFT = "draft"
+    SIGNATURE_SENT = "sent"
+    SIGNATURE_NOTIFIED = "notified"
+
+    @staticmethod
+    def row_signature(row) -> Optional[str]:
+        """Firma di stato di una riga della lista documenti (vedi sopra)."""
+        try:
+            actions = row.find_all("a", attrs={"data-action": True})
+        except Exception:
+            return None
+        if not actions:
+            return None
+        names = {a.get("data-action") for a in actions}
+        # Le notifiche SDI sono la prova più forte: se una riga le ha, è
+        # trasmessa anche se il markup mostrasse pure "Invia".
+        if "show_notifiche" in names or "get_fattura" in names:
+            return FatturaProConnector.SIGNATURE_NOTIFIED
+        if "invia_doc" in names:
+            return FatturaProConnector.SIGNATURE_DRAFT
+        return FatturaProConnector.SIGNATURE_SENT
+
+    # Stati SDI finali accettati dalla piattaforma (definizione unica in
+    # backend/engine/sdi.py).
+    SDI_FINAL_OK = SDI_FINAL_OK
+
+    @staticmethod
+    def sdi_state_from_notifications(names) -> str:
+        return sdi_state_from_notifications(names)
+
+    def search_documents(self, phrase: str, limit: int = 300,
+                         column: str = "documenti.Destinatario") -> Tuple[List[Dict[str, Any]], bool]:
+        """Documenti di FatturaPro il cui Destinatario contiene `phrase`, dalla
+        lista COMPLETA (documenti.php: anche saldate) che espone la colonna
+        Stato. Verificato dal vivo: xcrud[search]=1 + xcrud[column]=
+        documenti.Destinatario + xcrud[phrase]. Ogni riga porta
+        fp_state_label ("Inviabile" / "Inviato SDI" / "Consegnato" …) e
+        fp_signature. Ritorna (rows, complete): complete=False se la
+        risposta non è affidabile (sessione scaduta, xcrud-error, lista
+        troncata al limite)."""
+        if not phrase or not phrase.strip():
+            return [], True
+        if not self._authenticated and not self.login():
+            return [], False
+        try:
+            first = self.client.get(f"{self.base_url}/documenti.php", timeout=self.timeout)
+            first.raise_for_status()
+            if self._looks_like_auth_page(first):
+                return [], False
+            colmap = self._derive_column_map(first.text)
+            key, _ = self._xcrud_tokens(first.text)
+            if not key:
+                return [], False
+            rows: List[Dict[str, Any]] = []
+            seen = set()
+            start = 0
+            for _ in range(10):  # 10 pagine × limit: nessun cliente ne ha di più
+                resp = self.client.post(
+                    f"{self.base_url}/xcrud/xcrud_ajax.php",
+                    data={
+                        "xcrud[key]": key,
+                        "xcrud[instance]": "documenti",
+                        "xcrud[task]": "list",
+                        "xcrud[orderby]": "documenti.NumeroSezionale",
+                        "xcrud[order]": "desc",
+                        "xcrud[start]": str(start),
+                        "xcrud[limit]": str(limit),
+                        "xcrud[column]": column,
+                        "xcrud[search]": "1",
+                        "xcrud[phrase]": phrase.strip(),
+                    },
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": f"{self.base_url}/documenti.php",
+                    },
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                if "xcrud-error" in resp.text or self._looks_like_auth_page(resp):
+                    return rows, False
+                batch = self._parse_invoice_table(resp.text, colmap)
+                nk, _ = self._xcrud_tokens(resp.text)
+                if nk:
+                    key = nk
+                added = 0
+                for r in batch:
+                    k = str(r.get("doc_id") or r.get("invoice_number"))
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    rows.append(r)
+                    added += 1
+                # La riga di totale è già scartata dal parser (numero/data
+                # vuoti). Pagina più corta del limite = fine della lista.
+                if len(batch) < limit or added == 0:
+                    return rows, True
+                start += limit
+            return rows, False
+        except Exception as e:
+            logger.warning(f"Ricerca documenti FatturaPro fallita per {phrase!r}: {e}")
+            return [], False
+
+    def _refresh_documenti_key(self) -> Optional[str]:
+        """Chiave xcrud fresca dalla pagina documenti (ogni risposta xcrud ne
+        ruota una nuova: quella usata resta valida solo per la richiesta
+        successiva)."""
+        try:
+            resp = self.client.get(f"{self.base_url}/documenti.php?s=1", timeout=self.timeout)
+            resp.raise_for_status()
+            if self._looks_like_auth_page(resp):
+                return None
+            key, _ = self._xcrud_tokens(resp.text)
+            self._documenti_key = key
+            return key
+        except Exception as e:
+            logger.warning(f"Chiave xcrud documenti non disponibile: {e}")
+            return None
+
+    def fetch_sdi_notifications(self, doc_id) -> Optional[List[str]]:
+        """Notifiche SDI di un documento ("Mostra Notifiche" di FatturaPro):
+        lista dei nomi (es. ["RicevutaConsegna"]) più i nomi file, così lo
+        stato si ricava anche dal codice (_RC_/_MC_/_NS_). None se la
+        chiamata fallisce (sessione scaduta, xcrud-error): il chiamante NON
+        deve leggerlo come "nessuna notifica"."""
+        if not doc_id:
+            return None
+        key = getattr(self, "_documenti_key", None) or self._refresh_documenti_key()
+        if not key:
+            return None
+        try:
+            resp = self.client.post(
+                f"{self.base_url}/xcrud/xcrud_ajax.php",
+                data={
+                    "xcrud[key]": key,
+                    "xcrud[instance]": "documenti",
+                    "xcrud[task]": "action",
+                    "xcrud[action]": "show_notifiche",
+                    "xcrud[doc_id]": str(doc_id),
+                },
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": f"{self.base_url}/documenti.php?s=1",
+                },
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Notifiche SDI non disponibili per doc {doc_id}: {e}")
+            self._documenti_key = None
+            return None
+        text = resp.text or ""
+        if "xcrud-error" in text or self._looks_like_auth_page(resp):
+            self._documenti_key = None
+            return None
+        new_key, _ = self._xcrud_tokens(text)
+        if new_key:
+            self._documenti_key = new_key
+        soup = BeautifulSoup(text, "html.parser")
+        # Solo i link ai messaggi SDI (displayMessaggioSDI.php?file=…): nessun
+        # ripiego sui <li> generici (nel modal c'è anche il menu del sito e
+        # un testo qualsiasi fabbricherebbe uno stato). Nessun link = nessuna
+        # notifica ancora ("sent"): non è un'evidenza di consegna né di scarto.
+        names: List[str] = []
+        for a in soup.find_all("a", href=True):
+            href = a.get("href") or ""
+            if "MessaggioSDI" in href:
+                names.append(a.get_text(strip=True))
+                m = re.search(r"file=([^&\"']+)", href)
+                if m:
+                    names.append(m.group(1))
+        return names
 
     def _parse_currency(self, value_str: str) -> float:
         """Parse currency string to float.

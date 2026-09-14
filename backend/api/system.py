@@ -101,7 +101,7 @@ def get_system_status():
         customers_auto = total_customers - customers_shopify
 
         invoices_open = session.query(func.count(Invoice.id)).filter(
-            Invoice.status != "paid"
+            Invoice.status.notin_(("paid", "void"))
         ).scalar() or 0
         invoices_paid = session.query(func.count(Invoice.id)).filter(
             Invoice.status == "paid"
@@ -167,6 +167,16 @@ def get_system_status():
                 "updated": fp.get("updated", 0),
                 "paid_detected": fp.get("paid_detected", 0),
                 "error": fp.get("error"),
+                # Stato SDI (regola owner): nulla scartato in silenzio
+                "skipped_draft": fp.get("skipped_draft", 0),
+                "skipped_pending": fp.get("skipped_pending", 0),
+                "skipped_scartata": fp.get("skipped_scartata", 0),
+                "voided": fp.get("voided", 0),
+                "reactivated": fp.get("reactivated", 0),
+                "sdi_checked": fp.get("sdi_checked", 0),
+                "draft_guard_triggered": fp.get("draft_guard_triggered", 0),
+                "reassign_guard_triggered": fp.get("reassign_guard_triggered", 0),
+                "reassigned_on_paid": fp.get("reassigned_on_paid", 0),
             }
 
         cust_result = _sync_status.get("customers", {}).get("result")
@@ -229,7 +239,7 @@ def get_system_status():
 
         # Check: invoices with days_overdue = 0 but actually overdue
         stale_overdue = session.query(func.count(Invoice.id)).filter(
-            Invoice.status != "paid",
+            Invoice.status.notin_(("paid", "void")),
             Invoice.days_overdue == 0,
             Invoice.due_date.isnot(None),
             Invoice.due_date < date.today(),
@@ -398,6 +408,21 @@ def _summarize_sync_result(key: str, result: dict) -> str:
             )
             if fp.get("due_date_enriched"):
                 summary += f", {fp['due_date_enriched']} scadenze reali"
+            sdi_bits = []
+            if fp.get("skipped_draft"):
+                sdi_bits.append(f"{fp['skipped_draft']} bozze escluse")
+            if fp.get("skipped_pending"):
+                sdi_bits.append(f"{fp['skipped_pending']} in elaborazione")
+            if fp.get("skipped_scartata"):
+                sdi_bits.append(f"{fp['skipped_scartata']} scartate")
+            if fp.get("voided"):
+                sdi_bits.append(f"{fp['voided']} annullate")
+            if fp.get("reactivated"):
+                sdi_bits.append(f"{fp['reactivated']} riattivate")
+            if fp.get("draft_guard_triggered") or fp.get("reassign_guard_triggered"):
+                sdi_bits.append("GUARDIA SDI SCATTATA")
+            if sdi_bits:
+                summary += " · SDI: " + ", ".join(sdi_bits)
             if fp.get("partial"):
                 summary += " (PARZIALE)"
             return summary
@@ -494,6 +519,7 @@ def match_audit(
         query = session.query(Invoice).filter(
             Invoice.customer_id.isnot(None),
         )
+        query = query.filter(Invoice.status != "void")
         if not include_paid:
             query = query.filter(Invoice.status != "paid")
         invoices = query.order_by(Invoice.id).all()
@@ -511,7 +537,7 @@ def match_audit(
         # può superare il denominatore → "2 fatture su 0".
         counts_query = session.query(
             Invoice.customer_id, func.count(Invoice.id)
-        ).filter(Invoice.customer_id.isnot(None))
+        ).filter(Invoice.customer_id.isnot(None), Invoice.status != "void")
         if not include_paid:
             counts_query = counts_query.filter(Invoice.status != "paid")
         counts_by_customer = dict(

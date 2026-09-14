@@ -330,6 +330,7 @@ def close_case(session: Session, case: RecoveryCase, reason: str) -> None:
     ).all()
     note_by_reason = {
         "paid": "annullata: pratica chiusa a saldo",
+        "voided": "annullata: fatture annullate su FatturaPro (non trasmesse/scartate)",
         "no_overdue": "sospesa: nessuna fattura scaduta residua",
         "in_incasso": "sospesa: fatture coperte da assegno in attesa di incasso",
         "resolved": "annullata: restano solo fatture contestate",
@@ -568,9 +569,9 @@ def update_case_lifecycle(session: Session, allow_close: bool = True) -> Dict[st
                 attached = session.query(Invoice).filter(
                     Invoice.case_id == open_case.id
                 ).all()
-                non_paid = [inv for inv in attached if inv.status != "paid"]
+                non_paid = [inv for inv in attached if inv.status not in ("paid", "void")]
                 if attached and not non_paid:
-                    reason = "paid"
+                    reason = "paid" if any(inv.status == "paid" for inv in attached) else "voided"
                 elif non_paid and all(inv.status == "disputed" for inv in non_paid):
                     reason = "resolved"
                 elif non_paid and any(is_in_incasso(inv) for inv in non_paid) and all(
@@ -899,9 +900,9 @@ def refresh_customer_lifecycle(session: Session, customer: Customer) -> Optional
         return open_case
     if open_case:
         attached = session.query(Invoice).filter(Invoice.case_id == open_case.id).all()
-        non_paid = [inv for inv in attached if inv.status != "paid"]
+        non_paid = [inv for inv in attached if inv.status not in ("paid", "void")]
         if attached and not non_paid:
-            reason = "paid"
+            reason = "paid" if any(inv.status == "paid" for inv in attached) else "voided"
         elif non_paid and all(inv.status == "disputed" for inv in non_paid):
             reason = "resolved"
         elif non_paid and any(is_in_incasso(inv) for inv in non_paid) and all(

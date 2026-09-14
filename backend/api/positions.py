@@ -59,6 +59,9 @@ def list_positions(
         # Apply filters
         if status:
             query = query.filter(Invoice.status == status)
+        else:
+            # Le annullate (void) non sono crediti: si vedono solo chiedendole
+            query = query.filter(Invoice.status != "void")
 
         if exclude_status:
             query = query.filter(Invoice.status != exclude_status)
@@ -249,7 +252,7 @@ def list_suggestions(session: Session = Depends(get_session)):
             .filter(
                 Invoice.customer_id.is_(None),
                 Invoice.suggested_customer_id.isnot(None),
-                Invoice.status != "paid",
+                Invoice.status.notin_(("paid", "void")),
             )
             .order_by(Invoice.suggested_score.desc().nullslast())
             .all()

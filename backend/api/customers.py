@@ -23,6 +23,8 @@ from backend.engine.normalizer import normalize_ragione_sociale, name_similarity
 from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
 from backend.engine.overdue import overdue_clause, RECOVERY_ACTION_TYPES
 from backend.engine.piva import validate_piva
+from backend.engine.fp_verify import compare_documents, fp_state_of
+from backend.engine.sdi import SDI_FINAL_OK, SDI_LABELS
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -61,6 +63,7 @@ def _audit_customer_ids(session, include_paid: bool = False) -> set:
         .join(Customer, Invoice.customer_id == Customer.id)
         .filter(Invoice.audit_reviewed_at.is_(None))
     )
+    q = q.filter(Invoice.status != "void")
     if not include_paid:
         q = q.filter(Invoice.status != "paid")
     for inv, cust in q.all():
@@ -177,7 +180,7 @@ def list_customers(
                 func.min(case((overdue_clause(), Invoice.due_date), else_=None)).label("earliest_due_date"),
                 func.max(case((overdue_clause(), Invoice.days_overdue), else_=None)).label("max_days_overdue"),
             )
-            .filter(Invoice.status != "paid", Invoice.customer_id.isnot(None))
+            .filter(Invoice.status.notin_(("paid", "void")), Invoice.customer_id.isnot(None))
             .group_by(Invoice.customer_id)
             .all()
         )
@@ -447,7 +450,7 @@ def bonifica_suggestions(session: Session = Depends(get_session)):
     rows = (
         session.query(Invoice, Customer)
         .join(Customer, Invoice.customer_id == Customer.id)
-        .filter(Invoice.status != "paid")
+        .filter(Invoice.status.notin_(("paid", "void")))
         .all()
     )
     by_customer = {}  # customer_id → {"customer": Customer, "invoices": [Invoice]}
@@ -726,6 +729,11 @@ def get_customer_detail(
         invoices = session.query(Invoice).filter(
             Invoice.customer_id == customer_id
         ).order_by(Invoice.due_date.desc()).all()
+        # Le ANNULLATE (bozze/scartate/riassegnate su FatturaPro) non sono
+        # crediti: fuori da elenco, conteggi e totali, ma dichiarate a parte
+        # (nessun dato invisibile).
+        voided = [inv for inv in invoices if inv.status == "void"]
+        invoices = [inv for inv in invoices if inv.status != "void"]
 
         # Calculate totals excluding paid invoices
         total_amount = sum(inv.amount for inv in invoices if inv.status != "paid")
@@ -793,6 +801,8 @@ def get_customer_detail(
                 ),
                 "sollecito_today": inv.id in today_ids,
                 "recovery_note": inv.recovery_note,
+                "sdi_state": inv.sdi_state,
+                "sdi_label": SDI_LABELS.get(inv.sdi_state) if inv.sdi_state else None,
                 "history": inv_history.get(inv.id, []),
                 # "Ultima azione" della riga = ultimo SOLLECITO o consegna al
                 # legale (le note non sono azioni compiute): data e canale dalla
@@ -971,6 +981,12 @@ def get_customer_detail(
                 "total_due": float(total_due),
                 "count": len(invoices),
                 "items": invoice_list,
+                "voided": [{
+                    "id": v.id, "invoice_number": v.invoice_number, "amount": float(v.amount or 0),
+                    "issue_date": v.issue_date.isoformat() if v.issue_date else None,
+                    "sdi_state": v.sdi_state, "void_reason": v.void_reason,
+                    "voided_at": v.voided_at.isoformat() if v.voided_at else None,
+                } for v in voided],
             },
             "pending_suggestions": pending_suggestions,
             "recovery_actions": action_list,
@@ -1020,7 +1036,7 @@ def audit_customer(
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
 
-    q = session.query(Invoice).filter(Invoice.customer_id == customer_id)
+    q = session.query(Invoice).filter(Invoice.customer_id == customer_id, Invoice.status != "void")
     if not include_paid:
         q = q.filter(Invoice.status != "paid")
     invoices = q.order_by(Invoice.due_date.desc()).all()
@@ -1786,3 +1802,284 @@ def create_customer(
         logger.error(f"Error creating customer: {e}", exc_info=True)
         session.rollback()
         raise
+
+
+# ── Verifica allineamento con FatturaPro (per UN cliente) ────────────────
+
+def _fp_search_names(session, customer) -> List[str]:
+    """Nomi con cui cercare il cliente su FatturaPro: la ragione sociale e i
+    nomi grezzi con cui FatturaPro stesso ha intestato le sue fatture (match
+    esatto garantito)."""
+    names = []
+    seen = set()
+    raw = session.query(Invoice.customer_name_raw).filter(
+        Invoice.customer_id == customer.id, Invoice.source_platform == "fatturapro",
+        Invoice.customer_name_raw.isnot(None),
+    ).distinct().all()
+    for (n,) in raw:
+        k = (n or "").strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            names.append(n.strip())
+    k = (customer.ragione_sociale or "").strip().lower()
+    if k and k not in seen:
+        names.append(customer.ragione_sociale.strip())
+    return names
+
+
+def _fp_name_key(name) -> str:
+    """Chiave STRETTA (maiuscole/spazi ignorati, nient'altro): il filtro degli
+    omonimi deve escludere 'ROSSI S.P.A.' da 'ROSSI SRL', quindi non può usare
+    il normalizzatore tollerante del matching."""
+    return " ".join((name or "").split()).strip().lower()
+
+
+def _fp_number_phrase(number: str) -> str:
+    """Frase di ricerca per numero su FatturaPro: il progressivo a 8 cifre
+    ('2026/00001600/SAK - Fattura' → '00001600'), altrimenti il numero grezzo."""
+    import re as _re
+    m = _re.search(r"\d{6,}", number or "")
+    return m.group(0) if m else (number or "").strip()
+
+
+def _fp_rows_for_customer(connector, names, known_doc_ids=(), known_numbers=()) -> tuple:
+    """Documenti FatturaPro del cliente. La ricerca di FatturaPro è un LIKE
+    sul destinatario ('ROSSI' trova anche 'ROSSI & C.'): si tengono le righe
+    il cui destinatario coincide ESATTAMENTE con uno dei nomi cercati, più
+    quelle già note al cliente per doc_id o numero (cliente rinominato in
+    anagrafica FatturaPro: non deve far sparire le sue fatture)."""
+    wanted = {_fp_name_key(n) for n in names}
+    known_ids = {str(x) for x in known_doc_ids if x}
+    known_nums = {(x or "").strip() for x in known_numbers if x}
+    rows: dict = {}
+    complete = True
+    for name in names:
+        found, ok = connector.search_documents(name)
+        complete = complete and ok
+        for r in found:
+            same_name = _fp_name_key(r.get("customer_name")) in wanted
+            known = (str(r.get("doc_id") or "") in known_ids
+                     or (r.get("invoice_number") or "").strip() in known_nums)
+            if not same_name and not known:
+                continue
+            key = str(r.get("doc_id") or r.get("invoice_number"))
+            rows[key] = r
+    # Cliente RINOMINATO in anagrafica FatturaPro: la ricerca per nome non
+    # trova nulla. Ripiego per NUMERO sulle fatture note (poche): se un
+    # documento c'è ancora, lo si prende; se non si trova nulla neppure
+    # così, l'assenza non è una prova → lista incompleta.
+    if not rows and known_numbers:
+        for number in list(dict.fromkeys(n for n in known_numbers if n))[:30]:
+            found, ok = connector.search_documents(
+                _fp_number_phrase(number), column="documenti.NumeroSezionale")
+            complete = complete and ok
+            for r in found:
+                if (r.get("invoice_number") or "").strip() == number.strip() or str(r.get("doc_id") or "") in known_ids:
+                    rows[str(r.get("doc_id") or r.get("invoice_number"))] = r
+        if not rows:
+            complete = False
+    return list(rows.values()), complete
+
+
+@router.post("/{customer_id}/verify-fatturapro")
+def verify_fatturapro(customer_id: int, session: Session = Depends(get_session)):
+    """Confronta le fatture del cliente con i documenti che FatturaPro
+    intesta a lui (lista completa, con stato SDI): numeri, importi, saldi,
+    stato. Solo lettura: le correzioni si applicano con /apply."""
+    from backend.connectors.fatturapro import FatturaProConnector
+    customer = session.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    names = _fp_search_names(session, customer)
+    if not names:
+        raise HTTPException(status_code=400, detail="Cliente senza ragione sociale: impossibile cercarlo su FatturaPro")
+    platform = session.query(Invoice).filter(
+        Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
+    ).order_by(Invoice.id.asc()).all()
+    connector = FatturaProConnector()
+    try:
+        if not connector.login():
+            raise HTTPException(status_code=424, detail="FatturaPro non raggiungibile (login fallito): riprova più tardi")
+        fp_rows, complete = _fp_rows_for_customer(
+            connector, names, [i.source_id for i in platform], [i.invoice_number for i in platform])
+    finally:
+        try:
+            connector.close()
+        except Exception:
+            pass
+    result = compare_documents(platform, fp_rows, complete=complete)
+    session.add(ActivityLog(
+        action="fatturapro_verify", entity_type="customer", entity_id=customer_id,
+        details={"customer": customer.ragione_sociale, "names": names, "fp_rows": len(fp_rows),
+                 "complete": complete, "summary": result["summary"]},
+    ))
+    session.commit()
+    return {
+        "customer_id": customer_id,
+        "searched_names": names,
+        "fatturapro_documents": len(fp_rows),
+        "complete": complete,
+        "checked_at": datetime.utcnow().isoformat(),
+        **result,
+    }
+
+
+class FpFix(BaseModel):
+    invoice_number: str
+    fix: str  # import / replace / void / mark_paid / reopen / reactivate / update_amount
+    key: Optional[str] = None  # chiave riga della verifica (numero#id): distingue i doppioni
+
+
+class FpApplyBody(BaseModel):
+    fixes: List[FpFix] = []
+
+
+@router.post("/{customer_id}/verify-fatturapro/apply")
+def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session = Depends(get_session)):
+    """Applica le correzioni scelte dall'operatore dopo la verifica. Ogni
+    correzione viene RIVERIFICATA contro FatturaPro al momento (lo stato può
+    essere cambiato): si applica solo se il verdetto è ancora quello."""
+    from backend.connectors.fatturapro import FatturaProConnector
+    from backend.api.sync import _void_invoice, _reactivate_invoice, _recalculate_days_overdue
+    from backend.engine.cases import refresh_customer_lifecycle
+    customer = session.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if not body.fixes:
+        raise HTTPException(status_code=400, detail="Nessuna correzione selezionata")
+    names = _fp_search_names(session, customer)
+    platform = session.query(Invoice).filter(
+        Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
+    ).order_by(Invoice.id.asc()).all()
+    connector = FatturaProConnector()
+    try:
+        if not connector.login():
+            raise HTTPException(status_code=424, detail="FatturaPro non raggiungibile (login fallito): riprova più tardi")
+        fp_rows, complete = _fp_rows_for_customer(
+            connector, names, [i.source_id for i in platform], [i.invoice_number for i in platform])
+    finally:
+        try:
+            connector.close()
+        except Exception:
+            pass
+    verdict_rows = compare_documents(platform, fp_rows, complete=complete)["rows"]
+    current = {r["key"]: r for r in verdict_rows}
+    by_number = {}
+    for r in verdict_rows:
+        by_number.setdefault(r["invoice_number"], []).append(r)
+    by_id = {i.id: i for i in platform}
+    by_num_fp = {}
+    for r in fp_rows:
+        by_num_fp[(r.get("invoice_number") or "").strip()] = r
+    applied, skipped = [], []
+    imported_ids = {}
+    now = datetime.utcnow()
+    for fx in body.fixes:
+        num = fx.invoice_number.strip()
+        row = current.get(fx.key) if fx.key else None
+        if row is None:
+            cands = by_number.get(num, [])
+            row = cands[0] if len(cands) == 1 else None
+        if not row or row.get("fix") != fx.fix:
+            skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "verdetto cambiato: ricontrolla"})
+            continue
+        # La riga della piattaforma su cui agire è QUELLA del verdetto (attiva,
+        # o l'annullata riattivabile), mai una scelta per numero.
+        pl = by_id.get((row.get("platform") or {}).get("id"))
+        fp = by_num_fp.get(num)
+
+        def _import_from_fp():
+            state = fp_state_of(fp)
+            if state not in SDI_FINAL_OK:
+                return "non più valida su FatturaPro"
+            # Lo stesso numero ATTIVO su un altro cliente (abbinamento
+            # diverso): non si duplica, si segnala. Le annullate non contano.
+            elsewhere = session.query(Invoice).filter(
+                Invoice.invoice_number == num, Invoice.source_platform == "fatturapro",
+                Invoice.status != "void",
+            ).first()
+            if elsewhere is not None:
+                return f"già presente in piattaforma sul cliente {elsewhere.customer_id}"
+            created = Invoice(
+                invoice_number=num, amount=float(fp.get("total") or 0), amount_due=float(fp.get("balance") or 0),
+                issue_date=fp.get("date"), due_date=fp.get("due_date"),
+                due_date_source="real" if fp.get("due_date") else None,
+                customer_name_raw=fp.get("customer_name"), customer_id=customer_id,
+                source_platform="fatturapro", source_id=fp.get("doc_id"),
+                match_method="fatturapro_verify", sdi_state=state, sdi_checked_at=now,
+            )
+            session.add(created)
+            session.flush()
+            imported_ids[num] = created.id
+            return None
+
+        if fx.fix == "import" and fp is not None and pl is None:
+            why = _import_from_fp()
+            if why:
+                skipped.append({"invoice_number": num, "fix": fx.fix, "reason": why})
+                continue
+        elif fx.fix == "replace" and fp is not None and pl is not None:
+            # Numero riassegnato: la riga vecchia descrive un documento sparito
+            # (si annulla SENZA timbrarle lo stato del documento nuovo) e il
+            # documento nuovo entra come fattura a sé.
+            _void_invoice(session, pl, f"verifica FatturaPro: {row['verdict_label']} (documento {pl.source_id} → {fp.get('doc_id')})")
+            session.flush()
+            why = _import_from_fp()
+            if why:
+                skipped.append({"invoice_number": num, "fix": fx.fix, "reason": why})
+                continue
+        elif fx.fix == "void" and pl is not None:
+            if row["verdict"] == "inesistente" and not complete:
+                skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "lista FatturaPro incompleta: l'assenza non è una prova"})
+                continue
+            # Lo stato SDI si timbra solo se è di QUESTO documento (non di un
+            # doppione / documento nuovo con lo stesso numero).
+            same_doc = bool(fp and pl.source_id and str(pl.source_id) == str(fp.get("doc_id")))
+            _void_invoice(session, pl, f"verifica FatturaPro: {row['verdict_label']}",
+                          fp_state_of(fp) if (fp and same_doc) else None)
+        elif fx.fix == "mark_paid" and pl is not None:
+            pl.amount_due_at_paid = pl.amount_due
+            pl.paid_at = now
+            pl.status = "paid"
+            pl.payment_pending = None
+            pl.bounced_at = None
+            pl.bounced_note = None
+            pl.amount_due = 0
+            pl.days_overdue = 0
+            pl.updated_at = now
+        elif fx.fix == "reopen" and pl is not None and fp is not None:
+            pl.status = "open"
+            pl.paid_at = None
+            pl.amount_due_at_paid = None
+            pl.amount_due = float(fp.get("balance") or 0)
+            pl.updated_at = now
+        elif fx.fix == "reactivate" and pl is not None and fp is not None:
+            _reactivate_invoice(pl, fp_state_of(fp) or "consegnata")
+            pl.source_id = str(fp.get("doc_id") or pl.source_id or "")
+            pl.amount = float(fp.get("total") or pl.amount or 0)
+            pl.amount_due = float(fp.get("balance") or 0)
+            if pl.amount_due == 0:
+                # Già saldata su FatturaPro: riattivarla come aperta la farebbe
+                # marcare pagata due sync dopo con residuo 0 → pagata subito.
+                pl.status = "paid"
+                pl.paid_at = now
+                pl.amount_due_at_paid = 0
+        elif fx.fix == "update_amount" and pl is not None and fp is not None:
+            pl.amount = float(fp.get("total") or 0)
+            pl.amount_due = float(fp.get("balance") or 0)
+            pl.updated_at = now
+        else:
+            skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "correzione non applicabile"})
+            continue
+        applied.append({"invoice_number": num, "fix": fx.fix})
+        session.add(ActivityLog(
+            action=f"fatturapro_fix_{fx.fix}", entity_type="invoice",
+            entity_id=(pl.id if pl is not None else imported_ids.get(num)),
+            details={"customer_id": customer_id, "invoice_number": num, "verdict": row["verdict"]},
+        ))
+    session.commit()
+    _recalculate_days_overdue(session)
+    session.refresh(customer)
+    refresh_customer_lifecycle(session, customer)
+    session.commit()
+    return {"applied": applied, "skipped": skipped, "complete": complete}
