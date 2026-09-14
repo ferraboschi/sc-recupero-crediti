@@ -2013,7 +2013,15 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             imported_ids[num] = created.id
             return None
 
-        if fx.fix == "import" and fp is not None and pl is None:
+        # Stesso documento rinumerato da FatturaPro: il numero nuovo si applica
+        # insieme a qualunque correzione (tranne l'annullamento).
+        if pl is not None and fp is not None and row.get("renumber_from") and fx.fix != "void":
+            pl.invoice_number = (fp.get("invoice_number") or pl.invoice_number).strip()
+            pl.updated_at = now
+        if fx.fix == "renumber" and pl is not None and fp is not None:
+            pl.amount = float(fp.get("total") or pl.amount or 0)
+            pl.amount_due = float(fp.get("balance") or 0) if pl.status != "paid" else pl.amount_due
+        elif fx.fix == "import" and fp is not None and pl is None:
             why = _import_from_fp()
             if why:
                 skipped.append({"invoice_number": num, "fix": fx.fix, "reason": why})

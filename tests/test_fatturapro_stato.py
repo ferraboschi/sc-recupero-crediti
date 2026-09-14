@@ -587,3 +587,59 @@ def test_find_existing_prefers_unpaid_active_row(test_db_session):
     openr = _mk(test_db_session, "X9/2026", source_id="o")
     assert _find_existing(test_db_session, "X9/2026", "zzz").id == openr.id
     assert _find_existing(test_db_session, "X9/2026", "p").id == paid.id
+
+
+# ── Rinumerazione di FatturaPro (identità = doc_id) ────────────────────────
+
+def test_sync_matches_by_doc_id_and_renumbers(monkeypatch, test_db_session):
+    """Cecconi dal vivo: doc 4607157 era '1609' (poi sparito → 'pagata'), oggi è
+    '1600'; il vecchio '1600' (doc 4606196) oggi è '1592' di un altro cliente."""
+    from backend.database import Customer as C
+    cec = C(ragione_sociale="CECCONI MARIO S.R.L."); bil = C(ragione_sociale="Billiken"); test_db_session.add_all([cec, bil]); test_db_session.commit()
+    _mk(test_db_session, "2026/00001609/SAK - Fattura", source_id="4607157", customer_id=cec.id, customer_name_raw="CECCONI MARIO S.R.L.",
+        status="paid", amount_due=0, days_overdue=0, paid_at=datetime(2026, 9, 14), amount_due_at_paid=459.42, amount=459.42)
+    _mk(test_db_session, "2026/00001600/SAK - Fattura", source_id="4606196", customer_id=cec.id, customer_name_raw="CECCONI MARIO S.R.L.", amount=459.42, amount_due=459.42)
+    r = _sync(monkeypatch, test_db_session, [
+        _raw("2026/00001600/SAK - Fattura", "4607157", "draft", balance=459.42, name="CECCONI MARIO S.R.L."),
+        _raw("2026/00001592/SAK - Fattura", "4606196", "sent", balance=410.71, name="Billiken di Okuda Atsushi"),
+    ])
+    rows = {x.source_id: x for x in test_db_session.query(Invoice).all()}
+    assert set(rows) == {"4607157", "4606196"}  # nessuna riga nuova, nessun doppione
+    a = rows["4607157"]; b = rows["4606196"]
+    assert a.invoice_number == "2026/00001600/SAK - Fattura" and a.status == "void" and a.paid_at is None and "rinumerazione" in a.void_reason
+    assert b.invoice_number == "2026/00001592/SAK - Fattura" and b.status == "open" and b.amount_due == 410.71 and b.sdi_state == "sent"
+    assert b.customer_name_raw.startswith("Billiken") and b.audit_reviewed_at is None  # abbinamento da ricontrollare
+    assert r["renumbered"] == 2 and r["voided"] == 1 and r["created"] == 0
+    assert test_db_session.query(ActivityLog).filter_by(action="invoice_renumbered").count() == 2
+    assert test_db_session.query(ActivityLog).filter_by(action="invoice_customer_name_changed").count() == 1
+
+
+def test_number_taken_over_creates_new_row_without_void(monkeypatch, test_db_session):
+    """Il vecchio documento è ancora in lista (sotto altro numero) e il numero è
+    passato a un documento nuovo: si crea il nuovo, si rinumera il vecchio."""
+    _mk(test_db_session, "N1/2026", source_id="old", amount_due=10.0)
+    r = _sync(monkeypatch, test_db_session, [
+        _raw("N1/2026", "new", "notified", balance=50.0),
+        _raw("N0/2026", "old", "notified", balance=10.0),
+    ], notif={"new": ["RicevutaConsegna"], "old": ["RicevutaConsegna"]})
+    rows = {x.source_id: (x.invoice_number, x.status) for x in test_db_session.query(Invoice).all()}
+    assert rows == {"old": ("N0/2026", "open"), "new": ("N1/2026", "open")}
+    assert r["voided"] == 0 and r["created"] == 1 and r.get("number_taken_over") == 1 and r["renumbered"] == 1
+
+
+def test_verify_reports_renumbered_and_apply_renumbers(test_client, test_db_session, monkeypatch):
+    import backend.connectors.fatturapro as fpmod
+    monkeypatch.setattr(fpmod, "FatturaProConnector", FakeSearchFP)
+    cust = Customer(ragione_sociale="CECCONI MARIO S.R.L."); test_db_session.add(cust); test_db_session.commit()
+    inv = _mk(test_db_session, "2026/00001420/SAK - Fattura", customer_id=cust.id, source_id="4546390", amount=1044.66, amount_due=1044.66, customer_name_raw="CECCONI MARIO S.R.L.")
+    FakeSearchFP.rows = [_fp("2026/00001419/SAK - Fattura", "4546390", 1044.66, 1044.66, "Consegnato")]
+    FakeSearchFP.by_number = {}
+    r = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    assert len(r["rows"]) == 1
+    row = r["rows"][0]
+    assert row["verdict"] == "rinumerata" and row["fix"] == "renumber" and row["fix_safe"] is True
+    assert row["invoice_number"] == "2026/00001419/SAK - Fattura" and row["renumber_from"] == "2026/00001420/SAK - Fattura"
+    a = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro/apply", json={"fixes": [{"invoice_number": row["invoice_number"], "fix": "renumber", "key": row["key"]}]}).json()
+    assert [x["fix"] for x in a["applied"]] == ["renumber"]
+    test_db_session.expire_all()
+    assert test_db_session.query(Invoice).get(inv.id).invoice_number == "2026/00001419/SAK - Fattura"

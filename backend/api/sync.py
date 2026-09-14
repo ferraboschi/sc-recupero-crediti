@@ -364,13 +364,48 @@ def _sync_invoices_task() -> dict:
                     .filter(Invoice.source_platform == "fatturapro").all()
                 }
                 raw_invoices = sorted(raw_invoices, key=lambda r: r.get("invoice_number") in known_numbers)
-                # Riga esistente per ogni riga letta (una sola lookup, riusata
-                # dal pre-pass e dal ciclo di scrittura).
-                existing_of = {id(r): _find_existing(session, r["invoice_number"], r.get("doc_id")) for r in raw_invoices}
+                # IDENTITÀ = doc_id di FatturaPro, non il numero. FatturaPro
+                # RINUMERA i documenti non ancora trasmessi quando se ne
+                # elimina uno precedente (i numeri scalano, gli id restano):
+                # verificato dal vivo il 2026-09-14 (Cecconi: doc 4607157 era
+                # la "1609", oggi è la "1600"). Abbinare per numero mescolava
+                # documenti diversi. Quindi: prima per doc_id (e si aggiorna
+                # il numero), poi per numero (righe storiche senza doc_id).
+                fp_doc_ids = {str(r["doc_id"]) for r in raw_invoices if r.get("doc_id")}
+                by_doc = {}
+                if fp_doc_ids:
+                    for row_ in session.query(Invoice).filter(
+                        Invoice.source_platform == "fatturapro",
+                        Invoice.source_id.in_(list(fp_doc_ids)),
+                    ).order_by(Invoice.id.asc()).all():
+                        cur = by_doc.get(str(row_.source_id))
+                        rank = lambda x: (x.status == "void", x.status == "paid", x.id)  # noqa: E731
+                        if cur is None or rank(row_) < rank(cur):
+                            by_doc[str(row_.source_id)] = row_
+
+                def _resolve(r):
+                    ex = by_doc.get(str(r.get("doc_id") or ""))
+                    if ex is not None:
+                        return ex
+                    return _find_existing(session, r["invoice_number"], r.get("doc_id"))
+
+                existing_of = {id(r): _resolve(r) for r in raw_invoices}
 
                 def _doc_mismatch(ex, r):
+                    """Stesso numero, documento diverso, E il documento vecchio
+                    NON è più nella lista (se c'è ancora, verrà rinumerato dalla
+                    sua riga: non è un conflitto)."""
                     return bool(ex is not None and r.get("doc_id") and ex.source_id
-                                and str(ex.source_id) != str(r["doc_id"]))
+                                and str(ex.source_id) != str(r["doc_id"])
+                                and str(ex.source_id) not in fp_doc_ids)
+
+                def _number_taken_over(ex, r):
+                    """Stesso numero, documento diverso, ma il documento vecchio è
+                    ancora nella lista sotto un altro numero: la riga vecchia
+                    verrà rinumerata; questa riga è un documento NUOVO."""
+                    return bool(ex is not None and r.get("doc_id") and ex.source_id
+                                and str(ex.source_id) != str(r["doc_id"])
+                                and str(ex.source_id) in fp_doc_ids)
 
                 # ── Guardie anti-disastro (markup cambiato ≠ realtà cambiata) ──
                 # Conta le righe che VERREBBERO annullate: attive lette come
@@ -461,6 +496,38 @@ def _sync_invoices_task() -> dict:
                     sig = inv.get("fp_signature")
                     existing = existing_of[id(inv)]
 
+                    # Stesso documento (doc_id) con NUMERO diverso: rinumerazione
+                    # di FatturaPro → si aggiorna il numero, mai un doppione.
+                    if (existing is not None and inv.get("doc_id") and existing.source_id
+                            and str(existing.source_id) == str(inv["doc_id"])
+                            and existing.invoice_number != inv_num):
+                        session.add(ActivityLog(
+                            action="invoice_renumbered", entity_type="invoice", entity_id=existing.id,
+                            details={"doc_id": existing.source_id, "from": existing.invoice_number,
+                                     "to": inv_num, "customer_id": existing.customer_id},
+                        ))
+                        logger.info("Rinumerata da FatturaPro: %s → %s (doc %s)", existing.invoice_number, inv_num, existing.source_id)
+                        existing.invoice_number = inv_num
+                        fp["renumbered"] = fp.get("renumbered", 0) + 1
+                        # Se col numero cambia anche il destinatario, l'abbinamento
+                        # al cliente fatto col vecchio nome va ricontrollato: la
+                        # riga torna all'audit (mai un cliente sbagliato in silenzio).
+                        new_name = (inv.get("customer_name") or "").strip()
+                        if new_name and (existing.customer_name_raw or "").strip().lower() != new_name.lower():
+                            existing.audit_reviewed_at = None
+                            session.add(ActivityLog(
+                                action="invoice_customer_name_changed", entity_type="invoice", entity_id=existing.id,
+                                details={"from": existing.customer_name_raw, "to": new_name,
+                                         "customer_id": existing.customer_id, "invoice_number": inv_num},
+                            ))
+
+                    # Numero PRESO da un documento nuovo mentre il vecchio esiste
+                    # ancora sotto un altro numero: la riga vecchia si rinumera
+                    # dalla sua riga; qui si crea il documento nuovo.
+                    if _number_taken_over(existing, inv):
+                        fp["number_taken_over"] = fp.get("number_taken_over", 0) + 1
+                        existing = None
+
                     # Numero RIASSEGNATO: stesso numero, documento diverso →
                     # il record esistente descrive un documento che non c'è
                     # più (bozza eliminata). Si annulla e la riga si tratta
@@ -496,7 +563,20 @@ def _sync_invoices_task() -> dict:
                             existing.missing_streak = 0
                             continue
                         if existing.status == "paid":
-                            fp["draft_on_paid"] = fp.get("draft_on_paid", 0) + 1
+                            if (inv.get("balance") or 0) > 0 and existing.paid_at is not None:
+                                # "Pagata per assenza" ma è QUI, ancora bozza con
+                                # residuo: non era un incasso, era una rinumerazione
+                                # (la bozza era sparita sotto il vecchio numero).
+                                if draft_void_enabled:
+                                    existing.paid_at = None
+                                    existing.amount_due_at_paid = None
+                                    existing.status = "open"
+                                    if _void_invoice(session, existing, "bozza riapparsa dopo 'pagata per assenza': era una rinumerazione, non un incasso", "draft"):
+                                        fp["voided"] += 1
+                                else:
+                                    fp["draft_void_skipped"] = fp.get("draft_void_skipped", 0) + 1
+                            else:
+                                fp["draft_on_paid"] = fp.get("draft_on_paid", 0) + 1
                             existing.missing_streak = 0
                             continue
                         # Bozza mai trasmessa (importata prima del filtro): non
@@ -536,6 +616,10 @@ def _sync_invoices_task() -> dict:
                             else:
                                 existing.missing_streak = 0
                                 continue
+
+                    if existing is not None and existing.source_id is None and inv.get("doc_id"):
+                        # Riga storica senza identità: adotta il doc_id
+                        existing.source_id = str(inv["doc_id"])
 
                     if existing:
                         existing.amount = inv.get("total", 0)

@@ -19,7 +19,7 @@ const toISODateLocal = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).pad
 // Stato SDI (FatturaPro): si importano solo consegnata / mancata_consegna.
 // Etichette di ripiego: il backend manda già sdi_label / state_label (fonte unica, engine/sdi.py).
 const SDI_LABELS = { draft: 'Non trasmessa (bozza)', sent: 'Trasmessa, in elaborazione', consegnata: 'Consegnata', mancata_consegna: 'Mancata consegna', scartata: 'Scartata dallo SDI' }
-const FP_FIX_LABELS = { import: 'Importa', replace: 'Annulla la vecchia e importa il documento nuovo', void: 'Annulla in piattaforma (esce da scaduto, dovuto e recuperato)', mark_paid: 'Segna pagata', reopen: 'Riapri', reactivate: 'Riattiva', update_amount: 'Aggiorna importo' }
+const FP_FIX_LABELS = { renumber: 'Aggiorna il numero (stesso documento)', import: 'Importa', replace: 'Annulla la vecchia e importa il documento nuovo', void: 'Annulla in piattaforma (esce da scaduto, dovuto e recuperato)', mark_paid: 'Segna pagata', reopen: 'Riapri', reactivate: 'Riattiva', update_amount: 'Aggiorna importo' }
 
 // Fattura su cui si può registrare un sollecito (stessa regola del backend,
 // is_overdue_unpaid): scaduta, non pagata, non contestata, non in incasso.
@@ -2558,7 +2558,7 @@ export default function ClientDetail() {
                         <td className="px-3 py-2">
                           {r.fix && !(r.verdict === 'inesistente' && !fpVerify.complete) && <input type="checkbox" checked={fpFixSel.has(r.key)} onChange={() => setFpFixSel(prev => { const n = new Set(prev); if (n.has(r.key)) n.delete(r.key); else n.add(r.key); return n })} className="rounded border-dark-border bg-dark-bg" />}
                         </td>
-                        <td className="px-3 py-2 font-medium text-txt-primary">{r.invoice_number}</td>
+                        <td className="px-3 py-2 font-medium text-txt-primary">{r.invoice_number}{r.renumber_from && <span className="block text-[10px] text-txt-muted">in piattaforma: {r.renumber_from}</span>}</td>
                         <td className="px-3 py-2 text-txt-secondary">
                           {r.fatturapro ? `${r.fatturapro.state_label || r.fatturapro.state || '?'} · tot. ${formatCurrency(r.fatturapro.total)} · saldo ${formatCurrency(r.fatturapro.balance)}${r.fatturapro.date ? ` · ${formatDate(r.fatturapro.date)}` : ''}` : <span className="text-accent-red">non presente</span>}
                         </td>
