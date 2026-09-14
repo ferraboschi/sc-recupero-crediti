@@ -60,7 +60,7 @@ from backend.engine.piva import validate_piva
 logger = logging.getLogger(__name__)
 
 # Abbinamenti decisi esplicitamente da un operatore: mai toccati dal repair.
-HUMAN_DECIDED_METHODS = ("manual", "fuzzy_confirmed", "unlinked")
+HUMAN_DECIDED_METHODS = ("manual", "fuzzy_confirmed", "unlinked", "fatturapro_verify")
 
 # Marker di osservabilità (ultima esecuzione + stats). La key resta 'v2'
 # per continuità con lo storico in produzione.
@@ -208,7 +208,7 @@ def repair_matches(session: Session) -> Dict[str, Any]:
     # solo customer_id NULL). Interviene solo su esiti deterministici;
     # tutto il resto è review deduplicata.
     for inv in attached:
-        if inv.customer_id is None or inv.status == "paid":
+        if inv.customer_id is None or inv.status in ("paid", "void"):
             continue
         if inv.match_method in HUMAN_DECIDED_METHODS:
             continue

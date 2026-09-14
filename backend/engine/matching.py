@@ -361,7 +361,8 @@ def run_matching(session: Session) -> Dict[str, Any]:
     }
 
     unmatched_invoices = session.query(Invoice).filter(
-        Invoice.customer_id.is_(None)
+        Invoice.customer_id.is_(None),
+        Invoice.status != "void",
     ).all()
     stats['total'] = len(unmatched_invoices)
 

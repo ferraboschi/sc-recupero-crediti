@@ -261,8 +261,12 @@ class FakeSearchFP:
     def login(self):
         return True
 
-    def search_documents(self, phrase, limit=300):
-        FakeSearchFP.searched.append(phrase)
+    by_number = {}   # ripiego per numero: frase → righe
+
+    def search_documents(self, phrase, limit=300, column="documenti.Destinatario"):
+        FakeSearchFP.searched.append((column, phrase))
+        if column != "documenti.Destinatario":
+            return list(FakeSearchFP.by_number.get(phrase, [])), True
         return list(FakeSearchFP.rows), True
 
     def close(self):
@@ -282,6 +286,7 @@ def test_verify_and_apply_endpoints(test_client, test_db_session, monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert "CECCONI MARIO S.R.L." in body["searched_names"] and "Cecconi Mario Srl" in body["searched_names"]
+    FakeSearchFP.by_number = {}
     v = {x["invoice_number"]: x for x in body["rows"]}
     assert v["1609"]["verdict"] == "inesistente" and v["1609"]["fix"] == "void"
     assert v["1700"]["verdict"] == "mancante" and v["1700"]["fix"] == "import"
@@ -371,7 +376,7 @@ def test_apply_replace_and_incomplete_guard(test_client, test_db_session, monkey
     assert rows[0].sdi_state is None  # niente stato del documento nuovo sulla riga vecchia
     # ricerca fallita → nessun annullamento per assenza
     class BrokenFP(FakeSearchFP):
-        def search_documents(self, phrase, limit=300):
+        def search_documents(self, phrase, limit=300, column="documenti.Destinatario"):
             return [], False
     monkeypatch.setattr(fpmod, "FatturaProConnector", BrokenFP)
     r2 = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
@@ -486,3 +491,99 @@ def test_search_documents_paginates(monkeypatch):
     assert [r["invoice_number"] for r in rows] == ["P0", "P1", "P2", "P3"] and complete is True
     assert [c["xcrud[start]"] for c in calls] == ["0", "3"] and calls[1]["xcrud[key]"] == "k2"
     assert all(c["xcrud[search]"] == "1" and c["xcrud[phrase]"] == "ACME" for c in calls)
+
+
+# ── Trovati dalla review di secondo giro ────────────────────────────────────
+
+def test_renamed_customer_falls_back_to_number_search(test_client, test_db_session, monkeypatch):
+    """Ricerca per nome vuota (cliente rinominato su FatturaPro): ripiego per
+    numero; se neppure così si trova nulla, l'assenza non è una prova."""
+    import backend.connectors.fatturapro as fpmod
+    monkeypatch.setattr(fpmod, "FatturaProConnector", FakeSearchFP)
+    cust = Customer(ragione_sociale="VECCHIO NOME SRL"); test_db_session.add(cust); test_db_session.commit()
+    _mk(test_db_session, "2026/00000900/SAK - Fattura", customer_id=cust.id, source_id="d900", amount=100.0, customer_name_raw="VECCHIO NOME SRL")
+    _mk(test_db_session, "2026/00000901/SAK - Fattura", customer_id=cust.id, source_id="d901", amount=50.0, customer_name_raw="VECCHIO NOME SRL")
+    FakeSearchFP.rows = []
+    row900 = dict(_fp("2026/00000900/SAK - Fattura", "d900", 100.0, 100.0, "Consegnato")); row900["customer_name"] = "NUOVO NOME SPA"
+    FakeSearchFP.by_number = {"00000900": [row900], "00000901": []}
+    FakeSearchFP.searched = []
+    r = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    v = {x["invoice_number"]: x["verdict"] for x in r["rows"]}
+    assert v["2026/00000900/SAK - Fattura"] == "ok" and v["2026/00000901/SAK - Fattura"] == "inesistente"
+    assert ("documenti.NumeroSezionale", "00000900") in FakeSearchFP.searched
+    # nulla neppure per numero → lista incompleta, niente 'inesistente'
+    FakeSearchFP.by_number = {}
+    r2 = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    assert r2["complete"] is False and all(x["verdict"] == "non_verificabile" for x in r2["rows"])
+    FakeSearchFP.by_number = {}
+
+
+def test_draft_signature_never_voids_delivered_or_paid(monkeypatch, test_db_session):
+    _mk(test_db_session, "DEL/2026", source_id="1", sdi_state="consegnata")
+    _mk(test_db_session, "PAID/2026", source_id="2", status="paid", amount_due=0, days_overdue=0)
+    r = _sync(monkeypatch, test_db_session, [_raw("DEL/2026", "1", "draft"), _raw("PAID/2026", "2", "draft")])
+    assert _get(test_db_session, "DEL/2026").status == "open"
+    assert _get(test_db_session, "PAID/2026").status == "paid"
+    assert r["voided"] == 0 and r.get("draft_on_delivered") == 1 and r.get("draft_on_paid") == 1
+
+
+def test_absent_row_checked_once_scartata_voided_rc_paid(monkeypatch, test_db_session):
+    """Alla soglia di 'pagata' una sola chiamata notifiche: scartata → annullata,
+    consegnata → pagata (regola storica)."""
+    _mk(test_db_session, "NS/2026", source_id="ns", sdi_state="sent", missing_streak=1)
+    _mk(test_db_session, "RC/2026", source_id="rc", sdi_state="sent", missing_streak=1)
+    r = _sync(monkeypatch, test_db_session, [_raw("OTHER/2026", "3", None)], notif={"ns": ["NotificaScarto"], "rc": ["RicevutaConsegna"]})
+    assert _get(test_db_session, "NS/2026").status == "void"
+    assert _get(test_db_session, "RC/2026").status == "paid"
+    assert sorted(FakeFP.calls) == ["ns", "rc"] and r["voided"] == 1 and r["paid_detected"] == 1
+
+
+def test_notifications_are_fetched_before_any_write(monkeypatch, test_db_session):
+    """Pre-pass: tutte le chiamate notifiche avvengono prima della prima scrittura
+    (niente lock Postgres tenuti durante lo scraping)."""
+    from backend.api import sync as sync_mod
+    _mk(test_db_session, "OLD/2026", source_id="o")
+    order = []
+    orig = FakeFP.fetch_sdi_notifications
+
+    def spy(self, doc_id):
+        order.append(("http", doc_id)); return orig(self, doc_id)
+    monkeypatch.setattr(FakeFP, "fetch_sdi_notifications", spy)
+    orig_void = sync_mod._void_invoice
+
+    def spy_void(*a, **k):
+        order.append(("write", "void")); return orig_void(*a, **k)
+    monkeypatch.setattr(sync_mod, "_void_invoice", spy_void)
+    _sync(monkeypatch, test_db_session, [_raw("OLD/2026", "o", "draft"), _raw("NEW/2026", "n", "notified")], notif={"n": ["RicevutaConsegna"]})
+    kinds = [k for k, _ in order]
+    assert kinds.index("http") < kinds.index("write")
+
+
+def test_apply_targets_row_by_key_with_duplicates(test_client, test_db_session, monkeypatch):
+    import backend.connectors.fatturapro as fpmod
+    monkeypatch.setattr(fpmod, "FatturaProConnector", FakeSearchFP)
+    cust = Customer(ragione_sociale="CECCONI MARIO S.R.L."); test_db_session.add(cust); test_db_session.commit()
+    a = _mk(test_db_session, "0800", customer_id=cust.id, source_id="a", customer_name_raw="CECCONI MARIO S.R.L.")
+    b = _mk(test_db_session, "0800", customer_id=cust.id, source_id="b", amount=100.0, amount_due=100.0, customer_name_raw="CECCONI MARIO S.R.L.")
+    FakeSearchFP.rows = [_fp("0800", "b", 130.0, 130.0, "Consegnato")]
+    r = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    rows = {x["verdict"]: x for x in r["rows"]}
+    assert rows["importo_diverso"]["platform"]["id"] == b.id and rows["duplicato"]["platform"]["id"] == a.id
+    assert rows["importo_diverso"]["key"] != rows["duplicato"]["key"]
+    ap = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro/apply", json={"fixes": [
+        {"invoice_number": "0800", "fix": "update_amount", "key": rows["importo_diverso"]["key"]},
+        {"invoice_number": "0800", "fix": "void", "key": rows["duplicato"]["key"]},
+    ]}).json()
+    assert {x["fix"] for x in ap["applied"]} == {"update_amount", "void"}
+    test_db_session.expire_all()
+    assert test_db_session.query(Invoice).get(b.id).amount == 130.0
+    va = test_db_session.query(Invoice).get(a.id)
+    assert va.status == "void" and va.sdi_state is None  # niente stato dell'altro documento
+
+
+def test_find_existing_prefers_unpaid_active_row(test_db_session):
+    from backend.api.sync import _find_existing
+    paid = _mk(test_db_session, "X9/2026", source_id="p", status="paid", amount_due=0, days_overdue=0)
+    openr = _mk(test_db_session, "X9/2026", source_id="o")
+    assert _find_existing(test_db_session, "X9/2026", "zzz").id == openr.id
+    assert _find_existing(test_db_session, "X9/2026", "p").id == paid.id

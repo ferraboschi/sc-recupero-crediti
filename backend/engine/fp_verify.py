@@ -7,13 +7,14 @@ import re
 from typing import Any, Dict, List, Optional
 
 from backend.engine.sdi import SDI_FINAL_OK, SDI_LABELS, sdi_state_from_label
+from backend.connectors.fatturapro import doc_key
 
 VERDICT_LABELS = {
     "ok": "Allineata",
     "mancante": "Su FatturaPro ma non in piattaforma",
     "inesistente": "In piattaforma ma non su FatturaPro",
     "non_verificabile": "Non trovata su FatturaPro (lista incompleta)",
-    "non_valida": "Non trasmessa / scartata su FatturaPro",
+    "non_valida": "Non ancora consegnata su FatturaPro (bozza, in elaborazione o scartata)",
     "numero_riassegnato": "Stesso numero, documento diverso",
     "importo_diverso": "Importo diverso",
     "pagata_su_fatturapro": "Saldata su FatturaPro, aperta in piattaforma",
@@ -78,16 +79,22 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
     Ritorna {"rows": [...], "summary": {verdetto: n}}: una riga per numero
     fattura, con i dati dei due lati, il verdetto e la correzione proposta.
     """
+    # Le due liste di FatturaPro possono rendere il numero con forme
+    # diverse: si confronta per chiave canonica (doc_key, anno incluso).
     by_num_fp: Dict[str, Dict[str, Any]] = {}
+    label_of: Dict[str, str] = {}
     for r in fp_rows:
-        num = (r.get("invoice_number") or "").strip()
+        raw = (r.get("invoice_number") or "").strip()
+        num = doc_key(raw) if raw else ""
         if num:
             by_num_fp[num] = r
+            label_of.setdefault(num, raw)
     active_pl: Dict[str, Any] = {}
     extra_active: List[Any] = []  # doppioni attivi (stesso numero, documento diverso)
     void_pl: Dict[str, List[Any]] = {}
     for inv in platform_invoices:
-        num = (inv.invoice_number or "").strip()
+        num = doc_key((inv.invoice_number or "").strip())
+        label_of.setdefault(num, (inv.invoice_number or "").strip())
         if inv.status == "void":
             void_pl.setdefault(num, []).append(inv)
             continue
@@ -146,7 +153,8 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
                 verdict = "importo_diverso"
         fix = VERDICT_FIX.get(verdict)
         rows.append({
-            "invoice_number": num,
+            "invoice_number": label_of.get(num, num),
+            "key": f"{num}#{shown.id if shown is not None else 'fp'}",
             "verdict": verdict,
             "verdict_label": VERDICT_LABELS.get(verdict, verdict),
             "fix": fix,
@@ -174,6 +182,7 @@ def compare_documents(platform_invoices: List[Any], fp_rows: List[Dict[str, Any]
     for dup in extra_active:
         rows.append({
             "invoice_number": (dup.invoice_number or "").strip(),
+            "key": f"{doc_key((dup.invoice_number or '').strip())}#{dup.id}",
             "verdict": "duplicato",
             "verdict_label": VERDICT_LABELS["duplicato"],
             "fix": "void",

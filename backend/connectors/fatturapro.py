@@ -1279,10 +1279,12 @@ class FatturaProConnector:
         if not actions:
             return None
         names = {a.get("data-action") for a in actions}
-        if "invia_doc" in names:
-            return FatturaProConnector.SIGNATURE_DRAFT
+        # Le notifiche SDI sono la prova più forte: se una riga le ha, è
+        # trasmessa anche se il markup mostrasse pure "Invia".
         if "show_notifiche" in names or "get_fattura" in names:
             return FatturaProConnector.SIGNATURE_NOTIFIED
+        if "invia_doc" in names:
+            return FatturaProConnector.SIGNATURE_DRAFT
         return FatturaProConnector.SIGNATURE_SENT
 
     # Stati SDI finali accettati dalla piattaforma (definizione unica in
@@ -1293,7 +1295,8 @@ class FatturaProConnector:
     def sdi_state_from_notifications(names) -> str:
         return sdi_state_from_notifications(names)
 
-    def search_documents(self, phrase: str, limit: int = 300) -> Tuple[List[Dict[str, Any]], bool]:
+    def search_documents(self, phrase: str, limit: int = 300,
+                         column: str = "documenti.Destinatario") -> Tuple[List[Dict[str, Any]], bool]:
         """Documenti di FatturaPro il cui Destinatario contiene `phrase`, dalla
         lista COMPLETA (documenti.php: anche saldate) che espone la colonna
         Stato. Verificato dal vivo: xcrud[search]=1 + xcrud[column]=
@@ -1329,7 +1332,7 @@ class FatturaProConnector:
                         "xcrud[order]": "desc",
                         "xcrud[start]": str(start),
                         "xcrud[limit]": str(limit),
-                        "xcrud[column]": "documenti.Destinatario",
+                        "xcrud[column]": column,
                         "xcrud[search]": "1",
                         "xcrud[phrase]": phrase.strip(),
                     },

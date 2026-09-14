@@ -791,7 +791,7 @@ export default function ClientDetail() {
       setFpVerify(res.data)
       // Pre-selezionate SOLO le correzioni non distruttive (importa, aggiorna
       // importo); annulla / segna pagata / riapri / riattiva le spunta l'operatore.
-      setFpFixSel(new Set((res.data.rows || []).filter(r => r.fix && r.fix_safe).map(r => r.invoice_number)))
+      setFpFixSel(new Set((res.data.rows || []).filter(r => r.fix && r.fix_safe).map(r => r.key)))
     } catch (err) {
       alert(err.response?.data?.detail || 'Verifica con FatturaPro non riuscita')
     } finally {
@@ -800,7 +800,7 @@ export default function ClientDetail() {
   }
   const applyFpFixes = async () => {
     if (!fpVerify || fpApplying) return
-    const fixes = (fpVerify.rows || []).filter(r => r.fix && fpFixSel.has(r.invoice_number)).map(r => ({ invoice_number: r.invoice_number, fix: r.fix }))
+    const fixes = (fpVerify.rows || []).filter(r => r.fix && fpFixSel.has(r.key)).map(r => ({ invoice_number: r.invoice_number, fix: r.fix, key: r.key }))
     if (fixes.length === 0) return
     if (!window.confirm(`Applicare ${fixes.length} correzion${fixes.length === 1 ? 'e' : 'i'} alle fatture di questo cliente?\n\nOgni correzione viene ricontrollata su FatturaPro al momento; le fatture annullate restano nell'archivio ma escono da scaduto e dovuto.`)) return
     setFpApplying(true)
@@ -2554,16 +2554,16 @@ export default function ClientDetail() {
                   </thead>
                   <tbody className="divide-y divide-dark-border">
                     {(fpVerify.rows || []).filter(r => r.verdict !== 'ok').map(r => (
-                      <tr key={r.invoice_number} className="text-sm">
+                      <tr key={r.key} className="text-sm">
                         <td className="px-3 py-2">
-                          {r.fix && !(r.verdict === 'inesistente' && !fpVerify.complete) && <input type="checkbox" checked={fpFixSel.has(r.invoice_number)} onChange={() => setFpFixSel(prev => { const n = new Set(prev); if (n.has(r.invoice_number)) n.delete(r.invoice_number); else n.add(r.invoice_number); return n })} className="rounded border-dark-border bg-dark-bg" />}
+                          {r.fix && !(r.verdict === 'inesistente' && !fpVerify.complete) && <input type="checkbox" checked={fpFixSel.has(r.key)} onChange={() => setFpFixSel(prev => { const n = new Set(prev); if (n.has(r.key)) n.delete(r.key); else n.add(r.key); return n })} className="rounded border-dark-border bg-dark-bg" />}
                         </td>
                         <td className="px-3 py-2 font-medium text-txt-primary">{r.invoice_number}</td>
                         <td className="px-3 py-2 text-txt-secondary">
                           {r.fatturapro ? `${r.fatturapro.state_label || r.fatturapro.state || '?'} · tot. ${formatCurrency(r.fatturapro.total)} · saldo ${formatCurrency(r.fatturapro.balance)}${r.fatturapro.date ? ` · ${formatDate(r.fatturapro.date)}` : ''}` : <span className="text-accent-red">non presente</span>}
                         </td>
                         <td className="px-3 py-2 text-txt-secondary">
-                          {r.platform ? `${r.platform.status === 'paid' ? 'pagata' : r.platform.status === 'void' ? 'annullata' : 'aperta'} · imp. ${formatCurrency(r.platform.amount)} · residuo ${formatCurrency(r.platform.amount_due)}` : <span className="text-accent-amber">non presente</span>}
+                          {r.platform ? `${r.platform.status === 'paid' ? 'pagata' : r.platform.status === 'void' ? 'annullata' : r.platform.status === 'disputed' ? 'contestata' : 'aperta'} · imp. ${formatCurrency(r.platform.amount)} · residuo ${formatCurrency(r.platform.amount_due)}` : <span className="text-accent-amber">non presente</span>}
                         </td>
                         <td className="px-3 py-2"><span className="sc-badge text-xs bg-accent-amber/15 text-accent-amber">{r.verdict_label}</span></td>
                         <td className="px-3 py-2 text-txt-secondary">{r.fix ? FP_FIX_LABELS[r.fix] || r.fix : '—'}</td>
@@ -2572,8 +2572,8 @@ export default function ClientDetail() {
                   </tbody>
                 </table>
                 <div className="mt-3 flex items-center gap-3 flex-wrap">
-                  <button onClick={applyFpFixes} disabled={fpApplying || (fpVerify.rows || []).filter(r => r.fix && fpFixSel.has(r.invoice_number)).length === 0} className="px-4 py-2 bg-accent-amber text-dark-bg rounded-lg text-sm font-bold min-w-[12rem] hover:brightness-110 disabled:opacity-50">
-                    {fpApplying ? 'Applico…' : (() => { const n = (fpVerify.rows || []).filter(r => r.fix && fpFixSel.has(r.invoice_number)).length; return n === 1 ? 'Applica 1 correzione' : `Applica ${n} correzioni` })()}
+                  <button onClick={applyFpFixes} disabled={fpApplying || (fpVerify.rows || []).filter(r => r.fix && fpFixSel.has(r.key)).length === 0} className="px-4 py-2 bg-accent-amber text-dark-bg rounded-lg text-sm font-bold min-w-[12rem] hover:brightness-110 disabled:opacity-50">
+                    {fpApplying ? 'Applico…' : (() => { const n = (fpVerify.rows || []).filter(r => r.fix && fpFixSel.has(r.key)).length; return n === 1 ? 'Applica 1 correzione' : `Applica ${n} correzioni` })()}
                   </button>
                   <span className="text-[11px] text-txt-muted">Le fatture annullate restano in archivio (mai cancellate) ma escono da scaduto, dovuto e recuperato.</span>
                 </div>

@@ -63,6 +63,7 @@ def _audit_customer_ids(session, include_paid: bool = False) -> set:
         .join(Customer, Invoice.customer_id == Customer.id)
         .filter(Invoice.audit_reviewed_at.is_(None))
     )
+    q = q.filter(Invoice.status != "void")
     if not include_paid:
         q = q.filter(Invoice.status != "paid")
     for inv, cust in q.all():
@@ -449,7 +450,7 @@ def bonifica_suggestions(session: Session = Depends(get_session)):
     rows = (
         session.query(Invoice, Customer)
         .join(Customer, Invoice.customer_id == Customer.id)
-        .filter(Invoice.status != "paid")
+        .filter(Invoice.status.notin_(("paid", "void")))
         .all()
     )
     by_customer = {}  # customer_id → {"customer": Customer, "invoices": [Invoice]}
@@ -1035,7 +1036,7 @@ def audit_customer(
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
 
-    q = session.query(Invoice).filter(Invoice.customer_id == customer_id)
+    q = session.query(Invoice).filter(Invoice.customer_id == customer_id, Invoice.status != "void")
     if not include_paid:
         q = q.filter(Invoice.status != "paid")
     invoices = q.order_by(Invoice.due_date.desc()).all()
@@ -1833,6 +1834,14 @@ def _fp_name_key(name) -> str:
     return " ".join((name or "").split()).strip().lower()
 
 
+def _fp_number_phrase(number: str) -> str:
+    """Frase di ricerca per numero su FatturaPro: il progressivo a 8 cifre
+    ('2026/00001600/SAK - Fattura' → '00001600'), altrimenti il numero grezzo."""
+    import re as _re
+    m = _re.search(r"\d{6,}", number or "")
+    return m.group(0) if m else (number or "").strip()
+
+
 def _fp_rows_for_customer(connector, names, known_doc_ids=(), known_numbers=()) -> tuple:
     """Documenti FatturaPro del cliente. La ricerca di FatturaPro è un LIKE
     sul destinatario ('ROSSI' trova anche 'ROSSI & C.'): si tengono le righe
@@ -1855,6 +1864,20 @@ def _fp_rows_for_customer(connector, names, known_doc_ids=(), known_numbers=()) 
                 continue
             key = str(r.get("doc_id") or r.get("invoice_number"))
             rows[key] = r
+    # Cliente RINOMINATO in anagrafica FatturaPro: la ricerca per nome non
+    # trova nulla. Ripiego per NUMERO sulle fatture note (poche): se un
+    # documento c'è ancora, lo si prende; se non si trova nulla neppure
+    # così, l'assenza non è una prova → lista incompleta.
+    if not rows and known_numbers:
+        for number in list(dict.fromkeys(n for n in known_numbers if n))[:30]:
+            found, ok = connector.search_documents(
+                _fp_number_phrase(number), column="documenti.NumeroSezionale")
+            complete = complete and ok
+            for r in found:
+                if (r.get("invoice_number") or "").strip() == number.strip() or str(r.get("doc_id") or "") in known_ids:
+                    rows[str(r.get("doc_id") or r.get("invoice_number"))] = r
+        if not rows:
+            complete = False
     return list(rows.values()), complete
 
 
@@ -1903,7 +1926,8 @@ def verify_fatturapro(customer_id: int, session: Session = Depends(get_session))
 
 class FpFix(BaseModel):
     invoice_number: str
-    fix: str  # import / void / mark_paid / reopen / reactivate / update_amount
+    fix: str  # import / replace / void / mark_paid / reopen / reactivate / update_amount
+    key: Optional[str] = None  # chiave riga della verifica (numero#id): distingue i doppioni
 
 
 class FpApplyBody(BaseModel):
@@ -1938,15 +1962,24 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             connector.close()
         except Exception:
             pass
-    current = {r["invoice_number"]: r for r in compare_documents(platform, fp_rows, complete=complete)["rows"]}
+    verdict_rows = compare_documents(platform, fp_rows, complete=complete)["rows"]
+    current = {r["key"]: r for r in verdict_rows}
+    by_number = {}
+    for r in verdict_rows:
+        by_number.setdefault(r["invoice_number"], []).append(r)
     by_id = {i.id: i for i in platform}
-    by_num_fp = {(r.get("invoice_number") or "").strip(): r for r in fp_rows}
+    by_num_fp = {}
+    for r in fp_rows:
+        by_num_fp[(r.get("invoice_number") or "").strip()] = r
     applied, skipped = [], []
     imported_ids = {}
     now = datetime.utcnow()
     for fx in body.fixes:
         num = fx.invoice_number.strip()
-        row = current.get(num)
+        row = current.get(fx.key) if fx.key else None
+        if row is None:
+            cands = by_number.get(num, [])
+            row = cands[0] if len(cands) == 1 else None
         if not row or row.get("fix") != fx.fix:
             skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "verdetto cambiato: ricontrolla"})
             continue
@@ -1999,8 +2032,11 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             if row["verdict"] == "inesistente" and not complete:
                 skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "lista FatturaPro incompleta: l'assenza non è una prova"})
                 continue
+            # Lo stato SDI si timbra solo se è di QUESTO documento (non di un
+            # doppione / documento nuovo con lo stesso numero).
+            same_doc = bool(fp and pl.source_id and str(pl.source_id) == str(fp.get("doc_id")))
             _void_invoice(session, pl, f"verifica FatturaPro: {row['verdict_label']}",
-                          fp_state_of(fp) if fp else None)
+                          fp_state_of(fp) if (fp and same_doc) else None)
         elif fx.fix == "mark_paid" and pl is not None:
             pl.amount_due_at_paid = pl.amount_due
             pl.paid_at = now
