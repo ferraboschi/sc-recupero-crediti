@@ -160,6 +160,10 @@ DRAFT_GUARD_SHARE = 0.05
 # Stessa guardia per i numeri riassegnati (doc_id diverso): oltre soglia in
 # un ciclo = markup/ordine dei link cambiato, non 20 riassegnazioni vere.
 REASSIGN_GUARD_ABS = 20
+# Rinumerazioni che cambiano anche il DESTINATARIO: un caso vero ne cambia
+# uno o due (Cecconi/Billiken); uno sfasamento del parser (doc_id della riga
+# accanto) li cambia quasi tutti → sopra soglia nessuna rinumerazione.
+RENUMBER_NAME_GUARD_ABS = 5
 
 
 def _void_invoice(session, inv, reason: str, sdi_state: str = None) -> bool:
@@ -383,6 +387,14 @@ def _sync_invoices_task() -> dict:
                         if cur is None or rank(row_) < rank(cur):
                             by_doc[str(row_.source_id)] = row_
 
+                def _is_absent(known, fetched_numbers, doc_ids):
+                    """Presenza per IDENTITÀ: una riga con doc_id è presente solo
+                    se il suo documento è in lista (il numero può appartenere
+                    a un altro documento); senza doc_id vale il numero."""
+                    if known.source_id:
+                        return str(known.source_id) not in doc_ids
+                    return known.invoice_number not in fetched_numbers
+
                 def _resolve(r):
                     ex = by_doc.get(str(r.get("doc_id") or ""))
                     if ex is not None:
@@ -429,6 +441,26 @@ def _sync_invoices_task() -> dict:
                         "layout FatturaPro: nessun annullamento in questo ciclo",
                         len(void_draft_candidates), len(raw_invoices),
                     )
+
+                def _renumber_case(r):
+                    ex = existing_of[id(r)]
+                    return bool(ex is not None and r.get("doc_id") and ex.source_id
+                                and str(ex.source_id) == str(r["doc_id"])
+                                and ex.invoice_number != r["invoice_number"])
+
+                def _name_changed(ex, r):
+                    new_name = (r.get("customer_name") or "").strip().lower()
+                    return bool(new_name and (ex.customer_name_raw or "").strip().lower() != new_name)
+
+                renumber_name_changes = [r for r in raw_invoices if _renumber_case(r) and _name_changed(existing_of[id(r)], r)]
+                renumber_enabled = len(renumber_name_changes) <= RENUMBER_NAME_GUARD_ABS
+                if not renumber_enabled:
+                    fp["renumber_guard_triggered"] = len(renumber_name_changes)
+                    logger.error(
+                        "SDI: %d rinumerazioni con cambio di destinatario in un ciclo — sospetto "
+                        "sfasamento del parser (doc_id): nessuna rinumerazione in questo ciclo",
+                        len(renumber_name_changes),
+                    )
                 reassign_candidates = [
                     r for r in raw_invoices
                     if _doc_mismatch(existing_of[id(r)], r) and existing_of[id(r)].status not in ("void", "paid")
@@ -468,7 +500,8 @@ def _sync_invoices_task() -> dict:
                         if r.get("fp_signature") != "notified":
                             continue
                         ex = existing_of[id(r)]
-                        if ex is None or ex.sdi_state not in SDI_FINAL_OK:
+                        if (ex is None or ex.sdi_state not in SDI_FINAL_OK
+                                or _doc_mismatch(ex, r) or _number_taken_over(ex, r)):
                             _check(r.get("doc_id"))
                     # Assenti alla soglia di "pagata": una chiamata per
                     # distinguere lo scarto (→ annullata) dal pagamento.
@@ -478,7 +511,7 @@ def _sync_invoices_task() -> dict:
                             Invoice.source_platform == "fatturapro",
                             Invoice.status.notin_(("paid", "void")),
                         ).all():
-                            if (known.invoice_number not in fetched_now
+                            if (_is_absent(known, fetched_now, fp_doc_ids)
                                     and (known.missing_streak or 0) + 1 >= PAID_ABSENCE_STREAK
                                     and known.sdi_state not in SDI_FINAL_OK):
                                 _check(known.source_id)
@@ -501,6 +534,9 @@ def _sync_invoices_task() -> dict:
                     if (existing is not None and inv.get("doc_id") and existing.source_id
                             and str(existing.source_id) == str(inv["doc_id"])
                             and existing.invoice_number != inv_num):
+                        if not renumber_enabled:
+                            fp["renumber_skipped"] = fp.get("renumber_skipped", 0) + 1
+                            continue
                         session.add(ActivityLog(
                             action="invoice_renumbered", entity_type="invoice", entity_id=existing.id,
                             details={"doc_id": existing.source_id, "from": existing.invoice_number,
@@ -514,12 +550,21 @@ def _sync_invoices_task() -> dict:
                         # riga torna all'audit (mai un cliente sbagliato in silenzio).
                         new_name = (inv.get("customer_name") or "").strip()
                         if new_name and (existing.customer_name_raw or "").strip().lower() != new_name.lower():
-                            existing.audit_reviewed_at = None
+                            # Destinatario diverso: l'abbinamento fatto col vecchio
+                            # nome non vale più. Si SCOLLEGA (il matching riabbina
+                            # per P.IVA/nome), così il credito non resta nel dovuto
+                            # e nella pratica del cliente sbagliato.
                             session.add(ActivityLog(
                                 action="invoice_customer_name_changed", entity_type="invoice", entity_id=existing.id,
                                 details={"from": existing.customer_name_raw, "to": new_name,
-                                         "customer_id": existing.customer_id, "invoice_number": inv_num},
+                                         "customer_id_was": existing.customer_id, "invoice_number": inv_num,
+                                         "unlinked": True},
                             ))
+                            existing.customer_id = None
+                            existing.case_id = None
+                            existing.match_method = None
+                            existing.match_score = None
+                            existing.audit_reviewed_at = None
 
                     # Numero PRESO da un documento nuovo mentre il vecchio esiste
                     # ancora sotto un altro numero: la riga vecchia si rinumera
@@ -547,12 +592,24 @@ def _sync_invoices_task() -> dict:
                         elif not reassign_enabled:
                             fp["reassign_skipped"] = fp.get("reassign_skipped", 0) + 1
                             continue
-                        else:
+                        elif existing.sdi_state == "draft" and not partial:
+                            # Evidenza positiva: era una bozza e il suo documento
+                            # non c'è più → eliminata, il numero è passato a un
+                            # altro documento.
                             if _void_invoice(
                                 session, existing,
                                 f"numero riassegnato su FatturaPro (documento {existing.source_id} → {inv['doc_id']})",
+                                "draft",
                             ):
                                 fp["voided"] += 1
+                            existing = None
+                        else:
+                            # Nessuna evidenza: il documento vecchio può essere
+                            # stato INCASSATO (una consegnata esce dalla lista
+                            # quando è pagata). La riga vecchia va alla payment
+                            # detection per assenza (per doc_id); qui entra il
+                            # documento nuovo.
+                            fp["number_taken_over"] = fp.get("number_taken_over", 0) + 1
                             existing = None
 
                     if existing is not None and sig == "draft":
@@ -563,16 +620,19 @@ def _sync_invoices_task() -> dict:
                             existing.missing_streak = 0
                             continue
                         if existing.status == "paid":
-                            if (inv.get("balance") or 0) > 0 and existing.paid_at is not None:
+                            manual_paid = session.query(ActivityLog.id).filter(
+                                ActivityLog.entity_type == "invoice", ActivityLog.entity_id == existing.id,
+                                ActivityLog.action == "fatturapro_fix_mark_paid",
+                            ).first() is not None
+                            if (inv.get("balance") or 0) > 0 and existing.paid_at is not None and not manual_paid:
                                 # "Pagata per assenza" ma è QUI, ancora bozza con
                                 # residuo: non era un incasso, era una rinumerazione
                                 # (la bozza era sparita sotto il vecchio numero).
                                 if draft_void_enabled:
-                                    existing.paid_at = None
-                                    existing.amount_due_at_paid = None
-                                    existing.status = "open"
                                     if _void_invoice(session, existing, "bozza riapparsa dopo 'pagata per assenza': era una rinumerazione, non un incasso", "draft"):
                                         fp["voided"] += 1
+                                    existing.paid_at = None
+                                    existing.amount_due_at_paid = None
                                 else:
                                     fp["draft_void_skipped"] = fp.get("draft_void_skipped", 0) + 1
                             else:
@@ -747,7 +807,7 @@ def _sync_invoices_task() -> dict:
                         result["fatturapro"]["partial"] = True
                     else:
                         for known_inv in known_fp_invoices:
-                            if known_inv.invoice_number not in fetched_invoice_numbers:
+                            if _is_absent(known_inv, fetched_invoice_numbers, fp_doc_ids):
                                 # La "pagata" è un'inferenza per assenza: una
                                 # riga persa silenziosamente dal fetch non
                                 # deve sparire dai conteggi scadute. Si marca

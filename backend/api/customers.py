@@ -1974,7 +1974,9 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
     applied, skipped = [], []
     imported_ids = {}
     now = datetime.utcnow()
-    for fx in body.fixes:
+    # Le rinumerazioni PRIMA: liberano i numeri che gli import devono usare.
+    ordered = sorted(body.fixes, key=lambda f: 0 if f.fix == "renumber" else 1)
+    for fx in ordered:
         num = fx.invoice_number.strip()
         row = current.get(fx.key) if fx.key else None
         if row is None:
@@ -1995,11 +1997,12 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             # Lo stesso numero ATTIVO su un altro cliente (abbinamento
             # diverso): non si duplica, si segnala. Le annullate non contano.
             elsewhere = session.query(Invoice).filter(
-                Invoice.invoice_number == num, Invoice.source_platform == "fatturapro",
-                Invoice.status != "void",
+                Invoice.source_platform == "fatturapro", Invoice.status != "void",
+                or_(Invoice.invoice_number == num,
+                    Invoice.source_id == str(fp.get("doc_id") or "-")),
             ).first()
             if elsewhere is not None:
-                return f"già presente in piattaforma sul cliente {elsewhere.customer_id}"
+                return f"già presente in piattaforma sul cliente {elsewhere.customer_id} (n. {elsewhere.invoice_number})"
             created = Invoice(
                 invoice_number=num, amount=float(fp.get("total") or 0), amount_due=float(fp.get("balance") or 0),
                 issue_date=fp.get("date"), due_date=fp.get("due_date"),
