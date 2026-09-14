@@ -1835,14 +1835,20 @@ def _fp_name_key(name) -> str:
 
 
 def _action_counts(session, invoices) -> dict:
-    """{invoice_id: n azioni collegate} per decidere, fra doppioni, chi porta la storia."""
+    """{invoice_id: peso di 'storia'} per decidere, fra doppioni, chi la porta:
+    stesso predicato del sync (solleciti, assegno in mano, insoluto, note)."""
     ids = [i.id for i in invoices]
     if not ids:
         return {}
     from backend.database import RecoveryActionInvoice
     rows = session.query(RecoveryActionInvoice.invoice_id, func.count(RecoveryActionInvoice.action_id)).filter(
         RecoveryActionInvoice.invoice_id.in_(ids)).group_by(RecoveryActionInvoice.invoice_id).all()
-    return {r[0]: int(r[1]) for r in rows}
+    out = {r[0]: int(r[1]) for r in rows}
+    for inv in invoices:
+        if (inv.payment_pending or inv.bounced_at is not None or (inv.recovery_note or "").strip()
+                or (inv.payment_pending_note or "").strip()):
+            out[inv.id] = out.get(inv.id, 0) + 100
+    return out
 
 
 def _fp_number_phrase(number: str) -> str:

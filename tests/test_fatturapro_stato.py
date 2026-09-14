@@ -642,7 +642,7 @@ def test_number_taken_over_creates_new_row_without_void(monkeypatch, test_db_ses
     ], notif={"new": ["RicevutaConsegna"], "old": ["RicevutaConsegna"]})
     rows = {x.source_id: (x.invoice_number, x.status) for x in test_db_session.query(Invoice).all()}
     assert rows == {"old": ("N0/2026", "open"), "new": ("N1/2026", "open")}
-    assert r["voided"] == 0 and r["created"] == 1 and r.get("number_taken_over") == 1 and r["renumbered"] == 1
+    assert r["voided"] == 0 and r["created"] == 1 and r["renumbered"] == 1
 
 
 def test_verify_reports_renumbered_and_apply_renumbers(test_client, test_db_session, monkeypatch):
@@ -977,3 +977,74 @@ def test_two_rows_with_history_same_number_no_automatic_write(monkeypatch, test_
     l = test_db_session.query(Invoice).get(l_id); d = test_db_session.query(Invoice).get(d_id)
     assert l.status == "open" and d.status == "open" and l.source_id == "fossil" and d.source_id == "D"
     assert r["voided"] == 0 and r.get("number_conflicts") == 1 and r.get("fossil_released", 0) == 0
+
+
+# ── Terzo giro ──────────────────────────────────────────────────────────────
+
+def test_fossil_twin_absent_is_voided_not_paid(monkeypatch, test_db_session):
+    """A: blocco scalato L1(N1,F1) L2(N2,F2); FP (N0,F1) (N1,F2): L1 adotta F2;
+    L2 (numero N2 non più in lista, fossile F2 vivo sotto N1) è la gemella
+    fossile senza storia → annullata come rinumerata, mai 'pagata'."""
+    l1 = _mk(test_db_session, "N1/2026", source_id="F1", doc_id_verified=False, customer_name_raw="ACME SRL").id
+    l2 = _mk(test_db_session, "N2/2026", source_id="F2", doc_id_verified=False, customer_name_raw="ACME SRL", missing_streak=1).id
+    r = _sync(monkeypatch, test_db_session, [_raw("N0/2026", "F1", "notified", balance=10.0), _raw("N1/2026", "F2", "notified", balance=20.0)],
+              notif={"F1": ["RicevutaConsegna"], "F2": ["RicevutaConsegna"]})
+    a = test_db_session.query(Invoice).get(l1); b = test_db_session.query(Invoice).get(l2)
+    assert (a.source_id, a.status, a.amount_due) == ("F2", "open", 20.0)
+    assert b.status == "void" and "rinumerata" in b.void_reason and b.paid_at is None
+    assert r["paid_detected"] == 0 and r["created"] == 1  # N0/F1 entra come riga nuova
+
+
+def test_conflict_row_is_never_paid_by_absence(monkeypatch, test_db_session):
+    """A: gemella fossile CON storia: conflitto loggato e, finché aperto, mai
+    'pagata per assenza'."""
+    from backend.database import Customer as C
+    c = C(ragione_sociale="ACME SRL"); test_db_session.add(c); test_db_session.commit(); cid = c.id
+    _mk(test_db_session, "N1/2026", source_id="F1", doc_id_verified=False, customer_name_raw="ACME SRL", customer_id=cid)
+    l2 = _mk(test_db_session, "N2/2026", source_id="F2", doc_id_verified=False, customer_name_raw="ACME SRL", customer_id=cid, missing_streak=1).id
+    _act(test_db_session, l2, cid)
+    for _ in range(2):
+        r = _sync(monkeypatch, test_db_session, [_raw("N1/2026", "F2", "notified", balance=20.0)], notif={"F2": ["RicevutaConsegna"]})
+        b = test_db_session.query(Invoice).get(l2)
+        assert b.status == "open" and r["paid_detected"] == 0 and r.get("number_conflicts") == 1
+
+
+def test_renumber_guard_ignores_cosmetic_name_changes(monkeypatch, test_db_session):
+    """B: sei owner storici con 'S.R.L.' vs 'SRL' non fanno scattare la guardia;
+    la rinumerazione legittima procede e il documento entra."""
+    for i in range(6):
+        _mk(test_db_session, f"OLD{i}/2026", source_id=f"d{i}", doc_id_verified=False, customer_name_raw=f"CLIENTE {i} S.R.L.")
+    raw = [_raw(f"NEW{i}/2026", f"d{i}", "notified", balance=10.0, name=f"CLIENTE {i} SRL") for i in range(6)]
+    r = _sync(monkeypatch, test_db_session, raw, notif={f"d{i}": ["RicevutaConsegna"] for i in range(6)})
+    assert r.get("renumber_guard_triggered") is None and r["renumbered"] == 6 and r.get("renumber_skipped", 0) == 0
+    assert all(x.invoice_number.startswith("NEW") and x.customer_id is None or x.customer_id is None for x in test_db_session.query(Invoice).all())
+
+
+def test_verify_history_includes_assegno(test_db_session):
+    """K: la verifica per cliente usa lo stesso predicato di storia del sync."""
+    from backend.api.customers import _action_counts
+    cust = Customer(ragione_sociale="ACME SRL"); test_db_session.add(cust); test_db_session.commit()
+    legacy = _mk(test_db_session, "0800", customer_id=cust.id, source_id="fossil", doc_id_verified=False, payment_pending="assegno")
+    dup = _mk(test_db_session, "0800", customer_id=cust.id, source_id="real", doc_id_verified=True)
+    _act(test_db_session, dup.id, cust.id)
+    res = compare_documents([legacy, dup], [_fp("0800", "real", 100.0, 100.0, "Consegnato")], action_counts=_action_counts(test_db_session, [legacy, dup]))
+    v = {r["verdict"]: r["platform"]["id"] for r in res["rows"]}
+    assert v["ok"] == legacy.id and v["duplicato"] == dup.id
+
+
+def test_legacy_owner_with_present_number_adopts_instead_of_renumber(monkeypatch, test_db_session):
+    """Determinismo: L('N', fossile F) col numero N ancora in lista (doc D) e F
+    vivo sotto N': L adotta D (per lei vale il numero), F entra come riga nuova —
+    in qualunque ordine."""
+    for order in (0, 1):
+        for x in test_db_session.query(Invoice).all():
+            test_db_session.delete(x)
+        test_db_session.commit()
+        l_id = _mk(test_db_session, "N/2026", source_id="F", doc_id_verified=False, customer_name_raw="ACME SRL").id
+        rows = [_raw("N/2026", "D", "notified", balance=10.0), _raw("NX/2026", "F", "notified", balance=30.0)]
+        if order:
+            rows.reverse()
+        r = _sync(monkeypatch, test_db_session, rows, notif={"D": ["RicevutaConsegna"], "F": ["RicevutaConsegna"]})
+        l = test_db_session.query(Invoice).get(l_id)
+        assert (l.invoice_number, l.source_id, l.doc_id_verified) == ("N/2026", "D", True)
+        assert _get(test_db_session, "NX/2026").source_id == "F" and r["created"] == 1 and r["voided"] == 0
