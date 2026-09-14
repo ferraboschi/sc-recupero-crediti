@@ -1825,13 +1825,24 @@ def _fp_search_names(session, customer) -> List[str]:
     return names
 
 
+def _fp_name_key(name) -> str:
+    return normalize_ragione_sociale(name or "") or (name or "").strip().lower()
+
+
 def _fp_rows_for_customer(connector, names) -> tuple:
+    """Documenti FatturaPro del cliente. La ricerca di FatturaPro è un LIKE
+    sul destinatario ('ROSSI' trova anche 'ROSSI & C.'): si tengono SOLO le
+    righe il cui destinatario coincide con uno dei nomi cercati (normalizzati),
+    altrimenti si proporrebbe di importare fatture di un ALTRO cliente."""
+    wanted = {_fp_name_key(n) for n in names}
     rows: dict = {}
     complete = True
     for name in names:
         found, ok = connector.search_documents(name)
         complete = complete and ok
         for r in found:
+            if _fp_name_key(r.get("customer_name")) not in wanted:
+                continue
             key = str(r.get("doc_id") or r.get("invoice_number"))
             rows[key] = r
     return list(rows.values()), complete
@@ -1932,6 +1943,15 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
             state = fp_state_of(fp)
             if state not in SDI_FINAL_OK:
                 skipped.append({"invoice_number": num, "fix": fx.fix, "reason": "non più valida su FatturaPro"})
+                continue
+            # Lo stesso numero su un ALTRO cliente (abbinamento diverso): non
+            # si duplica, si segnala.
+            elsewhere = session.query(Invoice).filter(
+                Invoice.invoice_number == num, Invoice.source_platform == "fatturapro",
+            ).first()
+            if elsewhere is not None:
+                skipped.append({"invoice_number": num, "fix": fx.fix,
+                                "reason": f"già presente in piattaforma sul cliente {elsewhere.customer_id}"})
                 continue
             session.add(Invoice(
                 invoice_number=num, amount=float(fp.get("total") or 0), amount_due=float(fp.get("balance") or 0),

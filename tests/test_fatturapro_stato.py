@@ -300,3 +300,21 @@ def test_verify_and_apply_endpoints(test_client, test_db_session, monkeypatch):
     det = test_client.get(f"/api/customers/{cust.id}").json()
     assert [x["invoice_number"] for x in det["invoices"]["voided"]] == ["1609"]
     assert "1609" not in [x["invoice_number"] for x in det["invoices"]["items"]]
+
+
+def test_verify_ignores_homonyms_and_duplicates_elsewhere(test_client, test_db_session, monkeypatch):
+    import backend.connectors.fatturapro as fpmod
+    monkeypatch.setattr(fpmod, "FatturaProConnector", FakeSearchFP)
+    cust = Customer(ragione_sociale="ROSSI SRL"); test_db_session.add(cust); test_db_session.commit()
+    other = Customer(ragione_sociale="ROSSI & C. SNC"); test_db_session.add(other); test_db_session.commit()
+    _mk(test_db_session, "0500", customer_id=other.id, source_id="o", customer_name_raw="ROSSI & C. SNC")
+    homonym = dict(_fp("0500", "o", 100.0, 100.0, "Consegnato")); homonym["customer_name"] = "ROSSI & C. SNC"
+    mine = dict(_fp("0600", "m", 200.0, 200.0, "Consegnato")); mine["customer_name"] = "Rossi S.r.l."
+    FakeSearchFP.rows = [homonym, mine]
+    r = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro").json()
+    nums = {x["invoice_number"] for x in r["rows"]}
+    assert nums == {"0600"} and r["fatturapro_documents"] == 1  # l'omonimo non entra
+    # se un numero fosse già in piattaforma su un altro cliente, l'import non duplica
+    _mk(test_db_session, "0600", customer_id=other.id, source_id="m", customer_name_raw="Rossi S.r.l.")
+    a = test_client.post(f"/api/customers/{cust.id}/verify-fatturapro/apply", json={"fixes": [{"invoice_number": "0600", "fix": "import"}]}).json()
+    assert a["applied"] == [] and "già presente" in a["skipped"][0]["reason"]
