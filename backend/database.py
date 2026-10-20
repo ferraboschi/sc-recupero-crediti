@@ -572,14 +572,45 @@ def _run_migrations(engine):
     _enable_rls(engine)
 
 
+# Tabelle legacy ancora presenti nel DB prod ma non più mappate dal codice:
+# vanno comunque protette (sono nello schema public esposto alla Data API).
+_LEGACY_TABLES = ("messages", "conversations")
+
+# Seconda cintura, a livello di schema: i ruoli della Data API Supabase
+# (anon, authenticated) perdono ogni privilegio sulle tabelle public,
+# presenti e FUTURE (default privileges). Il backend si collega come
+# postgres e non è toccato; l'app non usa mai la chiave anon.
+_RLS_SCHEMA_STATEMENTS = (
+    "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated",
+    "REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated",
+    "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM anon, authenticated",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM anon, authenticated",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM anon, authenticated",
+)
+
+
+def _rls_tables():
+    """Tabelle su cui accendere la RLS: TUTTE quelle mappate dai modelli
+    (così una tabella nuova è coperta al primo avvio, senza liste scritte a
+    mano — l'alert Supabase del 21/10/2026 su recovery_action_invoices nasceva
+    proprio da una lista manuale non aggiornata) più le legacy."""
+    mapped = [t.name for t in Base.metadata.sorted_tables]
+    return mapped + [t for t in _LEGACY_TABLES if t not in mapped]
+
+
 def _enable_rls(engine):
     """Enable Row Level Security on all public tables for Supabase.
 
     - Enables RLS on each table (idempotent — no-op if already enabled)
     - Creates a permissive policy for the 'postgres' role (our backend connection)
+    - Revokes every privilege of anon/authenticated on the public schema
+      (tables, sequences, functions) and on objects created in future
     - This blocks anon/authenticated Supabase client access via PostgREST
       while allowing our SQLAlchemy backend full access.
 
+    Each statement is independent (own try/except) so that one failure
+    never leaves the other tables unprotected.
     Skipped entirely for SQLite (local dev).
     """
     import logging
@@ -588,49 +619,41 @@ def _enable_rls(engine):
     if config.DATABASE_URL.startswith("sqlite"):
         return
 
-    tables = [
-        "customers", "invoices", "recovery_cases",
-        "recovery_actions", "activity_log", "sync_state",
-        "overdue_snapshots", "customer_accepted_names",
-        # legacy, non più mappate dal codice ma presenti nel DB
-        "messages", "conversations",
-    ]
+    tables = _rls_tables()
+    statements = []
+    for table in tables:
+        statements.append(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+        # DROP + CREATE for idempotency
+        statements.append(f"DROP POLICY IF EXISTS backend_full_access ON {table}")
+        statements.append(
+            f"CREATE POLICY backend_full_access ON {table} "
+            f"FOR ALL TO postgres USING (true) WITH CHECK (true)"
+        )
+    statements.extend(_RLS_SCHEMA_STATEMENTS)
 
+    failed = []
     try:
         raw = engine.raw_connection()
         try:
             cur = raw.cursor()
-            for table in tables:
+            for stmt in statements:
                 try:
-                    # Enable RLS
-                    cur.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+                    cur.execute(stmt)
                     raw.commit()
-                except Exception:
+                except Exception as e:
                     raw.rollback()
-
-                try:
-                    # Create policy allowing full access for postgres role (our backend)
-                    # DROP + CREATE for idempotency
-                    cur.execute(
-                        f"DROP POLICY IF EXISTS backend_full_access ON {table}"
-                    )
-                    raw.commit()
-                except Exception:
-                    raw.rollback()
-
-                try:
-                    cur.execute(
-                        f"CREATE POLICY backend_full_access ON {table} "
-                        f"FOR ALL TO postgres USING (true) WITH CHECK (true)"
-                    )
-                    raw.commit()
-                except Exception:
-                    raw.rollback()  # policy already exists
-
+                    failed.append((stmt, e))
             cur.close()
-            _logger.info(f"RLS enabled on {len(tables)} tables with backend_full_access policy")
         finally:
             raw.close()
+        if failed:
+            # Mai in silenzio: elenco (senza segreti) di cosa non è passato.
+            for stmt, e in failed:
+                _logger.warning(f"RLS statement failed: {stmt} — {e}")
+        _logger.info(
+            f"RLS enabled on {len(tables)} tables with backend_full_access policy "
+            f"({len(failed)} statements failed)"
+        )
     except Exception as e:
         _logger.warning(f"RLS setup warning (non-fatal): {e}")
 
