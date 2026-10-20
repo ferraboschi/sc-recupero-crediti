@@ -572,14 +572,90 @@ def _run_migrations(engine):
     _enable_rls(engine)
 
 
+# Tabelle legacy ancora presenti nel DB prod ma non più mappate dal codice:
+# vanno comunque protette (sono nello schema public esposto alla Data API).
+_LEGACY_TABLES = ("messages", "conversations")
+
+# Seconda cintura, a livello di schema: i ruoli della Data API Supabase
+# (anon, authenticated) perdono i privilegi sulle tabelle/sequenze/funzioni
+# public, presenti e FUTURE (default privileges del ruolo postgres, cioè chi
+# crea le tabelle). Per le funzioni va tolto anche PUBLIC (EXECUTE di default).
+# Il backend si collega come postgres e non è toccato; l'app non usa mai la
+# chiave anon.
+_RLS_SCHEMA_STATEMENTS = (
+    "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated",
+    "REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated",
+    "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, anon, authenticated",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM anon, authenticated",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM PUBLIC, anon, authenticated",
+)
+
+# Stato attuale (RLS accesa? policy presente?) per saltare le ALTER già fatte:
+# a regime l'avvio non prende nessun lock sulle tabelle.
+_RLS_STATE_SQL = (
+    "SELECT c.relname, c.relrowsecurity, EXISTS ("
+    "  SELECT 1 FROM pg_policies p WHERE p.schemaname = n.nspname"
+    "  AND p.tablename = c.relname AND p.policyname = 'backend_full_access')"
+    " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+    " WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')"
+)
+
+
+def _rls_tables():
+    """Tabelle su cui accendere la RLS: TUTTE quelle mappate dai modelli
+    (così una tabella nuova è coperta al primo avvio, senza liste scritte a
+    mano — l'alert Supabase del 21/10/2026 su recovery_action_invoices nasceva
+    proprio da una lista manuale non aggiornata) più le legacy."""
+    mapped = [t.name for t in Base.metadata.sorted_tables]
+    return mapped + [t for t in _LEGACY_TABLES if t not in mapped]
+
+
+def _rls_qualified(name):
+    """public."nome": quotato, così un nome riservato o maiuscolo non rompe
+    la DDL (e la tabella non resta scoperta)."""
+    return 'public."' + name.replace('"', '""') + '"'
+
+
+def _rls_statements(rls_on=(), policy_on=()):
+    """DDL per proteggere le tabelle: ENABLE RLS (saltata se già accesa) e
+    policy per il backend sulle tabelle mappate (saltata se già presente).
+    Le legacy prendono solo ENABLE RLS IF EXISTS: nessuna policy (il ruolo
+    postgres è owner e bypassa la RLS comunque) e nessun errore se sparite."""
+    mapped = {t.name for t in Base.metadata.sorted_tables}
+    stmts = []
+    for table in _rls_tables():
+        q = _rls_qualified(table)
+        if table not in mapped:
+            if table not in rls_on:
+                stmts.append(f"ALTER TABLE IF EXISTS {q} ENABLE ROW LEVEL SECURITY")
+            continue
+        if table not in rls_on:
+            stmts.append(f"ALTER TABLE {q} ENABLE ROW LEVEL SECURITY")
+        if table not in policy_on:
+            # DROP + CREATE for idempotency
+            stmts.append(f"DROP POLICY IF EXISTS backend_full_access ON {q}")
+            stmts.append(
+                f"CREATE POLICY backend_full_access ON {q} "
+                f"FOR ALL TO postgres USING (true) WITH CHECK (true)"
+            )
+    stmts.extend(_RLS_SCHEMA_STATEMENTS)
+    return stmts
+
+
 def _enable_rls(engine):
     """Enable Row Level Security on all public tables for Supabase.
 
-    - Enables RLS on each table (idempotent — no-op if already enabled)
+    - Enables RLS on each table (idempotent — skipped if already enabled)
     - Creates a permissive policy for the 'postgres' role (our backend connection)
+    - Revokes the privileges of anon/authenticated on the public schema
+      (tables, sequences, functions) and on objects created in future
     - This blocks anon/authenticated Supabase client access via PostgREST
       while allowing our SQLAlchemy backend full access.
 
+    Each statement is independent (own try/except) so that one failure
+    never leaves the other tables unprotected; every failure is logged
+    (ERROR summary) — a security control must never fail in silence.
     Skipped entirely for SQLite (local dev).
     """
     import logging
@@ -588,51 +664,59 @@ def _enable_rls(engine):
     if config.DATABASE_URL.startswith("sqlite"):
         return
 
-    tables = [
-        "customers", "invoices", "recovery_cases",
-        "recovery_actions", "activity_log", "sync_state",
-        "overdue_snapshots", "customer_accepted_names",
-        # legacy, non più mappate dal codice ma presenti nel DB
-        "messages", "conversations",
-    ]
-
+    tables = _rls_tables()
+    failed = 0
     try:
         raw = engine.raw_connection()
         try:
             cur = raw.cursor()
-            for table in tables:
+            # Lock breve: se una transazione lunga (sync) tiene la tabella,
+            # meglio fallire e loggare che bloccare l'avvio e le query dietro.
+            try:
+                cur.execute("SET lock_timeout = '10s'")
+                raw.commit()
+            except Exception:
+                raw.rollback()
+            rls_on, policy_on = set(), set()
+            try:
+                cur.execute(_RLS_STATE_SQL)
+                for relname, rls, has_policy in cur.fetchall():
+                    if rls:
+                        rls_on.add(relname)
+                    if has_policy:
+                        policy_on.add(relname)
+                raw.rollback()
+            except Exception:
+                raw.rollback()  # stato ignoto → si rifà tutto (idempotente)
+                rls_on, policy_on = set(), set()
+            statements = _rls_statements(rls_on, policy_on)
+            for stmt in statements:
                 try:
-                    # Enable RLS
-                    cur.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+                    cur.execute(stmt)
                     raw.commit()
-                except Exception:
-                    raw.rollback()
-
-                try:
-                    # Create policy allowing full access for postgres role (our backend)
-                    # DROP + CREATE for idempotency
-                    cur.execute(
-                        f"DROP POLICY IF EXISTS backend_full_access ON {table}"
-                    )
-                    raw.commit()
-                except Exception:
-                    raw.rollback()
-
-                try:
-                    cur.execute(
-                        f"CREATE POLICY backend_full_access ON {table} "
-                        f"FOR ALL TO postgres USING (true) WITH CHECK (true)"
-                    )
-                    raw.commit()
-                except Exception:
-                    raw.rollback()  # policy already exists
-
+                except Exception as e:
+                    failed += 1
+                    # Subito, prima del rollback: mai in silenzio
+                    # (statement statici, nessun segreto nel messaggio).
+                    _logger.warning(f"RLS statement failed: {stmt} — {e}")
+                    try:
+                        raw.rollback()
+                    except Exception:
+                        pass
             cur.close()
-            _logger.info(f"RLS enabled on {len(tables)} tables with backend_full_access policy")
         finally:
             raw.close()
+        if failed:
+            _logger.error(
+                f"RLS setup INCOMPLETE: {failed}/{len(statements)} statements failed "
+                f"({len(tables)} tables) — check the warnings above"
+            )
+        else:
+            _logger.info(
+                f"RLS ok on {len(tables)} tables ({len(statements)} statements run)"
+            )
     except Exception as e:
-        _logger.warning(f"RLS setup warning (non-fatal): {e}")
+        _logger.error(f"RLS setup failed (non-fatal for boot): {e}")
 
 
 def get_session():
