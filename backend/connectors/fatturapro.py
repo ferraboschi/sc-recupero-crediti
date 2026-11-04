@@ -108,6 +108,11 @@ class FatturaProConnector:
         self._xcrud_key: Optional[str] = None
         self._authenticated = False
         self._documenti_key = None
+        # Messaggio mostrato da FatturaPro all'ultimo login rifiutato (alert
+        # della pagina + header utili): senza questo, credenziali giuste e
+        # login rifiutato (blocco IP, verifica dispositivo) sono indistinguibili
+        # da una password sbagliata.
+        self.last_login_error: Optional[str] = None
         # Contatore righe-fattura scartate dall'ultimo _parse_invoice_table
         self._last_parse_drops = 0
 
@@ -181,6 +186,7 @@ class FatturaProConnector:
         """
         username = config.FATTURAPRO_USERNAME
         password = config.FATTURAPRO_PASSWORD
+        self.last_login_error = None
 
         if not username or not password:
             logger.warning("FATTURAPRO_USERNAME or FATTURAPRO_PASSWORD not configured")
@@ -220,6 +226,7 @@ class FatturaProConnector:
                 timeout=self.timeout,
             )
             logger.info(f"Login POST status: {response.status_code}, URL: {response.url}")
+            self.last_login_error = self._login_rejection_message(response)
 
             # After successful login, check if we can access a protected page
             check = self.client.get(
@@ -232,8 +239,11 @@ class FatturaProConnector:
             final_url = str(check.url)
             if "signin.php" in final_url:
                 logger.warning("Form login failed: redirected back to signin")
-                # Log a snippet of the page to debug
-                logger.info(f"Login page snippet: {check.text[:500]}")
+                if self.last_login_error:
+                    logger.error(f"FatturaPro ha rifiutato il login: {self.last_login_error}")
+                else:
+                    # Nessun alert nella risposta: logga un pezzo di pagina
+                    logger.info(f"Login page snippet: {check.text[:500]}")
                 return False
 
             # Check if the page contains actual content (not login form)
@@ -247,6 +257,37 @@ class FatturaProConnector:
         except Exception as e:
             logger.error(f"Form login error: {e}", exc_info=True)
             return False
+
+    @staticmethod
+    def _login_rejection_message(response) -> Optional[str]:
+        """Testo degli alert della pagina restituita dal POST di login
+        (es. «ATTENZIONE: i dati inseriti non sono validi…») più gli header
+        che rivelano un blocco a monte (Cloudflare). Mai il contenuto del form.
+
+        Returns:
+            Messaggio compatto (max 300 caratteri) o None se non c'è nulla.
+        """
+        try:
+            text = response.text or ""
+            soup = BeautifulSoup(text, "html.parser")
+            parts: list = []
+            for el in soup.select("[class*=alert], [class*=error], [class*=errore], [class*=warning]"):
+                txt = " ".join(el.get_text(" ", strip=True).split())
+                if txt and txt not in parts:
+                    parts.append(txt)
+            if not parts and ("cf-chl" in text or "challenge-platform" in text):
+                parts.append("pagina di verifica Cloudflare (bot check)")
+            msg = " | ".join(parts)[:300]
+            hdr = []
+            for k in ("server", "cf-ray", "cf-mitigated", "retry-after"):
+                v = response.headers.get(k)
+                if v:
+                    hdr.append(f"{k}={v}")
+            if hdr:
+                msg = f"{msg} [{' '.join(hdr)}]".strip()
+            return msg or None
+        except Exception:
+            return None
 
     def _try_ws_auth(self) -> bool:
         """Try authentication via /ws/ endpoint with API key.

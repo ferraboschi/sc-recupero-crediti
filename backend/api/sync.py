@@ -240,6 +240,16 @@ def _reactivate_invoice(inv, sdi_state: str) -> None:
     inv.updated_at = datetime.utcnow()
 
 
+def _login_failure_error(connector) -> str:
+    """Messaggio per result['fatturapro']['error'] (pannello Sistema) quando il
+    login fallisce: include ciò che FatturaPro ha risposto, se c'è, così
+    «password sbagliata» e «login rifiutato con credenziali giuste» (blocco
+    IP, verifica dispositivo) non si confondono."""
+    rejection = getattr(connector, "last_login_error", None)
+    base = "Login failed — check FATTURAPRO_USERNAME/PASSWORD env vars"
+    return f"{base} — FatturaPro: {rejection}" if rejection else base
+
+
 def _sync_invoices_task() -> dict:
     """Background task to sync invoices from FatturaPro.
 
@@ -1339,9 +1349,7 @@ def _sync_invoices_task() -> dict:
                     f"partial={result['fatturapro']['partial']}"
                 )
             else:
-                result["fatturapro"]["error"] = (
-                    "Login failed — check FATTURAPRO_USERNAME/PASSWORD env vars"
-                )
+                result["fatturapro"]["error"] = _login_failure_error(fatturapro)
                 logger.error("FatturaPro login failed — cannot sync invoices")
         except Exception as e:
             result["fatturapro"]["error"] = str(e)
