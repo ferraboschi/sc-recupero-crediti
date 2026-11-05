@@ -246,8 +246,10 @@ def _login_failure_error(connector) -> str:
     «password sbagliata» e «login rifiutato con credenziali giuste» (blocco
     IP, verifica dispositivo) non si confondono."""
     rejection = getattr(connector, "last_login_error", None)
-    base = "Login failed — check FATTURAPRO_USERNAME/PASSWORD env vars"
-    return f"{base} — FatturaPro: {rejection}" if rejection else base
+    if rejection:
+        # Il motivo lo dice FatturaPro: non suggerire «password» a caso.
+        return f"Login rifiutato da FatturaPro: {rejection}"
+    return "Login failed — check FATTURAPRO_USERNAME/PASSWORD env vars"
 
 
 def _sync_invoices_task() -> dict:

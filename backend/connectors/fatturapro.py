@@ -227,6 +227,14 @@ class FatturaProConnector:
             )
             logger.info(f"Login POST status: {response.status_code}, URL: {response.url}")
             self.last_login_error = self._login_rejection_message(response)
+            if self.last_login_error and self.SINGLE_SESSION_RE.search(self.last_login_error):
+                # «L'account è già in uso su un altro dispositivo: se prosegui
+                # l'altra sessione verrà chiusa»: è una domanda, non un rifiuto.
+                response = self._confirm_single_session(response, form_data)
+                logger.info(
+                    f"Single-session confirm → status {response.status_code}, URL: {response.url}"
+                )
+                self.last_login_error = self._login_rejection_message(response)
 
             # After successful login, check if we can access a protected page
             check = self.client.get(
@@ -257,6 +265,91 @@ class FatturaProConnector:
         except Exception as e:
             logger.error(f"Form login error: {e}", exc_info=True)
             return False
+
+    # Avviso di FatturaPro quando l'account ha già una sessione aperta altrove
+    # (introdotto a fine ottobre 2026): va confermato, altrimenti il login
+    # non si completa mai.
+    SINGLE_SESSION_RE = re.compile(r"in uso su un altro dispositivo|altra sessione", re.I)
+    _PROCEED_RE = re.compile(r"prosegui|continua|procedi|conferm", re.I)
+
+    @staticmethod
+    def _form_fields(form) -> dict:
+        """Campi hidden del form + il primo bottone di invio con un nome."""
+        data = {}
+        for hidden in form.find_all("input", {"type": "hidden"}):
+            name = hidden.get("name")
+            if name:
+                data[name] = hidden.get("value", "")
+        for btn in form.find_all(["button", "input"]):
+            if btn.name == "input" and btn.get("type") not in ("submit", "image"):
+                continue
+            if btn.name == "button" and btn.get("type", "submit") != "submit":
+                continue
+            if btn.get("name"):
+                data[btn["name"]] = btn.get("value", "")
+                break
+        return data
+
+    @staticmethod
+    def _form_action(form, response) -> str:
+        return urljoin(str(response.url), form.get("action") or "signin.php")
+
+    @classmethod
+    def _describe_forms(cls, forms) -> str:
+        """Struttura dei form per i log (nomi e tipi, mai valori lunghi)."""
+        out = []
+        for form in forms:
+            fields = []
+            for inp in form.find_all(["input", "button", "select", "textarea"]):
+                name = inp.get("name") or "-"
+                typ = inp.get("type") or inp.name
+                val = inp.get("value", "")
+                show = f"={val}" if typ in ("hidden", "submit") and 0 < len(str(val)) <= 8 else ""
+                fields.append(f"{name}({typ}){show}")
+            btns = [b.get_text(" ", strip=True) for b in form.find_all("button")]
+            out.append(
+                f"form action={form.get('action') or '-'} method={form.get('method') or '-'} "
+                f"fields=[{', '.join(fields)}] buttons={btns}"
+            )
+        return " || ".join(out) or "nessun form"
+
+    def _confirm_single_session(self, response, form_data: dict):
+        """Risponde all'avviso «account già in uso su un altro dispositivo».
+
+        Tre forme possibili della pagina, in ordine di preferenza:
+        1. un form di conferma senza campo password (hidden + bottone): si invia;
+        2. il form di login con campi hidden aggiuntivi (es. force=1): si
+           ripetono le credenziali insieme ai nuovi campi;
+        3. un link «prosegui/continua»: si segue.
+        Un solo tentativo; la struttura della pagina va nei log (senza
+        credenziali) per verificare dal vivo quale caso si è presentato.
+        """
+        try:
+            soup = BeautifulSoup(response.text, "html.parser")
+            forms = soup.find_all("form")
+            logger.info(f"Single-session page: {self._describe_forms(forms)}")
+            for form in forms:
+                if form.find("input", {"type": "password"}):
+                    continue
+                data = self._form_fields(form)
+                text = form.get_text(" ", strip=True)
+                if data and (self._PROCEED_RE.search(text) or form.find("input", {"type": "hidden"})):
+                    return self.client.post(self._form_action(form, response), data=data, timeout=self.timeout)
+            for form in forms:
+                if form.find("input", {"type": "password"}):
+                    extra = self._form_fields(form)
+                    if not extra:
+                        continue  # stesso form di prima: ripetere non cambierebbe nulla
+                    data = dict(form_data)
+                    data.update(extra)
+                    return self.client.post(self._form_action(form, response), data=data, timeout=self.timeout)
+            for a in soup.find_all("a", href=True):
+                if self._PROCEED_RE.search(a.get_text(" ", strip=True)):
+                    return self.client.get(urljoin(str(response.url), a["href"]), timeout=self.timeout)
+            logger.warning("Single-session page: nessun form/link di conferma riconosciuto")
+        except Exception as e:
+            logger.warning(f"Single-session confirm failed: {e}")
+        return response
 
     @staticmethod
     def _login_rejection_message(response) -> Optional[str]:
@@ -1588,8 +1681,29 @@ class FatturaProConnector:
             logger.error(f"Error requesting XML export: {e}", exc_info=True)
             return None
 
+    def logout(self) -> bool:
+        """Chiude la sessione lato FatturaPro (signout.php).
+
+        FatturaPro ammette UNA sessione per account: una sessione lasciata
+        appesa dal sync precedente farebbe scattare al login successivo
+        l'avviso «account già in uso su un altro dispositivo». Best effort:
+        un errore qui non deve mai far fallire il sync.
+        """
+        if not self._authenticated:
+            return False
+        try:
+            self.client.get(f"{self.base_url}/signout.php", timeout=self.timeout)
+            logger.info("FatturaPro session closed (signout)")
+            return True
+        except Exception as e:
+            logger.warning(f"FatturaPro signout failed (non-fatal): {e}")
+            return False
+        finally:
+            self._authenticated = False
+
     def close(self):
-        """Close the HTTP client connection."""
+        """Sign out of FatturaPro (if logged in) and close the HTTP client."""
+        self.logout()
         try:
             self.client.close()
             logger.debug("FatturaPro connector closed")
