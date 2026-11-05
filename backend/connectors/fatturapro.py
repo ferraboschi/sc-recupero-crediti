@@ -18,6 +18,27 @@ from backend.engine.sdi import SDI_FINAL_OK, sdi_state_from_notifications
 logger = logging.getLogger(__name__)
 
 
+# FatturaPRO tiene UNA sola sessione per utente (da ~fine ottobre 2026): con
+# l'account già aperto altrove il login risponde «L'account e' gia' in uso su un
+# altro dispositivo: se prosegui l'altra sessione verra' chiusa» (form con
+# prosegui=1 + conferma_sessione). SC Recupero, l'app ordini e le persone usano
+# lo STESSO utente (owner: un utente per app costa troppo) → si fanno i turni:
+# SC Recupero allo scoccare dell'ora (e alle 8:30), l'app ordini dai :40, e
+# ognuno ESCE (signout.php) a fine lavoro — vedi close(). Account ancora
+# occupato: in orario d'ufficio si aspetta il giro dopo (mai chiudere la
+# sessione di chi sta lavorando); sera, notte e weekend «Prosegui».
+def in_use_policy(now: Optional[datetime] = None) -> str:
+    """'wait' lun–ven 8–19 (Europe/Rome), altrimenti 'take_over'."""
+    from zoneinfo import ZoneInfo
+    local = (now or datetime.now(ZoneInfo("UTC"))).astimezone(ZoneInfo(config.TIMEZONE or "Europe/Rome"))
+    return "wait" if local.weekday() < 5 and 8 <= local.hour < 19 else "take_over"
+
+
+def is_account_in_use_page(html: str) -> bool:
+    """La pagina «account già in uso» (pulsante conferma_sessione)?"""
+    return bool(re.search(r"name=[\"']conferma_sessione[\"']", html or "", re.I))
+
+
 def doc_key(raw: str) -> str:
     """Chiave canonica YEAR-AWARE per il JOIN fattura↔scadenzario.
 
@@ -227,6 +248,23 @@ class FatturaProConnector:
             )
             logger.info(f"Login POST status: {response.status_code}, URL: {response.url}")
             self.last_login_error = self._login_rejection_message(response)
+
+            # Account già aperto altrove (una persona o l'app ordini): vedi in_use_policy.
+            if is_account_in_use_page(response.text):
+                if in_use_policy() == "wait":
+                    self.last_login_error = (
+                        "Account FatturaPRO aperto su un altro dispositivo (una persona o l'app ordini): "
+                        "in orario d'ufficio non chiudo la sessione altrui, riprovo al prossimo giro"
+                    )
+                    logger.warning(self.last_login_error)
+                    return False
+                self.client.post(
+                    f"{self.base_url}/signin.php",
+                    data={"prosegui": "1", "conferma_sessione": ""},
+                    timeout=self.timeout,
+                )
+                self.last_login_error = None
+                logger.warning("Account FatturaPRO aperto su un altro dispositivo: fuori orario d'ufficio, sessione ripresa («Prosegui»)")
 
             # After successful login, check if we can access a protected page
             check = self.client.get(
@@ -1589,7 +1627,18 @@ class FatturaProConnector:
             return None
 
     def close(self):
-        """Close the HTTP client connection."""
+        """Esce da FatturaPRO (signout.php) e chiude il client HTTP.
+
+        L'uscita libera l'unica sessione dell'utente condiviso: senza, l'app
+        ordini e le persone troverebbero l'account «già in uso».
+        """
+        if self._authenticated:
+            try:
+                self.client.get(f"{self.base_url}/signout.php", timeout=self.timeout)
+                logger.info("Uscito da FatturaPro (sessione liberata)")
+            except Exception as e:
+                logger.warning(f"Uscita da FatturaPro non riuscita: {e}")
+            self._authenticated = False
         try:
             self.client.close()
             logger.debug("FatturaPro connector closed")
