@@ -43,6 +43,14 @@ class Config:
     SCHEDULER_HOUR = int(os.getenv("SCHEDULER_HOUR", "8"))
     SCHEDULER_MINUTE = int(os.getenv("SCHEDULER_MINUTE", "30"))
 
+    # FatturaPro ammette UNA sessione per account: ogni nostro login chiude
+    # quella del personale. Regola owner (5/11/2026): un solo accesso al
+    # giorno, al mattino presto, e mai in orario d'ufficio (nemmeno dai
+    # pulsanti dell'app). Ore in TIMEZONE; "8-18" = bloccato da 08:00 a 17:59.
+    FATTURAPRO_QUIET_HOURS = os.getenv("FATTURAPRO_QUIET_HOURS", "8-18")
+    FATTURAPRO_SYNC_HOUR = int(os.getenv("FATTURAPRO_SYNC_HOUR", "7"))
+    FATTURAPRO_SYNC_MINUTE = int(os.getenv("FATTURAPRO_SYNC_MINUTE", "0"))
+
     # CORS - frontend origin (GitHub Pages)
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "https://recupero.sakecompany.com,http://localhost:5173").split(",")
 

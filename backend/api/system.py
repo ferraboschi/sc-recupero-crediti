@@ -161,6 +161,8 @@ def get_system_status():
         if inv_result:
             fp = inv_result.get("fatturapro", {})
             connectors["fatturapro"]["status"] = "ok" if fp.get("success") else "error"
+            if inv_result.get("skipped"):
+                connectors["fatturapro"]["status"] = "paused"
             connectors["fatturapro"]["last_result"] = {
                 "success": fp.get("success"),
                 "created": fp.get("created", 0),

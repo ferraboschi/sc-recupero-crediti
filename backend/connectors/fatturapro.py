@@ -14,6 +14,7 @@ from urllib.parse import urljoin
 
 from backend.config import config
 from backend.engine.sdi import SDI_FINAL_OK, sdi_state_from_notifications
+from backend.engine.office_hours import in_quiet_hours
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,9 @@ class FatturaProConnector:
         # login rifiutato (blocco IP, verifica dispositivo) sono indistinguibili
         # da una password sbagliata.
         self.last_login_error: Optional[str] = None
+        # True se l'ultimo login è stato NEGATO da noi per orario d'ufficio
+        # (non è un errore di FatturaPro: il personale sta lavorando).
+        self.quiet_hours_block = False
         # Contatore righe-fattura scartate dall'ultimo _parse_invoice_table
         self._last_parse_drops = 0
 
@@ -136,8 +140,12 @@ class FatturaProConnector:
             self.client.cookies.set(name, value, domain="cloud.fatturapro.click")
         logger.info(f"Set {len(cookies)} cookies for FatturaPro session")
 
-    def login(self) -> bool:
+    def login(self, force: bool = False) -> bool:
         """Authenticate with FatturaPro platform.
+
+        In orario d'ufficio (in_quiet_hours) il login viene NEGATO da noi
+        (quiet_hours_block=True) a meno di force=True: FatturaPro ammette una
+        sessione sola e il nostro accesso sconnetterebbe il personale.
 
         Attempts authentication in this order:
         1. Try /ws/ endpoint with API key
@@ -146,6 +154,13 @@ class FatturaProConnector:
         Returns:
             True if authentication successful, False otherwise
         """
+        self.quiet_hours_block = False
+        if not force and not self._authenticated and in_quiet_hours():
+            self.quiet_hours_block = True
+            self.last_login_error = None
+            logger.info("FatturaPro login skipped: orario d'ufficio (quiet hours)")
+            return False
+
         if self._authenticated:
             # Verify session is still valid
             if self._check_session_valid():

@@ -163,9 +163,10 @@ class TestSchedulerJobs:
     def test_hourly_job_runs_light_sync(self, monkeypatch):
         captured = {}
 
-        def fake_full(include_order_matching=True, manual=False):
+        def fake_full(include_order_matching=True, manual=False, **kwargs):
             captured["include_order_matching"] = include_order_matching
             captured["manual"] = manual
+            captured["include_fatturapro"] = kwargs.get("include_fatturapro", True)
             return {"ok": True}
 
         monkeypatch.setattr(sync_mod, "_full_sync_task", fake_full)
@@ -195,9 +196,10 @@ class TestSchedulerJobs:
     def test_daily_job_runs_full_sync(self, monkeypatch):
         captured = {}
 
-        def fake_full(include_order_matching=True, manual=False):
+        def fake_full(include_order_matching=True, manual=False, **kwargs):
             captured["include_order_matching"] = include_order_matching
             captured["manual"] = manual
+            captured["include_fatturapro"] = kwargs.get("include_fatturapro", True)
             return {"ok": True}
 
         monkeypatch.setattr(sync_mod, "_full_sync_task", fake_full)

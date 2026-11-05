@@ -16,6 +16,7 @@ Pipeline (ordine vincolante — vedi design luglio 2026):
 import logging
 import csv
 import threading
+from typing import Optional
 from collections import defaultdict
 from io import StringIO
 from fastapi import APIRouter, BackgroundTasks, UploadFile, File
@@ -26,6 +27,7 @@ from backend.database import (
     Invoice, Customer, SyncState,
 )
 from backend.connectors.fatturapro import FatturaProConnector
+from backend.engine.office_hours import in_quiet_hours, quiet_hours_message
 from backend.engine.sdi import SDI_FINAL_OK, sdi_state_from_notifications
 from backend.database import RecoveryActionInvoice
 from backend.connectors.shopify import ShopifyConnector
@@ -245,11 +247,53 @@ def _login_failure_error(connector) -> str:
     login fallisce: include ciò che FatturaPro ha risposto, se c'è, così
     «password sbagliata» e «login rifiutato con credenziali giuste» (blocco
     IP, verifica dispositivo) non si confondono."""
+    if getattr(connector, "quiet_hours_block", False):
+        return quiet_hours_message()
     rejection = getattr(connector, "last_login_error", None)
     if rejection:
         # Il motivo lo dice FatturaPro: non suggerire «password» a caso.
         return f"Login rifiutato da FatturaPro: {rejection}"
     return "Login failed — check FATTURAPRO_USERNAME/PASSWORD env vars"
+
+
+def _fatturapro_skip_reason(include_fatturapro: bool, now=None) -> Optional[str]:
+    """Perché il passo fatture (FatturaPro) NON va eseguito in questo sync,
+    o None se va eseguito. Regola owner: un accesso al giorno (job dedicato
+    alle FATTURAPRO_SYNC_HOUR) e mai in orario d'ufficio."""
+    if not include_fatturapro:
+        return (
+            "FatturaPro non consultato in questo sync: accesso programmato una volta al giorno alle "
+            f"{config.FATTURAPRO_SYNC_HOUR:02d}:{config.FATTURAPRO_SYNC_MINUTE:02d} (ora italiana)"
+        )
+    if in_quiet_hours(now):
+        return quiet_hours_message()
+    return None
+
+
+def _run_invoice_passes(passes: int) -> dict:
+    """Esegue il passo fatture `passes` volte di seguito (stesso giro, login
+    separati con signout in mezzo) e fonde i contatori: il rilevamento
+    incassi richiede PAID_ABSENCE_STREAK letture complete consecutive, e con
+    un solo accesso al giorno due passaggi al mattino valgono due letture.
+    Si ferma al primo passaggio parziale o fallito."""
+    merged = None
+    for n in range(max(1, passes)):
+        res = _sync_invoices_task()
+        fp = res.get("fatturapro", {}) if isinstance(res, dict) else {}
+        if merged is None:
+            merged = res
+        else:
+            mfp = merged.setdefault("fatturapro", {})
+            for k in ("created", "updated", "paid_detected", "piva_enriched", "due_date_enriched",
+                      "voided", "reactivated", "sdi_checked"):
+                mfp[k] = (mfp.get(k) or 0) + (fp.get(k) or 0)
+            mfp["success"] = bool(fp.get("success"))
+            mfp["partial"] = bool(fp.get("partial"))
+            mfp["error"] = fp.get("error")
+        merged.setdefault("fatturapro", {})["passes"] = n + 1
+        if not fp.get("success") or fp.get("partial"):
+            break
+    return merged or {}
 
 
 def _sync_invoices_task() -> dict:
@@ -2102,6 +2146,14 @@ def _reconcile_incassi_task() -> dict:
 
     Ritorna: {passes, marked_paid, partial, message}.
     """
+    if in_quiet_hours():
+        logger.info("Reconcile incassi saltato: orario d'ufficio")
+        return {
+            "passes": 0,
+            "marked_paid": 0,
+            "partial": False,
+            "message": quiet_hours_message(),
+        }
     if not _sync_lock.acquire(blocking=False):
         logger.warning("Reconcile incassi saltato: un altro sync è in corso")
         return {
@@ -2210,7 +2262,12 @@ async def sync_cases(background_tasks: BackgroundTasks):
     }
 
 
-def _full_sync_task(include_order_matching: bool = True, manual: bool = False) -> dict:
+def _full_sync_task(
+    include_order_matching: bool = True,
+    manual: bool = False,
+    include_fatturapro: bool = True,
+    fatturapro_passes: int = 1,
+) -> dict:
     """Run full sync sequentially:
     invoices → customers → [repair] → matching → auto-create → cases →
     order matching.
@@ -2257,13 +2314,22 @@ def _full_sync_task(include_order_matching: bool = True, manual: bool = False) -
         )
         results = {}
 
-        # Step 1: Sync invoices first (gets latest data from platforms)
+        # Step 1: Sync invoices first (gets latest data from platforms).
+        # Regola owner: FatturaPro una volta al giorno e mai in orario
+        # d'ufficio (sessione unica: il login sconnette il personale). Quando
+        # si salta, lo stato persistito 'invoices' resta quello dell'ultimo
+        # accesso VERO (niente sovrascrittura con un risultato vuoto).
         _set_progress("invoices", "Fatture (FatturaPro)", 1, total_steps)
-        try:
-            results["invoices"] = _sync_invoices_task()
-        except Exception as e:
-            logger.error(f"Invoice sync failed: {e}", exc_info=True)
-            results["invoices"] = {"error": str(e)}
+        skip_reason = _fatturapro_skip_reason(include_fatturapro)
+        if skip_reason:
+            logger.info(f"Invoice step skipped: {skip_reason}")
+            results["invoices"] = {"skipped": skip_reason}
+        else:
+            try:
+                results["invoices"] = _run_invoice_passes(fatturapro_passes)
+            except Exception as e:
+                logger.error(f"Invoice sync failed: {e}", exc_info=True)
+                results["invoices"] = {"error": str(e)}
 
         # Step 2: Sync customers from Shopify
         _set_progress("customers", "Clienti (Shopify)", 2, total_steps)

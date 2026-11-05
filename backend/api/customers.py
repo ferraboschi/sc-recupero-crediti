@@ -24,6 +24,7 @@ from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
 from backend.engine.overdue import overdue_clause, RECOVERY_ACTION_TYPES
 from backend.engine.piva import validate_piva
 from backend.engine.fp_verify import compare_documents, fp_state_of
+from backend.engine.office_hours import in_quiet_hours, quiet_hours_message
 from backend.engine.sdi import SDI_FINAL_OK, SDI_LABELS
 
 logger = logging.getLogger(__name__)
@@ -1928,6 +1929,8 @@ def verify_fatturapro(customer_id: int, session: Session = Depends(get_session))
     platform = session.query(Invoice).filter(
         Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
     ).order_by(Invoice.id.asc()).all()
+    if in_quiet_hours():
+        raise HTTPException(status_code=423, detail=quiet_hours_message())
     connector = FatturaProConnector()
     try:
         if not connector.login():
@@ -1985,6 +1988,8 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
     platform = session.query(Invoice).filter(
         Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
     ).order_by(Invoice.id.asc()).all()
+    if in_quiet_hours():
+        raise HTTPException(status_code=423, detail=quiet_hours_message())
     connector = FatturaProConnector()
     try:
         if not connector.login():

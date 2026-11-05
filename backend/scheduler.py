@@ -45,7 +45,8 @@ def run_daily_job(manual: bool = False):
     logger.info(f"Starting daily job (manual={manual})")
 
     try:
-        results = _full_sync_task(include_order_matching=True, manual=manual)
+        # FatturaPro NON qui (8:30 = orario d'ufficio): lo fa run_fatturapro_job.
+        results = _full_sync_task(include_order_matching=True, manual=manual, include_fatturapro=False)
         results["timestamp"] = datetime.utcnow().isoformat()
     except Exception as e:
         logger.error(f"Error in daily job: {e}", exc_info=True)
@@ -88,7 +89,7 @@ def run_hourly_job():
     logger.info("Starting hourly job (light sync, no order matching)")
 
     try:
-        results = _full_sync_task(include_order_matching=False, manual=False)
+        results = _full_sync_task(include_order_matching=False, manual=False, include_fatturapro=False)
         results["timestamp"] = datetime.utcnow().isoformat()
     except Exception as e:
         logger.error(f"Error in hourly job: {e}", exc_info=True)
@@ -100,6 +101,31 @@ def run_hourly_job():
         _last_sync[key] = now
 
     logger.info(f"Hourly job completed: {results}")
+    return results
+
+
+def run_fatturapro_job():
+    """
+    Job giornaliero FatturaPro (regola owner 5/11/2026): UN solo accesso al
+    giorno, al mattino presto, fuori dall'orario d'ufficio. FatturaPro
+    ammette una sessione per account: ogni nostro login chiude quella del
+    personale, quindi niente accessi orari. Due passaggi di lettura nello
+    stesso giro, così il rilevamento incassi (PAID_ABSENCE_STREAK=2 letture
+    complete consecutive) si chiude la mattina stessa.
+    """
+    from backend.api.sync import _full_sync_task
+    logger.info("Starting daily FatturaPro job (2 passes)")
+    try:
+        results = _full_sync_task(
+            include_order_matching=False, manual=False,
+            include_fatturapro=True, fatturapro_passes=2,
+        )
+        results["timestamp"] = datetime.utcnow().isoformat()
+    except Exception as e:
+        logger.error(f"Error in FatturaPro job: {e}", exc_info=True)
+        results = {"error": str(e), "timestamp": datetime.utcnow().isoformat()}
+    _last_sync["invoices"] = datetime.utcnow().isoformat()
+    logger.info(f"FatturaPro job completed: {results}")
     return results
 
 
@@ -136,6 +162,30 @@ def start_scheduler():
         )
     except Exception as e:
         logger.error(f"Failed to schedule daily job: {e}", exc_info=True)
+        raise
+
+    # Job giornaliero FatturaPro alle FATTURAPRO_SYNC_HOUR (default 07:00,
+    # fuori dall'orario d'ufficio 8-18): l'UNICO accesso automatico del giorno.
+    try:
+        fp_trigger = CronTrigger(
+            hour=config.FATTURAPRO_SYNC_HOUR,
+            minute=config.FATTURAPRO_SYNC_MINUTE,
+            timezone=config.TIMEZONE,
+        )
+        _scheduler.add_job(
+            run_fatturapro_job,
+            trigger=fp_trigger,
+            id="fatturapro_daily_job",
+            name="Daily FatturaPro sync (single login, 2 passes)",
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info(
+            f"Scheduled daily FatturaPro job at {config.FATTURAPRO_SYNC_HOUR:02d}:"
+            f"{config.FATTURAPRO_SYNC_MINUTE:02d} ({config.TIMEZONE})"
+        )
+    except Exception as e:
+        logger.error(f"Failed to schedule FatturaPro job: {e}", exc_info=True)
         raise
 
     # Schedule hourly light sync (allo scoccare di ogni ora): sync leggero
@@ -207,7 +257,7 @@ def get_scheduler_status():
     # Prossima esecuzione dei job (APScheduler la popola dopo lo start).
     next_run_times = {}
     if _scheduler is not None:
-        for job_id in ("daily_sync_job", "hourly_sync_job", "startup_sync"):
+        for job_id in ("daily_sync_job", "hourly_sync_job", "fatturapro_daily_job", "startup_sync"):
             try:
                 job = _scheduler.get_job(job_id)
                 if job is not None and job.next_run_time is not None:
@@ -223,6 +273,9 @@ def get_scheduler_status():
         "scheduler_minute": config.SCHEDULER_MINUTE,
         "timezone": config.TIMEZONE,
         "hourly_enabled": True,
+        "fatturapro_hour": config.FATTURAPRO_SYNC_HOUR,
+        "fatturapro_minute": config.FATTURAPRO_SYNC_MINUTE,
+        "fatturapro_quiet_hours": config.FATTURAPRO_QUIET_HOURS,
         "next_run_times": next_run_times,
         "last_sync": _last_sync,
     }
