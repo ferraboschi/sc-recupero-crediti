@@ -1923,14 +1923,14 @@ def verify_fatturapro(customer_id: int, session: Session = Depends(get_session))
     customer = session.query(Customer).filter(Customer.id == customer_id).first()
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
+    if in_quiet_hours():
+        raise HTTPException(status_code=423, detail=quiet_hours_message())
     names = _fp_search_names(session, customer)
     if not names:
         raise HTTPException(status_code=400, detail="Cliente senza ragione sociale: impossibile cercarlo su FatturaPro")
     platform = session.query(Invoice).filter(
         Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
     ).order_by(Invoice.id.asc()).all()
-    if in_quiet_hours():
-        raise HTTPException(status_code=423, detail=quiet_hours_message())
     connector = FatturaProConnector()
     try:
         if not connector.login():
@@ -1982,14 +1982,14 @@ def apply_fatturapro_fixes(customer_id: int, body: FpApplyBody, session: Session
     customer = session.query(Customer).filter(Customer.id == customer_id).first()
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
+    if in_quiet_hours():
+        raise HTTPException(status_code=423, detail=quiet_hours_message())
     if not body.fixes:
         raise HTTPException(status_code=400, detail="Nessuna correzione selezionata")
     names = _fp_search_names(session, customer)
     platform = session.query(Invoice).filter(
         Invoice.customer_id == customer_id, Invoice.source_platform == "fatturapro",
     ).order_by(Invoice.id.asc()).all()
-    if in_quiet_hours():
-        raise HTTPException(status_code=423, detail=quiet_hours_message())
     connector = FatturaProConnector()
     try:
         if not connector.login():
