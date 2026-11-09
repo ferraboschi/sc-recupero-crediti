@@ -70,7 +70,7 @@ class ShopifyConnector(BaseConnector):
 
         while True:
             page_count += 1
-            logger.info(f"Fetching B2B customers page {page_count}")
+            logger.info(f"Fetching business customers (B2B/B2D/Wholesale) page {page_count}")
 
             # Con page_info Shopify rifiuta i parametri di filtro (query):
             # nelle pagine successive restano solo limit/fields/page_info.

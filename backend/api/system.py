@@ -455,6 +455,16 @@ def _summarize_sync_result(key: str, result: dict) -> str:
         parts = []
         if created > 0:
             parts.append(f"Shopify: {created} nuovi")
+        linked = (result.get("adopted") or 0) + (result.get("adopted_by_email") or 0)
+        if linked > 0:
+            parts.append(
+                f"{linked} schede agganciate a Shopify "
+                f"({result.get('adopted') or 0} per P.IVA, {result.get('adopted_by_email') or 0} per email)"
+            )
+        if result.get("skipped_non_b2b"):
+            parts.append(f"{result['skipped_non_b2b']} B2D/ingrosso senza scheda (non importati)")
+        if result.get("email_ambiguous"):
+            parts.append(f"{result['email_ambiguous']} email condivise (nessun aggancio)")
         if shopify_err:
             parts.append("Shopify: errore token")
         return " | ".join(parts) if parts else "Nessuna modifica"

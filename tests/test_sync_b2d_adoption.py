@@ -182,3 +182,89 @@ class TestNonB2bNeverCreatesCustomers:
         assert res["updated"] == 1 and res["skipped_non_b2b"] == 0
         c = _reload(test_db_session, cid)
         assert c.tags == "B2D, Maggioni"
+
+
+class TestEmailAdoptionAfterReview:
+    """Rilievi della revisione avversariale: la P.IVA comanda sull'email, le
+    schede escluse non si agganciano, il telefono non si sovrascrive, le
+    ambiguità si contano."""
+
+    def test_piva_owner_in_batch_wins_over_email(self, monkeypatch, test_db_session):
+        # Orfano con P.IVA P ed email E. Profilo Shopify 1 (prima nel lotto):
+        # senza P.IVA, email E. Profilo 2: P.IVA P, altra email.
+        oid = _orphan(test_db_session, "Sakura Sushi Srl", "info@sakura.it", piva=PIVA_A)
+        res = _run(monkeypatch, test_db_session, [
+            _shop(21, "Sakura Sushi", "info@sakura.it", "B2B"),
+            _shop(22, "Sakura Sushi Srl", "ordini@sakura.it", "B2B, Izzo", piva=PIVA_A),
+        ])
+        assert res["adopted"] == 1 and res["adopted_by_email"] == 0
+        orphan = _reload(test_db_session, oid)
+        assert orphan.shopify_id == "gid://shopify/Customer/22" and orphan.tags == "B2B, Izzo"
+        # Il profilo 1 (B2B senza aggancio) si crea come su main: nessun duplicato con la stessa P.IVA
+        others = [c for c in test_db_session.query(Customer).all() if c.id != oid]
+        assert len(others) == 1 and others[0].partita_iva is None
+
+    def test_orphan_duplicate_of_linked_customer_is_not_adopted_by_second_profile(self, monkeypatch, test_db_session):
+        linked = Customer(ragione_sociale="Sakura Sushi Srl", partita_iva=PIVA_A, email="x@sakura.it",
+                          shopify_id="gid://shopify/Customer/30", source="shopify", tags="B2B")
+        test_db_session.add(linked)
+        test_db_session.commit()
+        oid = _orphan(test_db_session, "Sakura Sushi Srl", "amm@sakura.it", piva=PIVA_A)
+        res = _run(monkeypatch, test_db_session, [
+            _shop(30, "Sakura Sushi Srl", "x@sakura.it", "B2B", piva=PIVA_A),
+            _shop(31, "Sakura Sushi", "amm@sakura.it", "B2D, Maggioni"),
+        ])
+        assert res["adopted_by_email"] == 0 and res["skipped_non_b2b"] == 1
+        assert _reload(test_db_session, oid).shopify_id is None
+
+    def test_excluded_orphan_is_never_adopted_by_email(self, monkeypatch, test_db_session):
+        c = Customer(ragione_sociale="Vecchio Cliente", email="old@x.it", excluded=True, source="fatturapro")
+        test_db_session.add(c)
+        test_db_session.commit()
+        cid = c.id
+        res = _run(monkeypatch, test_db_session, [_shop(40, "Vecchio Cliente", "old@x.it", "B2D, Scotti")])
+        assert res["adopted_by_email"] == 0 and res["skipped_non_b2b"] == 1
+        assert _reload(test_db_session, cid).shopify_id is None
+
+    def test_email_adoption_keeps_manual_phone_and_fills_missing(self, monkeypatch, test_db_session):
+        with_phone = Customer(ragione_sociale="Japlab srl", email="info@japlab.it", phone="+39 02 111",
+                              source="manual")
+        without_phone = Customer(ragione_sociale="Nove.10 Snc", email="nove@x.it", source="fatturapro")
+        test_db_session.add_all([with_phone, without_phone])
+        test_db_session.commit()
+        ids = (with_phone.id, without_phone.id)
+        res = _run(monkeypatch, test_db_session, [
+            _shop(50, "Japlab", "info@japlab.it", "B2D, Izzo"),
+            _shop(51, "Nove.10", "nove@x.it", "B2D, Maggioni"),
+        ])
+        assert res["adopted_by_email"] == 2
+        a = _reload(test_db_session, ids[0])
+        assert a.phone == "+39 02 111" and a.tags == "B2D, Izzo"  # telefono manuale conservato
+        b = _reload(test_db_session, ids[1])
+        assert b.phone == "+39 333 000 1111"  # completato dove mancava
+
+    def test_shared_email_is_counted_as_ambiguous(self, monkeypatch, test_db_session):
+        _orphan(test_db_session, "Ristorante Kiyo", "studio@commercialista.it", piva=PIVA_A)
+        _orphan(test_db_session, "Sushi Kiyo Due", "studio@commercialista.it", piva=PIVA_B)
+        res = _run(monkeypatch, test_db_session, [_shop(60, "Ristorante Kiyo", "studio@commercialista.it", "B2D, Izzo")])
+        assert res["email_ambiguous"] == 1 and res["adopted_by_email"] == 0
+
+    def test_b2b_tag_variants_are_not_created(self, monkeypatch, test_db_session):
+        # Censimento tag prod (9/11/2026): esiste solo "B2B" esatto; le
+        # varianti composte non creano schede e vengono contate.
+        res = _run(monkeypatch, test_db_session, [
+            _shop(70, "Uno", "uno@x.it", "b2b"),
+            _shop(71, "Due", "due@x.it", "B2B Premium"),
+        ])
+        assert res["created"] == 1 and res["skipped_non_b2b"] == 1
+
+
+class TestSystemSummary:
+    def test_summary_mentions_links(self):
+        from backend.api.system import _summarize_sync_result
+        text = _summarize_sync_result("customers", {
+            "success": True, "created": 0, "adopted": 1, "adopted_by_email": 3,
+            "skipped_non_b2b": 40, "email_ambiguous": 2,
+        })
+        assert "4 schede agganciate" in text and "3 per email" in text
+        assert "40 B2D" in text and "2 email condivise" in text
