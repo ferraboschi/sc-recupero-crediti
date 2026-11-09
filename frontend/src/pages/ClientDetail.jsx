@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import client from '../api/client'
 import AgentBadges from '../components/AgentBadges'
+import { ReminderEmailHistory } from '../components/ReminderEmailPanel'
 import StageBadge, { CHANNEL_LABELS } from '../components/StageBadge'
 
 const ACTION_LABELS = {
@@ -2463,6 +2464,9 @@ export default function ClientDetail() {
           </div>
         )}
       </div>
+
+      {/* Promemoria email automatici (giorno prima della scadenza) */}
+      <ReminderEmailHistory customerId={customerId} />
 
       {/* SEZIONE FATTURE PAGATE */}
       {paidInvoices.length > 0 && (

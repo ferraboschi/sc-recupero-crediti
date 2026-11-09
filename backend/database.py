@@ -9,7 +9,8 @@ eliminate manualmente quando si è certi di non doverle più consultare.
 import datetime
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Boolean,
-    DateTime, Date, Text, ForeignKey, JSON, Index, event, text
+    DateTime, Date, Text, ForeignKey, JSON, Index, event, text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from backend.config import config
@@ -324,6 +325,46 @@ class ActivityLog(Base):
     entity_id = Column(Integer, nullable=True)
 
 
+class InvoiceReminderEmail(Base):
+    """Promemoria email pre-scadenza: UNA riga per (fattura, data di scadenza).
+
+    È il registro di cosa è stato composto/inviato/saltato dal giro quotidiano
+    (backend/engine/reminder_email.py): la chiave unica rende il giro
+    idempotente (può girare più volte al giorno senza doppioni; solo le righe
+    `failed` vengono ritentate). Le esclusioni restano registrate con il
+    motivo (`skipped`): nessun dato scartato in silenzio.
+
+    Tabella NUOVA: la crea create_all (nessuna ALTER); la RLS la copre perché
+    derivata dai modelli.
+    """
+    __tablename__ = "invoice_reminder_emails"
+    __table_args__ = (
+        UniqueConstraint("invoice_id", "due_date", name="uq_reminder_invoice_due"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=False, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, index=True)
+    due_date = Column(Date, nullable=False)
+    status = Column(String, nullable=False, default="prepared")  # prepared / sending / sent / failed / skipped
+    mode = Column(String, nullable=False, default="prova")       # prova / test / reale
+    skip_reason = Column(String, nullable=True)                  # senza_email / avvocato / in_incasso / ...
+    to_email = Column(String, nullable=True)
+    original_to = Column(String, nullable=True)                  # in modalità test: il destinatario vero
+    subject = Column(String, nullable=True)
+    body_text = Column(Text, nullable=True)
+    attachments_json = Column(JSON, nullable=True)               # nomi dei PDF allegati
+    amount_due = Column(Float, nullable=True)
+    overdue_count = Column(Integer, default=0)
+    overdue_total = Column(Float, default=0.0)
+    provider_message_id = Column(String, nullable=True)
+    error = Column(Text, nullable=True)
+    error_kind = Column(String, nullable=True)                   # pdf / validation / provider / network / other
+    attempted_at = Column(DateTime, nullable=True)               # ultimo tentativo di invio
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    sent_at = Column(DateTime, nullable=True)
+
+
 class SyncState(Base):
     """Persists sync status across server restarts."""
     __tablename__ = "sync_state"
@@ -494,6 +535,11 @@ def _run_migrations(engine):
         "UPDATE invoices SET missing_streak = 0 WHERE missing_streak IS NULL",
         # Audit abbinamenti: "Segna verificato" per le fatture già controllate
         "ALTER TABLE invoices ADD COLUMN audit_reviewed_at TIMESTAMP",
+        # Promemoria email: colonne aggiunte dopo la prima stesura del modello
+        # (la tabella nuova nasce già completa da create_all; qui per i DB
+        # locali creati con la prima versione).
+        "ALTER TABLE invoice_reminder_emails ADD COLUMN error_kind VARCHAR",
+        "ALTER TABLE invoice_reminder_emails ADD COLUMN attempted_at TIMESTAMP",
         # Riconciliazione: data di pagamento vera + residuo all'atto del
         # pagamento. NESSUN backfill: le righe già 'paid' non hanno una data
         # di pagamento vera (updated_at non lo è) né un residuo recuperabile

@@ -1128,37 +1128,65 @@ def generate_selected_invoices_pdf(
         raise
 
 
+def _company_header(pdf, *, centered: bool = False) -> None:
+    """Intestazione aziendale condivisa da tutti i PDF: nome + (se configurati)
+    P.IVA e indirizzo. Mai valori inventati: righe vuote = righe omesse."""
+    from backend.engine.format import pdf_text
+
+    align = "C" if centered else "L"
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, pdf_text(config.COMPANY_NAME), new_x="LMARGIN", new_y="NEXT", align=align)
+    details = []
+    if config.COMPANY_VAT:
+        details.append(f"P.IVA: {config.COMPANY_VAT}")
+    if config.COMPANY_ADDRESS:
+        details.append(config.COMPANY_ADDRESS)
+    if details:
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 5, pdf_text(" | ".join(details)), new_x="LMARGIN", new_y="NEXT", align=align)
+    pdf.ln(4)
+
+
+def _payment_block(pdf, causale: str) -> None:
+    """Coordinate per il pagamento (stesse su copia di cortesia e riepilogo)."""
+    from backend.engine.format import pdf_text
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "Coordinate per il pagamento:", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, pdf_text(f"Intestatario: {config.COMPANY_NAME}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"IBAN: {config.COMPANY_IBAN}", new_x="LMARGIN", new_y="NEXT")
+    if config.COMPANY_BANK:
+        pdf.cell(0, 6, pdf_text(f"Banca: {config.COMPANY_BANK}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, pdf_text(f"Causale: {causale}"), new_x="LMARGIN", new_y="NEXT")
+
+
 def _build_riepilogativo_pdf(customer, invoices):
-    """Build the PDF riepilogativo using fpdf2."""
+    """Riepilogo delle fatture scadute del cliente (fpdf2). Va anche al
+    cliente come allegato del promemoria: testo al Lei, importi in formato
+    italiano, nessun dato interno."""
     from fpdf import FPDF
+    from backend.engine.format import fmt_date_pdf, fmt_eur_pdf, italian_today, pdf_text
 
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
 
-    # Header
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 12, "Sake Company", new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, "Sake Company srl", new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.ln(8)
+    _company_header(pdf, centered=True)
 
-    # Title
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 10, "Riepilogo Fatture Scadute", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(6)
 
-    # Customer info
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 7, f"Cliente: {customer.ragione_sociale}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, pdf_text(f"Cliente: {customer.ragione_sociale}"), new_x="LMARGIN", new_y="NEXT")
     if customer.partita_iva:
         pdf.set_font("Helvetica", "", 10)
-        pdf.cell(0, 6, f"P.IVA: {customer.partita_iva}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, pdf_text(f"P.IVA: {customer.partita_iva}"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, f"Data: {date.today().strftime('%d/%m/%Y')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Data: {fmt_date_pdf(italian_today())}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(8)
 
-    # Table header
     pdf.set_font("Helvetica", "B", 10)
     pdf.set_fill_color(240, 240, 240)
     col_widths = [50, 45, 40, 55]  # Fattura, Importo, Scadenza, GG Ritardo
@@ -1167,188 +1195,145 @@ def _build_riepilogativo_pdf(customer, invoices):
         pdf.cell(col_widths[i], 8, h, border=1, fill=True, align="C")
     pdf.ln()
 
-    # Table rows
     pdf.set_font("Helvetica", "", 10)
     total_due = 0.0
     for inv in invoices:
-        total_due += float(inv.amount_due)
-        pdf.cell(col_widths[0], 7, str(inv.invoice_number)[:25], border=1, align="L")
-        pdf.cell(col_widths[1], 7, f"{float(inv.amount_due):,.2f} EUR".replace(",", "."), border=1, align="R")
-        pdf.cell(col_widths[2], 7, inv.due_date.strftime("%d/%m/%Y") if inv.due_date else "-", border=1, align="C")
+        total_due += float(inv.amount_due or 0)
+        pdf.cell(col_widths[0], 7, pdf_text(str(inv.invoice_number))[:25], border=1, align="L")
+        pdf.cell(col_widths[1], 7, fmt_eur_pdf(inv.amount_due), border=1, align="R")
+        pdf.cell(col_widths[2], 7, fmt_date_pdf(inv.due_date), border=1, align="C")
         pdf.cell(col_widths[3], 7, str(inv.days_overdue or 0), border=1, align="C")
         pdf.ln()
 
-    # Total row
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(col_widths[0], 9, "TOTALE", border=1, fill=True, align="R")
-    pdf.cell(col_widths[1], 9, f"{total_due:,.2f} EUR".replace(",", "."), border=1, fill=True, align="R")
+    pdf.cell(col_widths[1], 9, fmt_eur_pdf(total_due), border=1, fill=True, align="R")
     pdf.cell(col_widths[2] + col_widths[3], 9, "", border=1, fill=True)
     pdf.ln(14)
 
-    # Payment info
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, "Coordinate per il pagamento:", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(2)
     pdf.set_font("Helvetica", "", 11)
     pdf.cell(0, 7, "Pagamento: a vista", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 7, "Intestatario: Sake Company srl", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 7, f"IBAN: {os.getenv('COMPANY_IBAN', 'IT44N0200801671000105175151')}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 7, "Banca: UniCredit", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 7, f"Causale: Saldo fatture {customer.ragione_sociale}", new_x="LMARGIN", new_y="NEXT")
+    _payment_block(pdf, f"Saldo fatture {customer.ragione_sociale}")
     pdf.ln(8)
 
-    # Footer note
     pdf.set_font("Helvetica", "I", 9)
     pdf.multi_cell(
         0, 5,
-        "Vi preghiamo di provvedere al pagamento a vista. "
-        "Per qualsiasi chiarimento, non esitate a contattarci."
+        pdf_text(
+            "La preghiamo di provvedere al pagamento a vista. "
+            "Per qualsiasi chiarimento può contattarci."
+        ),
     )
 
     return pdf.output()
 
 
-def _build_invoice_pdf(customer, invoice):
-    """Build a courtesy copy PDF for a single invoice."""
+_INVOICE_STATUS_LABELS = {
+    "open": "Aperto", "paid": "Pagato",
+    "contacted": "Contattato", "promised": "Promesso",
+    "disputed": "Contestato", "escalated": "Escalation",
+}
+
+
+def _build_invoice_pdf(customer, invoice, *, courtesy: bool = False):
+    """PDF della singola fattura (fpdf2).
+
+    courtesy=False (staff, dossier avvocato): come sempre, con fonte e stato
+    interno della fattura.
+    courtesy=True (allegato al cliente): si intitola COPIA DI CORTESIA, non
+    stampa fonte/stato del recupero né il nome del tool — l'originale al
+    cliente è arrivato via SdI, questo è solo un promemoria.
+    """
     from fpdf import FPDF
+    from backend.engine.format import fmt_date_pdf, fmt_eur_pdf, italian_today, pdf_text
 
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
 
-    # --- Company header ---
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, "Sake Company srl", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 5, "P.IVA: 04aborita6 | Milano, Italia",
-             new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
+    _company_header(pdf)
 
-    # Line separator
     pdf.set_draw_color(200, 200, 200)
     pdf.line(10, pdf.get_y(), 200, pdf.get_y())
     pdf.ln(6)
 
-    # --- FATTURA title + number ---
     pdf.set_font("Helvetica", "B", 20)
-    pdf.cell(0, 12, "FATTURA", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 12, "COPIA DI CORTESIA" if courtesy else "FATTURA", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 11)
-    pdf.cell(0, 7,
-             f"N. {invoice.invoice_number}",
-             new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, pdf_text(f"Fattura n. {invoice.invoice_number}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
-    # --- Two-column: dates left, customer right ---
     y_start = pdf.get_y()
-
-    # Left: dates
     pdf.set_font("Helvetica", "", 10)
-    issue_str = (invoice.issue_date.strftime("%d/%m/%Y")
-                 if invoice.issue_date else "-")
-    due_str = (invoice.due_date.strftime("%d/%m/%Y")
-               if invoice.due_date else "-")
-    pdf.cell(95, 6, f"Data emissione: {issue_str}",
-             new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(95, 6, f"Data scadenza: {due_str}",
-             new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(95, 6, f"Data emissione: {fmt_date_pdf(invoice.issue_date)}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(95, 6, f"Data scadenza: {fmt_date_pdf(invoice.due_date)}", new_x="LMARGIN", new_y="NEXT")
     if invoice.days_overdue and invoice.days_overdue > 0:
         pdf.set_text_color(200, 0, 0)
-        pdf.cell(95, 6,
-                 f"Giorni di ritardo: {invoice.days_overdue}",
-                 new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(95, 6, f"Giorni di ritardo: {invoice.days_overdue}", new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
-    pdf.cell(95, 6,
-             f"Fonte: {invoice.source_platform or '-'}",
-             new_x="LMARGIN", new_y="NEXT")
+    if not courtesy:
+        pdf.cell(95, 6, pdf_text(f"Fonte: {invoice.source_platform or '-'}"), new_x="LMARGIN", new_y="NEXT")
     y_after_left = pdf.get_y()
 
-    # Right: customer box
     pdf.set_y(y_start)
     pdf.set_x(110)
     pdf.set_font("Helvetica", "B", 10)
     pdf.cell(90, 6, "Destinatario:", new_x="LMARGIN", new_y="NEXT")
     pdf.set_x(110)
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(90, 6, customer.ragione_sociale or "-",
-             new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(90, 6, pdf_text(customer.ragione_sociale or "-"), new_x="LMARGIN", new_y="NEXT")
     if customer.partita_iva:
         pdf.set_x(110)
-        pdf.cell(90, 6, f"P.IVA: {customer.partita_iva}",
-                 new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(90, 6, pdf_text(f"P.IVA: {customer.partita_iva}"), new_x="LMARGIN", new_y="NEXT")
     if customer.codice_fiscale:
         pdf.set_x(110)
-        pdf.cell(90, 6, f"C.F.: {customer.codice_fiscale}",
-                 new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(90, 6, pdf_text(f"C.F.: {customer.codice_fiscale}"), new_x="LMARGIN", new_y="NEXT")
     if customer.email:
         pdf.set_x(110)
-        pdf.cell(90, 6, f"Email: {customer.email}",
-                 new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(90, 6, pdf_text(f"Email: {customer.email}"), new_x="LMARGIN", new_y="NEXT")
 
     pdf.set_y(max(y_after_left, pdf.get_y()) + 8)
 
-    # --- Invoice line table ---
     pdf.set_draw_color(180, 180, 180)
     pdf.set_font("Helvetica", "B", 10)
     pdf.set_fill_color(245, 245, 245)
+    last_col = "Scadenza" if courtesy else "Stato"
     pdf.cell(90, 8, "Descrizione", border=1, fill=True, align="L")
     pdf.cell(35, 8, "Importo", border=1, fill=True, align="R")
     pdf.cell(35, 8, "Dovuto", border=1, fill=True, align="R")
-    pdf.cell(30, 8, "Stato", border=1, fill=True, align="C")
+    pdf.cell(30, 8, last_col, border=1, fill=True, align="C")
     pdf.ln()
 
     pdf.set_font("Helvetica", "", 10)
-    desc = f"Fattura n. {invoice.invoice_number}"
-    status_label = {
-        "open": "Aperto", "paid": "Pagato",
-        "contacted": "Contattato", "promised": "Promesso",
-        "disputed": "Contestato", "escalated": "Escalation",
-    }.get(invoice.status, invoice.status or "-")
-
+    desc = pdf_text(f"Fattura n. {invoice.invoice_number}")
+    last_val = (
+        fmt_date_pdf(invoice.due_date) if courtesy
+        else _INVOICE_STATUS_LABELS.get(invoice.status, invoice.status or "-")
+    )
     pdf.cell(90, 7, desc[:45], border=1, align="L")
-    pdf.cell(35, 7,
-             f"{float(invoice.amount):,.2f}".replace(",", "."),
-             border=1, align="R")
-    pdf.cell(35, 7,
-             f"{float(invoice.amount_due):,.2f}".replace(",", "."),
-             border=1, align="R")
-    pdf.cell(30, 7, status_label, border=1, align="C")
+    pdf.cell(35, 7, fmt_eur_pdf(invoice.amount), border=1, align="R")
+    pdf.cell(35, 7, fmt_eur_pdf(invoice.amount_due), border=1, align="R")
+    pdf.cell(30, 7, pdf_text(last_val), border=1, align="C")
     pdf.ln()
 
-    # Totals
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(90, 9, "", border=0)
     pdf.cell(35, 9, "TOTALE:", border=1, fill=True, align="R")
-    pdf.cell(35, 9,
-             f"{float(invoice.amount_due):,.2f} EUR".replace(",", "."),
-             border=1, fill=True, align="R")
+    pdf.cell(35, 9, fmt_eur_pdf(invoice.amount_due), border=1, fill=True, align="R")
     pdf.cell(30, 9, "", border=1, fill=True)
     pdf.ln(14)
 
-    # --- Payment info ---
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, "Coordinate per il pagamento:",
-             new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, "Intestatario: Sake Company srl",
-             new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, f"IBAN: {os.getenv('COMPANY_IBAN', 'IT44N0200801671000105175151')}",
-             new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, "Banca: UniCredit",
-             new_x="LMARGIN", new_y="NEXT")
-    causale = f"Saldo fattura {invoice.invoice_number}"
-    pdf.cell(0, 6, f"Causale: {causale}",
-             new_x="LMARGIN", new_y="NEXT")
+    _payment_block(pdf, f"Saldo fattura {invoice.invoice_number}")
     pdf.ln(10)
 
-    # Footer
     pdf.set_font("Helvetica", "I", 8)
     pdf.set_text_color(120, 120, 120)
-    pdf.cell(0, 5,
-             "Copia di cortesia generata da SC Recupero Crediti",
-             new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.cell(0, 5,
-             f"Generata il {date.today().strftime('%d/%m/%Y')}",
-             new_x="LMARGIN", new_y="NEXT", align="C")
+    footer = (
+        f"Copia di cortesia, non valida ai fini fiscali. {config.COMPANY_NAME}"
+        if courtesy else "Copia di cortesia generata da SC Recupero Crediti"
+    )
+    pdf.cell(0, 5, pdf_text(footer), new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 5, f"Generata il {fmt_date_pdf(italian_today())}", new_x="LMARGIN", new_y="NEXT", align="C")
 
     return pdf.output()
 

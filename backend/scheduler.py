@@ -1,7 +1,7 @@
 """APScheduler integration for scheduled jobs."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -103,6 +103,46 @@ def run_hourly_job():
     return results
 
 
+def run_reminder_email_job():
+    """Promemoria email il giorno prima della scadenza (una volta al giorno,
+    dopo il sync completo delle 08:30 così lo stato delle fatture è fresco).
+    In modalità prova compone e registra soltanto."""
+    from backend.database import get_session_direct
+    from backend.engine.reminder_email import run_reminders
+
+    from backend.engine.reminder_email import ReminderBusy
+
+    session = get_session_direct()
+    try:
+        summary = run_reminders(session)
+        brief = {k: v for k, v in summary.items() if k != "items"}
+        logger.info(f"Reminder email job completed: {brief}")
+        return summary
+    except ReminderBusy:
+        logger.warning("Reminder email job skipped: un giro è già in corso")
+        return {"skipped": "busy"}
+    except Exception as e:
+        logger.error(f"Reminder email job failed: {e}", exc_info=True)
+        return {"error": str(e)}
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def run_reminder_email_catchup():
+    """Dopo un riavvio (deploy, cold start) recupera il giro delle 09:15 se è
+    saltato, ma solo in orario d'ufficio italiano: idempotente per
+    costruzione (le righe già lavorate non si rifanno)."""
+    from backend.engine.reminder_email import in_catchup_window
+
+    if not in_catchup_window():
+        logger.info("Reminder email catch-up skipped (fuori dalla finestra 09-18)")
+        return {"skipped": "window"}
+    return run_reminder_email_job()
+
+
 def start_scheduler():
     """Start the background scheduler."""
     global _scheduler, _scheduler_started
@@ -157,13 +197,45 @@ def start_scheduler():
         logger.error(f"Failed to schedule hourly job: {e}", exc_info=True)
         raise
 
+    # Promemoria email pre-scadenza: giornaliero, dopo il sync delle 08:30.
+    try:
+        reminder_trigger = CronTrigger(
+            hour=config.REMINDER_EMAIL_HOUR,
+            minute=config.REMINDER_EMAIL_MINUTE,
+            timezone=config.TIMEZONE,
+        )
+        _scheduler.add_job(
+            run_reminder_email_job,
+            trigger=reminder_trigger,
+            id="reminder_email_job",
+            name="Promemoria email pre-scadenza",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=6 * 3600,  # un riavvio alle 09:15 non deve far saltare il giro
+        )
+        _scheduler.add_job(
+            run_reminder_email_catchup,
+            trigger="date",
+            run_date=datetime.now(pytz.timezone(config.TIMEZONE)) + timedelta(seconds=180),
+            id="reminder_email_catchup",
+            name="Promemoria email: recupero dopo riavvio",
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info(
+            f"Scheduled reminder email job at {config.REMINDER_EMAIL_HOUR:02d}:"
+            f"{config.REMINDER_EMAIL_MINUTE:02d} ({config.TIMEZONE})"
+        )
+    except Exception as e:
+        logger.error(f"Failed to schedule reminder email job: {e}", exc_info=True)
+        raise
+
     # Sync al boot (recupero da cold start di Render). LEGGERO (run_hourly_job,
     # senza l'aggancio ordini Shopify che è il passo più lento e CPU-pesante):
     # il full sync con order-matching lo fa il giornaliero alle 8:30. Un sync
     # pesante subito dopo il boot metteva sotto pressione l'istanza proprio
     # nella finestra in cui Render valuta l'health check. Ritardato a 120s per
     # dare tempo ai primi health check di passare.
-    from datetime import timedelta
     _scheduler.add_job(
         run_hourly_job,
         trigger="date",
@@ -207,7 +279,7 @@ def get_scheduler_status():
     # Prossima esecuzione dei job (APScheduler la popola dopo lo start).
     next_run_times = {}
     if _scheduler is not None:
-        for job_id in ("daily_sync_job", "hourly_sync_job", "startup_sync"):
+        for job_id in ("daily_sync_job", "hourly_sync_job", "startup_sync", "reminder_email_job"):
             try:
                 job = _scheduler.get_job(job_id)
                 if job is not None and job.next_run_time is not None:
