@@ -7,7 +7,9 @@ import AgentBadges from './AgentBadges'
 // Pannello di controllo (pagina Sistema): modalità effettiva, cosa manca per
 // l'invio reale, anteprima del prossimo giro col testo, esecuzione manuale e
 // registro delle email composte/inviate/saltate. Niente invii impliciti: la
-// modalità dipende SOLO dalle variabili d'ambiente su Render.
+// modalità dipende SOLO dalle variabili d'ambiente su Render e ogni
+// esecuzione chiede conferma citando la modalità, che il server ricontrolla
+// (409 se nel frattempo è cambiata).
 
 const fmtEur = (v) => new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(v || 0)
 const fmtDate = (s) => {
@@ -15,31 +17,56 @@ const fmtDate = (s) => {
   const d = s.length === 10 ? new Date(s + 'T00:00:00') : new Date(s)
   return d.toLocaleDateString('it-IT')
 }
-const fmtDateTime = (s) => (s ? new Date(s).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—')
+// I timestamp del server sono UTC senza suffisso: va dichiarato, altrimenti
+// il browser li legge come ora locale (−1/−2 ore).
+const asUtc = (s) => (s.endsWith('Z') || /[+-]\d\d:\d\d$/.test(s) ? s : s + 'Z')
+const fmtDateTime = (s) => (s ? new Date(asUtc(s)).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—')
 
 const MODE_STYLE = {
   prova: 'bg-[rgba(148,163,184,0.15)] text-txt-secondary',
   test: 'bg-accent-amber/15 text-accent-amber',
   reale: 'bg-accent-green/15 text-accent-green',
 }
+const RUN_LABEL = {
+  prova: 'Prepara ora (senza inviare)',
+  test: 'Invia ora (indirizzo di prova)',
+  reale: 'Invia ora ai clienti',
+}
 const STATUS_LABEL = {
   sent: ['Inviata', 'bg-accent-green/15 text-accent-green'],
   prepared: ['Preparata (prova)', 'bg-[rgba(148,163,184,0.15)] text-txt-secondary'],
+  sending: ['Interrotta', 'bg-accent-red/15 text-accent-red'],
   failed: ['Errore', 'bg-accent-red/15 text-accent-red'],
   skipped: ['Saltata', 'bg-accent-amber/15 text-accent-amber'],
 }
+const PLANNED_STYLE = 'bg-accent-blue/15 text-accent-blue'
 
 export function ReminderStatusBadge({ row }) {
   const [label, cls] = STATUS_LABEL[row.status] || [row.status, STATUS_LABEL.prepared[1]]
+  const suffix = row.status === 'skipped' && row.skip_label ? `: ${row.skip_label}` : ''
   return (
-    <span className={`sc-badge ${cls}`} title={row.error || row.skip_label || ''}>
-      {label}{row.status === 'skipped' && row.skip_label ? `: ${row.skip_label}` : ''}
+    <span className={`sc-badge whitespace-nowrap ${cls}`} title={row.error || row.skip_label || ''}>
+      {label}{suffix}
     </span>
   )
 }
 
+async function errorDetail(e) {
+  // Con responseType blob la risposta d'errore è un Blob: va letta.
+  let detail = e.message
+  try {
+    const data = e.response?.data
+    if (data && typeof data.text === 'function') detail = JSON.parse(await data.text())?.detail || detail
+    else if (data?.detail) detail = data.detail
+  } catch { /* resta e.message */ }
+  return detail
+}
+
 function Attachments({ row }) {
+  const [busy, setBusy] = useState(null)
   const download = async (index, name) => {
+    if (busy !== null) return
+    setBusy(index)
     try {
       const res = await client.get(`/reminders/email/${row.id}/attachments/${index}`, { responseType: 'blob' })
       const url = URL.createObjectURL(res.data)
@@ -47,20 +74,33 @@ function Attachments({ row }) {
       a.href = url
       a.download = name
       a.click()
-      URL.revokeObjectURL(url)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
     } catch (e) {
-      window.alert('Allegato non disponibile: ' + (e.response?.data?.detail || e.message))
+      window.alert(`Allegato non disponibile (viene rigenerato dai dati attuali e può non esistere più): ${await errorDetail(e)}`)
+    } finally {
+      setBusy(null)
     }
   }
   if (!row.attachments || row.attachments.length === 0) return <span className="text-txt-muted">—</span>
   return (
     <span className="flex flex-wrap gap-1">
       {row.attachments.map((name, i) => (
-        <button key={name} type="button" onClick={() => download(i, name)} className="text-xs text-accent-teal underline hover:text-accent-cyan" title="Scarica il PDF (rigenerato dai dati attuali)">
-          {i === 0 ? 'Fattura' : 'Riepilogo scadute'}
+        <button key={name} type="button" onClick={() => download(i, name)} disabled={busy !== null}
+          className="text-xs text-accent-teal underline hover:text-accent-cyan disabled:opacity-50"
+          title="Scarica il PDF (rigenerato dai dati attuali)">
+          {busy === i ? '…' : i === 0 ? 'Copia di cortesia' : 'Riepilogo scadute'}
         </button>
       ))}
     </span>
+  )
+}
+
+function CustomerName({ id, name, navigate }) {
+  if (!id) return <span className="text-txt-primary">{name || '—'}</span>
+  return (
+    <button type="button" onClick={() => navigate(`/customers/${id}`)} className="text-accent-teal hover:text-accent-cyan text-left">
+      {name || '—'}
+    </button>
   )
 }
 
@@ -71,6 +111,7 @@ export default function ReminderEmailPanel() {
   const [error, setError] = useState(null)
   const [running, setRunning] = useState(false)
   const [runResult, setRunResult] = useState(null)
+  const [retryingId, setRetryingId] = useState(null)
   const [openText, setOpenText] = useState(null)   // invoice_id dell'anteprima aperta
   const [detail, setDetail] = useState(null)       // riga del registro aperta
 
@@ -79,8 +120,10 @@ export default function ReminderEmailPanel() {
       const res = await client.get('/reminders/email')
       setData(res.data)
       setError(null)
+      return res.data
     } catch (e) {
       setError(e.response?.data?.detail || e.message)
+      return null
     } finally {
       setLoading(false)
     }
@@ -89,24 +132,52 @@ export default function ReminderEmailPanel() {
   useEffect(() => { load() }, [load])
 
   const runNow = async () => {
-    if (!data) return
-    const n = (data.preview || []).filter(p => !p.skip_reason && !p.already).length
-    const msg = data.mode === 'reale'
-      ? `Invio ADESSO le email AI CLIENTI per le ${n} fatture in scadenza il ${fmtDate(data.target_due_date)}. Procedere?`
-      : data.mode === 'test'
-        ? `Invio le ${n} email di prova a ${data.test_to} (i clienti non ricevono nulla). Procedere?`
-        : `Modalità prova: preparo e registro le ${n} email senza inviarle. Procedere?`
+    // Si ricarica lo stato PRIMA di chiedere conferma: la modalità mostrata
+    // deve essere quella attuale (le env possono essere cambiate).
+    const fresh = await load()
+    if (!fresh) return
+    const toSend = (fresh.preview || []).filter(p => p.will_process)
+    const n = toSend.length
+    const msg = fresh.mode === 'reale'
+      ? `Invio ADESSO le email AI CLIENTI per ${n} fattur${n === 1 ? 'a' : 'e'} in scadenza il ${fmtDate(fresh.target_due_date)}. Procedere?`
+      : fresh.mode === 'test'
+        ? `Invio ${n} email di prova a ${fresh.test_to} (i clienti non ricevono nulla). Procedere?`
+        : `Modalità prova: preparo e registro ${n} email senza inviarle. Procedere?`
     if (!window.confirm(msg)) return
     setRunning(true)
     setRunResult(null)
     try {
-      const res = await client.post('/reminders/email/run')
+      const res = await client.post('/reminders/email/run', { expected_mode: fresh.mode }, { noRetry: true, timeout: 600000 })
       setRunResult(res.data)
       await load()
     } catch (e) {
       setRunResult({ error: e.response?.data?.detail || e.message })
+      await load()
     } finally {
       setRunning(false)
+    }
+  }
+
+  const retry = async (row) => {
+    const fresh = await load()
+    if (!fresh) return
+    const msg = fresh.mode === 'reale'
+      ? `Ritento ADESSO l'invio AL CLIENTE (${row.to_email}) della fattura ${row.invoice_number}. Se l'invio precedente fosse in realtà partito, Resend non lo duplica. Procedere?`
+      : fresh.mode === 'test'
+        ? `Ritento l'invio di prova a ${fresh.test_to} per la fattura ${row.invoice_number}. Procedere?`
+        : `Modalità prova: preparo di nuovo il promemoria della fattura ${row.invoice_number} senza inviarlo. Procedere?`
+    if (!window.confirm(msg)) return
+    setRetryingId(row.id)
+    setRunResult(null)
+    try {
+      const res = await client.post(`/reminders/email/${row.id}/retry`, { expected_mode: fresh.mode }, { noRetry: true, timeout: 120000 })
+      setRunResult(res.data)
+      await load()
+    } catch (e) {
+      setRunResult({ error: e.response?.data?.detail || e.message })
+      await load()
+    } finally {
+      setRetryingId(null)
     }
   }
 
@@ -134,8 +205,9 @@ export default function ReminderEmailPanel() {
   if (error) return <div className="sc-card overflow-hidden">{header}<p className="px-6 py-4 text-sm text-accent-red">Errore: {error}</p></div>
 
   const preview = data.preview || []
-  const toSend = preview.filter(p => !p.skip_reason && !p.already)
+  const toSend = preview.filter(p => p.will_process)
   const recent = data.recent || []
+  const company = data.company || {}
 
   return (
     <div className="sc-card overflow-hidden">
@@ -144,13 +216,15 @@ export default function ReminderEmailPanel() {
       {/* Configurazione */}
       <div className="px-6 py-4 border-b border-dark-border text-sm space-y-2">
         <p className="text-txt-secondary">
-          Per ogni fattura non pagata in scadenza domani il cliente riceve una email con il PDF della fattura e, se ha scadute non saldate, il riepilogo con il totale. Una email per fattura.
+          Per ogni fattura non pagata in scadenza domani il cliente riceve una email con la copia di cortesia della fattura e, se ha scadute non saldate, il riepilogo con il totale. Una email per fattura.
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs">
           <p><span className="text-txt-muted">Mittente:</span> <span className="text-txt-primary">{data.sender || '—'}</span></p>
           <p><span className="text-txt-muted">Risposte a:</span> <span className="text-txt-primary">{data.reply_to || '—'}</span></p>
           <p><span className="text-txt-muted">Copia nascosta:</span> <span className="text-txt-primary">{data.bcc || '—'}</span></p>
           <p><span className="text-txt-muted">Indirizzo di prova:</span> <span className="text-txt-primary">{data.test_to || '—'}</span></p>
+          <p><span className="text-txt-muted">Intestazione PDF:</span> <span className="text-txt-primary">{company.name}{company.vat ? ` · P.IVA ${company.vat}` : ''}{company.address ? ` · ${company.address}` : ''}</span></p>
+          <p><span className="text-txt-muted">IBAN sui PDF:</span> <span className="text-txt-primary">{company.iban_tail ? `…${company.iban_tail}` : '—'}</span></p>
         </div>
         {data.missing_config?.length > 0 && (
           <p className="text-xs text-accent-amber">
@@ -158,26 +232,33 @@ export default function ReminderEmailPanel() {
             Con <span className="font-mono">REMINDER_EMAIL_TEST_TO</span> impostato, tutte le email vanno a quell'indirizzo (prova sicura).
           </p>
         )}
+        {!company.vat && (
+          <p className="text-xs text-accent-amber">
+            Sui PDF manca la P.IVA aziendale: impostare <span className="font-mono">COMPANY_VAT</span> (e <span className="font-mono">COMPANY_ADDRESS</span>) su Render prima dell'invio ai clienti.
+          </p>
+        )}
       </div>
 
       {/* Anteprima del prossimo giro */}
       <div className="px-6 py-4 border-b border-dark-border">
         <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
-          <p className="text-sm font-semibold text-txt-primary">
-            Scadenza {fmtDate(data.target_due_date)}: {preview.length === 0 ? 'nessuna fattura' : `${preview.length} fattur${preview.length === 1 ? 'a' : 'e'}`}
-            {preview.length > 0 && <span className="text-txt-muted font-normal"> · {toSend.length} da inviare</span>}
-          </p>
-          <button type="button" onClick={runNow} disabled={running || preview.length === 0} className="sc-btn-primary text-xs disabled:opacity-50">
-            {running ? 'In corso…' : data.mode === 'prova' ? 'Prepara ora (senza inviare)' : 'Esegui ora'}
+          <div className="flex items-center gap-3 flex-wrap min-h-[2rem]">
+            <p className="text-sm font-semibold text-txt-primary">
+              Scadenza {fmtDate(data.target_due_date)}: {preview.length === 0 ? 'nessuna fattura' : `${preview.length} fattur${preview.length === 1 ? 'a' : 'e'}`}
+              {preview.length > 0 && <span className="text-txt-muted font-normal"> · {toSend.length} da lavorare</span>}
+            </p>
+            {runResult && (
+              <span className={`text-xs ${runResult.error ? 'text-accent-red' : 'text-txt-secondary'}`} role="status">
+                {runResult.error
+                  ? `Errore: ${runResult.error}`
+                  : `Esito: ${runResult.sent} inviate · ${runResult.prepared} preparate · ${runResult.skipped} saltate · ${runResult.failed} errori · ${runResult.already} non lavorate`}
+              </span>
+            )}
+          </div>
+          <button type="button" onClick={runNow} disabled={running || toSend.length === 0} className="sc-btn-primary text-xs disabled:opacity-50">
+            {running ? 'In corso…' : RUN_LABEL[data.mode] || 'Esegui ora'}
           </button>
         </div>
-        {runResult && (
-          <p className={`text-xs mb-3 ${runResult.error ? 'text-accent-red' : 'text-txt-secondary'}`}>
-            {runResult.error
-              ? `Errore: ${runResult.error}`
-              : `Esito: ${runResult.sent} inviate · ${runResult.prepared} preparate · ${runResult.skipped} saltate · ${runResult.failed} errori · ${runResult.already} già fatte`}
-          </p>
-        )}
         {preview.length > 0 && (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -196,22 +277,22 @@ export default function ReminderEmailPanel() {
                   <React.Fragment key={p.invoice_id}>
                     <tr>
                       <td className="py-2 pr-3">
-                        <button type="button" onClick={() => p.customer_id && navigate(`/customers/${p.customer_id}`)} className="text-accent-teal hover:text-accent-cyan text-left">{p.ragione_sociale || '—'}</button>
+                        <CustomerName id={p.customer_id} name={p.ragione_sociale} navigate={navigate} />
                         <span className="block text-xs text-txt-muted font-mono">{p.to_email || 'senza email'}</span>
                       </td>
                       <td className="py-2 pr-3 font-mono text-xs text-txt-secondary">{p.invoice_number}</td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(p.amount_due)}</td>
                       <td className="py-2 pr-3 text-right text-txt-secondary">{p.overdue_count > 0 ? `${p.overdue_count} · ${fmtEur(p.overdue_total)}` : '—'}</td>
                       <td className="py-2 pr-3">
-                        {p.already
-                          ? <ReminderStatusBadge row={{ status: p.already }} />
-                          : p.skip_reason
-                            ? <span className="sc-badge bg-accent-amber/15 text-accent-amber">Saltata: {p.skip_label}</span>
-                            : <span className="sc-badge bg-accent-green/15 text-accent-green">{data.mode === 'prova' ? 'Da preparare' : 'Da inviare'}</span>}
+                        {p.skip_reason
+                          ? <span className="sc-badge whitespace-nowrap bg-accent-amber/15 text-accent-amber">Saltata: {p.skip_label}</span>
+                          : p.will_process
+                            ? <span className={`sc-badge whitespace-nowrap ${PLANNED_STYLE}`}>{data.mode === 'prova' ? 'Da preparare' : 'Da inviare'}{p.already ? ` (${p.why})` : ''}</span>
+                            : <ReminderStatusBadge row={{ status: p.already, skip_label: p.why }} />}
                       </td>
                       <td className="py-2">
                         {p.text && (
-                          <button type="button" onClick={() => setOpenText(openText === p.invoice_id ? null : p.invoice_id)} className="text-xs text-accent-teal underline hover:text-accent-cyan">
+                          <button type="button" aria-expanded={openText === p.invoice_id} onClick={() => setOpenText(openText === p.invoice_id ? null : p.invoice_id)} className="text-xs text-accent-teal underline hover:text-accent-cyan">
                             {openText === p.invoice_id ? 'Chiudi' : 'Mostra'}
                           </button>
                         )}
@@ -250,19 +331,19 @@ export default function ReminderEmailPanel() {
                   <th className="text-left py-2 pr-3">Stato</th>
                   <th className="text-left py-2 pr-3">Destinatario</th>
                   <th className="text-left py-2 pr-3">Allegati</th>
-                  <th className="text-left py-2">Testo</th>
+                  <th className="text-left py-2">Azioni</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-dark-border">
                 {recent.map(row => (
                   <React.Fragment key={row.id}>
                     <tr>
-                      <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap">{fmtDateTime(row.sent_at || row.created_at)}</td>
+                      <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap">{fmtDateTime(row.sent_at || row.attempted_at || row.created_at)}</td>
                       <td className="py-2 pr-3">
-                        <button type="button" onClick={() => row.customer_id && navigate(`/customers/${row.customer_id}`)} className="text-accent-teal hover:text-accent-cyan text-left">{row.ragione_sociale || '—'}</button>
+                        <CustomerName id={row.customer_id} name={row.ragione_sociale} navigate={navigate} />
                         <AgentBadges agents={row.agents} className="ml-2" />
                       </td>
-                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary">{row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span></td>
+                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary whitespace-nowrap">{row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span></td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(row.amount_due)}</td>
                       <td className="py-2 pr-3"><ReminderStatusBadge row={row} />{row.mode === 'test' && <span className="ml-1 text-xs text-txt-muted">(test)</span>}</td>
                       <td className="py-2 pr-3 text-xs font-mono text-txt-secondary">
@@ -271,11 +352,18 @@ export default function ReminderEmailPanel() {
                       </td>
                       <td className="py-2 pr-3"><Attachments row={row} /></td>
                       <td className="py-2">
-                        {row.subject && (
-                          <button type="button" onClick={() => openDetail(row)} className="text-xs text-accent-teal underline hover:text-accent-cyan">
-                            {detail?.id === row.id ? 'Chiudi' : 'Mostra'}
-                          </button>
-                        )}
+                        <span className="flex items-center gap-2 whitespace-nowrap">
+                          {row.subject && (
+                            <button type="button" aria-expanded={detail?.id === row.id} onClick={() => openDetail(row)} className="text-xs text-accent-teal underline hover:text-accent-cyan">
+                              {detail?.id === row.id ? 'Chiudi' : 'Testo'}
+                            </button>
+                          )}
+                          {(row.status === 'failed' || row.status === 'sending') && (
+                            <button type="button" onClick={() => retry(row)} disabled={retryingId !== null || running} className="sc-btn-secondary text-xs disabled:opacity-50" title={row.needs_manual_retry ? 'Ferma finché non la ritenti tu' : 'Verrà ritentata anche al prossimo giro'}>
+                              {retryingId === row.id ? '…' : 'Riprova'}
+                            </button>
+                          )}
+                        </span>
                       </td>
                     </tr>
                     {detail?.id === row.id && (
@@ -311,9 +399,9 @@ export function ReminderEmailHistory({ customerId }) {
   if (!items || items.length === 0) return null
   return (
     <div className="sc-card overflow-hidden">
-      <div className="sc-card-header">
-        <h2 className="text-base font-bold text-txt-primary">Promemoria email ({items.length})</h2>
-        <span className="text-xs text-txt-muted">Inviati automaticamente il giorno prima della scadenza</span>
+      <div className="sc-card-header flex items-center justify-between gap-3 flex-wrap">
+        <h2 className="text-base font-bold text-txt-primary">Promemoria email</h2>
+        <span className="text-xs text-txt-muted">Registro dei promemoria automatici (il giorno prima della scadenza): ultimi {items.length}</span>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
@@ -330,8 +418,8 @@ export function ReminderEmailHistory({ customerId }) {
           <tbody className="divide-y divide-dark-border">
             {items.map(row => (
               <tr key={row.id}>
-                <td className="px-6 py-2 text-xs text-txt-secondary whitespace-nowrap">{fmtDateTime(row.sent_at || row.created_at)}</td>
-                <td className="px-3 py-2 font-mono text-xs text-txt-secondary">{row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span></td>
+                <td className="px-6 py-2 text-xs text-txt-secondary whitespace-nowrap">{fmtDateTime(row.sent_at || row.attempted_at || row.created_at)}</td>
+                <td className="px-3 py-2 font-mono text-xs text-txt-secondary whitespace-nowrap">{row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span></td>
                 <td className="px-3 py-2 text-right text-txt-primary">{fmtEur(row.amount_due)}</td>
                 <td className="px-3 py-2"><ReminderStatusBadge row={row} />{row.mode === 'test' && <span className="ml-1 text-xs text-txt-muted">(test)</span>}</td>
                 <td className="px-3 py-2 text-xs font-mono text-txt-secondary">{row.to_email || '—'}</td>

@@ -17,7 +17,15 @@ DEFAULT_API_URL = "https://api.resend.com"
 
 
 class MailSendError(Exception):
-    """Invio rifiutato o fallito: il messaggio è già pulito (niente segreti)."""
+    """Invio rifiutato o fallito: il messaggio è già pulito (niente segreti).
+
+    `kind`: 'validation' (HTTP 4xx: l'email NON è partita), 'provider'
+    (HTTP 5xx: stato incerto), 'network' (timeout/connessione: stato incerto).
+    """
+
+    def __init__(self, message: str, kind: str = "provider"):
+        super().__init__(message)
+        self.kind = kind
 
 
 class ResendMailer:
@@ -63,8 +71,12 @@ class ResendMailer:
         reply_to=None,
         bcc=None,
         attachments: Optional[Iterable[Tuple[str, bytes]]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> str:
-        """Invia e ritorna l'id del messaggio assegnato da Resend."""
+        """Invia e ritorna l'id del messaggio assegnato da Resend.
+
+        `idempotency_key`: Resend non invia due volte la stessa chiave (24h):
+        un ritento dopo un timeout non duplica l'email al cliente."""
         payload = {
             "from": sender,
             "to": self._as_list(to),
@@ -87,10 +99,11 @@ class ResendMailer:
                 }
                 for name, content in attachments
             ]
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         try:
-            response = self.client.post("/emails", json=payload)
+            response = self.client.post("/emails", json=payload, headers=headers)
         except httpx.HTTPError as e:
-            raise MailSendError(f"Resend non raggiungibile: {type(e).__name__}") from e
+            raise MailSendError(f"Resend non raggiungibile: {type(e).__name__}", kind="network") from e
         if response.status_code >= 300:
             message = ""
             try:
@@ -98,8 +111,9 @@ class ResendMailer:
                 message = str(body.get("message") or body.get("error") or "")
             except Exception:
                 message = (response.text or "")[:200]
+            kind = "validation" if response.status_code < 500 else "provider"
             raise MailSendError(
-                f"Resend HTTP {response.status_code}: {message[:300]}".strip()
+                f"Resend HTTP {response.status_code}: {message[:300]}".strip(), kind=kind
             )
         try:
             message_id = str(response.json().get("id") or "")

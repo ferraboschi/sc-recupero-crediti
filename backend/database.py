@@ -346,7 +346,7 @@ class InvoiceReminderEmail(Base):
     invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=False, index=True)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, index=True)
     due_date = Column(Date, nullable=False)
-    status = Column(String, nullable=False, default="prepared")  # prepared / sent / failed / skipped
+    status = Column(String, nullable=False, default="prepared")  # prepared / sending / sent / failed / skipped
     mode = Column(String, nullable=False, default="prova")       # prova / test / reale
     skip_reason = Column(String, nullable=True)                  # senza_email / avvocato / in_incasso / ...
     to_email = Column(String, nullable=True)
@@ -359,6 +359,8 @@ class InvoiceReminderEmail(Base):
     overdue_total = Column(Float, default=0.0)
     provider_message_id = Column(String, nullable=True)
     error = Column(Text, nullable=True)
+    error_kind = Column(String, nullable=True)                   # pdf / validation / provider / network / other
+    attempted_at = Column(DateTime, nullable=True)               # ultimo tentativo di invio
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     sent_at = Column(DateTime, nullable=True)
 

@@ -1,7 +1,7 @@
 """APScheduler integration for scheduled jobs."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -110,12 +110,17 @@ def run_reminder_email_job():
     from backend.database import get_session_direct
     from backend.engine.reminder_email import run_reminders
 
+    from backend.engine.reminder_email import ReminderBusy
+
     session = get_session_direct()
     try:
         summary = run_reminders(session)
         brief = {k: v for k, v in summary.items() if k != "items"}
         logger.info(f"Reminder email job completed: {brief}")
         return summary
+    except ReminderBusy:
+        logger.warning("Reminder email job skipped: un giro è già in corso")
+        return {"skipped": "busy"}
     except Exception as e:
         logger.error(f"Reminder email job failed: {e}", exc_info=True)
         return {"error": str(e)}
@@ -124,6 +129,18 @@ def run_reminder_email_job():
             session.close()
         except Exception:
             pass
+
+
+def run_reminder_email_catchup():
+    """Dopo un riavvio (deploy, cold start) recupera il giro delle 09:15 se è
+    saltato, ma solo in orario d'ufficio italiano: idempotente per
+    costruzione (le righe già lavorate non si rifanno)."""
+    from backend.engine.reminder_email import in_catchup_window
+
+    if not in_catchup_window():
+        logger.info("Reminder email catch-up skipped (fuori dalla finestra 09-18)")
+        return {"skipped": "window"}
+    return run_reminder_email_job()
 
 
 def start_scheduler():
@@ -194,6 +211,16 @@ def start_scheduler():
             name="Promemoria email pre-scadenza",
             replace_existing=True,
             max_instances=1,
+            misfire_grace_time=6 * 3600,  # un riavvio alle 09:15 non deve far saltare il giro
+        )
+        _scheduler.add_job(
+            run_reminder_email_catchup,
+            trigger="date",
+            run_date=datetime.now(pytz.timezone(config.TIMEZONE)) + timedelta(seconds=180),
+            id="reminder_email_catchup",
+            name="Promemoria email: recupero dopo riavvio",
+            replace_existing=True,
+            max_instances=1,
         )
         logger.info(
             f"Scheduled reminder email job at {config.REMINDER_EMAIL_HOUR:02d}:"
@@ -209,7 +236,6 @@ def start_scheduler():
     # pesante subito dopo il boot metteva sotto pressione l'istanza proprio
     # nella finestra in cui Render valuta l'health check. Ritardato a 120s per
     # dare tempo ai primi health check di passare.
-    from datetime import timedelta
     _scheduler.add_job(
         run_hourly_job,
         trigger="date",

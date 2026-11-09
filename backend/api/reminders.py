@@ -1,29 +1,31 @@
-"""API dei promemoria email pre-scadenza (stato, anteprima, esecuzione, registro).
-
-Vedi backend/engine/reminder_email.py per le regole; qui solo trasporto.
-"""
+"""API dei promemoria email pre-scadenza (stato, anteprima, esecuzione,
+ritento, registro). Vedi backend/engine/reminder_email.py per le regole;
+qui solo trasporto."""
 import logging
-import threading
 from io import BytesIO
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from backend.config import config
 from backend.database import get_session, Customer, Invoice, InvoiceReminderEmail
 from backend.engine.agents import agents_of
 from backend.engine.reminder_email import (
-    MODE_LABELS, SKIP_LABELS, build_attachments, overdue_invoices, preview,
-    resolve_mode, run_reminders, target_due_date,
+    AUTO_RETRY_KINDS, MODE_LABELS, SKIP_LABELS, ModeMismatch, ReminderBusy, build_attachments,
+    overdue_invoices, preview, resolve_mode, retry_row, run_reminders, target_due_date,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Un giro alla volta (il job schedulato e il pulsante non devono sovrapporsi).
-_run_lock = threading.Lock()
+
+class RunBody(BaseModel):
+    # La modalità che l'operatore ha letto e confermato a video: se il server
+    # ne risolve un'altra (env cambiate), 409 — mai un invio "a sorpresa".
+    expected_mode: Optional[str] = None
 
 
 def _serialize(row: InvoiceReminderEmail, invoice: Optional[Invoice], customer: Optional[Customer]) -> dict:
@@ -48,6 +50,12 @@ def _serialize(row: InvoiceReminderEmail, invoice: Optional[Invoice], customer: 
         "attachments": row.attachments_json or [],
         "provider_message_id": row.provider_message_id,
         "error": row.error,
+        "error_kind": row.error_kind,
+        # Ferma finché un operatore non preme «Riprova»?
+        "needs_manual_retry": row.status == "sending" or (
+            row.status == "failed" and (row.error_kind or "other") not in AUTO_RETRY_KINDS
+        ),
+        "attempted_at": row.attempted_at.isoformat() if row.attempted_at else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "sent_at": row.sent_at.isoformat() if row.sent_at else None,
     }
@@ -58,6 +66,16 @@ def _rows_query(session: Session):
         session.query(InvoiceReminderEmail, Invoice, Customer)
         .outerjoin(Invoice, Invoice.id == InvoiceReminderEmail.invoice_id)
         .outerjoin(Customer, Customer.id == InvoiceReminderEmail.customer_id)
+    )
+
+
+def _mode_mismatch(e: ModeMismatch) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=(
+            f"La modalità sul server è ora «{MODE_LABELS.get(e.actual, e.actual)}», non "
+            f"«{MODE_LABELS.get(e.expected, e.expected)}»: ricarica la pagina e conferma di nuovo."
+        ),
     )
 
 
@@ -84,23 +102,47 @@ def reminder_email_status(
         "reply_to": config.REMINDER_EMAIL_REPLY_TO or None,
         "bcc": config.REMINDER_EMAIL_BCC or None,
         "test_to": config.REMINDER_EMAIL_TEST_TO or None,
+        "company": {
+            "name": config.COMPANY_NAME, "vat": config.COMPANY_VAT or None,
+            "address": config.COMPANY_ADDRESS or None,
+            "iban_tail": config.COMPANY_IBAN[-4:] if config.COMPANY_IBAN else None,
+        },
         "schedule": f"{config.REMINDER_EMAIL_HOUR:02d}:{config.REMINDER_EMAIL_MINUTE:02d} {config.TIMEZONE}",
         "target_due_date": due.isoformat(),
-        "preview": preview(session, due),
+        "preview": preview(session, due, mode=mode),
         "recent": [_serialize(r, i, c) for r, i, c in rows],
     }
 
 
 @router.post("/email/run")
-def reminder_email_run(session: Session = Depends(get_session)):
+def reminder_email_run(body: Optional[RunBody] = None, session: Session = Depends(get_session)):
     """Esegue ADESSO il giro per la scadenza di domani (stessa logica del job
-    delle 09:00). In modalità prova prepara soltanto."""
-    if not _run_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="Un giro di promemoria è già in corso")
+    delle 09:15). In modalità prova prepara soltanto."""
+    expected = body.expected_mode if body else None
     try:
-        return run_reminders(session)
-    finally:
-        _run_lock.release()
+        return run_reminders(session, expected_mode=expected)
+    except ReminderBusy:
+        raise HTTPException(status_code=409, detail="Un giro di promemoria è già in corso")
+    except ModeMismatch as e:
+        raise _mode_mismatch(e)
+
+
+@router.post("/email/{row_id}/retry")
+def reminder_email_retry(row_id: int, body: Optional[RunBody] = None, session: Session = Depends(get_session)):
+    """Ritenta un promemoria fermo (fallito o interrotto), anche di una
+    scadenza passata."""
+    row = session.query(InvoiceReminderEmail).filter(InvoiceReminderEmail.id == row_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Promemoria non trovato")
+    expected = body.expected_mode if body else None
+    try:
+        return retry_row(session, row, expected_mode=expected)
+    except ReminderBusy:
+        raise HTTPException(status_code=409, detail="Un giro di promemoria è già in corso")
+    except ModeMismatch as e:
+        raise _mode_mismatch(e)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @router.get("/email/log")
@@ -133,8 +175,9 @@ def reminder_email_detail(row_id: int, session: Session = Depends(get_session)):
 
 @router.get("/email/{row_id}/attachments/{index}")
 def reminder_email_attachment(row_id: int, index: int, session: Session = Depends(get_session)):
-    """Rigenera l'allegato n-esimo (0 = fattura, 1 = riepilogo scadute) dai
-    dati attuali, per controllo."""
+    """Rigenera l'allegato n-esimo (0 = copia di cortesia, 1 = riepilogo
+    scadute) dai dati attuali, per controllo: può differire da quello
+    inviato se nel frattempo le scadute sono cambiate."""
     found = _rows_query(session).filter(InvoiceReminderEmail.id == row_id).first()
     if not found:
         raise HTTPException(status_code=404, detail="Promemoria non trovato")
@@ -144,7 +187,10 @@ def reminder_email_attachment(row_id: int, index: int, session: Session = Depend
     overdue = overdue_invoices(session, customer.id, exclude_id=invoice.id)
     attachments = build_attachments(customer, invoice, overdue)
     if index < 0 or index >= len(attachments):
-        raise HTTPException(status_code=404, detail="Allegato non presente")
+        raise HTTPException(
+            status_code=404,
+            detail="Allegato non più disponibile: viene rigenerato dai dati attuali e le scadute sono cambiate",
+        )
     name, content = attachments[index]
     return StreamingResponse(
         BytesIO(content),
