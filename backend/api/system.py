@@ -7,6 +7,7 @@ from sqlalchemy import func, text
 
 from backend.database import get_session_direct, Customer, Invoice, RecoveryCase, ActivityLog
 from backend.config import config
+from backend.engine.agents import agents_of
 from backend.scheduler import get_scheduler_status
 from backend.api.sync import _sync_status, _load_sync_state
 
@@ -622,6 +623,7 @@ def match_audit(
                     g = {
                         "customer_id": cust.id,
                         "customer_name": cust.ragione_sociale,
+                        "agents": agents_of(cust),
                         "customer_piva": cust.partita_iva,
                         "total_invoices": counts_by_customer.get(cust.id, 0),
                         "problem_count": 0,

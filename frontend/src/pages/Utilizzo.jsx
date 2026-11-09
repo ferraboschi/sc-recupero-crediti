@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import client from '../api/client'
+import AgentBadges from '../components/AgentBadges'
 
 // Etichette leggibili per tipo azione e canale del sollecito.
 const ACTION_LABELS = {
@@ -177,7 +178,10 @@ export default function Utilizzo() {
                       key={`${g.data}-${i}`}
                       className="flex items-baseline justify-between gap-4 px-5 py-2 border-b border-dark-border/60 last:border-0"
                     >
-                      <span className="text-sm text-txt-primary truncate">{ev.cliente || '—'}</span>
+                      <span className="flex items-center gap-2 min-w-0">
+                        <span className="text-sm text-txt-primary truncate">{ev.cliente || '—'}</span>
+                        <AgentBadges agents={ev.agents} className="shrink-0" />
+                      </span>
                       <span className="text-xs text-txt-muted shrink-0">
                         {ACTION_LABELS[ev.action_type] || ev.action_type}
                         {ev.channel && <> · {CHANNEL_LABELS[ev.channel] || ev.channel}</>}

@@ -18,6 +18,7 @@ from backend.engine.overdue import (
     OVERDUE_BUCKETS, CASE_STAGES, RECOVERY_ACTION_TYPES,
 )
 from backend.engine.cases import business_day_start
+from backend.engine.agents import agents_of, agents_from_tags
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -109,6 +110,7 @@ def search_dashboard(
                 {
                     "id": c.id,
                     "ragione_sociale": c.ragione_sociale,
+                    "agents": agents_of(c),
                     "partita_iva": c.partita_iva,
                     "phone": c.phone,
                     "recovery_status": c.recovery_status,
@@ -247,6 +249,7 @@ def get_todos(session: Session = Depends(get_session)):
                 "priority": priority,
                 "customer_id": cid,
                 "customer_name": action.customer.ragione_sociale,
+                "agents": agents_of(action.customer),
                 "partita_iva": action.customer.partita_iva,
                 "phone": action.customer.phone,
                 "action_type": action.action_type,
@@ -275,6 +278,7 @@ def get_todos(session: Session = Depends(get_session)):
                 "priority": "new",
                 "customer_id": cust.id,
                 "customer_name": cust.ragione_sociale,
+                "agents": agents_of(cust),
                 "partita_iva": cust.partita_iva,
                 "phone": cust.phone,
                 "action_type": "first_contact",
@@ -380,6 +384,7 @@ def get_calendar(
                 "id": a.id,
                 "customer_id": a.customer_id,
                 "customer_name": a.customer.ragione_sociale,
+                "agents": agents_of(a.customer),
                 "phone": a.customer.phone,
                 "action_type": a.action_type,
                 "notes": a.notes,
@@ -563,6 +568,7 @@ def get_attivita(session: Session = Depends(get_session)):
             contacted.append({
                 "id": cust.id,
                 "ragione_sociale": cust.ragione_sociale,
+                "agents": agents_of(cust),
                 "partita_iva": cust.partita_iva,
                 "phone": cust.phone,
                 "recovery_status": cust.recovery_status,
@@ -598,6 +604,7 @@ def get_attivita(session: Session = Depends(get_session)):
                 func.count(Invoice.id).label("paid_count"),
                 func.sum(Invoice.amount).label("total_paid"),
                 func.max(Invoice.updated_at).label("last_payment"),
+                Customer.tags,  # agente di vendita (in coda: gli indici row[0..6] restano)
             )
             .join(Invoice, Invoice.customer_id == Customer.id)
             .join(
@@ -613,6 +620,7 @@ def get_attivita(session: Session = Depends(get_session)):
             .group_by(
                 Customer.id, Customer.ragione_sociale,
                 Customer.partita_iva, Customer.recovery_status,
+                Customer.tags,
             )
             .order_by(func.max(Invoice.updated_at).desc())
             .all()
@@ -643,6 +651,7 @@ def get_attivita(session: Session = Depends(get_session)):
             incassati.append({
                 "id": row[0],
                 "ragione_sociale": row[1],
+                "agents": agents_from_tags(row[7]),
                 "partita_iva": row[2],
                 "recovery_status": row[3],
                 "paid_count": row[4],
@@ -1170,7 +1179,7 @@ def _assegni_summary(session: Session) -> dict:
         ins_q = session.query(Invoice).filter(Invoice.bounced_at.isnot(None), Invoice.status != "paid")
         ins_tot = ins_q.with_entities(func.count(Invoice.id), func.sum(Invoice.amount_due)).one()
         insoluti_rows = (
-            session.query(Invoice, Customer.ragione_sociale)
+            session.query(Invoice, Customer.ragione_sociale, Customer.tags)
             .outerjoin(Customer, Invoice.customer_id == Customer.id)
             .filter(Invoice.bounced_at.isnot(None), Invoice.status != "paid")
             .order_by(Invoice.bounced_at.desc()).limit(20).all()
@@ -1179,7 +1188,7 @@ def _assegni_summary(session: Session) -> dict:
         # dal sync, non ancora confermate insolute dall'operatore).
         sosp_tot = session.query(func.count(Invoice.id)).filter(suspect_bounce_clause()).scalar() or 0
         sosp_rows = (
-            session.query(Invoice, Customer.ragione_sociale)
+            session.query(Invoice, Customer.ragione_sociale, Customer.tags)
             .outerjoin(Customer, Invoice.customer_id == Customer.id)
             .filter(suspect_bounce_clause())
             .order_by(Invoice.payment_pending_at.desc()).limit(20).all()
@@ -1195,18 +1204,18 @@ def _assegni_summary(session: Session) -> dict:
             "fatture": int(sosp_tot),
             "items": [{
                 "invoice_id": i.id, "invoice_number": i.invoice_number,
-                "customer_id": i.customer_id, "ragione_sociale": rs,
+                "customer_id": i.customer_id, "ragione_sociale": rs, "agents": agents_from_tags(tg),
                 "amount_due": float(i.amount_due),
-            } for i, rs in sosp_rows],
+            } for i, rs, tg in sosp_rows],
         },
         "insoluti": {
             "fatture": int(ins_tot[0] or 0),
             "importo": round(float(ins_tot[1] or 0), 2),
             "items": [{
                 "invoice_id": i.id, "invoice_number": i.invoice_number,
-                "customer_id": i.customer_id, "ragione_sociale": rs,
+                "customer_id": i.customer_id, "ragione_sociale": rs, "agents": agents_from_tags(tg),
                 "amount_due": float(i.amount_due),
                 "bounced_at": i.bounced_at.isoformat() if i.bounced_at else None,
-            } for i, rs in insoluti_rows],
+            } for i, rs, tg in insoluti_rows],
         },
     }

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import client from '../api/client'
+import AgentBadges from '../components/AgentBadges'
 
 // Sezione Avvocato: candidati alla pratica legale (debito > soglia + entrambi
 // i solleciti fatti), con i giorni dall'ultimo sollecito. Il SOGGETTO è la
@@ -240,6 +241,7 @@ export default function Avvocato() {
                   <tr className="sc-table-row">
                     <td className="px-4 py-3 text-sm font-medium text-txt-primary">
                       {item.ragione_sociale}
+                      <AgentBadges agents={item.agents} className="ml-2" />
                       {item.has_mature_invoice === false && (
                         <span className="ml-2 sc-badge bg-[rgba(148,163,184,0.15)] text-txt-muted" title="Nessuna fattura non consegnata con almeno 2 solleciti propri: scegli a mano">
                           nessuna fattura matura

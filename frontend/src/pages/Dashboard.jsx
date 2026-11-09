@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
+import AgentBadges from '../components/AgentBadges'
 import StatsWidget from '../components/StatsWidget'
 import RiconciliazioneCascata from '../components/RiconciliazioneCascata'
 import SyncStatus from '../components/SyncStatus'
@@ -249,8 +250,14 @@ export default function Dashboard() {
           {ACTION_LABELS[todo.action_type] || todo.action_type}
         </span>
         <div className="min-w-0">
-          <span className="text-sm font-medium text-txt-primary truncate block max-w-[220px]">
-            {todo.customer_name}
+          <span className="flex items-center gap-2 min-w-0 flex-wrap">
+            <span className="text-sm font-medium text-txt-primary truncate block max-w-[220px]">
+              {todo.customer_name}
+            </span>
+            {/* Sotto 640px la riga del promemoria non ha spazio nemmeno per il
+                nome (blocco destro a larghezza fissa): la pillola resta solo
+                da sm in su, per non coprire l'importo. */}
+            <AgentBadges agents={todo.agents} className="shrink-0 hidden sm:inline-flex" />
           </span>
           {todo.partita_iva && (
             <span className="text-xs text-txt-muted font-mono">{todo.partita_iva}</span>
@@ -338,7 +345,7 @@ export default function Dashboard() {
               <li key={i.invoice_id}>
                 <button type="button" onClick={() => navigate(`/customers/${i.customer_id}`)} className="underline hover:text-accent-red">
                   {i.ragione_sociale || 'cliente'}
-                </button>
+                </button><AgentBadges agents={i.agents} className="ml-2 [&>span]:py-0" />
                 {' '}· Fatt. {i.invoice_number} · {formatCurrency(i.amount_due)} · insoluto il {i.bounced_at ? new Date(i.bounced_at).toLocaleDateString('it-IT') : '—'}
               </li>
             ))}
@@ -355,7 +362,7 @@ export default function Dashboard() {
           <li key={i.invoice_id}>
             <button type="button" onClick={() => navigate(`/customers/${i.customer_id}`)} className="underline hover:text-accent-amber">
               {i.ragione_sociale || 'cliente'}
-            </button>
+            </button><AgentBadges agents={i.agents} className="ml-2 [&>span]:py-0" />
             {' '}· Fatt. {i.invoice_number} · {formatCurrency(i.amount_due)}
           </li>
         ))}
@@ -408,7 +415,7 @@ export default function Dashboard() {
                       className="w-full flex items-center justify-between px-4 py-3 hover:bg-dark-cardHover transition-colors text-left border-b border-dark-border last:border-0"
                     >
                       <div>
-                        <p className="text-sm font-medium text-txt-primary">{r.ragione_sociale}</p>
+                        <p className="text-sm font-medium text-txt-primary">{r.ragione_sociale}<AgentBadges agents={r.agents} className="ml-2" /></p>
                         {r.partita_iva && <p className="text-xs text-txt-muted font-mono">{r.partita_iva}</p>}
                       </div>
                       <div className="text-right">

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 
 import { API_BASE as API } from '../utils/api'
+import AgentBadges from '../components/AgentBadges'
 
 function StatusBadge({ status }) {
   const colors = {
@@ -659,6 +660,7 @@ export default function System() {
                                 >
                                   {group.customer_name}
                                 </Link>
+                                <AgentBadges agents={group.agents} className="shrink-0" />
                                 <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
                                   group.worst_verdict === 'bad'
                                     ? 'bg-accent-red/15 text-accent-red'

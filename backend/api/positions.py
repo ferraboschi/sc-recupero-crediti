@@ -13,6 +13,7 @@ from backend.database import get_session, Invoice, Customer, ActivityLog
 from pydantic import BaseModel
 from backend.engine.overdue import is_overdue_unpaid, is_suspect_bounce
 from backend.engine.cases import get_open_case
+from backend.engine.agents import agents_of
 from typing import Optional
 from datetime import date as _date
 
@@ -172,6 +173,7 @@ def list_positions(
                     "customer": {
                         "id": pos.customer.id if pos.customer else None,
                         "ragione_sociale": pos.customer.ragione_sociale if pos.customer else pos.customer_name_raw,
+                        "agents": agents_of(pos.customer),
                         "partita_iva": pos.customer.partita_iva if pos.customer else pos.customer_piva_raw,
                         "phone": pos.customer.phone if pos.customer else None,
                     } if pos.customer else None,
@@ -288,6 +290,7 @@ def list_suggestions(session: Session = Depends(get_session)):
                 "suggested_customer": {
                     "id": cust.id,
                     "ragione_sociale": cust.ragione_sociale,
+                    "agents": agents_of(cust),
                     "partita_iva": cust.partita_iva,
                 } if cust else None,
             })
@@ -909,6 +912,7 @@ def assign_name_to_customer(
                 "homonym": {
                     "id": homonym.id,
                     "ragione_sociale": homonym.ragione_sociale,
+                    "agents": agents_of(homonym),
                     "partita_iva": homonym.partita_iva,
                 } if homonym else None,
                 "impact": impact,
@@ -1057,6 +1061,7 @@ def get_position_detail(position_id: int, session: Session = Depends(get_session
             "customer": {
                 "id": position.customer.id if position.customer else None,
                 "ragione_sociale": position.customer.ragione_sociale if position.customer else position.customer_name_raw,
+                "agents": agents_of(position.customer),
                 "partita_iva": position.customer.partita_iva if position.customer else position.customer_piva_raw,
                 "phone": position.customer.phone if position.customer else None,
                 "email": position.customer.email if position.customer else None,

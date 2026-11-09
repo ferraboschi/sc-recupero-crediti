@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import client from '../api/client'
+import AgentBadges from '../components/AgentBadges'
 import StageBadge, { CHANNEL_LABELS } from '../components/StageBadge'
 
 const ACTION_LABELS = {
@@ -1247,7 +1248,10 @@ export default function ClientDetail() {
       <div className="sc-card p-6">
         <div className="flex items-start justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-txt-primary">{data.ragione_sociale}</h1>
+            <h1 className="text-2xl font-bold text-txt-primary flex items-center gap-3 flex-wrap">
+              <span>{data.ragione_sociale}</span>
+              <AgentBadges agents={data.agents} />
+            </h1>
             <div className="mt-2 space-y-1 text-sm text-txt-secondary">
               {data.partita_iva && <p>P.IVA: <span className="font-mono text-txt-primary">{data.partita_iva}</span></p>}
               {data.codice_fiscale && <p>C.F.: <span className="font-mono text-txt-primary">{data.codice_fiscale}</span></p>}
@@ -1589,6 +1593,7 @@ export default function ClientDetail() {
                                         title="Clicca per riassegnare la fattura a questo cliente (con conferma)"
                                       >
                                         {c.ragione_sociale}
+                                        <AgentBadges agents={c.agents} className="ml-1" />
                                         {c.partita_iva && (
                                           <span className="text-txt-muted"> · {c.partita_iva}</span>
                                         )}
@@ -1630,7 +1635,7 @@ export default function ClientDetail() {
                               {renamePreview.homonym ? (
                                 <>
                                   <p className="text-sm font-medium text-accent-red">
-                                    Esiste già il cliente &ldquo;<span className="font-semibold">{renamePreview.homonym.ragione_sociale}</span>&rdquo;
+                                    Esiste già il cliente &ldquo;<span className="font-semibold">{renamePreview.homonym.ragione_sociale}</span>&rdquo;<AgentBadges agents={renamePreview.homonym.agents} className="ml-1" />
                                     {renamePreview.homonym.partita_iva && ` (P.IVA ${renamePreview.homonym.partita_iva})`}:
                                     questa fattura è probabilmente sua.
                                   </p>

@@ -19,6 +19,7 @@ from io import BytesIO
 
 from backend.config import config
 from backend.database import get_session, Customer, Invoice, RecoveryAction, ActivityLog
+from backend.engine.agents import agents_from_tags
 from backend.engine.cases import (
     CONTACT_TYPES, business_day_start, contact_count, ensure_open_case,
     get_open_case, is_overdue_unpaid, schedule_next_action, close_case,
@@ -121,6 +122,7 @@ def get_utilizzo(session: Session = Depends(get_session)):
             RecoveryAction.channel,
             RecoveryAction.created_at,
             Customer.ragione_sociale,
+            Customer.tags,
         )
         .join(Customer, Customer.id == RecoveryAction.customer_id)
         .filter(RecoveryAction.channel.isnot(None))
@@ -130,7 +132,7 @@ def get_utilizzo(session: Session = Depends(get_session)):
 
     eventi = []
     per_giorno: dict = {}  # data (str) -> {"customers": set, "azioni": int}
-    for customer_id, action_type, channel, created_at, ragione_sociale in rows:
+    for customer_id, action_type, channel, created_at, ragione_sociale, tags in rows:
         if created_at is None:
             continue
         data_str = _italian_day(created_at).isoformat()
@@ -138,6 +140,7 @@ def get_utilizzo(session: Session = Depends(get_session)):
             "data": data_str,
             "customer_id": customer_id,
             "cliente": ragione_sociale,
+            "agents": agents_from_tags(tags),
             "action_type": action_type,
             "channel": channel,
         })

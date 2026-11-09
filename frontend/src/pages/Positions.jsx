@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
+import AgentBadges from '../components/AgentBadges'
 
 const STATUSES = [
   { value: 'open', label: 'Aperto', color: 'blue' },
@@ -352,7 +353,7 @@ export default function Positions() {
 
                   <div className="flex-1 min-w-[180px]">
                     <p className="text-xs font-semibold text-txt-label uppercase tracking-wider mb-1">Cliente suggerito</p>
-                    <p className="text-sm text-accent-teal">{sug.suggested_customer?.ragione_sociale || '-'}</p>
+                    <p className="text-sm text-accent-teal">{sug.suggested_customer?.ragione_sociale || '-'}<AgentBadges agents={sug.suggested_customer?.agents} className="ml-2" /></p>
                     <p className="text-xs font-mono text-txt-muted">{sug.suggested_customer?.partita_iva || '-'}</p>
                     <div className="flex items-center gap-2 mt-1">
                       <span className="sc-badge bg-[rgba(148,163,184,0.15)] text-txt-secondary">
@@ -624,16 +625,19 @@ export default function Positions() {
                       </td>
                       <td className="px-3 py-3 text-sm text-txt-primary">
                         <div className="flex flex-col">
-                          {pos.customer?.id ? (
-                            <span
-                              className="text-accent-teal cursor-pointer hover:text-accent-cyan"
-                              onClick={(e) => { e.stopPropagation(); navigate(`/customers/${pos.customer.id}`) }}
-                            >
-                              {pos.customer.ragione_sociale}
-                            </span>
-                          ) : (
-                            <span className="text-txt-secondary">{pos.customer_name_raw || 'Non assegnato'}</span>
-                          )}
+                          <span
+                            className={`inline-flex items-center gap-2 flex-wrap ${pos.customer?.id ? 'cursor-pointer' : ''}`}
+                            onClick={pos.customer?.id ? (e) => { e.stopPropagation(); navigate(`/customers/${pos.customer.id}`) } : undefined}
+                          >
+                            {pos.customer?.id ? (
+                              <span className="text-accent-teal hover:text-accent-cyan">
+                                {pos.customer.ragione_sociale}
+                              </span>
+                            ) : (
+                              <span className="text-txt-secondary">{pos.customer_name_raw || 'Non assegnato'}</span>
+                            )}
+                            <AgentBadges agents={pos.customer?.agents} />
+                          </span>
                           {!pos.customer && pos.customer_name_raw && (
                             <span className="text-xs text-accent-amber">da verificare</span>
                           )}

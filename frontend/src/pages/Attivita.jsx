@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
+import AgentBadges from '../components/AgentBadges'
 
 const ACTION_LABELS = {
   first_contact: 'I Contatto',
@@ -338,7 +339,7 @@ export default function Attivita() {
                         <div key={c.id} onClick={() => { setOverlayType(null); navigate(`/customers/${c.id}`) }}
                           className="flex items-center justify-between rounded-lg px-4 py-3 cursor-pointer border border-dark-border hover:bg-dark-cardHover transition-colors">
                           <div>
-                            <p className="text-sm font-medium text-txt-primary">{c.ragione_sociale}</p>
+                            <p className="text-sm font-medium text-txt-primary">{c.ragione_sociale}<AgentBadges agents={c.agents} className="ml-2" /></p>
                             <p className="text-xs text-txt-muted">
                               {c.overdue_count} fatture scadute
                               {c.last_contact_date ? ` — ultimo contatto: ${formatDate(c.last_contact_date)}` : ''}
@@ -360,7 +361,7 @@ export default function Attivita() {
                         className="rounded-lg px-4 py-3 cursor-pointer transition-colors border bg-accent-green/5 border-accent-green/30 hover:bg-accent-green/10">
                         <div className="flex items-center justify-between">
                           <div>
-                            <p className="text-sm font-medium text-txt-primary">{inc.ragione_sociale}</p>
+                            <p className="text-sm font-medium text-txt-primary">{inc.ragione_sociale}<AgentBadges agents={inc.agents} className="ml-2" /></p>
                             <p className="text-xs text-txt-muted mt-0.5">{inc.paid_count} fatture pagate — ultimo: {formatDate(inc.last_payment)}</p>
                           </div>
                           <p className="text-sm font-bold text-accent-green">{formatCurrency(inc.total_paid)}</p>
@@ -491,13 +492,14 @@ export default function Attivita() {
                           : 'bg-dark-card border-dark-border hover:bg-dark-cardHover hover:border-accent-teal/30'
                       }`}
                     >
-                      <div className="flex items-center gap-3 min-w-0">
+                      <div className="flex items-center gap-3 min-w-0 flex-wrap">
                         <span className={`${STATUS_BADGE[a.action_type] || STATUS_BADGE.first_contact} sc-badge shrink-0`}>
                           {ACTION_LABELS[a.action_type] || a.action_type}
                         </span>
                         <span className={`text-sm font-medium truncate ${a.completed_at ? 'text-txt-muted line-through' : 'text-txt-primary'}`}>
                           {a.customer_name}
                         </span>
+                        <AgentBadges agents={a.agents} className="shrink-0 hidden sm:inline-flex" />
                         {a.outcome && (
                           <span className="text-xs text-txt-muted">— {OUTCOME_LABELS[a.outcome] || a.outcome}</span>
                         )}
@@ -581,7 +583,7 @@ export default function Attivita() {
                             className="sc-table-row cursor-pointer"
                           >
                             <td className="py-3 pr-4">
-                              <p className="text-sm font-medium text-txt-primary">{c.ragione_sociale}</p>
+                              <p className="text-sm font-medium text-txt-primary">{c.ragione_sociale}<AgentBadges agents={c.agents} className="ml-2" /></p>
                               {c.partita_iva && <p className="text-xs text-txt-muted font-mono">{c.partita_iva}</p>}
                             </td>
                             <td className="py-3 pr-4">
@@ -665,7 +667,7 @@ export default function Attivita() {
                           {inc.fully_resolved ? 'INCASSATO' : 'PARZIALE'}
                         </span>
                         <div className="min-w-0">
-                          <p className="text-sm font-medium text-txt-primary truncate">{inc.ragione_sociale}</p>
+                          <p className="text-sm font-medium text-txt-primary flex items-center gap-2 min-w-0"><span className="truncate">{inc.ragione_sociale}</span><AgentBadges agents={inc.agents} className="shrink-0" /></p>
                           {inc.partita_iva && <p className="text-xs text-txt-muted font-mono">{inc.partita_iva}</p>}
                         </div>
                       </div>

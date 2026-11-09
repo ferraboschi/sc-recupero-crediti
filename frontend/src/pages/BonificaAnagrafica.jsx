@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
+import AgentBadges from '../components/AgentBadges'
 
 // Vista di REVISIONE della bonifica P.IVA in blocco. Vive su una pagina
 // dedicata (raggiunta da un banner nella lista Clienti) invece di affollare
@@ -212,6 +213,7 @@ export default function BonificaAnagrafica() {
                           title="Apri la scheda cliente"
                         >
                           {item.ragione_sociale || `Cliente #${item.customer_id}`}
+                          <AgentBadges agents={item.agents} className="ml-2" />
                         </button>
                       </td>
                       <td className="px-4 py-3 text-sm font-mono text-txt-primary">
