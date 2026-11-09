@@ -16,7 +16,7 @@ Pipeline (ordine vincolante — vedi design luglio 2026):
 import logging
 import csv
 import threading
-from collections import defaultdict
+from collections import defaultdict, Counter
 from io import StringIO
 from fastapi import APIRouter, BackgroundTasks, UploadFile, File
 from datetime import datetime, date, timedelta
@@ -32,6 +32,7 @@ from backend.connectors.shopify import ShopifyConnector
 from backend.engine.matching import run_matching
 from backend.engine.cases import update_case_lifecycle
 from backend.engine.piva import validate_piva
+from backend.engine.merge import names_correspond
 from backend.scheduler import get_scheduler_status
 from backend.config import config
 from backend.engine.normalizer import normalize_ragione_sociale, name_similarity_score
@@ -1445,6 +1446,77 @@ def _recalculate_days_overdue(session):
         logger.info(f"Recalculated days_overdue for {updated} invoices")
 
 
+def _email_key(value) -> "str | None":
+    """Email normalizzata per il confronto (minuscole, senza spazi)."""
+    key = (value or "").strip().lower()
+    return key if "@" in key else None
+
+
+def _has_tag(tags, wanted: str) -> bool:
+    return any(t.strip().lower() == wanted.lower() for t in (tags or "").split(","))
+
+
+def _email_adoption_candidate(cust: dict, cust_piva, orphans_by_email: dict, batch_emails: Counter,
+                              batch_pivas=frozenset(), counters: dict = None):
+    """L'orfano (scheda nata dalle fatture, senza shopify_id) adottabile per
+    EMAIL dal cliente Shopify `cust`, oppure None.
+
+    Serve ai clienti Shopify SENZA P.IVA abbinabile (es. i distributori B2D
+    con address2 vuoto): senza questo passo Cavo Luigi & co. restavano senza
+    collegamento, quindi senza agente di vendita. Regole prudenti (una email
+    non è una P.IVA):
+    - email presente e UNICA sia tra gli orfani sia nel lotto Shopify
+      (email condivisa = ambigua → niente);
+    - P.IVA compatibili (se entrambe presenti devono coincidere);
+    - i nomi devono corrispondere (names_correspond, lo stesso gate
+      dell'auto-merge), salvo nome Shopify vuoto;
+    - la P.IVA comanda: se l'orfano ha una P.IVA che appartiene a un ALTRO
+      cliente Shopify del lotto, lo adotta quello (per P.IVA), non questo.
+    Mai adozione per solo nome: regola dell'owner. Le ambiguità si contano
+    (counters["email_ambiguous"]) e si loggano: nulla scartato in silenzio.
+    """
+    counters = counters if counters is not None else {}
+    key = _email_key(cust.get("email"))
+    if not key:
+        return None
+    candidates = orphans_by_email.get(key) or []
+    if batch_emails.get(key, 0) != 1 or len(candidates) > 1:
+        if candidates:
+            counters["email_ambiguous"] = counters.get("email_ambiguous", 0) + 1
+            logger.info(
+                f"Adozione per email NON applicata (email condivisa: {batch_emails.get(key, 0)} "
+                f"clienti Shopify, {len(candidates)} schede): Shopify {cust['shopify_id']}"
+            )
+        return None
+    if not candidates:
+        return None
+    orphan = candidates[0]
+    orphan_piva = validate_piva(orphan.partita_iva)
+    if orphan_piva and not cust_piva and orphan_piva in batch_pivas:
+        logger.info(
+            f"Adozione per email NON applicata (la P.IVA {orphan_piva} appartiene a un altro "
+            f"cliente Shopify del lotto): '{orphan.ragione_sociale}' vs Shopify {cust['shopify_id']}"
+        )
+        return None
+    if orphan_piva and cust_piva and orphan_piva != cust_piva:
+        logger.info(
+            f"Adozione per email NON applicata (P.IVA diverse): "
+            f"'{orphan.ragione_sociale}' vs Shopify {cust['shopify_id']}"
+        )
+        return None
+    shop_name = (cust.get("ragione_sociale") or "").strip()
+    if shop_name:
+        ok, score = names_correspond(orphan.ragione_sociale, shop_name)
+        if not ok:
+            logger.info(
+                f"Adozione per email NON applicata (nomi diversi, score {score}): "
+                f"'{orphan.ragione_sociale}' vs Shopify '{shop_name}'"
+            )
+            return None
+    orphans_by_email.pop(key, None)
+    return orphan
+
+
 def _sync_customers_task() -> dict:
     """Background task to sync customers from Shopify.
 
@@ -1485,12 +1557,38 @@ def _sync_customers_task() -> dict:
                     if orphan_piva and orphan_piva not in orphans_by_piva:
                         orphans_by_piva[orphan_piva] = orphan
 
+                # Indice per EMAIL degli orfani (vedi _email_adoption_candidate)
+                # e conteggio delle email nel lotto Shopify (una email su due
+                # clienti Shopify = ambigua).
+                # Le schede ESCLUSE dal recupero non si agganciano con una
+                # chiave debole (riceverebbero contatti e aggancio ordini).
+                orphans_by_email = {}
+                for orphan in session.query(Customer).filter(
+                    Customer.shopify_id.is_(None),
+                    Customer.merged_into.is_(None),
+                    Customer.email.isnot(None),
+                ).all():
+                    if orphan.excluded:
+                        continue
+                    key = _email_key(orphan.email)
+                    if key:
+                        orphans_by_email.setdefault(key, []).append(orphan)
+                batch_emails = Counter(
+                    k for k in (_email_key(c.get("email")) for c in raw_customers) if k
+                )
+                batch_pivas = {validate_piva(c.get("partita_iva")) for c in raw_customers}
+                batch_pivas.discard(None)
+                email_counters = {}
+                adopted_by_email = 0
+                skipped_non_b2b = 0
+
                 for cust in raw_customers:
                     existing = session.query(Customer).filter_by(
                         shopify_id=cust["shopify_id"]
                     ).first()
 
                     was_adopted = False
+                    adopted_via_email = False
                     cust_piva = validate_piva(cust.get("partita_iva"))
                     raw_piva = (cust.get("partita_iva") or "").strip()
                     if raw_piva and not cust_piva and raw_piva not in discarded_pivas:
@@ -1510,11 +1608,33 @@ def _sync_customers_task() -> dict:
                             existing = orphan
                             was_adopted = True
                             adopted += 1
+                            key = _email_key(orphan.email)
+                            if key and orphan in (orphans_by_email.get(key) or []):
+                                orphans_by_email[key].remove(orphan)
                             logger.info(
                                 f"Adopted fatturapro-born customer "
                                 f"'{orphan.ragione_sociale}' (P.IVA {cust_piva}) "
                                 f"→ Shopify {cust['shopify_id']}"
                             )
+                        else:
+                            orphan = _email_adoption_candidate(
+                                cust, cust_piva, orphans_by_email, batch_emails,
+                                batch_pivas, email_counters,
+                            )
+                            if orphan is not None:
+                                orphan.shopify_id = cust["shopify_id"]
+                                existing = orphan
+                                was_adopted = True
+                                adopted_via_email = True
+                                adopted_by_email += 1
+                                o_piva = validate_piva(orphan.partita_iva)
+                                if o_piva and orphans_by_piva.get(o_piva) is orphan:
+                                    orphans_by_piva.pop(o_piva, None)
+                                logger.info(
+                                    f"Adopted fatturapro-born customer "
+                                    f"'{orphan.ragione_sociale}' (email) "
+                                    f"→ Shopify {cust['shopify_id']} [{cust.get('tags')}]"
+                                )
                     elif cust_piva and cust_piva in orphans_by_piva:
                         # Il cliente Shopify esiste già E c'è un orfano con
                         # la stessa P.IVA: duplicato che manderà le fatture
@@ -1573,12 +1693,35 @@ def _sync_customers_task() -> dict:
                             existing.partita_iva = cust_piva
                         existing.codice_fiscale = cust.get("codice_fiscale") or existing.codice_fiscale
                         existing.codice_sdi = cust.get("codice_sdi") or existing.codice_sdi
-                        existing.phone = cust.get("phone") or existing.phone
+                        if adopted_via_email:
+                            # Aggancio per EMAIL (chiave debole): il telefono
+                            # è il numero dei solleciti WhatsApp — quello
+                            # della scheda nata dalle fatture (magari messo
+                            # a mano) non si sovrascrive, si completa solo
+                            # dove manca.
+                            if cust.get("phone") and not existing.phone:
+                                existing.phone = cust["phone"]
+                            if cust.get("phones") and not existing.phones_json:
+                                existing.phones_json = cust["phones"]
+                        else:
+                            existing.phone = cust.get("phone") or existing.phone
+                            if cust.get("phones"):
+                                existing.phones_json = cust["phones"]
                         existing.email = cust.get("email") or existing.email
                         existing.tags = cust.get("tags") or existing.tags
-                        if cust.get("phones"):
-                            existing.phones_json = cust["phones"]
                         updated += 1
+                    elif not _has_tag(cust.get("tags"), "B2B"):
+                        # B2D / Wholesale senza scheda da agganciare: NESSUNA
+                        # scheda nuova. Una scheda Shopify senza P.IVA
+                        # diventerebbe un omonimo per il matching delle
+                        # fatture (quarantena). Contato nel risultato, non
+                        # perso: al prossimo giro, se intanto la scheda nata
+                        # dalle fatture ha la stessa email, viene agganciata.
+                        skipped_non_b2b += 1
+                        logger.debug(
+                            f"Cliente Shopify {cust['shopify_id']} ({cust.get('tags')}) non importato: "
+                            "nessuna scheda da agganciare"
+                        )
                     else:
                         new_customer = Customer(
                             shopify_id=cust["shopify_id"],
@@ -1605,11 +1748,16 @@ def _sync_customers_task() -> dict:
                 result["created"] = created
                 result["updated"] = updated
                 result["adopted"] = adopted
+                result["adopted_by_email"] = adopted_by_email
+                result["email_ambiguous"] = email_counters.get("email_ambiguous", 0)
+                result["skipped_non_b2b"] = skipped_non_b2b
                 result["orphan_contacts_enriched"] = orphan_contacts
                 result["piva_discarded"] = len(discarded_pivas)
                 logger.info(
                     f"Shopify sync: created={created}, updated={updated}, "
-                    f"adopted={adopted}, orphan_contacts={orphan_contacts}, "
+                    f"adopted={adopted}, adopted_by_email={adopted_by_email}, "
+                    f"email_ambiguous={email_counters.get('email_ambiguous', 0)}, "
+                    f"skipped_non_b2b={skipped_non_b2b}, orphan_contacts={orphan_contacts}, "
                     f"piva_discarded={len(discarded_pivas)}"
                 )
             else:
