@@ -48,7 +48,9 @@ class Config:
     # viene stampata (meglio niente che un valore sbagliato su un documento
     # che va ai clienti). L'IBAN conserva il valore storico del progetto.
     COMPANY_NAME = os.getenv("COMPANY_NAME", "Sake Company srl")
-    COMPANY_VAT = os.getenv("COMPANY_VAT", "")
+    # COMPANY_PIVA è la variabile già presente su Render (nome storico): vale
+    # come P.IVA se COMPANY_VAT non è impostata.
+    COMPANY_VAT = os.getenv("COMPANY_VAT", "") or os.getenv("COMPANY_PIVA", "")
     COMPANY_ADDRESS = os.getenv("COMPANY_ADDRESS", "")
     COMPANY_IBAN = os.getenv("COMPANY_IBAN", "IT44N0200801671000105175151")
     COMPANY_BANK = os.getenv("COMPANY_BANK", "UniCredit")
