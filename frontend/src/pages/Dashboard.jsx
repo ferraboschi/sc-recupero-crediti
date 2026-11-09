@@ -254,7 +254,10 @@ export default function Dashboard() {
             <span className="text-sm font-medium text-txt-primary truncate block max-w-[220px]">
               {todo.customer_name}
             </span>
-            <AgentBadges agents={todo.agents} className="shrink-0" />
+            {/* Sotto 640px la riga del promemoria non ha spazio nemmeno per il
+                nome (blocco destro a larghezza fissa): la pillola resta solo
+                da sm in su, per non coprire l'importo. */}
+            <AgentBadges agents={todo.agents} className="shrink-0 hidden sm:inline-flex" />
           </span>
           {todo.partita_iva && (
             <span className="text-xs text-txt-muted font-mono">{todo.partita_iva}</span>

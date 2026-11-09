@@ -499,7 +499,7 @@ export default function Attivita() {
                         <span className={`text-sm font-medium truncate ${a.completed_at ? 'text-txt-muted line-through' : 'text-txt-primary'}`}>
                           {a.customer_name}
                         </span>
-                        <AgentBadges agents={a.agents} className="shrink-0" />
+                        <AgentBadges agents={a.agents} className="shrink-0 hidden sm:inline-flex" />
                         {a.outcome && (
                           <span className="text-xs text-txt-muted">— {OUTCOME_LABELS[a.outcome] || a.outcome}</span>
                         )}
