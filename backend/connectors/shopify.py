@@ -39,12 +39,19 @@ class ShopifyConnector(BaseConnector):
             "Content-Type": "application/json",
         }
 
+    # Classi di clientela "business" su Shopify (stessa lista dell'app ordini):
+    # B2B = ristoranti, B2D = distributori, Wholesale = ingrosso. Solo i B2B
+    # generano schede NUOVE; B2D/Wholesale servono ad agganciare schede già
+    # esistenti (agente di vendita, contatti) — vedi _sync_customers_task.
+    BUSINESS_TAGS = ("B2B", "B2D", "Wholesale")
+
     def fetch_b2b_customers(self) -> List[Dict[str, Any]]:
         """
-        Fetch all B2B customers from Shopify using cursor pagination.
+        Fetch all business customers (B2B, B2D, Wholesale) from Shopify using
+        cursor pagination.
 
-        Uses the "B2B" tag to identify B2B customers and implements cursor-based
-        pagination via Link headers (rel="next").
+        Filtra per tag (BUSINESS_TAGS) e implementa la paginazione via Link
+        headers (rel="next"). Il nome storico del metodo resta per i chiamanti.
 
         Returns:
             List of customer dicts with keys:
@@ -74,7 +81,7 @@ class ShopifyConnector(BaseConnector):
             if cursor:
                 params["page_info"] = cursor
             else:
-                params["query"] = 'tag:"B2B"'
+                params["query"] = " OR ".join(f'tag:"{t}"' for t in self.BUSINESS_TAGS)
 
             try:
                 response = self.get("customers/search.json", headers=self._get_headers(), params=params)
