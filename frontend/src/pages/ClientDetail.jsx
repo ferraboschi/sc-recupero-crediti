@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import client from '../api/client'
+import AgentBadges from '../components/AgentBadges'
 import StageBadge, { CHANNEL_LABELS } from '../components/StageBadge'
 
 const ACTION_LABELS = {
@@ -1247,7 +1248,10 @@ export default function ClientDetail() {
       <div className="sc-card p-6">
         <div className="flex items-start justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-txt-primary">{data.ragione_sociale}</h1>
+            <h1 className="text-2xl font-bold text-txt-primary flex items-center gap-3 flex-wrap">
+              <span>{data.ragione_sociale}</span>
+              <AgentBadges agents={data.agents} />
+            </h1>
             <div className="mt-2 space-y-1 text-sm text-txt-secondary">
               {data.partita_iva && <p>P.IVA: <span className="font-mono text-txt-primary">{data.partita_iva}</span></p>}
               {data.codice_fiscale && <p>C.F.: <span className="font-mono text-txt-primary">{data.codice_fiscale}</span></p>}

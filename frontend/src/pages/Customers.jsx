@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
+import AgentBadges from '../components/AgentBadges'
 
 const STATUS_LABELS = {
   idle: 'Da Gestire',
@@ -401,6 +402,7 @@ export default function Customers() {
                     <span className="text-sm font-medium text-txt-primary group-hover:text-accent-teal">
                       {s.ragione_sociale}
                     </span>
+                    <AgentBadges agents={s.agents} />
                     {s.overdue_count > 0 && (
                       <span className="sc-badge bg-accent-red/15 text-accent-red">
                         {s.overdue_count} scadut{s.overdue_count === 1 ? 'a' : 'e'}
@@ -501,6 +503,7 @@ export default function Customers() {
                       <td className="px-4 py-3">
                         <div className="text-sm font-medium text-accent-teal hover:text-accent-cyan">
                           {displayName}
+                          <AgentBadges agents={customer.agents} className="ml-2" />
                         </div>
                         {!customer.ragione_sociale && (
                           <span className="text-xs text-txt-muted">(nome mancante)</span>

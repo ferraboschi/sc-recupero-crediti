@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
+import AgentBadges from '../components/AgentBadges'
 
 // Revisione dei DUPLICATI anagrafici: schede diverse che sono la stessa
 // azienda (stessa P.IVA). L'auto-merge del sync fonde già i sicuri (P.IVA
@@ -176,6 +177,7 @@ export default function MergeDuplicati() {
                         >
                           {m.nome || `Cliente #${m.id}`}
                         </button>
+                        <AgentBadges agents={m.agents} />
                         <p className="text-xs text-txt-muted">
                           {m.phone || 'senza telefono'} · {m.invoice_count} fatture · {m.overdue_count} scadute
                         </p>

@@ -32,6 +32,7 @@ from backend.database import (
     get_session, Customer, Invoice, RecoveryAction, RecoveryActionInvoice,
 )
 from backend.engine.overdue import overdue_clause, in_incasso_clause
+from backend.engine.agents import agents_of
 from backend.engine.cases import get_open_case, CHANNEL_LABELS
 from backend.engine.action_invoices import (
     per_invoice_sollecito_stats, per_invoice_actions, set_action_invoices,
@@ -221,6 +222,7 @@ def _candidate_rows(session: Session):
         rows.append({
             "id": cust.id,
             "ragione_sociale": cust.ragione_sociale,
+            "agents": agents_of(cust),
             "partita_iva": cust.partita_iva,
             "total_overdue": stats[cust.id]["total_overdue"],
             "overdue_count": stats[cust.id]["overdue_count"],

@@ -23,6 +23,7 @@ from backend.engine.normalizer import normalize_ragione_sociale, name_similarity
 from backend.engine.matching import PIVA_NAME_MISMATCH_THRESHOLD
 from backend.engine.overdue import overdue_clause, RECOVERY_ACTION_TYPES
 from backend.engine.piva import validate_piva
+from backend.engine.agents import agents_of, agents_from_tags
 from backend.engine.fp_verify import compare_documents, fp_state_of
 from backend.engine.sdi import SDI_FINAL_OK, SDI_LABELS
 
@@ -320,6 +321,7 @@ def list_customers(
             items.append({
                 "id": cust.id,
                 "ragione_sociale": cust.ragione_sociale,
+                "agents": agents_of(cust),
                 "partita_iva": cust.partita_iva,
                 "phone": cust.phone,
                 "email": cust.email,
@@ -373,7 +375,7 @@ def suggest_customers(
 
     rows = session.query(
         Customer.id, Customer.ragione_sociale,
-        Customer.partita_iva, Customer.excluded,
+        Customer.partita_iva, Customer.excluded, Customer.tags,
     ).filter(Customer.merged_into.is_(None)).all()
     if not rows:
         return {"query": q, "items": []}
@@ -406,6 +408,7 @@ def suggest_customers(
             "ragione_sociale": r[1],
             "partita_iva": r[2],
             "excluded": bool(r[3]),
+            "agents": agents_from_tags(r[4]),
             "score": score,
             "overdue_count": s["overdue_count"],
             "total_overdue": s["total_overdue"],
@@ -474,6 +477,7 @@ def bonifica_suggestions(session: Session = Depends(get_session)):
         items.append({
             "customer_id": cid,
             "ragione_sociale": cust.ragione_sociale,
+            "agents": agents_of(cust),
             "piva_suggerita": the_piva,
             "invoice_count": len(carrier_ids),
             "confidence": confidence,
@@ -634,6 +638,7 @@ def merge_suggestions(session: Session = Depends(get_session)):
             rows.append({
                 "id": c.id,
                 "nome": c.ragione_sociale,
+                "agents": agents_of(c),
                 "partita_iva": c.partita_iva,
                 "phone": c.phone,
                 "invoice_count": counts.get(c.id, 0),
@@ -971,6 +976,9 @@ def get_customer_detail(
             "phone_validated": customer.phone_validated,
             "shopify_id": customer.shopify_id,
             "tags": customer.tags,
+            # Agente di vendita (Maggioni/Izzo/Scotti) derivato dai tag:
+            # backend/engine/agents.py, mostrato accanto alla ragione sociale.
+            "agents": agents_of(customer),
             "recovery_status": customer.recovery_status,
             "next_action_date": customer.next_action_date.isoformat() if customer.next_action_date else None,
             "next_action_type": customer.next_action_type,
