@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 
 import { API_BASE as API } from '../utils/api'
 import AgentBadges from '../components/AgentBadges'
+import ReminderEmailPanel from '../components/ReminderEmailPanel'
 
 function StatusBadge({ status }) {
   const colors = {
@@ -542,6 +543,9 @@ export default function System() {
           </div>
         </div>
       </div>
+
+      {/* Promemoria email pre-scadenza */}
+      <ReminderEmailPanel />
 
       {/* Data Integrity */}
       <div className="sc-card overflow-hidden">

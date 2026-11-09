@@ -43,6 +43,19 @@ class Config:
     SCHEDULER_HOUR = int(os.getenv("SCHEDULER_HOUR", "8"))
     SCHEDULER_MINUTE = int(os.getenv("SCHEDULER_MINUTE", "30"))
 
+    # Promemoria email il giorno prima della scadenza (backend/engine/reminder_email.py).
+    # Senza REMINDER_EMAIL_ENABLED + RESEND_API_KEY la funzione resta in PROVA:
+    # compone e registra, non invia. Mittente deciso dall'owner: fatture@.
+    REMINDER_EMAIL_ENABLED = os.getenv("REMINDER_EMAIL_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+    RESEND_API_URL = os.getenv("RESEND_API_URL", "https://api.resend.com")
+    REMINDER_EMAIL_FROM = os.getenv("REMINDER_EMAIL_FROM", "Sake Company <fatture@sakecompany.com>")
+    REMINDER_EMAIL_REPLY_TO = os.getenv("REMINDER_EMAIL_REPLY_TO", "fatture@sakecompany.com")
+    REMINDER_EMAIL_BCC = os.getenv("REMINDER_EMAIL_BCC", "")
+    REMINDER_EMAIL_TEST_TO = os.getenv("REMINDER_EMAIL_TEST_TO", "")
+    REMINDER_EMAIL_HOUR = int(os.getenv("REMINDER_EMAIL_HOUR", "9"))
+    REMINDER_EMAIL_MINUTE = int(os.getenv("REMINDER_EMAIL_MINUTE", "0"))
+
     # CORS - frontend origin (GitHub Pages)
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "https://recupero.sakecompany.com,http://localhost:5173").split(",")
 
