@@ -535,6 +535,11 @@ def _run_migrations(engine):
         "UPDATE invoices SET missing_streak = 0 WHERE missing_streak IS NULL",
         # Audit abbinamenti: "Segna verificato" per le fatture già controllate
         "ALTER TABLE invoices ADD COLUMN audit_reviewed_at TIMESTAMP",
+        # Promemoria email: colonne aggiunte dopo la prima stesura del modello
+        # (la tabella nuova nasce già completa da create_all; qui per i DB
+        # locali creati con la prima versione).
+        "ALTER TABLE invoice_reminder_emails ADD COLUMN error_kind VARCHAR",
+        "ALTER TABLE invoice_reminder_emails ADD COLUMN attempted_at TIMESTAMP",
         # Riconciliazione: data di pagamento vera + residuo all'atto del
         # pagamento. NESSUN backfill: le righe già 'paid' non hanno una data
         # di pagamento vera (updated_at non lo è) né un residuo recuperabile
