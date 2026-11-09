@@ -1593,6 +1593,7 @@ export default function ClientDetail() {
                                         title="Clicca per riassegnare la fattura a questo cliente (con conferma)"
                                       >
                                         {c.ragione_sociale}
+                                        <AgentBadges agents={c.agents} className="ml-1" />
                                         {c.partita_iva && (
                                           <span className="text-txt-muted"> · {c.partita_iva}</span>
                                         )}
@@ -1634,7 +1635,7 @@ export default function ClientDetail() {
                               {renamePreview.homonym ? (
                                 <>
                                   <p className="text-sm font-medium text-accent-red">
-                                    Esiste già il cliente &ldquo;<span className="font-semibold">{renamePreview.homonym.ragione_sociale}</span>&rdquo;
+                                    Esiste già il cliente &ldquo;<span className="font-semibold">{renamePreview.homonym.ragione_sociale}</span>&rdquo;<AgentBadges agents={renamePreview.homonym.agents} className="ml-1" />
                                     {renamePreview.homonym.partita_iva && ` (P.IVA ${renamePreview.homonym.partita_iva})`}:
                                     questa fattura è probabilmente sua.
                                   </p>

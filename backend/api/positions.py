@@ -912,6 +912,7 @@ def assign_name_to_customer(
                 "homonym": {
                     "id": homonym.id,
                     "ragione_sociale": homonym.ragione_sociale,
+                    "agents": agents_of(homonym),
                     "partita_iva": homonym.partita_iva,
                 } if homonym else None,
                 "impact": impact,

@@ -213,8 +213,8 @@ export default function BonificaAnagrafica() {
                           title="Apri la scheda cliente"
                         >
                           {item.ragione_sociale || `Cliente #${item.customer_id}`}
+                          <AgentBadges agents={item.agents} className="ml-2" />
                         </button>
-                        <AgentBadges agents={item.agents} className="ml-2" />
                       </td>
                       <td className="px-4 py-3 text-sm font-mono text-txt-primary">
                         {item.piva_suggerita}

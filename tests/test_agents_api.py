@@ -218,6 +218,23 @@ class TestDashboard:
         assert item["agents"] == []
 
 
+# ── Utilizzo (registro del lavoro) ───────────────────────────────────
+
+class TestUtilizzo:
+    def test_events_expose_agents(self, test_client, test_db_session):
+        c = _agent_cust(test_db_session, "Zaza Ramen", "B2B, Maggioni", recovery_status="first_contact")
+        _inv(test_db_session, c, "ZR/1", 450.0, days_overdue=30)
+        case = RecoveryCase(customer_id=c.id, status="open")
+        test_db_session.add(case)
+        test_db_session.commit()
+        _contact(test_db_session, c, case, "first_contact", days_ago=1)  # channel valorizzato
+        r = test_client.get("/api/recovery/utilizzo")
+        assert r.status_code == 200
+        ev = next(e for e in r.json()["eventi"] if e["customer_id"] == c.id)
+        assert ev["cliente"] == "Zaza Ramen"
+        assert ev["agents"] == ["Maggioni"]
+
+
 # ── Avvocato ─────────────────────────────────────────────────────────
 
 class TestAvvocato:

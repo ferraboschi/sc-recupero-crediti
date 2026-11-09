@@ -250,7 +250,7 @@ export default function Dashboard() {
           {ACTION_LABELS[todo.action_type] || todo.action_type}
         </span>
         <div className="min-w-0">
-          <span className="flex items-center gap-2 min-w-0">
+          <span className="flex items-center gap-2 min-w-0 flex-wrap">
             <span className="text-sm font-medium text-txt-primary truncate block max-w-[220px]">
               {todo.customer_name}
             </span>
@@ -342,7 +342,7 @@ export default function Dashboard() {
               <li key={i.invoice_id}>
                 <button type="button" onClick={() => navigate(`/customers/${i.customer_id}`)} className="underline hover:text-accent-red">
                   {i.ragione_sociale || 'cliente'}
-                </button><AgentBadges agents={i.agents} className="ml-1" />
+                </button><AgentBadges agents={i.agents} className="ml-2 [&>span]:py-0" />
                 {' '}· Fatt. {i.invoice_number} · {formatCurrency(i.amount_due)} · insoluto il {i.bounced_at ? new Date(i.bounced_at).toLocaleDateString('it-IT') : '—'}
               </li>
             ))}
@@ -359,7 +359,7 @@ export default function Dashboard() {
           <li key={i.invoice_id}>
             <button type="button" onClick={() => navigate(`/customers/${i.customer_id}`)} className="underline hover:text-accent-amber">
               {i.ragione_sociale || 'cliente'}
-            </button><AgentBadges agents={i.agents} className="ml-1" />
+            </button><AgentBadges agents={i.agents} className="ml-2 [&>span]:py-0" />
             {' '}· Fatt. {i.invoice_number} · {formatCurrency(i.amount_due)}
           </li>
         ))}

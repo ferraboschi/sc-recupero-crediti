@@ -55,6 +55,9 @@ class TestAgentsFromTags:
         assert agents_from_tags("Pizzoccheri") == []
         assert agents_from_tags("Maggionida") == []
         assert agents_from_tags("izzo-roma") == ["Izzo"]  # trattino = confine di parola
+        # Scelta esplicita: l'underscore è carattere di parola, quindi NON
+        # separa ("izzo_roma" non è un tag reale: censimento 9/11/2026).
+        assert agents_from_tags("izzo_roma") == []
 
     def test_whitespace_and_separators_tolerated(self):
         assert agents_from_tags("  B2B ,  MAGGIONI  ") == ["Maggioni"]

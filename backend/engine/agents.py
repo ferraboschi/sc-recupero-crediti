@@ -13,6 +13,11 @@ Le grafie su Shopify non sono uniformi ("SCOTTI", "scotti", "Scotti",
 "rendina", "sgariglia de leo"): il confronto è per parola intera, senza
 distinzione di maiuscole, tag per tag.
 
+Censimento sul DB di produzione (9/11/2026): le sole grafie presenti nei tag
+sono «maggioni», «izzo», «scotti», «rendina», «sgariglia de leo» — nessuna
+forma di negazione («ex Scotti», «vecchio Maggioni»). Se un giorno comparisse,
+il pattern va stretto QUI (con un test sul tag vero), non nei chiamanti.
+
 Modulo PURO (nessun accesso al DB): testato in tests/test_agents.py.
 """
 import re

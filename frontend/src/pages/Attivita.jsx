@@ -492,7 +492,7 @@ export default function Attivita() {
                           : 'bg-dark-card border-dark-border hover:bg-dark-cardHover hover:border-accent-teal/30'
                       }`}
                     >
-                      <div className="flex items-center gap-3 min-w-0">
+                      <div className="flex items-center gap-3 min-w-0 flex-wrap">
                         <span className={`${STATUS_BADGE[a.action_type] || STATUS_BADGE.first_contact} sc-badge shrink-0`}>
                           {ACTION_LABELS[a.action_type] || a.action_type}
                         </span>

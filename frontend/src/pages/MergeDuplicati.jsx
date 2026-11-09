@@ -170,14 +170,16 @@ export default function MergeDuplicati() {
                         />
                       )}
                       <div className="flex-1 min-w-0">
-                        <button
-                          onClick={() => navigate(`/customers/${m.id}`)}
-                          className="text-sm font-medium text-accent-teal hover:text-accent-cyan text-left truncate block max-w-full"
-                          title="Apri la scheda cliente"
-                        >
-                          {m.nome || `Cliente #${m.id}`}
-                        </button>
-                        <AgentBadges agents={m.agents} />
+                        <div className="flex items-center gap-2 min-w-0">
+                          <button
+                            onClick={() => navigate(`/customers/${m.id}`)}
+                            className="text-sm font-medium text-accent-teal hover:text-accent-cyan text-left truncate min-w-0"
+                            title="Apri la scheda cliente"
+                          >
+                            {m.nome || `Cliente #${m.id}`}
+                          </button>
+                          <AgentBadges agents={m.agents} className="shrink-0" />
+                        </div>
                         <p className="text-xs text-txt-muted">
                           {m.phone || 'senza telefono'} · {m.invoice_count} fatture · {m.overdue_count} scadute
                         </p>

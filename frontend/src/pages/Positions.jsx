@@ -625,12 +625,12 @@ export default function Positions() {
                       </td>
                       <td className="px-3 py-3 text-sm text-txt-primary">
                         <div className="flex flex-col">
-                          <span className="inline-flex items-center gap-2 flex-wrap">
+                          <span
+                            className={`inline-flex items-center gap-2 flex-wrap ${pos.customer?.id ? 'cursor-pointer' : ''}`}
+                            onClick={pos.customer?.id ? (e) => { e.stopPropagation(); navigate(`/customers/${pos.customer.id}`) } : undefined}
+                          >
                             {pos.customer?.id ? (
-                              <span
-                                className="text-accent-teal cursor-pointer hover:text-accent-cyan"
-                                onClick={(e) => { e.stopPropagation(); navigate(`/customers/${pos.customer.id}`) }}
-                              >
+                              <span className="text-accent-teal hover:text-accent-cyan">
                                 {pos.customer.ragione_sociale}
                               </span>
                             ) : (
