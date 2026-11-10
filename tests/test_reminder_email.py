@@ -196,10 +196,12 @@ class TestCompose:
         o1 = _inv(test_db_session, c, "A/0", 1000.0, date.today() - timedelta(days=40), days_overdue=40)
         o2 = _inv(test_db_session, c, "A/00", 234.5, date.today() - timedelta(days=10), days_overdue=10)
         msg = compose(c, inv, [o1, o2])
-        assert "Risultano inoltre scadute e non saldate 2 fatture per un totale di 1.234,50 €: riepilogo in allegato" in msg["text"]
+        assert "Risultano inoltre scadute e non saldate 2 fatture per un totale di 1.234,50 €." in msg["text"]
+        assert "Totale da saldare, compresa la fattura in scadenza: 1.334,50 €. Riepilogo in allegato." in msg["text"]
+        assert msg["grand_total"] == 1334.5
         assert msg["overdue_count"] == 2 and msg["overdue_total"] == 1234.5
         one = compose(c, inv, [o1])
-        assert "Risulta inoltre scaduta e non saldata 1 fattura per 1.000,00 €" in one["text"]
+        assert "Risulta inoltre scaduta e non saldata 1 fattura per 1.000,00 €. Totale da saldare, compresa la fattura in scadenza: 1.100,00 €." in one["text"]
 
     def test_html_escapes_customer_name(self, test_db_session):
         c = _cust(test_db_session, nome="Bar <Tokyo> & Co")
@@ -231,6 +233,15 @@ class TestCompose:
 
         riep = _pdf_strings(bytes(_build_riepilogativo_pdf(c, [o1])))
         assert "1.000,00 EUR" in riep and "La preghiamo" in riep and "P.IVA: 01234567890" in riep
+        # Allegato del promemoria: fattura in scadenza in cima («in scadenza»), scaduta coi giorni, totale di entrambe
+        from backend.engine.reminder_email import build_attachments
+        names, contents = zip(*build_attachments(c, inv, [o1]))
+        assert names == ("copia_cortesia_fattura_C_1.pdf", "riepilogo_da_saldare_LAngolo_del_Sake.pdf")
+        allegato = _pdf_strings(bytes(contents[1]))
+        assert "Riepilogo Fatture da Saldare" in allegato
+        assert "C/1" in allegato and "in scadenza" in allegato  # la fattura che genera l'email
+        assert "C/0" in allegato and "40" in allegato            # la scaduta coi giorni di ritardo
+        assert "2.234,50 EUR" in allegato                        # totale di entrambe (1.234,50 + 1.000,00)
 
 
 # ── Selezione ed esclusioni ───────────────────────────────────────────
@@ -353,9 +364,9 @@ class TestRun:
         assert sent["reply_to"] == "fatture@sakecompany.com" and sent["bcc"] == "luigi@sakecompany.com"
         assert sent["idempotency_key"] == f"reminder-{inv.id}-{TOMORROW.isoformat()}-reale"
         names = [n for n, _ in sent["attachments"]]
-        assert names == ["copia_cortesia_fattura_R_1.pdf", "riepilogo_scadute_Shabu_Casatenovo.pdf"]
+        assert names == ["copia_cortesia_fattura_R_1.pdf", "riepilogo_da_saldare_Shabu_Casatenovo.pdf"]
         assert all(content[:4] == b"%PDF" for _, content in sent["attachments"])
-        assert "1 fattura per 1.000,00 €" in sent["text"]
+        assert "1 fattura per 1.000,00 €. Totale da saldare, compresa la fattura in scadenza: 1.100,00 €." in sent["text"]
         assert sent["cc"] == ["fatture@sakecompany.com"]  # cliente senza agente: solo la casella fatture
         row = test_db_session.query(InvoiceReminderEmail).one()
         assert row.status == "sent" and row.provider_message_id == "msg-1" and row.sent_at is not None
@@ -688,7 +699,7 @@ class TestWeekendAndCopies:
         sent = mailer.sent[0]
         assert sent["to"] == ["lorenzo@ef-ti.com"] and "cc" not in sent and "bcc" not in sent
         assert sent["subject"].startswith("[PROVA] Promemoria: fattura n. TST/1")
-        assert [n for n, _ in sent["attachments"]] == ["copia_cortesia_fattura_TST_1.pdf", "riepilogo_scadute_Shabu_Casatenovo.pdf"]
+        assert [n for n, _ in sent["attachments"]] == ["copia_cortesia_fattura_TST_1.pdf", "riepilogo_da_saldare_Shabu_Casatenovo.pdf"]
         assert out["would_cc"] == ["g.maggioni@sakecompany.com", "fatture@sakecompany.com"]
         assert test_db_session.query(InvoiceReminderEmail).count() == 0  # registro intoccato
         with pytest.raises(ValueError):
@@ -797,7 +808,7 @@ class TestApi:
         log = test_client.get("/api/reminders/email/log", params={"customer_id": c.id})
         item = log.json()["items"][0]
         assert item["status"] == "prepared" and item["invoice_number"] == "API/1" and item["needs_manual_retry"] is False
-        assert item["attachments"] == ["copia_cortesia_fattura_API_1.pdf", "riepilogo_scadute_Shabu_Casatenovo.pdf"]
+        assert item["attachments"] == ["copia_cortesia_fattura_API_1.pdf", "riepilogo_da_saldare_Shabu_Casatenovo.pdf"]
 
         detail = test_client.get(f"/api/reminders/email/{item['id']}")
         assert detail.status_code == 200 and "scade domani" in detail.json()["body_text"]

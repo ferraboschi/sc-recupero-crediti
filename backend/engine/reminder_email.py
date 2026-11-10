@@ -315,6 +315,7 @@ def compose(customer: Customer, invoice: Invoice, overdue: List[Invoice], today:
     subject = f"Promemoria: fattura n. {numero} in scadenza il {scadenza} ({importo})"
 
     total = round(sum(float(i.amount_due or 0) for i in overdue), 2)
+    grand_total = round(float(invoice.amount_due or 0) + total, 2)
     paragraphs = [
         f"Spett.le {name},",
         (
@@ -325,14 +326,13 @@ def compose(customer: Customer, invoice: Invoice, overdue: List[Invoice], today:
     if overdue:
         n = len(overdue)
         if n == 1:
-            paragraphs.append(
-                f"Risulta inoltre scaduta e non saldata 1 fattura per {fmt_eur(total)}: riepilogo in allegato."
-            )
+            scadute = f"Risulta inoltre scaduta e non saldata 1 fattura per {fmt_eur(total)}."
         else:
-            paragraphs.append(
-                f"Risultano inoltre scadute e non saldate {n} fatture per un totale di {fmt_eur(total)}: "
-                "riepilogo in allegato."
-            )
+            scadute = f"Risultano inoltre scadute e non saldate {n} fatture per un totale di {fmt_eur(total)}."
+        paragraphs.append(
+            f"{scadute} Totale da saldare, compresa la fattura in scadenza: {fmt_eur(grand_total)}. "
+            "Riepilogo in allegato."
+        )
     pagamento = f"Pagamento: bonifico a {config.COMPANY_NAME}"
     if config.COMPANY_IBAN:
         pagamento += f", IBAN {config.COMPANY_IBAN}"
@@ -354,6 +354,7 @@ def compose(customer: Customer, invoice: Invoice, overdue: List[Invoice], today:
         "html": html_body,
         "overdue_count": len(overdue),
         "overdue_total": total,
+        "grand_total": grand_total,
     }
 
 
@@ -367,9 +368,13 @@ def build_attachments(customer: Customer, invoice: Invoice, overdue: List[Invoic
         bytes(_build_invoice_pdf(customer, invoice, courtesy=True)),
     )]
     if overdue:
+        # Decisione owner (10/11/2026): nel riepilogo anche la fattura in
+        # scadenza che ha generato l'email (in cima), poi le scadute coi
+        # giorni di ritardo, e il totale di tutte: si aspetta il saldo di
+        # entrambe.
         out.append((
-            f"riepilogo_scadute_{safe_filename(customer.ragione_sociale or 'cliente')}.pdf",
-            bytes(_build_riepilogativo_pdf(customer, overdue)),
+            f"riepilogo_da_saldare_{safe_filename(customer.ragione_sociale or 'cliente')}.pdf",
+            bytes(_build_riepilogativo_pdf(customer, [invoice] + list(overdue), title="Riepilogo Fatture da Saldare")),
         ))
     return out
 

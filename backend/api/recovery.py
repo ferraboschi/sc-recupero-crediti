@@ -1161,10 +1161,11 @@ def _payment_block(pdf, causale: str) -> None:
     pdf.cell(0, 6, pdf_text(f"Causale: {causale}"), new_x="LMARGIN", new_y="NEXT")
 
 
-def _build_riepilogativo_pdf(customer, invoices):
-    """Riepilogo delle fatture scadute del cliente (fpdf2). Va anche al
-    cliente come allegato del promemoria: testo al Lei, importi in formato
-    italiano, nessun dato interno."""
+def _build_riepilogativo_pdf(customer, invoices, *, title="Riepilogo Fatture Scadute"):
+    """Riepilogo delle fatture da saldare del cliente (fpdf2). Va anche al
+    cliente come allegato del promemoria (con la fattura in scadenza che lo
+    ha generato in cima e le scadute coi giorni di ritardo): testo al Lei,
+    importi in formato italiano, nessun dato interno."""
     from fpdf import FPDF
     from backend.engine.format import fmt_date_pdf, fmt_eur_pdf, italian_today, pdf_text
 
@@ -1175,7 +1176,7 @@ def _build_riepilogativo_pdf(customer, invoices):
     _company_header(pdf, centered=True)
 
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, "Riepilogo Fatture Scadute", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 10, pdf_text(title), new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(6)
 
     pdf.set_font("Helvetica", "B", 11)
@@ -1202,7 +1203,8 @@ def _build_riepilogativo_pdf(customer, invoices):
         pdf.cell(col_widths[0], 7, pdf_text(str(inv.invoice_number))[:25], border=1, align="L")
         pdf.cell(col_widths[1], 7, fmt_eur_pdf(inv.amount_due), border=1, align="R")
         pdf.cell(col_widths[2], 7, fmt_date_pdf(inv.due_date), border=1, align="C")
-        pdf.cell(col_widths[3], 7, str(inv.days_overdue or 0), border=1, align="C")
+        days = int(inv.days_overdue or 0)
+        pdf.cell(col_widths[3], 7, str(days) if days > 0 else "in scadenza", border=1, align="C")
         pdf.ln()
 
     pdf.set_font("Helvetica", "B", 11)
