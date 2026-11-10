@@ -13,13 +13,20 @@ from sqlalchemy.orm import Session
 from backend.config import config
 from backend.database import get_session, Customer, Invoice, InvoiceReminderEmail
 from backend.engine.agents import agents_of
+from backend.connectors.resend_mail import MailSendError
 from backend.engine.reminder_email import (
-    AUTO_RETRY_KINDS, MODE_LABELS, SKIP_LABELS, ModeMismatch, ReminderBusy, build_attachments,
-    overdue_invoices, preview, resolve_mode, retry_row, run_reminders, target_due_date,
+    AUTO_RETRY_KINDS, MODE_LABELS, SKIP_LABELS, ModeMismatch, NotFound, ReminderBusy, agent_emails,
+    build_attachments, carbon_copies, overdue_invoices, preview, resolve_mode, retry_row, run_reminders,
+    send_test, target_due_dates,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+class TestSendBody(BaseModel):
+    invoice_id: int
+    to: str
 
 
 class RunBody(BaseModel):
@@ -42,6 +49,7 @@ def _serialize(row: InvoiceReminderEmail, invoice: Optional[Invoice], customer: 
         "skip_reason": row.skip_reason,
         "skip_label": SKIP_LABELS.get(row.skip_reason) if row.skip_reason else None,
         "to_email": row.to_email,
+        "cc": row.cc_json or [],
         "original_to": row.original_to,
         "subject": row.subject,
         "amount_due": float(row.amount_due or 0),
@@ -87,7 +95,7 @@ def reminder_email_status(
     """Stato della funzione: modalità, configurazione mancante, cosa partirà
     al prossimo giro (anteprima con testo) e le ultime email registrate."""
     mode, missing = resolve_mode()
-    due = target_due_date()
+    dates = target_due_dates()
     rows = (
         _rows_query(session)
         .order_by(InvoiceReminderEmail.created_at.desc(), InvoiceReminderEmail.id.desc())
@@ -101,6 +109,9 @@ def reminder_email_status(
         "sender": config.REMINDER_EMAIL_FROM or None,
         "reply_to": config.REMINDER_EMAIL_REPLY_TO or None,
         "bcc": config.REMINDER_EMAIL_BCC or None,
+        "cc": config.REMINDER_EMAIL_CC or None,
+        "cc_effective": carbon_copies(None, config),  # gli indirizzi fissi davvero usati (validi)
+        "agent_emails": agent_emails(),
         "test_to": config.REMINDER_EMAIL_TEST_TO or None,
         "company": {
             "name": config.COMPANY_NAME, "vat": config.COMPANY_VAT or None,
@@ -108,8 +119,10 @@ def reminder_email_status(
             "iban_tail": config.COMPANY_IBAN[-4:] if config.COMPANY_IBAN else None,
         },
         "schedule": f"{config.REMINDER_EMAIL_HOUR:02d}:{config.REMINDER_EMAIL_MINUTE:02d} {config.TIMEZONE}",
-        "target_due_date": due.isoformat(),
-        "preview": preview(session, due, mode=mode),
+        "target_due_date": dates[0].isoformat() if dates else None,
+        "target_due_dates": [d.isoformat() for d in dates],
+        "weekend": not dates,
+        "preview": preview(session, due_dates=dates, mode=mode) if dates else [],
         "recent": [_serialize(r, i, c) for r, i, c in rows],
     }
 
@@ -125,6 +138,23 @@ def reminder_email_run(body: Optional[RunBody] = None, session: Session = Depend
         raise HTTPException(status_code=409, detail="Un giro di promemoria è già in corso")
     except ModeMismatch as e:
         raise _mode_mismatch(e)
+
+
+@router.post("/email/test")
+def reminder_email_test(body: TestSendBody, session: Session = Depends(get_session)):
+    """Invia a un indirizzo scelto l'email che il cliente riceverebbe per la
+    fattura indicata ([PROVA], nessuna copia, registro intoccato)."""
+    try:
+        return send_test(session, body.invoice_id, body.to)
+    except NotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except MailSendError as e:  # messaggio già senza segreti
+        raise HTTPException(status_code=502, detail=f"Invio di prova fallito: {e}")
+    except Exception as e:
+        logger.error(f"Invio di prova fallito (errore interno): {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Invio di prova fallito: errore interno, vedi i log")
 
 
 @router.post("/email/{row_id}/retry")

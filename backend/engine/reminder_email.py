@@ -1,7 +1,8 @@
 """Promemoria email il giorno PRIMA della scadenza di una fattura.
 
 Decisione owner (9/11/2026): per ogni fattura non pagata in scadenza domani
-il cliente riceve una email con:
+(il venerdì: sabato, domenica e lunedì; nel weekend nulla) il cliente riceve
+una email con:
 - la copia di cortesia della fattura in scadenza (PDF generato dall'app);
 - se ha anche fatture GIÀ scadute e non saldate, un secondo PDF con il
   riepilogo e il totale, citato nel testo ("questa fattura vale X; il
@@ -48,6 +49,7 @@ from sqlalchemy.orm import Session
 
 from backend.config import config
 from backend.database import Customer, Invoice, InvoiceReminderEmail
+from backend.engine.agents import agents_of
 from backend.engine.format import fmt_date, fmt_eur, italian_today, safe_filename  # noqa: F401 (riesportati)
 from backend.engine.verify import verify_invoice_customer
 
@@ -103,6 +105,10 @@ class ReminderBusy(Exception):
     """Un giro di promemoria è già in corso."""
 
 
+class NotFound(LookupError):
+    """Riga o fattura inesistente."""
+
+
 class ModeMismatch(Exception):
     """La modalità sul server non è quella che l'operatore ha confermato."""
 
@@ -131,9 +137,77 @@ def resolve_mode(cfg=None) -> Tuple[str, List[str]]:
     return MODE_REALE, []
 
 
+def target_due_dates(now_utc: Optional[datetime] = None) -> List[date]:
+    """Le scadenze a cui si riferisce il giro di oggi (ora italiana).
+
+    Decisione owner (10/11/2026): mai email nel weekend. Da lunedì a giovedì
+    si ricorda la scadenza di DOMANI; il venerdì si anticipano sabato,
+    domenica e lunedì; sabato e domenica il giro non fa nulla.
+    """
+    today = italian_today(now_utc)
+    weekday = today.weekday()  # 0 = lunedì
+    if weekday >= 5:
+        return []
+    if weekday == 4:
+        return [today + timedelta(days=d) for d in (1, 2, 3)]
+    return [today + timedelta(days=1)]
+
+
 def target_due_date(now_utc: Optional[datetime] = None) -> date:
-    """La scadenza a cui si riferisce il giro di oggi: DOMANI (ora italiana)."""
-    return italian_today(now_utc) + timedelta(days=1)
+    """Compatibilità: la prima scadenza del giro (o domani, nel weekend)."""
+    dates = target_due_dates(now_utc)
+    return dates[0] if dates else italian_today(now_utc) + timedelta(days=1)
+
+
+WEEKDAYS_IT = ("lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica")
+
+
+def due_label(due: date, today: Optional[date] = None) -> str:
+    """«domani, martedì 11/11/2026» oppure «lunedì 16/11/2026» (giro del venerdì)."""
+    today = today or italian_today()
+    text = f"{WEEKDAYS_IT[due.weekday()]} {fmt_date(due)}"
+    return f"domani, {text}" if due == today + timedelta(days=1) else text
+
+
+_NUMBER_SUFFIX_RE = re.compile(r"\s*-\s*(fattura|nota di credito|nota di debito)\s*$", re.IGNORECASE)
+
+
+def invoice_label(invoice_number) -> str:
+    """Numero come lo legge il cliente: FatturaPro accoda « - Fattura» al
+    numero («2026/00001804/SAK - Fattura»); nell'email e nella causale resta
+    solo «2026/00001804/SAK»."""
+    return _NUMBER_SUFFIX_RE.sub("", str(invoice_number or "")).strip() or str(invoice_number or "")
+
+
+def agent_emails(cfg=None) -> dict:
+    """{'Maggioni': 'mail', ...} da REMINDER_AGENT_EMAILS ("Nome:mail;Nome:mail")."""
+    raw = (getattr(cfg or config, "REMINDER_AGENT_EMAILS", "") or "").strip()
+    out = {}
+    for part in raw.replace(";", ",").split(","):
+        if ":" in part or "=" in part:
+            name, _, mail = part.replace("=", ":").partition(":")
+            mail = normalize_email(mail)
+            if name.strip() and mail:
+                out[name.strip().title()] = mail
+    return out
+
+
+def carbon_copies(customer: Optional[Customer], cfg=None) -> List[str]:
+    """Copie della email REALE: casella fatture (REMINDER_EMAIL_CC) e il
+    commerciale di riferimento del cliente (tag Shopify → REMINDER_AGENT_EMAILS)."""
+    cfg = cfg or config
+    cc: List[str] = []
+    mapping = agent_emails(cfg)
+    for agent in agents_of(customer):
+        mail = mapping.get(agent)
+        if mail and mail not in cc:
+            cc.append(mail)
+    for part in (getattr(cfg, "REMINDER_EMAIL_CC", "") or "").replace(";", ",").split(","):
+        mail = normalize_email(part)
+        if mail and mail not in cc:
+            cc.append(mail)
+    to = normalize_email(getattr(customer, "email", None)) if customer else None
+    return [m for m in cc if m != to]
 
 
 def in_catchup_window(now_utc: Optional[datetime] = None, start_hour: int = 9, end_hour: int = 18) -> bool:
@@ -228,50 +302,47 @@ def overdue_invoices(session: Session, customer_id: int, exclude_id: Optional[in
 
 # ── Composizione ──────────────────────────────────────────────────────
 
-def compose(customer: Customer, invoice: Invoice, overdue: List[Invoice]) -> dict:
-    """Oggetto e testo (testo semplice + HTML equivalente). Testo in italiano,
-    approvato dall'owner prima dell'accensione dell'invio reale."""
+def compose(customer: Customer, invoice: Invoice, overdue: List[Invoice], today: Optional[date] = None) -> dict:
+    """Oggetto e testo (testo semplice + HTML). Decisione owner (10/11/2026):
+    segnalazione corta e veloce ma con tutti i dettagli — fattura, importo,
+    scadenza, allegati, eventuali scadute col totale, coordinate di pagamento,
+    cosa fare se ha già pagato."""
     name = (customer.ragione_sociale or "").strip() or "Cliente"
     importo = fmt_eur(invoice.amount_due)
     scadenza = fmt_date(invoice.due_date)
-    emissione = f" del {fmt_date(invoice.issue_date)}" if invoice.issue_date else ""
-    subject = (
-        f"Promemoria di cortesia: fattura n. {invoice.invoice_number} "
-        f"in scadenza il {scadenza} ({importo})"
-    )
+    label = due_label(invoice.due_date, today) if invoice.due_date else "a breve"
+    numero = invoice_label(invoice.invoice_number)
+    subject = f"Promemoria: fattura n. {numero} in scadenza il {scadenza} ({importo})"
 
     total = round(sum(float(i.amount_due or 0) for i in overdue), 2)
     paragraphs = [
         f"Spett.le {name},",
         (
-            f"Le ricordiamo che la fattura n. {invoice.invoice_number}{emissione}, "
-            f"di {importo}, scade domani, {scadenza}.\n"
-            "In allegato trova la copia di cortesia della fattura (l'originale Le è stato "
-            "trasmesso tramite il Sistema di Interscambio); le coordinate bancarie per il "
-            "pagamento sono riportate in calce al documento."
+            f"promemoria di cortesia: la fattura n. {numero} di {importo} "
+            f"scade {label}. Copia della fattura in allegato."
         ),
     ]
     if overdue:
         n = len(overdue)
-        scadute = (
-            "risulta scaduta e non ancora saldata 1 fattura, per "
-            if n == 1 else
-            f"risultano scadute e non ancora saldate {n} fatture, per un totale di "
-        )
-        paragraphs.append(
-            f"Le segnaliamo inoltre che, a oggi, {scadute}{fmt_eur(total)}: "
-            "nel secondo allegato trova il riepilogo completo. "
-            "La preghiamo di provvedere al saldo o di contattarci per concordare le modalità."
-        )
+        if n == 1:
+            paragraphs.append(
+                f"Risulta inoltre scaduta e non saldata 1 fattura per {fmt_eur(total)}: riepilogo in allegato."
+            )
+        else:
+            paragraphs.append(
+                f"Risultano inoltre scadute e non saldate {n} fatture per un totale di {fmt_eur(total)}: "
+                "riepilogo in allegato."
+            )
+    pagamento = f"Pagamento: bonifico a {config.COMPANY_NAME}"
+    if config.COMPANY_IBAN:
+        pagamento += f", IBAN {config.COMPANY_IBAN}"
+    pagamento += f", causale \"Fattura {numero}\"."
+    paragraphs.append(pagamento)
     paragraphs.append(
-        "Se ha già provveduto al pagamento, La preghiamo di non tenere conto del presente promemoria."
+        "Se ha già provveduto al pagamento, ignori questo messaggio. "
+        "Per chiarimenti può rispondere a questa email."
     )
-    paragraphs.append("Per qualsiasi chiarimento può rispondere direttamente a questa email.")
-    reply_to = (getattr(config, "REMINDER_EMAIL_REPLY_TO", "") or "").strip()
-    signature = f"Cordiali saluti,\n{config.COMPANY_NAME} - Amministrazione"
-    if reply_to:
-        signature += f"\n{reply_to}"
-    paragraphs.append(signature)
+    paragraphs.append(f"{config.COMPANY_NAME} - Amministrazione")
 
     text = "\n\n".join(paragraphs)
     html_body = "".join(
@@ -292,7 +363,7 @@ def build_attachments(customer: Customer, invoice: Invoice, overdue: List[Invoic
     from backend.api.recovery import _build_invoice_pdf, _build_riepilogativo_pdf
 
     out = [(
-        f"copia_cortesia_fattura_{safe_filename(invoice.invoice_number)}.pdf",
+        f"copia_cortesia_fattura_{safe_filename(invoice_label(invoice.invoice_number))}.pdf",
         bytes(_build_invoice_pdf(customer, invoice, courtesy=True)),
     )]
     if overdue:
@@ -347,6 +418,7 @@ def _item(row: InvoiceReminderEmail, invoice: Invoice, customer: Optional[Custom
         "due_date": row.due_date.isoformat() if row.due_date else None,
         "skip_reason": row.skip_reason,
         "to_email": row.to_email,
+        "cc": row.cc_json or [],
         "amount_due": float(invoice.amount_due or 0),
         "overdue_count": row.overdue_count or 0,
         "overdue_total": float(row.overdue_total or 0),
@@ -356,10 +428,19 @@ def _item(row: InvoiceReminderEmail, invoice: Invoice, customer: Optional[Custom
 
 
 def preview(session: Session, due_date: Optional[date] = None, now_utc: Optional[datetime] = None,
-            mode: Optional[str] = None) -> List[dict]:
-    """Cosa farebbe il giro per la scadenza data: NESSUNA scrittura."""
-    due = due_date or target_due_date(now_utc)
-    mode = mode or resolve_mode()[0]
+            mode: Optional[str] = None, due_dates: Optional[List[date]] = None, cfg=None) -> List[dict]:
+    """Cosa farebbe il giro per le scadenze date: NESSUNA scrittura."""
+    cfg = cfg or config
+    dates = due_dates or ([due_date] if due_date else target_due_dates(now_utc))
+    mode = mode or resolve_mode(cfg)[0]
+    today = italian_today(now_utc)
+    out = []
+    for due in dates:
+        out.extend(_preview_for(session, due, mode, today, cfg))
+    return out
+
+
+def _preview_for(session: Session, due: date, mode: str, today: date, cfg) -> List[dict]:
     out = []
     for inv in candidate_invoices(session, due):
         customer = inv.customer
@@ -372,8 +453,11 @@ def preview(session: Session, due_date: Optional[date] = None, now_utc: Optional
             "customer_id": customer.id if customer else None,
             "ragione_sociale": customer.ragione_sociale if customer else inv.customer_name_raw,
             "to_email": (customer.email or "").strip() if customer else None,
+            "cc": carbon_copies(customer, cfg) if (customer and mode == MODE_REALE) else [],
+            "would_cc": carbon_copies(customer, cfg) if customer else [],
             "amount_due": float(inv.amount_due or 0),
             "due_date": due.isoformat(),
+            "due_label": due_label(due, today),
             "skip_reason": reason,
             "skip_label": SKIP_LABELS.get(reason) if reason else None,
             "already": existing.status if existing else None,
@@ -387,7 +471,7 @@ def preview(session: Session, due_date: Optional[date] = None, now_utc: Optional
         }
         if not reason:
             overdue = overdue_invoices(session, customer.id, exclude_id=inv.id)
-            msg = compose(customer, inv, overdue)
+            msg = compose(customer, inv, overdue, today)
             entry.update({
                 "overdue_count": msg["overdue_count"],
                 "overdue_total": msg["overdue_total"],
@@ -415,9 +499,9 @@ def _resolve_runtime(cfg, mailer, mode):
     return mode, missing, mailer, own_mailer
 
 
-def _empty_summary(due: date, mode: str, missing: List[str]) -> dict:
+def _empty_summary(due: Optional[date], mode: str, missing: List[str]) -> dict:
     return {
-        "due_date": due.isoformat(), "mode": mode, "missing_config": missing,
+        "due_date": due.isoformat() if due else None, "mode": mode, "missing_config": missing,
         "candidates": 0, "sent": 0, "prepared": 0, "skipped": 0, "failed": 0,
         "already": 0, "items": [],
     }
@@ -443,7 +527,8 @@ def _classify_error(exc: Exception) -> str:
 
 
 def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, mailer, cfg, summary: dict,
-                     existing: Optional[InvoiceReminderEmail] = None) -> Optional[InvoiceReminderEmail]:
+                     existing: Optional[InvoiceReminderEmail] = None,
+                     today: Optional[date] = None) -> Optional[InvoiceReminderEmail]:
     """Compone, registra e (fuori dalla prova) invia il promemoria di UNA
     fattura; aggiorna `summary` e ritorna la riga (None se un altro giro
     l'aveva già riservata)."""
@@ -472,7 +557,7 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
         return row
 
     overdue = overdue_invoices(session, customer.id, exclude_id=inv.id)
-    msg = compose(customer, inv, overdue)
+    msg = compose(customer, inv, overdue, today or italian_today())
     real_to = normalize_email(customer.email)
     test_to = (getattr(cfg, "REMINDER_EMAIL_TEST_TO", "") or "").strip()
     row.skip_reason = None
@@ -482,6 +567,10 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
     row.overdue_total = msg["overdue_total"]
     row.original_to = real_to
     row.to_email = test_to if mode == MODE_TEST else real_to
+    # Copie (commerciale + fatture@) solo nell'invio REALE: in test tutto va
+    # al solo indirizzo di prova.
+    cc = carbon_copies(customer, cfg) if mode == MODE_REALE else []
+    row.cc_json = cc
 
     # Riserva PRIMA di fare qualsiasi cosa costosa o irreversibile.
     if not _reserve(session, row):
@@ -514,6 +603,7 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
                 text=msg["text"],
                 html=msg["html"],
                 reply_to=(getattr(cfg, "REMINDER_EMAIL_REPLY_TO", "") or None),
+                cc=cc or None,
                 bcc=(getattr(cfg, "REMINDER_EMAIL_BCC", "") or None) if mode == MODE_REALE else None,
                 attachments=attachments,
                 idempotency_key=f"reminder-{inv.id}-{due.isoformat()}-{mode}",
@@ -572,6 +662,7 @@ def run_reminders(
     cfg=None,
     mode: Optional[str] = None,
     expected_mode: Optional[str] = None,
+    due_dates: Optional[List[date]] = None,
 ) -> dict:
     """Il giro quotidiano: compone, registra e (fuori dalla prova) invia.
 
@@ -579,24 +670,56 @@ def run_reminders(
     server ne risolve un'altra (env cambiate nel frattempo) non si parte.
     """
     cfg = cfg or config
-    due = due_date or target_due_date(now_utc)
+    if due_dates is None:
+        dates = [due_date] if due_date else target_due_dates(now_utc)
+    else:
+        dates = list(due_dates)
     if not _reminder_lock.acquire(blocking=False):
         raise ReminderBusy()
     try:
         mode, missing, mailer, own_mailer = _resolve_runtime(cfg, mailer, mode)
         if expected_mode and expected_mode != mode:
             raise ModeMismatch(mode, expected_mode)
-        summary = _empty_summary(due, mode, missing)
+        summary = _empty_summary(dates[0] if dates else None, mode, missing)
+        summary["due_dates"] = [d.isoformat() for d in dates]
+        today = italian_today(now_utc)
         try:
-            for inv in candidate_invoices(session, due):
-                summary["candidates"] += 1
-                existing = session.query(InvoiceReminderEmail).filter_by(invoice_id=inv.id, due_date=due).first()
-                will, _why = needs_processing(existing, mode)
-                if not will:
-                    summary["already"] += 1
-                    continue
-                _process_safely(session, inv, due, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
-                                existing=existing)
+            for due in dates:
+                for inv in candidate_invoices(session, due):
+                    summary["candidates"] += 1
+                    existing = session.query(InvoiceReminderEmail).filter_by(invoice_id=inv.id, due_date=due).first()
+                    will, _why = needs_processing(existing, mode)
+                    if not will:
+                        summary["already"] += 1
+                        continue
+                    _process_safely(session, inv, due, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
+                                    existing=existing, today=today)
+            # Passaggio prova/test → reale: le scadenze FUTURE già lavorate in
+            # prova o in test (es. il venerdì copre anche lunedì) non devono
+            # restare senza l'email vera. Si riprendono le righe con
+            # scadenza da oggi in poi, fuori dalle date del giro.
+            if mode == MODE_REALE:
+                pending = (
+                    session.query(InvoiceReminderEmail)
+                    .filter(
+                        InvoiceReminderEmail.due_date >= today,
+                        InvoiceReminderEmail.status.in_((STATUS_PREPARED, STATUS_SENT)),
+                        InvoiceReminderEmail.mode != MODE_REALE,
+                    )
+                    .all()
+                )
+                for row in pending:
+                    if row.due_date in dates:
+                        continue
+                    will, _why = needs_processing(row, mode)
+                    inv = session.query(Invoice).filter(Invoice.id == row.invoice_id).first()
+                    if not will or inv is None or inv.status in NOT_REMINDABLE_STATUSES or float(inv.amount_due or 0) <= 0:
+                        continue
+                    summary["candidates"] += 1
+                    summary.setdefault("carried_over", 0)
+                    summary["carried_over"] += 1
+                    _process_safely(session, inv, row.due_date, mode=mode, mailer=mailer, cfg=cfg,
+                                    summary=summary, existing=row, today=today)
         finally:
             if own_mailer and mailer is not None:
                 mailer.close()
@@ -604,22 +727,85 @@ def run_reminders(
         _reminder_lock.release()
 
     logger.info(
-        "Promemoria email (scadenza %s, modalità %s): candidate=%d inviate=%d preparate=%d "
+        "Promemoria email (scadenze %s, modalità %s): candidate=%d inviate=%d preparate=%d "
         "saltate=%d fallite=%d non_lavorate=%d",
-        summary["due_date"], mode, summary["candidates"], summary["sent"], summary["prepared"],
-        summary["skipped"], summary["failed"], summary["already"],
+        ", ".join(summary["due_dates"]) or "nessuna (weekend)", mode, summary["candidates"], summary["sent"],
+        summary["prepared"], summary["skipped"], summary["failed"], summary["already"],
     )
     return summary
 
 
+def send_test(session: Session, invoice_id: int, to_address: str, *, mailer=None, cfg=None) -> dict:
+    """Invia a UN indirizzo scelto l'email che il cliente riceverebbe per la
+    fattura data (oggetto con prefisso [PROVA], nessuna copia, registro
+    intoccato). Serve a far leggere testo e allegati veri prima di accendere
+    l'invio ai clienti. Richiede Resend configurato."""
+    from sqlalchemy import func
+
+    cfg = cfg or config
+    to = normalize_email(to_address)
+    if not to:
+        raise ValueError("indirizzo di prova non valido")
+    inv = session.query(Invoice).filter(Invoice.id == invoice_id).first()
+    if inv is None:
+        raise NotFound("fattura non trovata")
+    if inv.customer is None:
+        raise ValueError("fattura senza cliente")
+    if inv.status in NOT_REMINDABLE_STATUSES or float(inv.amount_due or 0) <= 0:
+        raise ValueError("fattura pagata, annullata o contestata")
+    customer = inv.customer
+    reason = skip_reason(inv, customer)
+    if reason and reason not in ("senza_email", "email_non_valida"):
+        raise ValueError(f"promemoria non inviabile: {SKIP_LABELS.get(reason, reason)}")
+    # La prova va a un indirizzo INTERNO: mai a un cliente (nemmeno per errore
+    # di copia-incolla dall'anteprima).
+    is_customer_email = session.query(Customer.id).filter(
+        func.lower(func.trim(Customer.email)) == to
+    ).first() is not None
+    if is_customer_email or to == normalize_email(customer.email):
+        raise ValueError("l'indirizzo di prova coincide con l'email di un cliente: usare un indirizzo interno")
+    if not getattr(cfg, "RESEND_API_KEY", ""):
+        raise ValueError("Resend non configurato (RESEND_API_KEY)")
+    overdue = overdue_invoices(session, customer.id, exclude_id=inv.id)
+    msg = compose(customer, inv, overdue, italian_today())
+    attachments = build_attachments(customer, inv, overdue)
+    own = False
+    if mailer is None:
+        from backend.connectors.resend_mail import ResendMailer
+        mailer = ResendMailer(cfg.RESEND_API_KEY, getattr(cfg, "RESEND_API_URL", None))
+        own = True
+    try:
+        message_id = mailer.send(
+            sender=cfg.REMINDER_EMAIL_FROM,
+            to=[to],
+            subject=f"[PROVA] {msg['subject']}",
+            text=msg["text"],
+            html=msg["html"],
+            reply_to=(getattr(cfg, "REMINDER_EMAIL_REPLY_TO", "") or None),
+            attachments=attachments,
+        )
+    finally:
+        if own:
+            mailer.close()
+    logger.info("Promemoria di PROVA inviato per la fattura %s (cliente %s)", inv.invoice_number, customer.id)
+    return {
+        "sent_to": to, "invoice_id": inv.id, "invoice_number": inv.invoice_number,
+        "ragione_sociale": customer.ragione_sociale, "subject": f"[PROVA] {msg['subject']}",
+        "attachments": [name for name, _ in attachments], "provider_message_id": message_id or None,
+        "would_cc": carbon_copies(customer, cfg),
+    }
+
+
 def retry_row(session: Session, row: InvoiceReminderEmail, *, mailer=None, cfg=None, mode: Optional[str] = None,
               expected_mode: Optional[str] = None) -> dict:
-    """Ritenta UNA riga ferma (`failed` o `sending` orfana), anche di una
-    scadenza passata: il giro quotidiano guarda solo la scadenza di domani.
+    """Ritenta UNA riga ferma (`failed` o `sending` orfana) di una scadenza
+    non ancora passata: il giro quotidiano guarda solo le prossime scadenze.
     La fattura deve essere ancora da ricordare."""
     cfg = cfg or config
     if row.status not in (STATUS_FAILED, STATUS_SENDING):
         raise ValueError("si ritentano solo i promemoria falliti o interrotti")
+    if row.due_date and row.due_date < italian_today():
+        raise ValueError("scadenza già passata: non è più un promemoria (la fattura è ora tra le scadute)")
     inv = session.query(Invoice).filter(Invoice.id == row.invoice_id).first()
     if inv is None:
         raise ValueError("fattura non più presente")

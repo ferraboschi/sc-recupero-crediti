@@ -359,6 +359,7 @@ class InvoiceReminderEmail(Base):
     overdue_total = Column(Float, default=0.0)
     provider_message_id = Column(String, nullable=True)
     error = Column(Text, nullable=True)
+    cc_json = Column(JSON, nullable=True)                        # copie (commerciale, fatture@) in modalità reale
     error_kind = Column(String, nullable=True)                   # pdf / validation / provider / network / other
     attempted_at = Column(DateTime, nullable=True)               # ultimo tentativo di invio
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
@@ -540,6 +541,7 @@ def _run_migrations(engine):
         # locali creati con la prima versione).
         "ALTER TABLE invoice_reminder_emails ADD COLUMN error_kind VARCHAR",
         "ALTER TABLE invoice_reminder_emails ADD COLUMN attempted_at TIMESTAMP",
+        "ALTER TABLE invoice_reminder_emails ADD COLUMN cc_json JSON",
         # Riconciliazione: data di pagamento vera + residuo all'atto del
         # pagamento. NESSUN backfill: le righe già 'paid' non hanno una data
         # di pagamento vera (updated_at non lo è) né un residuo recuperabile

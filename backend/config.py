@@ -64,6 +64,14 @@ class Config:
     REMINDER_EMAIL_FROM = os.getenv("REMINDER_EMAIL_FROM", "Sake Company <fatture@sakecompany.com>")
     REMINDER_EMAIL_REPLY_TO = os.getenv("REMINDER_EMAIL_REPLY_TO", "fatture@sakecompany.com")
     REMINDER_EMAIL_BCC = os.getenv("REMINDER_EMAIL_BCC", "")
+    # Copia (CC) visibile su ogni promemoria REALE: la casella fatture + il
+    # commerciale di riferimento del cliente (decisione owner 10/11/2026).
+    REMINDER_EMAIL_CC = os.getenv("REMINDER_EMAIL_CC", "fatture@sakecompany.com")
+    # "Maggioni:mail;Izzo:mail;Scotti:mail" — senza indirizzo il commerciale non riceve copia.
+    REMINDER_AGENT_EMAILS = os.getenv(
+        "REMINDER_AGENT_EMAILS",
+        "Maggioni:g.maggioni@sakecompany.com;Izzo:a.izzo@sakecompany.com;Scotti:g.scotti@sakecompany.com",
+    )
     REMINDER_EMAIL_TEST_TO = os.getenv("REMINDER_EMAIL_TEST_TO", "")
     REMINDER_EMAIL_HOUR = int(os.getenv("REMINDER_EMAIL_HOUR", "9"))
     REMINDER_EMAIL_MINUTE = int(os.getenv("REMINDER_EMAIL_MINUTE", "15"))  # :15, fuori dal sync orario delle :00
