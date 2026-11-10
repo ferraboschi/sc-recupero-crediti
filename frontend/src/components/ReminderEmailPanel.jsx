@@ -141,7 +141,7 @@ export default function ReminderEmailPanel() {
     const n = toSend.length
     const dates = (fresh.target_due_dates || []).map(fmtDate).join(', ')
     const msg = fresh.mode === 'reale'
-      ? `Invio ADESSO le email AI CLIENTI per ${n} fattur${n === 1 ? 'a' : 'e'} in scadenza il ${dates}, con copia a fatture@ e al commerciale. Procedere?`
+      ? `Invio ADESSO le email AI CLIENTI per ${n} fattur${n === 1 ? 'a' : 'e'} in scadenza il ${dates}${(fresh.cc_effective || []).length ? `, con copia a ${fresh.cc_effective.join(', ')}` : ''}${Object.keys(fresh.agent_emails || {}).length ? ' e al commerciale del cliente' : ''}. Procedere?`
       : fresh.mode === 'test'
         ? `Invio ${n} email di prova a ${fresh.test_to} (i clienti non ricevono nulla). Procedere?`
         : `Modalità prova: preparo e registro ${n} email senza inviarle. Procedere?`
@@ -244,7 +244,7 @@ export default function ReminderEmailPanel() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs">
           <p><span className="text-txt-muted">Mittente:</span> <span className="text-txt-primary">{data.sender || '—'}</span></p>
           <p><span className="text-txt-muted">Risposte a:</span> <span className="text-txt-primary">{data.reply_to || '—'}</span></p>
-          <p><span className="text-txt-muted">In copia (invio reale):</span> <span className="text-txt-primary">{data.cc || '—'}{Object.keys(data.agent_emails || {}).length > 0 ? ' + commerciale del cliente' : ''}</span></p>
+          <p><span className="text-txt-muted">In copia (invio reale):</span> <span className="text-txt-primary">{(data.cc_effective || []).join(', ') || '—'}{Object.keys(data.agent_emails || {}).length > 0 ? ' + commerciale del cliente' : ''}</span></p>
           <p><span className="text-txt-muted">Commerciali:</span> <span className="text-txt-primary">{Object.entries(data.agent_emails || {}).map(([k, v]) => `${k} → ${v}`).join(' · ') || '—'}</span></p>
           <p><span className="text-txt-muted">Copia nascosta:</span> <span className="text-txt-primary">{data.bcc || '—'}</span></p>
           <p><span className="text-txt-muted">Indirizzo di prova:</span> <span className="text-txt-primary">{data.test_to || '—'}</span></p>
@@ -308,6 +308,7 @@ export default function ReminderEmailPanel() {
                         <CustomerName id={p.customer_id} name={p.ragione_sociale} navigate={navigate} />
                         <span className="block text-xs text-txt-muted font-mono">{p.to_email || 'senza email'}</span>
                         {p.cc && p.cc.length > 0 && <span className="block text-xs text-txt-muted">cc: {p.cc.join(', ')}</span>}
+                        {(!p.cc || p.cc.length === 0) && p.would_cc && p.would_cc.length > 0 && <span className="block text-xs text-txt-muted">in reale cc: {p.would_cc.join(', ')}</span>}
                       </td>
                       <td className="py-2 pr-3 font-mono text-xs text-txt-secondary">{p.invoice_number}</td>
                       <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap">{p.due_label || fmtDate(p.due_date)}</td>
@@ -439,7 +440,7 @@ export function ReminderEmailHistory({ customerId }) {
     <div className="sc-card overflow-hidden">
       <div className="sc-card-header flex items-center justify-between gap-3 flex-wrap">
         <h2 className="text-base font-bold text-txt-primary">Promemoria email</h2>
-        <span className="text-xs text-txt-muted">Registro dei promemoria automatici (il giorno prima della scadenza): ultimi {items.length}</span>
+        <span className="text-xs text-txt-muted">Registro dei promemoria automatici (il giorno prima della scadenza, il venerdì per il weekend): ultimi {items.length}</span>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">

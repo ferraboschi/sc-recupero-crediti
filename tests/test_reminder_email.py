@@ -29,7 +29,25 @@ from backend.engine.reminder_email import (
     target_due_date, target_due_dates,
 )
 
-TOMORROW = date.today() + timedelta(days=1)
+# Orologio FISSO per tutto il modulo: la logica usa l'ora italiana reale
+# (italian_today / target_due_dates); senza fissarla la suite fallirebbe nel
+# weekend e nelle ore in cui la data della macchina differisce da quella di
+# Roma. Martedì 10/11/2026 alle 11:00 italiane → scadenza del giro: 11/11.
+FIXED_NOW = datetime(2026, 11, 10, 10, 0, tzinfo=timezone.utc)
+TODAY = date(2026, 11, 10)
+TOMORROW = date(2026, 11, 11)
+
+
+class _FixedDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return FIXED_NOW.astimezone(tz) if tz else FIXED_NOW.replace(tzinfo=None)
+
+
+@pytest.fixture(autouse=True)
+def _fixed_clock(monkeypatch):
+    monkeypatch.setattr("backend.engine.format.datetime", _FixedDatetime)
+    monkeypatch.setattr("backend.engine.reminder_email.datetime", _FixedDatetime)
 
 
 def _cfg(**over):
@@ -612,12 +630,54 @@ class TestWeekendAndCopies:
         mailer = FakeMailer()
         summary = run_reminders(test_db_session, now_utc=friday, mailer=mailer, cfg=_real_cfg())
         assert summary["due_dates"] == ["2026-11-14", "2026-11-15", "2026-11-16"]
-        assert summary["sent"] == 3 and sorted(s["subject"][-32:] for s in mailer.sent)
+        assert summary["sent"] == 3 and len(mailer.sent) == 3
         texts = {s["subject"].split("n. ")[1].split(" in")[0]: s["text"] for s in mailer.sent}
         assert "scade domani, sabato 14/11/2026" in texts["SAB/1"]
         assert "scade lunedì 16/11/2026" in texts["LUN/1"]
         saturday = datetime(2026, 11, 14, 10, tzinfo=timezone.utc)
         assert run_reminders(test_db_session, now_utc=saturday, mailer=mailer, cfg=_real_cfg())["candidates"] == 0
+
+    def test_real_mode_carries_over_future_rows_done_in_test(self, test_db_session):
+        # Venerdì in TEST: il giro copre sab/dom/lun. Lunedì in REALE il giro
+        # guarda martedì, ma lunedì (già coperto in test) non deve restare
+        # senza l'email vera.
+        c = _cust(test_db_session)
+        friday = datetime(2026, 11, 13, 10, tzinfo=timezone.utc)
+        monday = datetime(2026, 11, 16, 8, tzinfo=timezone.utc)
+        _inv(test_db_session, c, "LUN/1", 30.0, date(2026, 11, 16))
+        _inv(test_db_session, c, "MAR/1", 40.0, date(2026, 11, 17))
+        mailer = FakeMailer()
+        test_cfg = _real_cfg(REMINDER_EMAIL_TEST_TO="lorenzo@example.com")
+        assert run_reminders(test_db_session, now_utc=friday, mailer=mailer, cfg=test_cfg)["sent"] == 1
+        summary = run_reminders(test_db_session, now_utc=monday, mailer=mailer, cfg=_real_cfg())
+        assert summary["sent"] == 2 and summary.get("carried_over") == 1
+        tos = [s["to"] for s in mailer.sent]
+        assert tos == [["lorenzo@example.com"], ["amministrazione@shabu.it"], ["amministrazione@shabu.it"]]
+        rows = {r.invoice_id: r for r in test_db_session.query(InvoiceReminderEmail).all()}
+        assert all(r.mode == "reale" and r.status == "sent" for r in rows.values())
+        # Una riga test con scadenza PASSATA non viene ripresa (è ormai scaduta).
+        tuesday = datetime(2026, 11, 17, 8, tzinfo=timezone.utc)
+        assert run_reminders(test_db_session, now_utc=tuesday, mailer=mailer, cfg=_real_cfg())["sent"] == 0
+
+    def test_retry_refuses_past_due_dates(self, test_db_session):
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c, "OLD/1", 100.0, TODAY - timedelta(days=1))
+        row = InvoiceReminderEmail(invoice_id=inv.id, customer_id=c.id, due_date=TODAY - timedelta(days=1),
+                                   status="failed", mode="reale", error_kind="network")
+        test_db_session.add(row)
+        test_db_session.commit()
+        with pytest.raises(ValueError, match="passata"):
+            retry_row(test_db_session, row, mailer=FakeMailer(), cfg=_real_cfg())
+
+    def test_preview_three_dates_with_labels(self, test_db_session):
+        c = _cust(test_db_session)
+        friday = datetime(2026, 11, 13, 10, tzinfo=timezone.utc)
+        _inv(test_db_session, c, "SAB/1", 10.0, date(2026, 11, 14))
+        _inv(test_db_session, c, "LUN/1", 30.0, date(2026, 11, 16))
+        items = preview(test_db_session, now_utc=friday, mode=MODE_TEST, cfg=_cfg())
+        assert [(i["invoice_number"], i["due_label"]) for i in items] == [
+            ("SAB/1", "domani, sabato 14/11/2026"), ("LUN/1", "lunedì 16/11/2026")]
+        assert items[0]["cc"] == [] and items[0]["would_cc"] == ["fatture@sakecompany.com"]
 
     def test_send_test_goes_only_to_chosen_address(self, test_db_session):
         c = _cust(test_db_session, tags="B2B, Maggioni")
@@ -635,6 +695,23 @@ class TestWeekendAndCopies:
             send_test(test_db_session, inv.id, "non-valida", mailer=mailer, cfg=_real_cfg())
         with pytest.raises(ValueError):
             send_test(test_db_session, inv.id, "a@b.it", mailer=mailer, cfg=_cfg())  # Resend non configurato
+        # Mai a un cliente, nemmeno un altro cliente dell'anagrafica
+        other = _cust(test_db_session, nome="Altro", email="altro@cliente.it", partita_iva=None)
+        for addr in ("amministrazione@shabu.it", "Altro@Cliente.it"):
+            with pytest.raises(ValueError, match="cliente"):
+                send_test(test_db_session, inv.id, addr, mailer=mailer, cfg=_real_cfg())
+        # Fattura inesistente / pagata / abbinamento dubbio
+        from backend.engine.reminder_email import NotFound
+        with pytest.raises(NotFound):
+            send_test(test_db_session, 999999, "lorenzo@ef-ti.com", mailer=mailer, cfg=_real_cfg())
+        inv.status = "paid"
+        test_db_session.commit()
+        with pytest.raises(ValueError, match="pagata"):
+            send_test(test_db_session, inv.id, "lorenzo@ef-ti.com", mailer=mailer, cfg=_real_cfg())
+        dubbia = _inv(test_db_session, other, "DUB/1", 10.0, TOMORROW, customer_name_raw="Altra Ditta Srl", customer_piva_raw="98765432100")
+        with pytest.raises(ValueError, match="verificare"):
+            send_test(test_db_session, dubbia.id, "lorenzo@ef-ti.com", mailer=mailer, cfg=_real_cfg())
+        assert mailer.calls == 1  # solo il primo invio è partito
 
 
 # ── Connettore Resend ─────────────────────────────────────────────────
@@ -654,6 +731,7 @@ class TestResendMailer:
         mid = mailer.send(
             sender="Sake Company <fatture@sakecompany.com>", to=["a@b.it"], subject="S",
             text="corpo", html="<p>corpo</p>", reply_to="fatture@sakecompany.com",
+            cc=["g.maggioni@sakecompany.com", "fatture@sakecompany.com"],
             bcc="luigi@sakecompany.com, dario@sakecompany.com",
             attachments=[("fattura.pdf", b"%PDF-1.4 test")], idempotency_key="reminder-1-2026-11-10-reale",
         )
@@ -664,6 +742,7 @@ class TestResendMailer:
         assert body["from"] == "Sake Company <fatture@sakecompany.com>" and body["to"] == ["a@b.it"]
         assert body["reply_to"] == ["fatture@sakecompany.com"]
         assert body["bcc"] == ["luigi@sakecompany.com", "dario@sakecompany.com"]
+        assert body["cc"] == ["g.maggioni@sakecompany.com", "fatture@sakecompany.com"]
         assert body["attachments"] == [{"filename": "fattura.pdf", "content": base64.b64encode(b"%PDF-1.4 test").decode()}]
         assert body["html"] == "<p>corpo</p>" and body["text"] == "corpo"
 
@@ -752,6 +831,28 @@ class TestApi:
         r = test_client.post("/api/reminders/email/test", json={"invoice_id": inv.id, "to": "lorenzo@ef-ti.com"})
         assert r.status_code == 200 and r.json()["sent_to"] == "lorenzo@ef-ti.com"
         assert created[0].sent[0]["to"] == ["lorenzo@ef-ti.com"] and created[0].closed
+
+    def test_status_in_weekend(self, test_client, monkeypatch):
+        monkeypatch.setattr("backend.api.reminders.target_due_dates", lambda: [])
+        data = test_client.get("/api/reminders/email").json()
+        assert data["weekend"] is True and data["preview"] == [] and data["target_due_date"] is None
+        assert data["cc_effective"] == ["fatture@sakecompany.com"]
+
+    def test_test_send_endpoint_errors(self, test_client, test_db_session, monkeypatch):
+        from backend.config import config as real_config
+        monkeypatch.setattr(real_config, "RESEND_API_KEY", "re_x")
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c, "API/E", 100.0, TOMORROW)
+        assert test_client.post("/api/reminders/email/test", json={"invoice_id": 999999, "to": "lorenzo@ef-ti.com"}).status_code == 404
+        assert test_client.post("/api/reminders/email/test", json={"invoice_id": inv.id, "to": "amministrazione@shabu.it"}).status_code == 409
+
+        class Failing(FakeMailer):
+            def __init__(self, api_key, api_url=None):
+                super().__init__(fail_times=1, kind=ERROR_VALIDATION)
+
+        monkeypatch.setattr("backend.connectors.resend_mail.ResendMailer", Failing)
+        r = test_client.post("/api/reminders/email/test", json={"invoice_id": inv.id, "to": "lorenzo@ef-ti.com"})
+        assert r.status_code == 502 and "Resend HTTP 422" in r.json()["detail"]
 
     def test_busy_lock_returns_409(self, test_client):
         assert re_mod._reminder_lock.acquire(blocking=False)

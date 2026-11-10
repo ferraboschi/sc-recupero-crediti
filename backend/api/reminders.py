@@ -13,9 +13,11 @@ from sqlalchemy.orm import Session
 from backend.config import config
 from backend.database import get_session, Customer, Invoice, InvoiceReminderEmail
 from backend.engine.agents import agents_of
+from backend.connectors.resend_mail import MailSendError
 from backend.engine.reminder_email import (
-    AUTO_RETRY_KINDS, MODE_LABELS, SKIP_LABELS, ModeMismatch, ReminderBusy, agent_emails, build_attachments,
-    overdue_invoices, preview, resolve_mode, retry_row, run_reminders, send_test, target_due_dates,
+    AUTO_RETRY_KINDS, MODE_LABELS, SKIP_LABELS, ModeMismatch, NotFound, ReminderBusy, agent_emails,
+    build_attachments, carbon_copies, overdue_invoices, preview, resolve_mode, retry_row, run_reminders,
+    send_test, target_due_dates,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,6 +110,7 @@ def reminder_email_status(
         "reply_to": config.REMINDER_EMAIL_REPLY_TO or None,
         "bcc": config.REMINDER_EMAIL_BCC or None,
         "cc": config.REMINDER_EMAIL_CC or None,
+        "cc_effective": carbon_copies(None, config),  # gli indirizzi fissi davvero usati (validi)
         "agent_emails": agent_emails(),
         "test_to": config.REMINDER_EMAIL_TEST_TO or None,
         "company": {
@@ -143,10 +146,15 @@ def reminder_email_test(body: TestSendBody, session: Session = Depends(get_sessi
     fattura indicata ([PROVA], nessuna copia, registro intoccato)."""
     try:
         return send_test(session, body.invoice_id, body.to)
+    except NotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
-    except Exception as e:  # MailSendError: messaggio già senza segreti
+    except MailSendError as e:  # messaggio già senza segreti
         raise HTTPException(status_code=502, detail=f"Invio di prova fallito: {e}")
+    except Exception as e:
+        logger.error(f"Invio di prova fallito (errore interno): {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Invio di prova fallito: errore interno, vedi i log")
 
 
 @router.post("/email/{row_id}/retry")

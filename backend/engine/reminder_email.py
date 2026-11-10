@@ -1,7 +1,8 @@
 """Promemoria email il giorno PRIMA della scadenza di una fattura.
 
 Decisione owner (9/11/2026): per ogni fattura non pagata in scadenza domani
-il cliente riceve una email con:
+(il venerdì: sabato, domenica e lunedì; nel weekend nulla) il cliente riceve
+una email con:
 - la copia di cortesia della fattura in scadenza (PDF generato dall'app);
 - se ha anche fatture GIÀ scadute e non saldate, un secondo PDF con il
   riepilogo e il totale, citato nel testo ("questa fattura vale X; il
@@ -102,6 +103,10 @@ _reminder_lock = threading.Lock()
 
 class ReminderBusy(Exception):
     """Un giro di promemoria è già in corso."""
+
+
+class NotFound(LookupError):
+    """Riga o fattura inesistente."""
 
 
 class ModeMismatch(Exception):
@@ -449,6 +454,7 @@ def _preview_for(session: Session, due: date, mode: str, today: date, cfg) -> Li
             "ragione_sociale": customer.ragione_sociale if customer else inv.customer_name_raw,
             "to_email": (customer.email or "").strip() if customer else None,
             "cc": carbon_copies(customer, cfg) if (customer and mode == MODE_REALE) else [],
+            "would_cc": carbon_copies(customer, cfg) if customer else [],
             "amount_due": float(inv.amount_due or 0),
             "due_date": due.isoformat(),
             "due_label": due_label(due, today),
@@ -664,7 +670,10 @@ def run_reminders(
     server ne risolve un'altra (env cambiate nel frattempo) non si parte.
     """
     cfg = cfg or config
-    dates = due_dates or ([due_date] if due_date else target_due_dates(now_utc))
+    if due_dates is None:
+        dates = [due_date] if due_date else target_due_dates(now_utc)
+    else:
+        dates = list(due_dates)
     if not _reminder_lock.acquire(blocking=False):
         raise ReminderBusy()
     try:
@@ -685,6 +694,32 @@ def run_reminders(
                         continue
                     _process_safely(session, inv, due, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
                                     existing=existing, today=today)
+            # Passaggio prova/test → reale: le scadenze FUTURE già lavorate in
+            # prova o in test (es. il venerdì copre anche lunedì) non devono
+            # restare senza l'email vera. Si riprendono le righe con
+            # scadenza da oggi in poi, fuori dalle date del giro.
+            if mode == MODE_REALE:
+                pending = (
+                    session.query(InvoiceReminderEmail)
+                    .filter(
+                        InvoiceReminderEmail.due_date >= today,
+                        InvoiceReminderEmail.status.in_((STATUS_PREPARED, STATUS_SENT)),
+                        InvoiceReminderEmail.mode != MODE_REALE,
+                    )
+                    .all()
+                )
+                for row in pending:
+                    if row.due_date in dates:
+                        continue
+                    will, _why = needs_processing(row, mode)
+                    inv = session.query(Invoice).filter(Invoice.id == row.invoice_id).first()
+                    if not will or inv is None or inv.status in NOT_REMINDABLE_STATUSES or float(inv.amount_due or 0) <= 0:
+                        continue
+                    summary["candidates"] += 1
+                    summary.setdefault("carried_over", 0)
+                    summary["carried_over"] += 1
+                    _process_safely(session, inv, row.due_date, mode=mode, mailer=mailer, cfg=cfg,
+                                    summary=summary, existing=row, today=today)
         finally:
             if own_mailer and mailer is not None:
                 mailer.close()
@@ -705,18 +740,32 @@ def send_test(session: Session, invoice_id: int, to_address: str, *, mailer=None
     fattura data (oggetto con prefisso [PROVA], nessuna copia, registro
     intoccato). Serve a far leggere testo e allegati veri prima di accendere
     l'invio ai clienti. Richiede Resend configurato."""
+    from sqlalchemy import func
+
     cfg = cfg or config
     to = normalize_email(to_address)
     if not to:
         raise ValueError("indirizzo di prova non valido")
     inv = session.query(Invoice).filter(Invoice.id == invoice_id).first()
-    if inv is None or inv.customer is None:
-        raise ValueError("fattura non trovata o senza cliente")
-    if inv.status in NOT_REMINDABLE_STATUSES:
+    if inv is None:
+        raise NotFound("fattura non trovata")
+    if inv.customer is None:
+        raise ValueError("fattura senza cliente")
+    if inv.status in NOT_REMINDABLE_STATUSES or float(inv.amount_due or 0) <= 0:
         raise ValueError("fattura pagata, annullata o contestata")
+    customer = inv.customer
+    reason = skip_reason(inv, customer)
+    if reason and reason not in ("senza_email", "email_non_valida"):
+        raise ValueError(f"promemoria non inviabile: {SKIP_LABELS.get(reason, reason)}")
+    # La prova va a un indirizzo INTERNO: mai a un cliente (nemmeno per errore
+    # di copia-incolla dall'anteprima).
+    is_customer_email = session.query(Customer.id).filter(
+        func.lower(func.trim(Customer.email)) == to
+    ).first() is not None
+    if is_customer_email or to == normalize_email(customer.email):
+        raise ValueError("l'indirizzo di prova coincide con l'email di un cliente: usare un indirizzo interno")
     if not getattr(cfg, "RESEND_API_KEY", ""):
         raise ValueError("Resend non configurato (RESEND_API_KEY)")
-    customer = inv.customer
     overdue = overdue_invoices(session, customer.id, exclude_id=inv.id)
     msg = compose(customer, inv, overdue, italian_today())
     attachments = build_attachments(customer, inv, overdue)
@@ -749,12 +798,14 @@ def send_test(session: Session, invoice_id: int, to_address: str, *, mailer=None
 
 def retry_row(session: Session, row: InvoiceReminderEmail, *, mailer=None, cfg=None, mode: Optional[str] = None,
               expected_mode: Optional[str] = None) -> dict:
-    """Ritenta UNA riga ferma (`failed` o `sending` orfana), anche di una
-    scadenza passata: il giro quotidiano guarda solo la scadenza di domani.
+    """Ritenta UNA riga ferma (`failed` o `sending` orfana) di una scadenza
+    non ancora passata: il giro quotidiano guarda solo le prossime scadenze.
     La fattura deve essere ancora da ricordare."""
     cfg = cfg or config
     if row.status not in (STATUS_FAILED, STATUS_SENDING):
         raise ValueError("si ritentano solo i promemoria falliti o interrotti")
+    if row.due_date and row.due_date < italian_today():
+        raise ValueError("scadenza già passata: non è più un promemoria (la fattura è ora tra le scadute)")
     inv = session.query(Invoice).filter(Invoice.id == row.invoice_id).first()
     if inv is None:
         raise ValueError("fattura non più presente")
