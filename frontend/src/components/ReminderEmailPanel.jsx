@@ -112,6 +112,7 @@ export default function ReminderEmailPanel() {
   const [running, setRunning] = useState(false)
   const [runResult, setRunResult] = useState(null)
   const [retryingId, setRetryingId] = useState(null)
+  const [testingId, setTestingId] = useState(null)
   const [openText, setOpenText] = useState(null)   // invoice_id dell'anteprima aperta
   const [detail, setDetail] = useState(null)       // riga del registro aperta
 
@@ -138,8 +139,9 @@ export default function ReminderEmailPanel() {
     if (!fresh) return
     const toSend = (fresh.preview || []).filter(p => p.will_process)
     const n = toSend.length
+    const dates = (fresh.target_due_dates || []).map(fmtDate).join(', ')
     const msg = fresh.mode === 'reale'
-      ? `Invio ADESSO le email AI CLIENTI per ${n} fattur${n === 1 ? 'a' : 'e'} in scadenza il ${fmtDate(fresh.target_due_date)}. Procedere?`
+      ? `Invio ADESSO le email AI CLIENTI per ${n} fattur${n === 1 ? 'a' : 'e'} in scadenza il ${dates}, con copia a fatture@ e al commerciale. Procedere?`
       : fresh.mode === 'test'
         ? `Invio ${n} email di prova a ${fresh.test_to} (i clienti non ricevono nulla). Procedere?`
         : `Modalità prova: preparo e registro ${n} email senza inviarle. Procedere?`
@@ -181,6 +183,21 @@ export default function ReminderEmailPanel() {
     }
   }
 
+  const sendTest = async (p) => {
+    const to = window.prompt(`Invio di PROVA dell'email per ${p.ragione_sociale} (fattura ${p.invoice_number}).\nA quale indirizzo? (nessuna copia, il registro non cambia)`, data?.test_to || '')
+    if (!to) return
+    setTestingId(p.invoice_id)
+    setRunResult(null)
+    try {
+      const res = await client.post('/reminders/email/test', { invoice_id: p.invoice_id, to }, { noRetry: true, timeout: 120000 })
+      setRunResult({ info: `Prova inviata a ${res.data.sent_to} (${res.data.attachments.length} allegati). In reale andrebbe in copia a: ${(res.data.would_cc || []).join(', ') || 'nessuno'}.` })
+    } catch (e) {
+      setRunResult({ error: e.response?.data?.detail || e.message })
+    } finally {
+      setTestingId(null)
+    }
+  }
+
   const openDetail = async (row) => {
     if (detail?.id === row.id) { setDetail(null); return }
     try {
@@ -197,7 +214,13 @@ export default function ReminderEmailPanel() {
         <h3 className="sc-section-title">Promemoria email pre-scadenza</h3>
         {data && <span className={`sc-badge ${MODE_STYLE[data.mode] || MODE_STYLE.prova}`}>{data.mode_label}</span>}
       </div>
-      {data && <span className="text-xs text-txt-muted">Ogni giorno alle {data.schedule} · scadenza di domani: {fmtDate(data.target_due_date)}</span>}
+      {data && (
+        <span className="text-xs text-txt-muted">
+          Ogni giorno alle {data.schedule} · {data.weekend
+            ? 'weekend: nessun invio (il venerdì copre sabato, domenica e lunedì)'
+            : `scadenz${(data.target_due_dates || []).length === 1 ? 'a' : 'e'}: ${(data.target_due_dates || []).map(fmtDate).join(', ')}`}
+        </span>
+      )}
     </div>
   )
 
@@ -221,6 +244,8 @@ export default function ReminderEmailPanel() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs">
           <p><span className="text-txt-muted">Mittente:</span> <span className="text-txt-primary">{data.sender || '—'}</span></p>
           <p><span className="text-txt-muted">Risposte a:</span> <span className="text-txt-primary">{data.reply_to || '—'}</span></p>
+          <p><span className="text-txt-muted">In copia (invio reale):</span> <span className="text-txt-primary">{data.cc || '—'}{Object.keys(data.agent_emails || {}).length > 0 ? ' + commerciale del cliente' : ''}</span></p>
+          <p><span className="text-txt-muted">Commerciali:</span> <span className="text-txt-primary">{Object.entries(data.agent_emails || {}).map(([k, v]) => `${k} → ${v}`).join(' · ') || '—'}</span></p>
           <p><span className="text-txt-muted">Copia nascosta:</span> <span className="text-txt-primary">{data.bcc || '—'}</span></p>
           <p><span className="text-txt-muted">Indirizzo di prova:</span> <span className="text-txt-primary">{data.test_to || '—'}</span></p>
           <p><span className="text-txt-muted">Intestazione PDF:</span> <span className="text-txt-primary">{company.name}{company.vat ? ` · P.IVA ${company.vat}` : ''}{company.address ? ` · ${company.address}` : ''}</span></p>
@@ -244,14 +269,16 @@ export default function ReminderEmailPanel() {
         <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
           <div className="flex items-center gap-3 flex-wrap min-h-[2rem]">
             <p className="text-sm font-semibold text-txt-primary">
-              Scadenza {fmtDate(data.target_due_date)}: {preview.length === 0 ? 'nessuna fattura' : `${preview.length} fattur${preview.length === 1 ? 'a' : 'e'}`}
+              {data.weekend ? 'Weekend: nessun promemoria oggi' : `Prossimo giro: ${preview.length === 0 ? 'nessuna fattura' : `${preview.length} fattur${preview.length === 1 ? 'a' : 'e'}`}`}
               {preview.length > 0 && <span className="text-txt-muted font-normal"> · {toSend.length} da lavorare</span>}
             </p>
             {runResult && (
               <span className={`text-xs ${runResult.error ? 'text-accent-red' : 'text-txt-secondary'}`} role="status">
                 {runResult.error
                   ? `Errore: ${runResult.error}`
-                  : `Esito: ${runResult.sent} inviate · ${runResult.prepared} preparate · ${runResult.skipped} saltate · ${runResult.failed} errori · ${runResult.already} non lavorate`}
+                  : runResult.info
+                    ? runResult.info
+                    : `Esito: ${runResult.sent} inviate · ${runResult.prepared} preparate · ${runResult.skipped} saltate · ${runResult.failed} errori · ${runResult.already} non lavorate`}
               </span>
             )}
           </div>
@@ -266,10 +293,11 @@ export default function ReminderEmailPanel() {
                 <tr className="text-xs uppercase tracking-wider text-txt-label border-b border-dark-border">
                   <th className="text-left py-2 pr-3">Cliente</th>
                   <th className="text-left py-2 pr-3">Fattura</th>
+                  <th className="text-left py-2 pr-3">Scade</th>
                   <th className="text-right py-2 pr-3">Importo</th>
                   <th className="text-right py-2 pr-3">Scadute</th>
                   <th className="text-left py-2 pr-3">Esito previsto</th>
-                  <th className="text-left py-2">Testo</th>
+                  <th className="text-left py-2">Azioni</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-dark-border">
@@ -279,8 +307,10 @@ export default function ReminderEmailPanel() {
                       <td className="py-2 pr-3">
                         <CustomerName id={p.customer_id} name={p.ragione_sociale} navigate={navigate} />
                         <span className="block text-xs text-txt-muted font-mono">{p.to_email || 'senza email'}</span>
+                        {p.cc && p.cc.length > 0 && <span className="block text-xs text-txt-muted">cc: {p.cc.join(', ')}</span>}
                       </td>
                       <td className="py-2 pr-3 font-mono text-xs text-txt-secondary">{p.invoice_number}</td>
+                      <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap">{p.due_label || fmtDate(p.due_date)}</td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(p.amount_due)}</td>
                       <td className="py-2 pr-3 text-right text-txt-secondary">{p.overdue_count > 0 ? `${p.overdue_count} · ${fmtEur(p.overdue_total)}` : '—'}</td>
                       <td className="py-2 pr-3">
@@ -291,16 +321,23 @@ export default function ReminderEmailPanel() {
                             : <ReminderStatusBadge row={{ status: p.already, skip_label: p.why }} />}
                       </td>
                       <td className="py-2">
-                        {p.text && (
-                          <button type="button" aria-expanded={openText === p.invoice_id} onClick={() => setOpenText(openText === p.invoice_id ? null : p.invoice_id)} className="text-xs text-accent-teal underline hover:text-accent-cyan">
-                            {openText === p.invoice_id ? 'Chiudi' : 'Mostra'}
-                          </button>
-                        )}
+                        <span className="flex items-center gap-2 whitespace-nowrap">
+                          {p.text && (
+                            <button type="button" aria-expanded={openText === p.invoice_id} onClick={() => setOpenText(openText === p.invoice_id ? null : p.invoice_id)} className="text-xs text-accent-teal underline hover:text-accent-cyan">
+                              {openText === p.invoice_id ? 'Chiudi' : 'Testo'}
+                            </button>
+                          )}
+                          {!p.skip_reason && (
+                            <button type="button" onClick={() => sendTest(p)} disabled={testingId !== null} className="sc-btn-secondary text-xs disabled:opacity-50" title="Invia questa email a un indirizzo a tua scelta (prefisso [PROVA], nessuna copia, registro intoccato)">
+                              {testingId === p.invoice_id ? '…' : 'Invia prova a…'}
+                            </button>
+                          )}
+                        </span>
                       </td>
                     </tr>
                     {openText === p.invoice_id && (
                       <tr>
-                        <td colSpan={6} className="py-3">
+                        <td colSpan={7} className="py-3">
                           <p className="text-xs text-txt-muted mb-1">Oggetto: <span className="text-txt-primary">{p.subject}</span></p>
                           <pre className="whitespace-pre-wrap text-xs text-txt-secondary bg-dark-bg/60 border border-dark-border rounded-lg p-3 font-sans">{p.text}</pre>
                         </td>
@@ -349,6 +386,7 @@ export default function ReminderEmailPanel() {
                       <td className="py-2 pr-3 text-xs font-mono text-txt-secondary">
                         {row.to_email || '—'}
                         {row.original_to && row.original_to !== row.to_email && <span className="block text-txt-muted">vero: {row.original_to}</span>}
+                        {row.cc && row.cc.length > 0 && <span className="block text-txt-muted">cc: {row.cc.join(', ')}</span>}
                       </td>
                       <td className="py-2 pr-3"><Attachments row={row} /></td>
                       <td className="py-2">

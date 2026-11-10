@@ -24,8 +24,9 @@ from backend.engine import reminder_email as re_mod
 from backend.engine.format import fmt_eur, fmt_eur_pdf, pdf_text, safe_filename
 from backend.engine.reminder_email import (
     ERROR_NETWORK, ERROR_VALIDATION, MODE_PROVA, MODE_REALE, MODE_TEST, ModeMismatch, ReminderBusy,
-    compose, in_catchup_window, needs_processing, normalize_email, overdue_invoices, preview,
-    resolve_mode, retry_row, run_reminders, skip_reason, target_due_date,
+    agent_emails, carbon_copies, compose, due_label, in_catchup_window, needs_processing, normalize_email,
+    overdue_invoices, preview, resolve_mode, retry_row, run_reminders, send_test, skip_reason,
+    target_due_date, target_due_dates,
 )
 
 TOMORROW = date.today() + timedelta(days=1)
@@ -37,6 +38,8 @@ def _cfg(**over):
         REMINDER_EMAIL_FROM="Sake Company <fatture@sakecompany.com>",
         REMINDER_EMAIL_REPLY_TO="fatture@sakecompany.com", REMINDER_EMAIL_BCC="",
         REMINDER_EMAIL_TEST_TO="", REMINDER_EMAIL_HOUR=9, REMINDER_EMAIL_MINUTE=15,
+        REMINDER_EMAIL_CC="fatture@sakecompany.com",
+        REMINDER_AGENT_EMAILS="Maggioni:g.maggioni@sakecompany.com;Izzo:a.izzo@sakecompany.com;Scotti:g.scotti@sakecompany.com",
         TIMEZONE="Europe/Rome",
     )
     base.update(over)
@@ -158,14 +161,14 @@ class TestCompose:
         c = _cust(test_db_session)
         inv = _inv(test_db_session, c, "2026/00001861/SAK", 540.0, TOMORROW)
         msg = compose(c, inv, [])
-        assert msg["subject"].startswith("Promemoria di cortesia: fattura n. 2026/00001861/SAK")
+        assert msg["subject"].startswith("Promemoria: fattura n. 2026/00001861/SAK in scadenza il")
         assert "540,00 €" in msg["subject"]
         assert "Spett.le Shabu Casatenovo" in msg["text"]
-        assert "Le ricordiamo" in msg["text"] and "scade domani" in msg["text"]
-        assert "copia di cortesia" in msg["text"] and "Sistema di Interscambio" in msg["text"]
-        assert "scadute" not in msg["text"]  # niente paragrafo sulle scadute
-        assert "non tenere conto del presente promemoria" in msg["text"]
-        assert "fatture@sakecompany.com" in msg["text"]
+        assert "scade domani," in msg["text"] and "Copia della fattura in allegato" in msg["text"]
+        assert "scadut" not in msg["text"]  # niente riga sulle scadute
+        assert "IBAN" in msg["text"] and "causale" in msg["text"]
+        assert "ignori questo messaggio" in msg["text"]
+        assert msg["text"].count("\n\n") <= 5  # segnalazione corta: al massimo 6 blocchi
         assert msg["overdue_count"] == 0 and msg["overdue_total"] == 0
         assert "<p>" in msg["html"] and "Shabu Casatenovo" in msg["html"]
 
@@ -175,11 +178,10 @@ class TestCompose:
         o1 = _inv(test_db_session, c, "A/0", 1000.0, date.today() - timedelta(days=40), days_overdue=40)
         o2 = _inv(test_db_session, c, "A/00", 234.5, date.today() - timedelta(days=10), days_overdue=10)
         msg = compose(c, inv, [o1, o2])
-        assert "risultano scadute e non ancora saldate 2 fatture, per un totale di 1.234,50 €" in msg["text"]
-        assert "secondo allegato" in msg["text"]
+        assert "Risultano inoltre scadute e non saldate 2 fatture per un totale di 1.234,50 €: riepilogo in allegato" in msg["text"]
         assert msg["overdue_count"] == 2 and msg["overdue_total"] == 1234.5
         one = compose(c, inv, [o1])
-        assert "risulta scaduta e non ancora saldata 1 fattura, per 1.000,00 €" in one["text"]
+        assert "Risulta inoltre scaduta e non saldata 1 fattura per 1.000,00 €" in one["text"]
 
     def test_html_escapes_customer_name(self, test_db_session):
         c = _cust(test_db_session, nome="Bar <Tokyo> & Co")
@@ -314,7 +316,7 @@ class TestRun:
         assert summary["prepared"] == 1 and summary["sent"] == 0 and mailer.calls == 0
         row = test_db_session.query(InvoiceReminderEmail).one()
         assert row.status == "prepared" and row.invoice_id == inv.id and row.customer_id == c.id
-        assert row.to_email == "amministrazione@shabu.it" and row.subject.startswith("Promemoria di cortesia")
+        assert row.to_email == "amministrazione@shabu.it" and row.subject.startswith("Promemoria: fattura n.")
         assert row.attachments_json == ["copia_cortesia_fattura_P_1.pdf"]
         assert row.body_text and "scade domani" in row.body_text
         assert row.attempted_at is not None
@@ -335,7 +337,8 @@ class TestRun:
         names = [n for n, _ in sent["attachments"]]
         assert names == ["copia_cortesia_fattura_R_1.pdf", "riepilogo_scadute_Shabu_Casatenovo.pdf"]
         assert all(content[:4] == b"%PDF" for _, content in sent["attachments"])
-        assert "1 fattura, per 1.000,00 €" in sent["text"]
+        assert "1 fattura per 1.000,00 €" in sent["text"]
+        assert sent["cc"] == ["fatture@sakecompany.com"]  # cliente senza agente: solo la casella fatture
         row = test_db_session.query(InvoiceReminderEmail).one()
         assert row.status == "sent" and row.provider_message_id == "msg-1" and row.sent_at is not None
         assert row.overdue_count == 1 and row.overdue_total == 1000.0
@@ -349,6 +352,7 @@ class TestRun:
         summary = run_reminders(test_db_session, due_date=TOMORROW, mailer=mailer, cfg=cfg)
         assert summary["mode"] == MODE_TEST and summary["sent"] == 1
         assert mailer.sent[0]["to"] == ["lorenzo@example.com"] and mailer.sent[0]["bcc"] is None
+        assert mailer.sent[0]["cc"] is None  # in test nessuna copia a commerciale/fatture
         row = test_db_session.query(InvoiceReminderEmail).one()
         assert row.to_email == "lorenzo@example.com" and row.original_to == "amministrazione@shabu.it"
         assert row.mode == MODE_TEST
@@ -480,7 +484,7 @@ class TestRun:
         _inv(test_db_session, c, "GOOD/1", 100.0, TOMORROW)
         original = re_mod.compose
 
-        def exploding(customer, invoice, overdue):
+        def exploding(customer, invoice, overdue, today=None):
             if invoice.invoice_number == "BAD/1":
                 raise RuntimeError("boom")
             return original(customer, invoice, overdue)
@@ -534,6 +538,86 @@ class TestRun:
         assert after["already"] == "prepared" and after["will_process"] is False
         real = preview(test_db_session, TOMORROW, mode=MODE_REALE)[0]
         assert real["will_process"] is True and real["why"] == "invio dopo la prova"
+
+
+# ── Weekend, etichette, copie, invio di prova ─────────────────────────
+
+class TestWeekendAndCopies:
+    def test_target_due_dates_skip_weekend_and_anticipate_on_friday(self):
+        # 2026-11-09 è lunedì (ora italiana: UTC+1 → 10:00Z = 11:00 CET)
+        assert target_due_dates(datetime(2026, 11, 9, 10, tzinfo=timezone.utc)) == [date(2026, 11, 10)]
+        assert target_due_dates(datetime(2026, 11, 12, 10, tzinfo=timezone.utc)) == [date(2026, 11, 13)]  # giovedì
+        assert target_due_dates(datetime(2026, 11, 13, 10, tzinfo=timezone.utc)) == [
+            date(2026, 11, 14), date(2026, 11, 15), date(2026, 11, 16)]  # venerdì → sab, dom, lun
+        assert target_due_dates(datetime(2026, 11, 14, 10, tzinfo=timezone.utc)) == []  # sabato
+        assert target_due_dates(datetime(2026, 11, 15, 10, tzinfo=timezone.utc)) == []  # domenica
+        assert target_due_date(datetime(2026, 11, 14, 10, tzinfo=timezone.utc)) == date(2026, 11, 15)
+
+    def test_due_label(self):
+        today = date(2026, 11, 13)  # venerdì
+        assert due_label(date(2026, 11, 14), today) == "domani, sabato 14/11/2026"
+        assert due_label(date(2026, 11, 16), today) == "lunedì 16/11/2026"
+
+    def test_agent_emails_parsing_and_default(self):
+        assert agent_emails(_cfg()) == {
+            "Maggioni": "g.maggioni@sakecompany.com", "Izzo": "a.izzo@sakecompany.com",
+            "Scotti": "g.scotti@sakecompany.com"}
+        assert agent_emails(_cfg(REMINDER_AGENT_EMAILS="izzo = A.Izzo@SakeCompany.com , Scotti:x")) == {
+            "Izzo": "a.izzo@sakecompany.com"}
+        from backend.config import config as real_config
+        assert agent_emails(real_config)["Maggioni"] == "g.maggioni@sakecompany.com"
+
+    def test_carbon_copies_agent_plus_fatture_dedup_and_exclude_to(self, test_db_session):
+        c = _cust(test_db_session, tags="B2B, Izzo")
+        assert carbon_copies(c, _cfg()) == ["a.izzo@sakecompany.com", "fatture@sakecompany.com"]
+        c2 = _cust(test_db_session, nome="Due", email="fatture@sakecompany.com", partita_iva=None, tags="B2D, Maggioni, Scotti")
+        assert carbon_copies(c2, _cfg()) == ["g.maggioni@sakecompany.com", "g.scotti@sakecompany.com"]
+        c3 = _cust(test_db_session, nome="Tre", email="t@t.it", partita_iva=None, tags="B2B")
+        assert carbon_copies(c3, _cfg(REMINDER_EMAIL_CC="")) == []
+
+    def test_real_run_copies_agent_and_fatture(self, test_db_session):
+        c = _cust(test_db_session, tags="B2B, rendina")
+        _inv(test_db_session, c, "CC/1", 100.0, TOMORROW)
+        mailer = FakeMailer()
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=mailer, cfg=_real_cfg())
+        assert mailer.sent[0]["to"] == ["amministrazione@shabu.it"]
+        assert mailer.sent[0]["cc"] == ["a.izzo@sakecompany.com", "fatture@sakecompany.com"]
+        row = test_db_session.query(InvoiceReminderEmail).one()
+        assert row.cc_json == ["a.izzo@sakecompany.com", "fatture@sakecompany.com"]
+
+    def test_friday_run_covers_three_due_dates(self, test_db_session):
+        c = _cust(test_db_session)
+        friday = datetime(2026, 11, 13, 10, tzinfo=timezone.utc)
+        _inv(test_db_session, c, "SAB/1", 10.0, date(2026, 11, 14))
+        _inv(test_db_session, c, "DOM/1", 20.0, date(2026, 11, 15))
+        _inv(test_db_session, c, "LUN/1", 30.0, date(2026, 11, 16))
+        _inv(test_db_session, c, "MAR/1", 40.0, date(2026, 11, 17))
+        mailer = FakeMailer()
+        summary = run_reminders(test_db_session, now_utc=friday, mailer=mailer, cfg=_real_cfg())
+        assert summary["due_dates"] == ["2026-11-14", "2026-11-15", "2026-11-16"]
+        assert summary["sent"] == 3 and sorted(s["subject"][-32:] for s in mailer.sent)
+        texts = {s["subject"].split("n. ")[1].split(" in")[0]: s["text"] for s in mailer.sent}
+        assert "scade domani, sabato 14/11/2026" in texts["SAB/1"]
+        assert "scade lunedì 16/11/2026" in texts["LUN/1"]
+        saturday = datetime(2026, 11, 14, 10, tzinfo=timezone.utc)
+        assert run_reminders(test_db_session, now_utc=saturday, mailer=mailer, cfg=_real_cfg())["candidates"] == 0
+
+    def test_send_test_goes_only_to_chosen_address(self, test_db_session):
+        c = _cust(test_db_session, tags="B2B, Maggioni")
+        inv = _inv(test_db_session, c, "TST/1", 100.0, TOMORROW)
+        _inv(test_db_session, c, "TST/0", 50.0, date.today() - timedelta(days=3), days_overdue=3)
+        mailer = FakeMailer()
+        out = send_test(test_db_session, inv.id, " Lorenzo@EF-TI.com ", mailer=mailer, cfg=_real_cfg())
+        sent = mailer.sent[0]
+        assert sent["to"] == ["lorenzo@ef-ti.com"] and "cc" not in sent and "bcc" not in sent
+        assert sent["subject"].startswith("[PROVA] Promemoria: fattura n. TST/1")
+        assert [n for n, _ in sent["attachments"]] == ["copia_cortesia_fattura_TST_1.pdf", "riepilogo_scadute_Shabu_Casatenovo.pdf"]
+        assert out["would_cc"] == ["g.maggioni@sakecompany.com", "fatture@sakecompany.com"]
+        assert test_db_session.query(InvoiceReminderEmail).count() == 0  # registro intoccato
+        with pytest.raises(ValueError):
+            send_test(test_db_session, inv.id, "non-valida", mailer=mailer, cfg=_real_cfg())
+        with pytest.raises(ValueError):
+            send_test(test_db_session, inv.id, "a@b.it", mailer=mailer, cfg=_cfg())  # Resend non configurato
 
 
 # ── Connettore Resend ─────────────────────────────────────────────────
@@ -604,7 +688,8 @@ class TestApi:
         data = status.json()
         assert data["mode"] == "prova" and "RESEND_API_KEY" in data["missing_config"]
         assert data["sender"] == "Sake Company <fatture@sakecompany.com>"
-        assert data["target_due_date"] == TOMORROW.isoformat() and data["schedule"].startswith("09:15")
+        assert data["schedule"].startswith("09:15") and data["agent_emails"]["Izzo"] == "a.izzo@sakecompany.com"
+        assert data["cc"] == "fatture@sakecompany.com"
         assert data["preview"][0]["invoice_number"] == "API/1" and data["preview"][0]["will_process"] is True
         assert data["recent"] == []
 
@@ -631,6 +716,25 @@ class TestApi:
         status2 = test_client.get("/api/reminders/email").json()
         assert status2["recent"][0]["invoice_id"] == inv.id and status2["preview"][0]["already"] == "prepared"
         assert status2["preview"][0]["will_process"] is False
+
+    def test_test_send_endpoint(self, test_client, test_db_session, monkeypatch):
+        from backend.config import config as real_config
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c, "API/T", 100.0, TOMORROW)
+        monkeypatch.setattr(real_config, "RESEND_API_KEY", "")
+        assert test_client.post("/api/reminders/email/test", json={"invoice_id": inv.id, "to": "lorenzo@ef-ti.com"}).status_code == 409
+        monkeypatch.setattr(real_config, "RESEND_API_KEY", "re_x")
+        created = []
+
+        class Spy(FakeMailer):
+            def __init__(self, api_key, api_url=None):
+                super().__init__()
+                created.append(self)
+
+        monkeypatch.setattr("backend.connectors.resend_mail.ResendMailer", Spy)
+        r = test_client.post("/api/reminders/email/test", json={"invoice_id": inv.id, "to": "lorenzo@ef-ti.com"})
+        assert r.status_code == 200 and r.json()["sent_to"] == "lorenzo@ef-ti.com"
+        assert created[0].sent[0]["to"] == ["lorenzo@ef-ti.com"] and created[0].closed
 
     def test_busy_lock_returns_409(self, test_client):
         assert re_mod._reminder_lock.acquire(blocking=False)

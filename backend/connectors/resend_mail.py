@@ -69,6 +69,7 @@ class ResendMailer:
         text: str,
         html: Optional[str] = None,
         reply_to=None,
+        cc=None,
         bcc=None,
         attachments: Optional[Iterable[Tuple[str, bytes]]] = None,
         idempotency_key: Optional[str] = None,
@@ -88,6 +89,9 @@ class ResendMailer:
         reply = self._as_list(reply_to)
         if reply:
             payload["reply_to"] = reply
+        cc_list = self._as_list(cc)
+        if cc_list:
+            payload["cc"] = cc_list
         bcc_list = self._as_list(bcc)
         if bcc_list:
             payload["bcc"] = bcc_list

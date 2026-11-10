@@ -106,6 +106,7 @@ Per setup completo con Nginx + SSL: `sudo bash deploy/setup.sh`
 | `RESEND_API_KEY` | Chiave Resend per l'invio (dominio sakecompany.com) |
 | `REMINDER_EMAIL_TEST_TO` | Se impostata, tutte le email di promemoria vanno a questo indirizzo |
 | `REMINDER_EMAIL_FROM` / `REMINDER_EMAIL_REPLY_TO` / `REMINDER_EMAIL_BCC` | Mittente, risposte, copia nascosta |
+| `REMINDER_EMAIL_CC` / `REMINDER_AGENT_EMAILS` | Copia visibile (default fatture@) e indirizzi dei commerciali (`Maggioni:mail;Izzo:mail;Scotti:mail`) |
 | `REMINDER_EMAIL_HOUR` / `REMINDER_EMAIL_MINUTE` | Orario del giro quotidiano (default 09:15 Europe/Rome) |
 | `COMPANY_NAME` / `COMPANY_VAT` / `COMPANY_ADDRESS` / `COMPANY_IBAN` / `COMPANY_BANK` | Dati aziendali stampati sui PDF (vuoto = riga omessa) |
 
