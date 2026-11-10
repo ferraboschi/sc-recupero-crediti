@@ -553,6 +553,23 @@ class TestWeekendAndCopies:
         assert target_due_dates(datetime(2026, 11, 15, 10, tzinfo=timezone.utc)) == []  # domenica
         assert target_due_date(datetime(2026, 11, 14, 10, tzinfo=timezone.utc)) == date(2026, 11, 15)
 
+    def test_invoice_label_strips_fatturapro_suffix(self):
+        from backend.engine.reminder_email import invoice_label
+        assert invoice_label("2026/00001804/SAK - Fattura") == "2026/00001804/SAK"
+        assert invoice_label("2026/00001605/SAK - Nota di Credito") == "2026/00001605/SAK"
+        assert invoice_label("234/2025") == "234/2025"
+        assert invoice_label(None) == ""
+
+    def test_compose_uses_clean_number_everywhere(self, test_db_session):
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c, "2026/00001804/SAK - Fattura", 426.76, TOMORROW)
+        msg = compose(c, inv, [])
+        assert "fattura n. 2026/00001804/SAK di 426,76 €" in msg["text"]
+        assert 'causale "Fattura 2026/00001804/SAK"' in msg["text"]
+        assert " - Fattura" not in msg["subject"] and " - Fattura" not in msg["text"]
+        from backend.engine.reminder_email import build_attachments
+        assert build_attachments(c, inv, [])[0][0] == "copia_cortesia_fattura_2026_00001804_SAK.pdf"
+
     def test_due_label(self):
         today = date(2026, 11, 13)  # venerdì
         assert due_label(date(2026, 11, 14), today) == "domani, sabato 14/11/2026"

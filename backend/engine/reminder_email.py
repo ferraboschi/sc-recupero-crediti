@@ -164,6 +164,16 @@ def due_label(due: date, today: Optional[date] = None) -> str:
     return f"domani, {text}" if due == today + timedelta(days=1) else text
 
 
+_NUMBER_SUFFIX_RE = re.compile(r"\s*-\s*(fattura|nota di credito|nota di debito)\s*$", re.IGNORECASE)
+
+
+def invoice_label(invoice_number) -> str:
+    """Numero come lo legge il cliente: FatturaPro accoda « - Fattura» al
+    numero («2026/00001804/SAK - Fattura»); nell'email e nella causale resta
+    solo «2026/00001804/SAK»."""
+    return _NUMBER_SUFFIX_RE.sub("", str(invoice_number or "")).strip() or str(invoice_number or "")
+
+
 def agent_emails(cfg=None) -> dict:
     """{'Maggioni': 'mail', ...} da REMINDER_AGENT_EMAILS ("Nome:mail;Nome:mail")."""
     raw = (getattr(cfg or config, "REMINDER_AGENT_EMAILS", "") or "").strip()
@@ -296,13 +306,14 @@ def compose(customer: Customer, invoice: Invoice, overdue: List[Invoice], today:
     importo = fmt_eur(invoice.amount_due)
     scadenza = fmt_date(invoice.due_date)
     label = due_label(invoice.due_date, today) if invoice.due_date else "a breve"
-    subject = f"Promemoria: fattura n. {invoice.invoice_number} in scadenza il {scadenza} ({importo})"
+    numero = invoice_label(invoice.invoice_number)
+    subject = f"Promemoria: fattura n. {numero} in scadenza il {scadenza} ({importo})"
 
     total = round(sum(float(i.amount_due or 0) for i in overdue), 2)
     paragraphs = [
         f"Spett.le {name},",
         (
-            f"promemoria di cortesia: la fattura n. {invoice.invoice_number} di {importo} "
+            f"promemoria di cortesia: la fattura n. {numero} di {importo} "
             f"scade {label}. Copia della fattura in allegato."
         ),
     ]
@@ -320,7 +331,7 @@ def compose(customer: Customer, invoice: Invoice, overdue: List[Invoice], today:
     pagamento = f"Pagamento: bonifico a {config.COMPANY_NAME}"
     if config.COMPANY_IBAN:
         pagamento += f", IBAN {config.COMPANY_IBAN}"
-    pagamento += f", causale \"Fattura {invoice.invoice_number}\"."
+    pagamento += f", causale \"Fattura {numero}\"."
     paragraphs.append(pagamento)
     paragraphs.append(
         "Se ha già provveduto al pagamento, ignori questo messaggio. "
@@ -347,7 +358,7 @@ def build_attachments(customer: Customer, invoice: Invoice, overdue: List[Invoic
     from backend.api.recovery import _build_invoice_pdf, _build_riepilogativo_pdf
 
     out = [(
-        f"copia_cortesia_fattura_{safe_filename(invoice.invoice_number)}.pdf",
+        f"copia_cortesia_fattura_{safe_filename(invoice_label(invoice.invoice_number))}.pdf",
         bytes(_build_invoice_pdf(customer, invoice, courtesy=True)),
     )]
     if overdue:
