@@ -699,32 +699,13 @@ def run_reminders(
                         continue
                     _process_safely(session, inv, due, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
                                     existing=existing, today=today)
-            # Passaggio prova/test → reale: le scadenze FUTURE già lavorate in
-            # prova o in test (es. il venerdì copre anche lunedì) non devono
-            # restare senza l'email vera. Si riprendono le righe con
-            # scadenza da oggi in poi, fuori dalle date del giro.
-            if mode == MODE_REALE:
-                pending = (
-                    session.query(InvoiceReminderEmail)
-                    .filter(
-                        InvoiceReminderEmail.due_date >= today,
-                        InvoiceReminderEmail.status.in_((STATUS_PREPARED, STATUS_SENT)),
-                        InvoiceReminderEmail.mode != MODE_REALE,
-                    )
-                    .all()
-                )
-                for row in pending:
-                    if row.due_date in dates:
-                        continue
-                    will, _why = needs_processing(row, mode)
-                    inv = session.query(Invoice).filter(Invoice.id == row.invoice_id).first()
-                    if not will or inv is None or inv.status in NOT_REMINDABLE_STATUSES or float(inv.amount_due or 0) <= 0:
-                        continue
-                    summary["candidates"] += 1
-                    summary.setdefault("carried_over", 0)
-                    summary["carried_over"] += 1
-                    _process_safely(session, inv, row.due_date, mode=mode, mailer=mailer, cfg=cfg,
-                                    summary=summary, existing=row, today=today)
+            # Nessun «riporto» di righe lavorate in prova/test fuori dalle date
+            # del giro: il promemoria parte il giorno prima (mai il giorno
+            # stesso) e mai nel weekend, quindi al passaggio in reale le date
+            # del giro sono le uniche da coprire — le righe prova/test di
+            # quelle date vengono riprese qui sopra (needs_processing). Una
+            # scadenza il cui «giorno prima» è passato in prova/test resta
+            # senza email: il registro lo mostra (riga prova/test).
         finally:
             if own_mailer and mailer is not None:
                 mailer.close()

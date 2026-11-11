@@ -648,27 +648,58 @@ class TestWeekendAndCopies:
         saturday = datetime(2026, 11, 14, 10, tzinfo=timezone.utc)
         assert run_reminders(test_db_session, now_utc=saturday, mailer=mailer, cfg=_real_cfg())["candidates"] == 0
 
-    def test_real_mode_carries_over_future_rows_done_in_test(self, test_db_session):
-        # Venerdì in TEST: il giro copre sab/dom/lun. Lunedì in REALE il giro
-        # guarda martedì, ma lunedì (già coperto in test) non deve restare
-        # senza l'email vera.
+    def test_real_mode_never_resends_test_rows_due_today(self, test_db_session):
+        # Bug del 10/11/2026: lunedì in TEST per martedì; martedì si passa in
+        # REALE e il giro delle 09:15 riprendeva ANCHE le righe test con
+        # scadenza oggi → 3 email ai clienti il giorno stesso della scadenza.
+        # Regola: promemoria il giorno prima, mai il giorno stesso. Parte solo
+        # la scadenza di domani; la riga test di oggi resta com'è.
+        c = _cust(test_db_session)
+        monday = datetime(2026, 11, 9, 10, tzinfo=timezone.utc)
+        today_inv = _inv(test_db_session, c, "MAR/1", 30.0, TODAY)
+        _inv(test_db_session, c, "MER/1", 40.0, TOMORROW)
+        mailer = FakeMailer()
+        test_cfg = _real_cfg(REMINDER_EMAIL_TEST_TO="lorenzo@example.com")
+        assert run_reminders(test_db_session, now_utc=monday, mailer=mailer, cfg=test_cfg)["sent"] == 1
+        entries = preview(test_db_session, now_utc=FIXED_NOW, cfg=_real_cfg())
+        assert [e["invoice_number"] for e in entries] == ["MER/1"]
+        summary = run_reminders(test_db_session, now_utc=FIXED_NOW, mailer=mailer, cfg=_real_cfg())
+        assert summary["sent"] == 1 and summary["candidates"] == 1 and "carried_over" not in summary
+        assert [s["to"] for s in mailer.sent] == [["lorenzo@example.com"], ["amministrazione@shabu.it"]]
+        assert "MER/1" in mailer.sent[1]["subject"]
+        old = test_db_session.query(InvoiceReminderEmail).filter_by(invoice_id=today_inv.id).one()
+        assert old.mode == "test" and old.status == "sent" and old.to_email == "lorenzo@example.com"
+        later = datetime(2026, 11, 12, 8, tzinfo=timezone.utc)
+        assert run_reminders(test_db_session, now_utc=later, mailer=mailer, cfg=_real_cfg())["sent"] == 0
+
+    def test_friday_test_then_real_sends_nothing_on_weekend_nor_monday_rows(self, test_db_session):
+        # Venerdì in TEST (copre sab/dom/lun), poi passaggio in REALE: sabato e
+        # domenica non parte nulla (weekend), lunedì il giro guarda martedì e
+        # NON riprende la riga test di lunedì (scade oggi). Il recupero giusto
+        # è il giro manuale di venerdì stesso dopo il passaggio in reale.
         c = _cust(test_db_session)
         friday = datetime(2026, 11, 13, 10, tzinfo=timezone.utc)
+        saturday = datetime(2026, 11, 14, 8, tzinfo=timezone.utc)
         monday = datetime(2026, 11, 16, 8, tzinfo=timezone.utc)
-        _inv(test_db_session, c, "LUN/1", 30.0, date(2026, 11, 16))
+        lun = _inv(test_db_session, c, "LUN/1", 30.0, date(2026, 11, 16))
         _inv(test_db_session, c, "MAR/1", 40.0, date(2026, 11, 17))
         mailer = FakeMailer()
         test_cfg = _real_cfg(REMINDER_EMAIL_TEST_TO="lorenzo@example.com")
         assert run_reminders(test_db_session, now_utc=friday, mailer=mailer, cfg=test_cfg)["sent"] == 1
-        summary = run_reminders(test_db_session, now_utc=monday, mailer=mailer, cfg=_real_cfg())
-        assert summary["sent"] == 2 and summary.get("carried_over") == 1
-        tos = [s["to"] for s in mailer.sent]
-        assert tos == [["lorenzo@example.com"], ["amministrazione@shabu.it"], ["amministrazione@shabu.it"]]
-        rows = {r.invoice_id: r for r in test_db_session.query(InvoiceReminderEmail).all()}
-        assert all(r.mode == "reale" and r.status == "sent" for r in rows.values())
-        # Una riga test con scadenza PASSATA non viene ripresa (è ormai scaduta).
-        tuesday = datetime(2026, 11, 17, 8, tzinfo=timezone.utc)
-        assert run_reminders(test_db_session, now_utc=tuesday, mailer=mailer, cfg=_real_cfg())["sent"] == 0
+        sat = run_reminders(test_db_session, now_utc=saturday, mailer=mailer, cfg=_real_cfg())
+        assert sat["due_dates"] == [] and sat["candidates"] == 0 and len(mailer.sent) == 1
+        mon = run_reminders(test_db_session, now_utc=monday, mailer=mailer, cfg=_real_cfg())
+        assert mon["due_dates"] == ["2026-11-17"] and mon["sent"] == 1
+        assert [s["to"] for s in mailer.sent] == [["lorenzo@example.com"], ["amministrazione@shabu.it"]]
+        assert "MAR/1" in mailer.sent[1]["subject"]
+        assert test_db_session.query(InvoiceReminderEmail).filter_by(invoice_id=lun.id).one().mode == "test"
+        # Venerdì stesso, dopo il passaggio in reale, il giro manuale copre
+        # sab/dom/lun e riprende la riga test di lunedì per davvero.
+        mailer2 = FakeMailer()
+        _inv(test_db_session, c, "LUN/2", 50.0, date(2026, 11, 16))
+        fri = run_reminders(test_db_session, now_utc=friday, mailer=mailer2, cfg=_real_cfg())
+        assert fri["sent"] == 2 and sorted(s["subject"].split("n. ")[1][:5] for s in mailer2.sent) == ["LUN/1", "LUN/2"]
+        assert all(s["to"] == ["amministrazione@shabu.it"] for s in mailer2.sent)
 
     def test_retry_refuses_past_due_dates(self, test_db_session):
         c = _cust(test_db_session)
