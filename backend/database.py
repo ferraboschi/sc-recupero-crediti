@@ -366,6 +366,48 @@ class InvoiceReminderEmail(Base):
     sent_at = Column(DateTime, nullable=True)
 
 
+class InvoiceFollowupEmail(Base):
+    """Secondo avviso email: fattura scaduta da N giorni e ancora non saldata.
+
+    Registro del giro quotidiano di backend/engine/followup_email.py: UNA riga
+    per (fattura, data di scadenza), come per il promemoria pre-scadenza, con
+    le STESSE colonne (lo stesso motore le scrive: riserva prima dell'invio,
+    ritenti, esclusioni registrate col motivo). È una tabella a sé — non una
+    colonna «tipo» su invoice_reminder_emails — perché così il promemoria già
+    in produzione non cambia né schema né query.
+
+    Tabella NUOVA: la crea create_all (nessuna ALTER); la RLS la copre perché
+    derivata dai modelli.
+    """
+    __tablename__ = "invoice_followup_emails"
+    __table_args__ = (
+        UniqueConstraint("invoice_id", "due_date", name="uq_followup_invoice_due"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=False, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True, index=True)
+    due_date = Column(Date, nullable=False)
+    status = Column(String, nullable=False, default="prepared")  # prepared / sending / sent / failed / skipped
+    mode = Column(String, nullable=False, default="prova")       # prova / test / reale
+    skip_reason = Column(String, nullable=True)                  # senza_promemoria / in_attesa / senza_email / ...
+    to_email = Column(String, nullable=True)
+    original_to = Column(String, nullable=True)                  # in modalità test: il destinatario vero
+    subject = Column(String, nullable=True)
+    body_text = Column(Text, nullable=True)
+    attachments_json = Column(JSON, nullable=True)               # nomi dei PDF allegati
+    amount_due = Column(Float, nullable=True)
+    overdue_count = Column(Integer, default=0)                   # ALTRE scadute del cliente
+    overdue_total = Column(Float, default=0.0)
+    provider_message_id = Column(String, nullable=True)
+    error = Column(Text, nullable=True)
+    cc_json = Column(JSON, nullable=True)                        # copie (commerciale, fatture@) in modalità reale
+    error_kind = Column(String, nullable=True)                   # pdf / validation / provider / network / other
+    attempted_at = Column(DateTime, nullable=True)               # ultimo tentativo di invio
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    sent_at = Column(DateTime, nullable=True)
+
+
 class SyncState(Base):
     """Persists sync status across server restarts."""
     __tablename__ = "sync_state"

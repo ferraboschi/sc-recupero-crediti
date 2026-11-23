@@ -1,6 +1,8 @@
-"""API dei promemoria email pre-scadenza (stato, anteprima, esecuzione,
-ritento, registro). Vedi backend/engine/reminder_email.py per le regole;
-qui solo trasporto."""
+"""API delle email automatiche per fattura: promemoria pre-scadenza
+(/email…) e secondo avviso a N giorni dalla scadenza (/followup…): stato,
+anteprima, esecuzione, ritento, registro. Le regole stanno in
+backend/engine/reminder_email.py e backend/engine/followup_email.py; qui
+solo trasporto."""
 import logging
 from io import BytesIO
 from typing import Optional
@@ -11,7 +13,8 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from backend.config import config
-from backend.database import get_session, Customer, Invoice, InvoiceReminderEmail
+from backend.database import get_session, Customer, Invoice, InvoiceFollowupEmail, InvoiceReminderEmail
+from backend.engine import followup_email as followup
 from backend.engine.agents import agents_of
 from backend.connectors.resend_mail import MailSendError
 from backend.engine.reminder_email import (
@@ -35,9 +38,11 @@ class RunBody(BaseModel):
     expected_mode: Optional[str] = None
 
 
-def _serialize(row: InvoiceReminderEmail, invoice: Optional[Invoice], customer: Optional[Customer]) -> dict:
+def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], kind: str = "promemoria") -> dict:
+    """Una riga del registro (promemoria o secondo avviso: stesse colonne)."""
     return {
         "id": row.id,
+        "kind": kind,
         "invoice_id": row.invoice_id,
         "invoice_number": invoice.invoice_number if invoice else None,
         "customer_id": row.customer_id,
@@ -69,11 +74,11 @@ def _serialize(row: InvoiceReminderEmail, invoice: Optional[Invoice], customer: 
     }
 
 
-def _rows_query(session: Session):
+def _rows_query(session: Session, model=InvoiceReminderEmail):
     return (
-        session.query(InvoiceReminderEmail, Invoice, Customer)
-        .outerjoin(Invoice, Invoice.id == InvoiceReminderEmail.invoice_id)
-        .outerjoin(Customer, Customer.id == InvoiceReminderEmail.customer_id)
+        session.query(model, Invoice, Customer)
+        .outerjoin(Invoice, Invoice.id == model.invoice_id)
+        .outerjoin(Customer, Customer.id == model.customer_id)
     )
 
 
@@ -181,15 +186,18 @@ def reminder_email_log(
     limit: int = Query(50, ge=1, le=500),
     session: Session = Depends(get_session),
 ):
-    query = _rows_query(session)
-    if customer_id is not None:
-        query = query.filter(InvoiceReminderEmail.customer_id == customer_id)
-    rows = (
-        query.order_by(InvoiceReminderEmail.created_at.desc(), InvoiceReminderEmail.id.desc())
-        .limit(limit)
-        .all()
-    )
-    return {"items": [_serialize(r, i, c) for r, i, c in rows], "count": len(rows)}
+    items = []
+    for model, kind in ((InvoiceReminderEmail, "promemoria"), (InvoiceFollowupEmail, followup.FOLLOWUP.key)):
+        query = _rows_query(session, model)
+        if customer_id is not None:
+            query = query.filter(model.customer_id == customer_id)
+        rows = query.order_by(model.created_at.desc(), model.id.desc()).limit(limit).all()
+        items.extend(_serialize(r, i, c, kind) for r, i, c in rows)
+    # Promemoria e secondi avvisi insieme, dal più recente (le date ISO si
+    # ordinano come testo; una riga senza data va in fondo).
+    items.sort(key=lambda it: (it["created_at"] or "", it["kind"], it["id"]), reverse=True)
+    items = items[:limit]
+    return {"items": items, "count": len(items)}
 
 
 @router.get("/email/{row_id}")
@@ -216,6 +224,144 @@ def reminder_email_attachment(row_id: int, index: int, session: Session = Depend
         raise HTTPException(status_code=404, detail="Fattura o cliente non più disponibili")
     overdue = overdue_invoices(session, customer.id, exclude_id=invoice.id)
     attachments = build_attachments(customer, invoice, overdue)
+    if index < 0 or index >= len(attachments):
+        raise HTTPException(
+            status_code=404,
+            detail="Allegato non più disponibile: viene rigenerato dai dati attuali e le scadute sono cambiate",
+        )
+    name, content = attachments[index]
+    return StreamingResponse(
+        BytesIO(content),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
+
+
+# ── Secondo avviso (fattura scaduta da N giorni) ──────────────────────
+
+def _followup_mode_mismatch(e: ModeMismatch) -> HTTPException:
+    labels = followup.FOLLOWUP_MODE_LABELS
+    return HTTPException(
+        status_code=409,
+        detail=(
+            f"La modalità sul server è ora «{labels.get(e.actual, e.actual)}», non "
+            f"«{labels.get(e.expected, e.expected)}»: ricarica la pagina e conferma di nuovo."
+        ),
+    )
+
+
+def _followup_row(session: Session, row_id: int):
+    found = _rows_query(session, InvoiceFollowupEmail).filter(InvoiceFollowupEmail.id == row_id).first()
+    if not found:
+        raise HTTPException(status_code=404, detail="Secondo avviso non trovato")
+    return found
+
+
+@router.get("/followup")
+def followup_email_status(
+    limit: int = Query(30, ge=1, le=200),
+    session: Session = Depends(get_session),
+):
+    """Stato del secondo avviso: acceso/spento, modalità, finestra delle
+    scadenze, affidabilità del dato «non pagata» (sync), cosa partirà al
+    prossimo giro (anteprima con testo) e gli ultimi avvisi registrati."""
+    mode, missing = followup.resolve_followup_mode()
+    send_mode = resolve_mode()[0]
+    window = followup.followup_window()
+    rows = (
+        _rows_query(session, InvoiceFollowupEmail)
+        .order_by(InvoiceFollowupEmail.created_at.desc(), InvoiceFollowupEmail.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "enabled": mode != followup.MODE_OFF,
+        "mode": mode,
+        "mode_label": followup.FOLLOWUP_MODE_LABELS.get(mode, mode),
+        # Modalità con cui partirebbe da acceso (quella del promemoria).
+        "send_mode": send_mode,
+        "send_mode_label": MODE_LABELS.get(send_mode, send_mode),
+        "missing_config": missing,
+        "days_after_due": followup.followup_days(),
+        "lookback_days": followup.followup_lookback(),
+        "window": [d.isoformat() for d in window] if window else None,
+        "weekend": window is None,
+        "sync": followup.sync_gate(session),
+        "schedule": f"{config.REMINDER_EMAIL_HOUR:02d}:{config.REMINDER_EMAIL_MINUTE:02d} {config.TIMEZONE}",
+        "sender": config.REMINDER_EMAIL_FROM or None,
+        "test_to": config.REMINDER_EMAIL_TEST_TO or None,
+        "cc_effective": carbon_copies(None, config),
+        "agent_emails": agent_emails(),
+        "preview": followup.preview_followups(session, mode=mode),
+        "recent": [_serialize(r, i, c, followup.FOLLOWUP.key) for r, i, c in rows],
+    }
+
+
+@router.post("/followup/run")
+def followup_email_run(body: Optional[RunBody] = None, session: Session = Depends(get_session)):
+    """Esegue ADESSO il giro del secondo avviso (stessa logica del job del
+    mattino). Da spento, nel weekend o con il sync non aggiornato non fa
+    nulla e lo dice in `blocked`."""
+    expected = body.expected_mode if body else None
+    try:
+        return followup.run_followups(session, expected_mode=expected)
+    except ReminderBusy:
+        raise HTTPException(status_code=409, detail="Un giro di email è già in corso")
+    except ModeMismatch as e:
+        raise _followup_mode_mismatch(e)
+
+
+@router.post("/followup/test")
+def followup_email_test(body: TestSendBody, session: Session = Depends(get_session)):
+    """Invia a un indirizzo interno il secondo avviso che il cliente
+    riceverebbe per la fattura indicata ([PROVA], nessuna copia, registro
+    intoccato). Funziona anche da spento."""
+    try:
+        return followup.send_followup_test(session, body.invoice_id, body.to)
+    except NotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except MailSendError as e:  # messaggio già senza segreti
+        raise HTTPException(status_code=502, detail=f"Invio di prova fallito: {e}")
+    except Exception as e:
+        logger.error(f"Invio di prova del secondo avviso fallito (errore interno): {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Invio di prova fallito: errore interno, vedi i log")
+
+
+@router.post("/followup/{row_id}/retry")
+def followup_email_retry(row_id: int, body: Optional[RunBody] = None, session: Session = Depends(get_session)):
+    """Ritenta un secondo avviso fermo (fallito o interrotto)."""
+    row, _invoice, _customer = _followup_row(session, row_id)
+    expected = body.expected_mode if body else None
+    try:
+        return followup.retry_followup_row(session, row, expected_mode=expected)
+    except ReminderBusy:
+        raise HTTPException(status_code=409, detail="Un giro di email è già in corso")
+    except ModeMismatch as e:
+        raise _followup_mode_mismatch(e)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@router.get("/followup/{row_id}")
+def followup_email_detail(row_id: int, session: Session = Depends(get_session)):
+    row, invoice, customer = _followup_row(session, row_id)
+    data = _serialize(row, invoice, customer, followup.FOLLOWUP.key)
+    data["body_text"] = row.body_text
+    return data
+
+
+@router.get("/followup/{row_id}/attachments/{index}")
+def followup_email_attachment(row_id: int, index: int, session: Session = Depends(get_session)):
+    """Rigenera l'allegato n-esimo (0 = copia di cortesia, 1 = riepilogo
+    scadute) dai dati attuali, per controllo: può differire da quello
+    inviato se nel frattempo le scadute sono cambiate."""
+    _row, invoice, customer = _followup_row(session, row_id)
+    if invoice is None or customer is None:
+        raise HTTPException(status_code=404, detail="Fattura o cliente non più disponibili")
+    overdue = overdue_invoices(session, customer.id, exclude_id=invoice.id)
+    attachments = followup.build_followup_attachments(customer, invoice, overdue)
     if index < 0 or index >= len(attachments):
         raise HTTPException(
             status_code=404,

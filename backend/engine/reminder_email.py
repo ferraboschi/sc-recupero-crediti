@@ -41,8 +41,9 @@ import html
 import logging
 import re
 import threading
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -87,6 +88,9 @@ SKIP_LABELS = {
     "abbinamento_da_verificare": "Abbinamento fattura→cliente da verificare (audit)",
     "senza_email": "Cliente senza email",
     "email_non_valida": "Email del cliente non valida",
+    # Solo secondo avviso (backend/engine/followup_email.py):
+    "senza_promemoria": "Promemoria pre-scadenza non inviato al cliente",
+    "in_attesa": "Pratica in attesa (decisa dall'operatore)",
 }
 
 MODE_LABELS = {
@@ -379,6 +383,44 @@ def build_attachments(customer: Customer, invoice: Invoice, overdue: List[Invoic
     return out
 
 
+# ── Tipo di email ─────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class EmailKind:
+    """Un tipo di email automatica per fattura. Il MOTORE è uno solo (riga
+    riservata prima dell'invio, Idempotency-Key, ritenti, esclusioni
+    registrate); cambiano il registro, il testo, gli allegati e le eventuali
+    esclusioni in più. Il promemoria pre-scadenza è PROMEMORIA; il secondo
+    avviso (fattura scaduta da N giorni) vive in followup_email.py."""
+    key: str                       # "promemoria" / "followup"
+    label: str                     # per i log
+    model: type                    # tabella del registro: una riga per (fattura, scadenza)
+    compose: Callable              # (customer, invoice, overdue, today) -> dict
+    attachments: Callable          # (customer, invoice, overdue) -> [(nome, bytes)]
+    idempotency_prefix: str        # prefisso della Idempotency-Key verso Resend
+    extra_skip: Optional[Callable] = None  # (session, invoice, customer) -> motivo | None
+
+
+# compose/build_attachments sono risolti alla CHIAMATA (non qui): chi li
+# sostituisce sul modulo — i test, un domani una variante — vale anche per il
+# giro, esattamente come prima che esistesse EmailKind.
+PROMEMORIA = EmailKind(
+    key="promemoria", label="Promemoria", model=InvoiceReminderEmail,
+    compose=lambda *a, **kw: compose(*a, **kw),
+    attachments=lambda *a, **kw: build_attachments(*a, **kw),
+    idempotency_prefix="reminder",
+)
+
+
+def kind_skip_reason(session: Session, invoice: Invoice, customer: Optional[Customer],
+                     kind: Optional[EmailKind] = None) -> Optional[str]:
+    """Esclusioni comuni + quelle proprie del tipo di email."""
+    reason = skip_reason(invoice, customer)
+    if reason is None and kind is not None and kind.extra_skip is not None:
+        reason = kind.extra_skip(session, invoice, customer)
+    return reason
+
+
 # ── Decisioni per riga ────────────────────────────────────────────────
 
 def needs_processing(existing: Optional[InvoiceReminderEmail], mode: str) -> Tuple[bool, str]:
@@ -533,19 +575,21 @@ def _classify_error(exc: Exception) -> str:
 
 def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, mailer, cfg, summary: dict,
                      existing: Optional[InvoiceReminderEmail] = None,
-                     today: Optional[date] = None) -> Optional[InvoiceReminderEmail]:
-    """Compone, registra e (fuori dalla prova) invia il promemoria di UNA
-    fattura; aggiorna `summary` e ritorna la riga (None se un altro giro
-    l'aveva già riservata)."""
+                     today: Optional[date] = None,
+                     kind: Optional[EmailKind] = None) -> Optional[InvoiceReminderEmail]:
+    """Compone, registra e (fuori dalla prova) invia l'email di UNA fattura
+    (promemoria, o il tipo passato in `kind`); aggiorna `summary` e ritorna la
+    riga (None se un altro giro l'aveva già riservata)."""
+    kind = kind or PROMEMORIA
     customer = inv.customer
-    row = existing or InvoiceReminderEmail(invoice_id=inv.id, due_date=due)
+    row = existing or kind.model(invoice_id=inv.id, due_date=due)
     row.customer_id = customer.id if customer else None
     row.mode = mode
     row.amount_due = float(inv.amount_due or 0)
     row.error = None
     row.error_kind = None
 
-    reason = skip_reason(inv, customer)
+    reason = kind_skip_reason(session, inv, customer, kind)
     if reason:
         row.status = STATUS_SKIPPED
         row.skip_reason = reason
@@ -562,7 +606,7 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
         return row
 
     overdue = overdue_invoices(session, customer.id, exclude_id=inv.id)
-    msg = compose(customer, inv, overdue, today or italian_today())
+    msg = kind.compose(customer, inv, overdue, today or italian_today())
     real_to = normalize_email(customer.email)
     test_to = (getattr(cfg, "REMINDER_EMAIL_TEST_TO", "") or "").strip()
     row.skip_reason = None
@@ -583,9 +627,9 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
         return None
 
     try:
-        attachments = build_attachments(customer, inv, overdue)
+        attachments = kind.attachments(customer, inv, overdue)
     except Exception as e:  # il PDF non deve far cadere il giro
-        logger.error(f"Promemoria {inv.invoice_number}: PDF non generato: {e}", exc_info=True)
+        logger.error(f"{kind.label} {inv.invoice_number}: PDF non generato: {e}", exc_info=True)
         row.status = STATUS_FAILED
         row.error_kind = ERROR_PDF
         row.error = f"PDF non generato: {e}"[:500]
@@ -611,14 +655,14 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
                 cc=cc or None,
                 bcc=(getattr(cfg, "REMINDER_EMAIL_BCC", "") or None) if mode == MODE_REALE else None,
                 attachments=attachments,
-                idempotency_key=f"reminder-{inv.id}-{due.isoformat()}-{mode}",
+                idempotency_key=f"{kind.idempotency_prefix}-{inv.id}-{due.isoformat()}-{mode}",
             )
             row.status = STATUS_SENT
             row.sent_at = datetime.utcnow()
             row.provider_message_id = message_id or None
             summary["sent"] += 1
         except Exception as e:  # messaggio già privo di segreti (MailSendError)
-            logger.error(f"Promemoria {inv.invoice_number}: invio fallito: {e}")
+            logger.error(f"{kind.label} {inv.invoice_number}: invio fallito: {e}")
             row.status = STATUS_FAILED
             row.error_kind = _classify_error(e)
             row.error = str(e)[:500]
@@ -633,16 +677,17 @@ def _process_safely(session, inv, due, **kwargs) -> None:
     """Una fattura non deve mai far saltare le altre: eccezioni impreviste
     → rollback, riga `failed` (other) se possibile, e si prosegue."""
     summary = kwargs["summary"]
+    kind = kwargs.get("kind") or PROMEMORIA
     try:
         _process_invoice(session, inv, due, **kwargs)
     except Exception as e:
-        logger.error(f"Promemoria {inv.invoice_number}: errore imprevisto: {e}", exc_info=True)
+        logger.error(f"{kind.label} {inv.invoice_number}: errore imprevisto: {e}", exc_info=True)
         try:
             session.rollback()
-            row = session.query(InvoiceReminderEmail).filter_by(invoice_id=inv.id, due_date=due).first()
+            row = session.query(kind.model).filter_by(invoice_id=inv.id, due_date=due).first()
             if row is None:
-                row = InvoiceReminderEmail(invoice_id=inv.id, due_date=due, customer_id=inv.customer_id,
-                                           mode=kwargs["mode"], amount_due=float(inv.amount_due or 0))
+                row = kind.model(invoice_id=inv.id, due_date=due, customer_id=inv.customer_id,
+                                 mode=kwargs["mode"], amount_due=float(inv.amount_due or 0))
             row.status = STATUS_FAILED
             row.error_kind = ERROR_OTHER
             row.error = f"Errore imprevisto: {e}"[:500]
@@ -651,7 +696,7 @@ def _process_safely(session, inv, due, **kwargs) -> None:
             summary["failed"] += 1
             summary["items"].append(_item(row, inv, inv.customer))
         except Exception as inner:
-            logger.error(f"Promemoria {inv.invoice_number}: impossibile registrare l'errore: {inner}")
+            logger.error(f"{kind.label} {inv.invoice_number}: impossibile registrare l'errore: {inner}")
             try:
                 session.rollback()
             except Exception:
@@ -721,13 +766,15 @@ def run_reminders(
     return summary
 
 
-def send_test(session: Session, invoice_id: int, to_address: str, *, mailer=None, cfg=None) -> dict:
+def send_test(session: Session, invoice_id: int, to_address: str, *, mailer=None, cfg=None,
+              kind: Optional[EmailKind] = None, today: Optional[date] = None) -> dict:
     """Invia a UN indirizzo scelto l'email che il cliente riceverebbe per la
     fattura data (oggetto con prefisso [PROVA], nessuna copia, registro
     intoccato). Serve a far leggere testo e allegati veri prima di accendere
     l'invio ai clienti. Richiede Resend configurato."""
     from sqlalchemy import func
 
+    kind = kind or PROMEMORIA
     cfg = cfg or config
     to = normalize_email(to_address)
     if not to:
@@ -741,8 +788,12 @@ def send_test(session: Session, invoice_id: int, to_address: str, *, mailer=None
         raise ValueError("fattura pagata, annullata o contestata")
     customer = inv.customer
     reason = skip_reason(inv, customer)
-    if reason and reason not in ("senza_email", "email_non_valida"):
-        raise ValueError(f"promemoria non inviabile: {SKIP_LABELS.get(reason, reason)}")
+    if reason in ("senza_email", "email_non_valida"):
+        reason = None  # la prova va a un altro indirizzo: l'email del cliente non serve
+    if reason is None and kind.extra_skip is not None:
+        reason = kind.extra_skip(session, inv, customer)
+    if reason:
+        raise ValueError(f"{kind.label.lower()} non inviabile: {SKIP_LABELS.get(reason, reason)}")
     # La prova va a un indirizzo INTERNO: mai a un cliente (nemmeno per errore
     # di copia-incolla dall'anteprima).
     is_customer_email = session.query(Customer.id).filter(
@@ -753,8 +804,8 @@ def send_test(session: Session, invoice_id: int, to_address: str, *, mailer=None
     if not getattr(cfg, "RESEND_API_KEY", ""):
         raise ValueError("Resend non configurato (RESEND_API_KEY)")
     overdue = overdue_invoices(session, customer.id, exclude_id=inv.id)
-    msg = compose(customer, inv, overdue, italian_today())
-    attachments = build_attachments(customer, inv, overdue)
+    msg = kind.compose(customer, inv, overdue, today or italian_today())
+    attachments = kind.attachments(customer, inv, overdue)
     own = False
     if mailer is None:
         from backend.connectors.resend_mail import ResendMailer
@@ -773,7 +824,7 @@ def send_test(session: Session, invoice_id: int, to_address: str, *, mailer=None
     finally:
         if own:
             mailer.close()
-    logger.info("Promemoria di PROVA inviato per la fattura %s (cliente %s)", inv.invoice_number, customer.id)
+    logger.info("%s di PROVA inviato per la fattura %s (cliente %s)", kind.label, inv.invoice_number, customer.id)
     return {
         "sent_to": to, "invoice_id": inv.id, "invoice_number": inv.invoice_number,
         "ragione_sociale": customer.ragione_sociale, "subject": f"[PROVA] {msg['subject']}",

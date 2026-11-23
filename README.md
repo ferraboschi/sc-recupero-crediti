@@ -108,6 +108,9 @@ Per setup completo con Nginx + SSL: `sudo bash deploy/setup.sh`
 | `REMINDER_EMAIL_FROM` / `REMINDER_EMAIL_REPLY_TO` / `REMINDER_EMAIL_BCC` | Mittente, risposte, copia nascosta |
 | `REMINDER_EMAIL_CC` / `REMINDER_AGENT_EMAILS` | Copia visibile (default fatture@) e indirizzi dei commerciali (`Maggioni:mail;Izzo:mail;Scotti:mail`) |
 | `REMINDER_EMAIL_HOUR` / `REMINDER_EMAIL_MINUTE` | Orario del giro quotidiano (default 09:15 Europe/Rome) |
+| `REMINDER_FOLLOWUP_ENABLED` | `true` accende il secondo avviso email: fattura scaduta da 7 giorni e ancora non pagata dopo il promemoria (default: spento, solo anteprima in Sistema) |
+| `REMINDER_FOLLOWUP_DAYS` / `REMINDER_FOLLOWUP_LOOKBACK_DAYS` | Giorni dalla scadenza (default 7) e giorni di recupero oltre il primo utile (default 6: weekend, giro saltato) |
+| `REMINDER_FOLLOWUP_MAX_SYNC_AGE_HOURS` | Il secondo avviso parte solo se l'ultimo sync delle fatture è riuscito ed è più recente di queste ore (default 3) |
 | `COMPANY_NAME` / `COMPANY_VAT` / `COMPANY_ADDRESS` / `COMPANY_IBAN` / `COMPANY_BANK` | Dati aziendali stampati sui PDF (vuoto = riga omessa) |
 
 ## API Endpoints

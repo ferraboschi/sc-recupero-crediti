@@ -76,6 +76,21 @@ class Config:
     REMINDER_EMAIL_HOUR = int(os.getenv("REMINDER_EMAIL_HOUR", "9"))
     REMINDER_EMAIL_MINUTE = int(os.getenv("REMINDER_EMAIL_MINUTE", "15"))  # :15, fuori dal sync orario delle :00
 
+    # Secondo avviso email (backend/engine/followup_email.py): N giorni dopo
+    # la scadenza, se la fattura ricordata dal promemoria risulta ancora non
+    # saldata. SPENTO finché l'owner non imposta REMINDER_FOLLOWUP_ENABLED=true:
+    # da spento il pannello mostra solo l'anteprima, il giro non scrive e non
+    # invia nulla. Mittente, copie e indirizzo di prova sono quelli del
+    # promemoria (REMINDER_EMAIL_*).
+    REMINDER_FOLLOWUP_ENABLED = os.getenv("REMINDER_FOLLOWUP_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    # Giorni dalla scadenza (7 = «scaduta da 7 giorni»).
+    REMINDER_FOLLOWUP_DAYS = os.getenv("REMINDER_FOLLOWUP_DAYS", "7")
+    # Giorni di recupero oltre il 7°: weekend, giro saltato, sync fermo.
+    REMINDER_FOLLOWUP_LOOKBACK_DAYS = os.getenv("REMINDER_FOLLOWUP_LOOKBACK_DAYS", "6")
+    # Il secondo avviso afferma «non risulta saldata»: parte solo se l'ultimo
+    # sync delle fatture è riuscito ed è più recente di queste ore.
+    REMINDER_FOLLOWUP_MAX_SYNC_AGE_HOURS = os.getenv("REMINDER_FOLLOWUP_MAX_SYNC_AGE_HOURS", "3")
+
     # CORS - frontend origin (GitHub Pages)
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "https://recupero.sakecompany.com,http://localhost:5173").split(",")
 
