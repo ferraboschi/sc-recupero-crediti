@@ -67,6 +67,19 @@ export async function errorDetail(e) {
 export const rowPath = (row) => `/reminders/${row.kind === 'followup' ? 'followup' : 'email'}/${row.id}`
 export const KIND_LABEL = { promemoria: 'Promemoria', followup: 'Secondo avviso' }
 
+// Secondo avviso: una email può riguardare più fatture dello stesso cliente
+// (una riga del registro per fattura). Sotto il numero dice con quali altre
+// fatture ha viaggiato, così due righe non sembrano due email.
+export function GroupNote({ row }) {
+  const others = row.group_invoices || []
+  if (others.length === 0) return null
+  return (
+    <span className="block text-txt-muted font-sans whitespace-normal" data-testid="email-group-note">
+      stessa email di {others.map(m => m.invoice_number).join(', ')}
+    </span>
+  )
+}
+
 export function Attachments({ row }) {
   const [busy, setBusy] = useState(null)
   const download = async (index, name) => {
@@ -87,13 +100,21 @@ export function Attachments({ row }) {
     }
   }
   if (!row.attachments || row.attachments.length === 0) return <span className="text-txt-muted">—</span>
+  // L'etichetta viene dal nome del file: un secondo avviso con più fatture ha
+  // una copia di cortesia per ciascuna (numerate), poi l'eventuale riepilogo.
+  const isCopy = (name) => name.startsWith('copia_cortesia')
+  const copies = row.attachments.filter(isCopy).length
+  const label = (name, i) => {
+    if (!isCopy(name)) return 'Riepilogo scadute'
+    return copies > 1 ? `Copia di cortesia ${row.attachments.slice(0, i + 1).filter(isCopy).length}` : 'Copia di cortesia'
+  }
   return (
     <span className="flex flex-wrap gap-1">
       {row.attachments.map((name, i) => (
         <button key={name} type="button" onClick={() => download(i, name)} disabled={busy !== null}
           className="text-xs text-accent-teal underline hover:text-accent-cyan disabled:opacity-50"
-          title="Scarica il PDF (rigenerato dai dati attuali)">
-          {busy === i ? '…' : i === 0 ? 'Copia di cortesia' : 'Riepilogo scadute'}
+          title={`Scarica ${name} (rigenerato dai dati attuali)`}>
+          {busy === i ? '…' : label(name, i)}
         </button>
       ))}
     </span>
@@ -466,7 +487,10 @@ export function ReminderEmailHistory({ customerId }) {
               <tr key={`${row.kind}-${row.id}`}>
                 <td className="px-6 py-2 text-xs text-txt-secondary whitespace-nowrap">{fmtDateTime(row.sent_at || row.attempted_at || row.created_at)}</td>
                 <td className="px-3 py-2 text-xs text-txt-secondary whitespace-nowrap">{KIND_LABEL[row.kind] || KIND_LABEL.promemoria}</td>
-                <td className="px-3 py-2 font-mono text-xs text-txt-secondary whitespace-nowrap">{row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span></td>
+                <td className="px-3 py-2 font-mono text-xs text-txt-secondary whitespace-nowrap">
+                  {row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span>
+                  <GroupNote row={row} />
+                </td>
                 <td className="px-3 py-2 text-right text-txt-primary">{fmtEur(row.amount_due)}</td>
                 <td className="px-3 py-2"><ReminderStatusBadge row={row} />{row.mode === 'test' && <span className="ml-1 text-xs text-txt-muted">(test)</span>}</td>
                 <td className="px-3 py-2 text-xs font-mono text-txt-secondary">{row.to_email || '—'}</td>

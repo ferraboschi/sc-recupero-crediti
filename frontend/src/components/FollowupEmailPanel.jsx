@@ -3,13 +3,15 @@ import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 import AgentBadges from './AgentBadges'
 import {
-  Attachments, CustomerName, MODE_STYLE, PLANNED_STYLE, RUN_LABEL, ReminderStatusBadge,
+  Attachments, CustomerName, GroupNote, MODE_STYLE, PLANNED_STYLE, RUN_LABEL, ReminderStatusBadge,
   fmtDate, fmtDateTime, fmtEur, rowPath,
 } from './ReminderEmailPanel'
 
 // Secondo avviso email (backend/engine/followup_email.py): a N giorni dalla
 // scadenza, se la fattura del promemoria risulta ancora non pagata, il
-// cliente riceve una seconda email, più diretta. Pannello di controllo
+// cliente riceve una seconda email, più diretta. UNA email per cliente: più
+// fatture da sollecitare (o con la scadenza a un giorno di distanza) partono
+// insieme; nel registro restano una riga per fattura. Pannello di controllo
 // (pagina Sistema), gemello di quello dei promemoria: acceso/spento,
 // affidabilità del dato «non pagata» (ultimo sync delle fatture), anteprima
 // del prossimo giro col testo, esecuzione manuale e registro. SPENTO finché
@@ -57,13 +59,15 @@ export default function FollowupEmailPanel() {
     // devono essere quelli attuali.
     const fresh = await load()
     if (!fresh || !fresh.enabled) return
-    const n = (fresh.preview || []).filter(p => p.will_process).length
-    const fatture = `${n} fattur${n === 1 ? 'a' : 'e'} scadut${n === 1 ? 'a' : 'e'} da almeno ${fresh.days_after_due} giorni`
+    const emails = (fresh.preview || []).filter(p => p.will_process)
+    const n = emails.length
+    const m = emails.reduce((sum, p) => sum + (p.invoice_count || 1), 0)
+    const quante = `${n} email (una per cliente) per ${m} fattur${m === 1 ? 'a' : 'e'} scadut${m === 1 ? 'a' : 'e'}`
     const msg = fresh.mode === 'reale'
-      ? `Invio ADESSO il secondo avviso AI CLIENTI per ${fatture}${copies(fresh)}. Procedere?`
+      ? `Invio ADESSO il secondo avviso AI CLIENTI: ${quante}${copies(fresh)}. Procedere?`
       : fresh.mode === 'test'
         ? `Invio ${n} email di prova a ${fresh.test_to} (i clienti non ricevono nulla). Procedere?`
-        : `Modalità prova: preparo e registro ${n} avvisi senza inviarli. Procedere?`
+        : `Modalità prova: preparo e registro ${n} email senza inviarle. Procedere?`
     if (!window.confirm(msg)) return
     setRunning(true)
     setRunResult(null)
@@ -82,11 +86,15 @@ export default function FollowupEmailPanel() {
   const retry = async (row) => {
     const fresh = await load()
     if (!fresh) return
+    const others = (row.group_invoices || []).map(m => m.invoice_number)
+    const what = others.length
+      ? `l'email unica con le fatture ${[row.invoice_number, ...others].join(', ')}`
+      : `la fattura ${row.invoice_number}`
     const msg = fresh.mode === 'reale'
-      ? `Ritento ADESSO l'invio AL CLIENTE (${row.to_email}) del secondo avviso per la fattura ${row.invoice_number}. Se l'invio precedente fosse in realtà partito, Resend non lo duplica. Procedere?`
+      ? `Ritento ADESSO l'invio AL CLIENTE (${row.to_email}) del secondo avviso per ${what}. Se l'invio precedente fosse in realtà partito, Resend non lo duplica. Procedere?`
       : fresh.mode === 'test'
-        ? `Ritento l'invio di prova a ${fresh.test_to} per la fattura ${row.invoice_number}. Procedere?`
-        : `Ritento il secondo avviso della fattura ${row.invoice_number} (modalità: ${fresh.mode_label}). Procedere?`
+        ? `Ritento l'invio di prova a ${fresh.test_to} per ${what}. Procedere?`
+        : `Ritento il secondo avviso per ${what} (modalità: ${fresh.mode_label}). Procedere?`
     if (!window.confirm(msg)) return
     setRetryingId(row.id)
     setRunResult(null)
@@ -103,7 +111,8 @@ export default function FollowupEmailPanel() {
   }
 
   const sendTest = async (p) => {
-    const to = window.prompt(`Invio di PROVA del secondo avviso per ${p.ragione_sociale} (fattura ${p.invoice_number}).\nA quale indirizzo? (nessuna copia, il registro non cambia)`, data?.test_to || '')
+    const what = (p.invoice_count || 1) > 1 ? `${p.invoice_count} fatture in un'unica email` : `fattura ${p.invoice_number}`
+    const to = window.prompt(`Invio di PROVA del secondo avviso per ${p.ragione_sociale} (${what}).\nA quale indirizzo? (nessuna copia, il registro non cambia)`, data?.test_to || '')
     if (!to) return
     setTestingId(p.invoice_id)
     setRunResult(null)
@@ -141,7 +150,7 @@ export default function FollowupEmailPanel() {
         <span className="text-xs text-txt-muted">
           Ogni giorno alle {data.schedule}, dopo i promemoria · {data.weekend
             ? 'weekend: nessun invio (le scadenze di sabato e domenica partono il lunedì)'
-            : `scadenze dal ${fmtDate(data.window[0])} al ${fmtDate(data.window[1])}`}
+            : `scadenze dal ${fmtDate(data.window[0])} al ${fmtDate(data.window[1])} (unite fino al ${fmtDate(data.merge_until)})`}
         </span>
       )}
     </div>
@@ -152,6 +161,8 @@ export default function FollowupEmailPanel() {
 
   const preview = data.preview || []
   const toSend = preview.filter(p => p.will_process)
+  const toSendInvoices = toSend.reduce((sum, p) => sum + (p.invoice_count || 1), 0)
+  const notSent = preview.length - toSend.length
   const recent = data.recent || []
   const sync = data.sync || {}
   const canRun = data.enabled && !data.weekend && sync.ok && toSend.length > 0
@@ -164,7 +175,7 @@ export default function FollowupEmailPanel() {
       {/* Regole e stato */}
       <div className="px-6 py-4 border-b border-dark-border text-sm space-y-2">
         <p className="text-txt-secondary">
-          Se a {data.days_after_due} giorni dalla scadenza la fattura a cui è stato inviato il promemoria risulta ancora non pagata, il cliente riceve una seconda email, più diretta: la fattura è scaduta da {data.days_after_due} giorni, chiediamo il saldo. In allegato la copia della fattura e, se ha altre scadute certe (non in conferma di pagamento, con scadenza stimata, promesse o dall'avvocato), il riepilogo con il totale. Una email per fattura, una volta sola; mai nel weekend.
+          Se a {data.days_after_due} giorni dalla scadenza la fattura a cui è stato inviato il promemoria risulta ancora non pagata, il cliente riceve una seconda email, più diretta: la fattura è scaduta, chiediamo il saldo. <span className="text-txt-primary">Una sola email per cliente</span>: se ha più fatture da sollecitare, o un'altra con la scadenza del giorno dopo, partono insieme in un'unica email con l'elenco e il totale. In allegato la copia di ogni fattura e, se ha altre scadute certe (non in conferma di pagamento, con scadenza stimata, promesse o dall'avvocato), il riepilogo con il totale. Una volta sola per fattura; mai nel weekend.
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs">
           <p><span className="text-txt-muted">Mittente:</span> <span className="text-txt-primary">{data.sender || '—'}</span></p>
@@ -194,8 +205,8 @@ export default function FollowupEmailPanel() {
         <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
           <div className="flex items-center gap-3 flex-wrap min-h-[2rem]">
             <p className="text-sm font-semibold text-txt-primary">
-              {data.weekend ? 'Weekend: nessun avviso oggi' : `Prossimo giro: ${preview.length === 0 ? 'nessuna fattura' : `${preview.length} fattur${preview.length === 1 ? 'a' : 'e'}`}`}
-              {preview.length > 0 && <span className="text-txt-muted font-normal"> · {toSend.length} da {data.enabled ? 'lavorare' : 'inviare se acceso'}</span>}
+              {data.weekend ? 'Weekend: nessun avviso oggi' : `Prossimo giro: ${preview.length === 0 ? 'nessuna fattura' : toSend.length === 0 ? 'nessuna email da inviare' : `${toSend.length} email per ${toSendInvoices} fattur${toSendInvoices === 1 ? 'a' : 'e'}`}`}
+              {preview.length > 0 && <span className="text-txt-muted font-normal">{toSend.length > 0 ? ` · ${data.enabled ? 'da lavorare' : 'da inviare se acceso'}` : ''}{notSent > 0 ? ` · ${notSent} fattur${notSent === 1 ? 'a non parte' : 'e non partono'}` : ''}</span>}
             </p>
             {runResult && (
               <span className={`text-xs ${runResult.error || runResult.blocked ? 'text-accent-red' : 'text-txt-secondary'}`} role="status">
@@ -205,7 +216,7 @@ export default function FollowupEmailPanel() {
                     ? runResult.info
                     : runResult.blocked
                       ? `Non eseguito: ${runResult.blocked_label}`
-                      : `Esito: ${runResult.sent} inviate · ${runResult.prepared} preparate · ${runResult.skipped} saltate · ${runResult.failed} errori · ${runResult.already} non lavorate`}
+                      : `Esito: ${runResult.sent} email inviate · ${runResult.prepared} preparate · ${runResult.invoices} fatture nelle email · ${runResult.skipped} saltate · ${runResult.failed} errori · ${runResult.already} non lavorate`}
               </span>
             )}
           </div>
@@ -220,7 +231,7 @@ export default function FollowupEmailPanel() {
               <thead>
                 <tr className="text-xs uppercase tracking-wider text-txt-label border-b border-dark-border">
                   <th className="text-left py-2 pr-3">Cliente</th>
-                  <th className="text-left py-2 pr-3">Fattura</th>
+                  <th className="text-left py-2 pr-3">Fatture nell'email</th>
                   <th className="text-left py-2 pr-3">Scaduta il</th>
                   <th className="text-right py-2 pr-3">Importo</th>
                   <th className="text-right py-2 pr-3">Altre scadute</th>
@@ -228,51 +239,65 @@ export default function FollowupEmailPanel() {
                   <th className="text-left py-2">Azioni</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-dark-border">
-                {preview.map(p => (
-                  <React.Fragment key={p.invoice_id}>
-                    <tr>
-                      <td className="py-2 pr-3">
-                        <CustomerName id={p.customer_id} name={p.ragione_sociale} navigate={navigate} />
-                        <span className="block text-xs text-txt-muted font-mono">{p.to_email || 'senza email'}</span>
-                        {p.cc && p.cc.length > 0 && <span className="block text-xs text-txt-muted">cc: {p.cc.join(', ')}</span>}
-                        {(!p.cc || p.cc.length === 0) && p.would_cc && p.would_cc.length > 0 && <span className="block text-xs text-txt-muted">in reale cc: {p.would_cc.join(', ')}</span>}
-                      </td>
-                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary">{p.invoice_number}</td>
-                      <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap">
-                        {fmtDate(p.due_date)} <span className="text-txt-muted">· {p.days_overdue} giorni</span>
-                        {p.reminder_sent_at && <span className="block text-txt-muted">promemoria: {fmtDateTime(p.reminder_sent_at)}</span>}
-                      </td>
-                      <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(p.amount_due)}</td>
-                      <td className="py-2 pr-3 text-right text-txt-secondary">{p.overdue_count > 0 ? `${p.overdue_count} · ${fmtEur(p.overdue_total)}` : '—'}</td>
-                      <td className="py-2 pr-3">
-                        {p.skip_reason
-                          ? (
-                            // Motivo sotto il badge (va a capo): la tabella resta nella larghezza della scheda.
-                            <>
-                              <span className="sc-badge whitespace-nowrap bg-accent-amber/15 text-accent-amber">Saltata</span>
-                              <span className="block text-xs text-txt-muted mt-1 max-w-[15rem]">{p.skip_label}</span>
-                            </>
-                          )
-                          : p.will_process
-                            ? <span className={`sc-badge whitespace-nowrap ${PLANNED_STYLE}`}>{plannedLabel}{p.already ? ` (${p.why})` : ''}</span>
-                            : <ReminderStatusBadge row={{ status: p.already, skip_label: p.why }} />}
-                      </td>
-                      <td className="py-2">
-                        <span className="flex items-center gap-2 whitespace-nowrap">
-                          {p.text && (
-                            <button type="button" aria-expanded={openText === p.invoice_id} onClick={() => setOpenText(openText === p.invoice_id ? null : p.invoice_id)} className="text-xs text-accent-teal underline hover:text-accent-cyan">
-                              {openText === p.invoice_id ? 'Chiudi' : 'Testo'}
-                            </button>
-                          )}
-                          {!p.skip_reason && (
-                            <button type="button" onClick={() => sendTest(p)} disabled={testingId !== null} className="sc-btn-secondary text-xs disabled:opacity-50" title="Invia questa email a un indirizzo a tua scelta (prefisso [PROVA], nessuna copia, registro intoccato)">
-                              {testingId === p.invoice_id ? '…' : 'Invia prova a…'}
-                            </button>
-                          )}
-                        </span>
-                      </td>
-                    </tr>
+              {preview.map(p => {
+                const invoices = p.invoices && p.invoices.length ? p.invoices : [p]
+                const span = invoices.length
+                return (
+                  <tbody key={p.invoice_id} className="border-b border-dark-border last:border-b-0" data-testid="followup-preview-email">
+                    {invoices.map((inv, idx) => (
+                      <tr key={inv.invoice_id}>
+                        {idx === 0 && (
+                          <td rowSpan={span} className="py-2 pr-3 align-top">
+                            <CustomerName id={p.customer_id} name={p.ragione_sociale} navigate={navigate} />
+                            <span className="block text-xs text-txt-muted font-mono">{p.to_email || 'senza email'}</span>
+                            {p.cc && p.cc.length > 0 && <span className="block text-xs text-txt-muted">cc: {p.cc.join(', ')}</span>}
+                            {(!p.cc || p.cc.length === 0) && p.would_cc && p.would_cc.length > 0 && <span className="block text-xs text-txt-muted">in reale cc: {p.would_cc.join(', ')}</span>}
+                            {span > 1 && <span className="block text-xs text-txt-primary mt-1">Email unica · {span} fatture · {fmtEur(p.amount_due)}</span>}
+                          </td>
+                        )}
+                        <td className="py-2 pr-3 font-mono text-xs text-txt-secondary align-top">
+                          {inv.invoice_number}
+                          {inv.early && <span className="block text-txt-muted font-sans">unita: scade il giorno dopo</span>}
+                        </td>
+                        <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap align-top">
+                          {fmtDate(inv.due_date)} <span className="text-txt-muted">· {inv.days_overdue} giorni</span>
+                          {inv.reminder_sent_at && <span className="block text-txt-muted">promemoria: {fmtDateTime(inv.reminder_sent_at)}</span>}
+                        </td>
+                        <td className="py-2 pr-3 text-right text-txt-primary align-top">{fmtEur(inv.amount_due)}</td>
+                        {idx === 0 && (
+                          <>
+                            <td rowSpan={span} className="py-2 pr-3 text-right text-txt-secondary align-top">{p.overdue_count > 0 ? `${p.overdue_count} · ${fmtEur(p.overdue_total)}` : '—'}</td>
+                            <td rowSpan={span} className="py-2 pr-3 align-top">
+                              {p.skip_reason
+                                ? (
+                                  // Motivo sotto il badge (va a capo): la tabella resta nella larghezza della scheda.
+                                  <>
+                                    <span className="sc-badge whitespace-nowrap bg-accent-amber/15 text-accent-amber">Saltata</span>
+                                    <span className="block text-xs text-txt-muted mt-1 max-w-[15rem]">{p.skip_label}</span>
+                                  </>
+                                )
+                                : p.will_process
+                                  ? <span className={`sc-badge whitespace-nowrap ${PLANNED_STYLE}`}>{plannedLabel}{p.already ? ` (${p.why})` : ''}</span>
+                                  : <ReminderStatusBadge row={{ status: p.already, skip_label: p.why }} />}
+                            </td>
+                            <td rowSpan={span} className="py-2 align-top">
+                              <span className="flex items-center gap-2 whitespace-nowrap">
+                                {p.text && (
+                                  <button type="button" aria-expanded={openText === p.invoice_id} onClick={() => setOpenText(openText === p.invoice_id ? null : p.invoice_id)} className="text-xs text-accent-teal underline hover:text-accent-cyan">
+                                    {openText === p.invoice_id ? 'Chiudi' : 'Testo'}
+                                  </button>
+                                )}
+                                {!p.skip_reason && (
+                                  <button type="button" onClick={() => sendTest(p)} disabled={testingId !== null} className="sc-btn-secondary text-xs disabled:opacity-50" title="Invia questa email a un indirizzo a tua scelta (prefisso [PROVA], nessuna copia, registro intoccato)">
+                                    {testingId === p.invoice_id ? '…' : 'Invia prova a…'}
+                                  </button>
+                                )}
+                              </span>
+                            </td>
+                          </>
+                        )}
+                      </tr>
+                    ))}
                     {openText === p.invoice_id && (
                       <tr>
                         <td colSpan={7} className="py-3">
@@ -281,9 +306,9 @@ export default function FollowupEmailPanel() {
                         </td>
                       </tr>
                     )}
-                  </React.Fragment>
-                ))}
-              </tbody>
+                  </tbody>
+                )
+              })}
             </table>
           </div>
         )}
@@ -291,7 +316,7 @@ export default function FollowupEmailPanel() {
 
       {/* Registro */}
       <div className="px-6 py-4">
-        <p className="text-sm font-semibold text-txt-primary mb-3">Ultimi secondi avvisi registrati</p>
+        <p className="text-sm font-semibold text-txt-primary mb-3">Ultimi secondi avvisi registrati <span className="text-txt-muted font-normal">· una riga per fattura</span></p>
         {recent.length === 0 ? (
           <p className="text-sm text-txt-muted">Nessun secondo avviso ancora registrato.</p>
         ) : (
@@ -318,7 +343,10 @@ export default function FollowupEmailPanel() {
                         <CustomerName id={row.customer_id} name={row.ragione_sociale} navigate={navigate} />
                         <AgentBadges agents={row.agents} className="ml-2" />
                       </td>
-                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary whitespace-nowrap">{row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span></td>
+                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary whitespace-nowrap">
+                        {row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span>
+                        <GroupNote row={row} />
+                      </td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(row.amount_due)}</td>
                       <td className="py-2 pr-3"><ReminderStatusBadge row={row} />{row.mode === 'test' && <span className="ml-1 text-xs text-txt-muted">(test)</span>}</td>
                       <td className="py-2 pr-3 text-xs font-mono text-txt-secondary">

@@ -371,10 +371,14 @@ class InvoiceFollowupEmail(Base):
 
     Registro del giro quotidiano di backend/engine/followup_email.py: UNA riga
     per (fattura, data di scadenza), come per il promemoria pre-scadenza, con
-    le STESSE colonne (lo stesso motore le scrive: riserva prima dell'invio,
-    ritenti, esclusioni registrate col motivo). È una tabella a sé — non una
+    le stesse colonne (riserva prima dell'invio, ritenti, esclusioni
+    registrate col motivo) più `group_key`. È una tabella a sé — non una
     colonna «tipo» su invoice_reminder_emails — perché così il promemoria già
     in produzione non cambia né schema né query.
+
+    UNA EMAIL PER CLIENTE (decisione owner 24/11/2026): più fatture dello
+    stesso cliente partono in un'unica email; ognuna ha la sua riga e le
+    righe della stessa email condividono `group_key`.
 
     Tabella NUOVA: la crea create_all (nessuna ALTER); la RLS la copre perché
     derivata dai modelli.
@@ -406,6 +410,7 @@ class InvoiceFollowupEmail(Base):
     attempted_at = Column(DateTime, nullable=True)               # ultimo tentativo di invio
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     sent_at = Column(DateTime, nullable=True)
+    group_key = Column(String, nullable=True, index=True)        # uguale per le fatture della stessa email
 
 
 class SyncState(Base):
@@ -584,6 +589,10 @@ def _run_migrations(engine):
         "ALTER TABLE invoice_reminder_emails ADD COLUMN error_kind VARCHAR",
         "ALTER TABLE invoice_reminder_emails ADD COLUMN attempted_at TIMESTAMP",
         "ALTER TABLE invoice_reminder_emails ADD COLUMN cc_json JSON",
+        # Secondo avviso: chiave dell'email unica per cliente (la tabella
+        # nuova nasce già completa da create_all; qui per i DB locali creati
+        # con la prima stesura).
+        "ALTER TABLE invoice_followup_emails ADD COLUMN group_key VARCHAR",
         # Riconciliazione: data di pagamento vera + residuo all'atto del
         # pagamento. NESSUN backfill: le righe già 'paid' non hanno una data
         # di pagamento vera (updated_at non lo è) né un residuo recuperabile

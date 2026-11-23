@@ -38,8 +38,13 @@ class RunBody(BaseModel):
     expected_mode: Optional[str] = None
 
 
-def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], kind: str = "promemoria") -> dict:
-    """Una riga del registro (promemoria o secondo avviso: stesse colonne)."""
+def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], kind: str = "promemoria",
+               groups: Optional[dict] = None) -> dict:
+    """Una riga del registro (promemoria o secondo avviso: stesse colonne).
+    `groups` (solo secondo avviso): le fatture della stessa email, per
+    `group_key` — una email con più fatture ha una riga per fattura."""
+    group_key = getattr(row, "group_key", None)
+    members = (groups or {}).get(group_key) or [] if group_key else []
     return {
         "id": row.id,
         "kind": kind,
@@ -71,6 +76,11 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
         "attempted_at": row.attempted_at.isoformat() if row.attempted_at else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+        # Email unica per più fatture dello stesso cliente (secondo avviso):
+        # le ALTRE fatture della stessa email.
+        "group_key": group_key,
+        "group_size": max(len(members), 1),
+        "group_invoices": [m for m in members if m["row_id"] != row.id],
     }
 
 
@@ -187,12 +197,13 @@ def reminder_email_log(
     session: Session = Depends(get_session),
 ):
     items = []
-    for model, kind in ((InvoiceReminderEmail, "promemoria"), (InvoiceFollowupEmail, followup.FOLLOWUP.key)):
+    for model, kind in ((InvoiceReminderEmail, "promemoria"), (InvoiceFollowupEmail, followup.KIND_KEY)):
         query = _rows_query(session, model)
         if customer_id is not None:
             query = query.filter(model.customer_id == customer_id)
         rows = query.order_by(model.created_at.desc(), model.id.desc()).limit(limit).all()
-        items.extend(_serialize(r, i, c, kind) for r, i, c in rows)
+        groups = followup.group_members(session, [r for r, _i, _c in rows]) if kind == followup.KIND_KEY else None
+        items.extend(_serialize(r, i, c, kind, groups) for r, i, c in rows)
     # Promemoria e secondi avvisi insieme, dal più recente (le date ISO si
     # ordinano come testo; una riga senza data va in fondo).
     items.sort(key=lambda it: (it["created_at"] or "", it["kind"], it["id"]), reverse=True)
@@ -274,6 +285,7 @@ def followup_email_status(
         .limit(limit)
         .all()
     )
+    groups = followup.group_members(session, [r for r, _i, _c in rows])
     return {
         "enabled": mode != followup.MODE_OFF,
         "mode": mode,
@@ -285,6 +297,10 @@ def followup_email_status(
         "days_after_due": followup.followup_days(),
         "lookback_days": followup.followup_lookback(),
         "window": [d.isoformat() for d in window] if window else None,
+        # Una email per cliente: vi entrano anche le sue fatture con la
+        # scadenza fino a questo giorno (± un giorno dall'ultima della finestra).
+        "near_days": followup.NEAR_DUE_DAYS,
+        "merge_until": followup.merge_until(window).isoformat() if window else None,
         "weekend": window is None,
         "sync": followup.sync_gate(session),
         "schedule": f"{config.REMINDER_EMAIL_HOUR:02d}:{config.REMINDER_EMAIL_MINUTE:02d} {config.TIMEZONE}",
@@ -293,7 +309,7 @@ def followup_email_status(
         "cc_effective": carbon_copies(None, config),
         "agent_emails": agent_emails(),
         "preview": followup.preview_followups(session, mode=mode),
-        "recent": [_serialize(r, i, c, followup.FOLLOWUP.key) for r, i, c in rows],
+        "recent": [_serialize(r, i, c, followup.KIND_KEY, groups) for r, i, c in rows],
     }
 
 
@@ -314,8 +330,9 @@ def followup_email_run(body: Optional[RunBody] = None, session: Session = Depend
 @router.post("/followup/test")
 def followup_email_test(body: TestSendBody, session: Session = Depends(get_session)):
     """Invia a un indirizzo interno il secondo avviso che il cliente
-    riceverebbe per la fattura indicata ([PROVA], nessuna copia, registro
-    intoccato). Funziona anche da spento."""
+    riceverebbe per la fattura indicata — l'email unica con le altre sue
+    fatture del giro di oggi, se ce ne sono ([PROVA], nessuna copia,
+    registro intoccato). Funziona anche da spento."""
     try:
         return followup.send_followup_test(session, body.invoice_id, body.to)
     except NotFound as e:
@@ -331,7 +348,8 @@ def followup_email_test(body: TestSendBody, session: Session = Depends(get_sessi
 
 @router.post("/followup/{row_id}/retry")
 def followup_email_retry(row_id: int, body: Optional[RunBody] = None, session: Session = Depends(get_session)):
-    """Ritenta un secondo avviso fermo (fallito o interrotto)."""
+    """Ritenta un secondo avviso fermo (fallito o interrotto), con le altre
+    fatture della stessa email ancora ferme: resta UNA email."""
     row, _invoice, _customer = _followup_row(session, row_id)
     expected = body.expected_mode if body else None
     try:
@@ -347,21 +365,23 @@ def followup_email_retry(row_id: int, body: Optional[RunBody] = None, session: S
 @router.get("/followup/{row_id}")
 def followup_email_detail(row_id: int, session: Session = Depends(get_session)):
     row, invoice, customer = _followup_row(session, row_id)
-    data = _serialize(row, invoice, customer, followup.FOLLOWUP.key)
+    data = _serialize(row, invoice, customer, followup.KIND_KEY, followup.group_members(session, [row]))
     data["body_text"] = row.body_text
     return data
 
 
 @router.get("/followup/{row_id}/attachments/{index}")
 def followup_email_attachment(row_id: int, index: int, session: Session = Depends(get_session)):
-    """Rigenera l'allegato n-esimo (0 = copia di cortesia, 1 = riepilogo
-    scadute) dai dati attuali, per controllo: può differire da quello
-    inviato se nel frattempo le scadute sono cambiate."""
-    _row, invoice, customer = _followup_row(session, row_id)
+    """Rigenera l'allegato n-esimo (una copia di cortesia per ogni fattura
+    dell'email, poi il riepilogo delle scadute) dai dati attuali, per
+    controllo: può differire da quello inviato se nel frattempo le scadute
+    sono cambiate."""
+    row, invoice, customer = _followup_row(session, row_id)
     if invoice is None or customer is None:
         raise HTTPException(status_code=404, detail="Fattura o cliente non più disponibili")
-    overdue = followup.other_overdue_invoices(session, customer.id, exclude_id=invoice.id)
-    attachments = followup.build_followup_attachments(customer, invoice, overdue)
+    invoices = followup.row_invoices(session, row)
+    overdue = followup.other_overdue_invoices(session, customer.id, exclude_ids=[i.id for i in invoices])
+    attachments = followup.build_followup_attachments(customer, invoices, overdue)
     if index < 0 or index >= len(attachments):
         raise HTTPException(
             status_code=404,

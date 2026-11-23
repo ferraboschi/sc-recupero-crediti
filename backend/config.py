@@ -81,7 +81,9 @@ class Config:
     # saldata. SPENTO finché l'owner non imposta REMINDER_FOLLOWUP_ENABLED=true:
     # da spento il pannello mostra solo l'anteprima, il giro non scrive e non
     # invia nulla. Mittente, copie e indirizzo di prova sono quelli del
-    # promemoria (REMINDER_EMAIL_*).
+    # promemoria (REMINDER_EMAIL_*). Una sola email per cliente: più fatture
+    # da sollecitare, o con la scadenza a un giorno di distanza, partono
+    # insieme (owner 24/11/2026).
     REMINDER_FOLLOWUP_ENABLED = os.getenv("REMINDER_FOLLOWUP_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
     # Giorni dalla scadenza (7 = «scaduta da 7 giorni»).
     REMINDER_FOLLOWUP_DAYS = os.getenv("REMINDER_FOLLOWUP_DAYS", "7")
