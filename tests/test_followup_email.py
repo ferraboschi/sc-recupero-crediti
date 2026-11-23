@@ -16,14 +16,16 @@ import pytest
 
 from backend.connectors.resend_mail import MailSendError
 from backend.database import (
-    Customer, Invoice, InvoiceFollowupEmail, InvoiceReminderEmail, RecoveryAction, SyncState,
+    Customer, Invoice, InvoiceFollowupEmail, InvoiceReminderEmail, RecoveryAction, RecoveryActionInvoice,
+    RecoveryCase, SyncState,
 )
 from backend.engine import followup_email as fu
 from backend.engine import reminder_email as re_mod
 from backend.engine.followup_email import (
     FOLLOWUP, MODE_OFF, candidate_invoices, compose_followup, followup_days, followup_extra_skip,
-    followup_lookback, followup_window, max_sync_age_hours, preview_followups, reminder_sent,
-    resolve_followup_mode, retry_followup_row, run_followups, send_followup_test, sync_gate,
+    followup_lookback, followup_skip_reason, followup_window, max_sync_age_hours, other_overdue_invoices,
+    preview_followups, reminder_sent, resolve_followup_mode, retry_followup_row, run_followups,
+    send_followup_test, sync_gate,
 )
 from backend.engine.reminder_email import (
     ERROR_NETWORK, ERROR_VALIDATION, MODE_PROVA, MODE_REALE, MODE_TEST, ModeMismatch, NotFound, ReminderBusy,
@@ -197,6 +199,11 @@ class TestConfig:
         # Mai «0 giorni dopo la scadenza», mai meno di un weekend di recupero.
         assert (followup_days(low), followup_lookback(low), max_sync_age_hours(low)) == (1, 2, 1)
         assert followup_days(_cfg(REMINDER_FOLLOWUP_DAYS=" 10 ")) == 10
+        # Un valore enorme non deve far saltare il calcolo delle date (né il pannello).
+        huge = _cfg(REMINDER_FOLLOWUP_DAYS="100000000", REMINDER_FOLLOWUP_LOOKBACK_DAYS="999999999",
+                    REMINDER_FOLLOWUP_MAX_SYNC_AGE_HOURS="100000")
+        assert (followup_days(huge), followup_lookback(huge), max_sync_age_hours(huge)) == (365, 60, 48)
+        assert followup_window(FIXED_NOW, huge) == (TODAY - timedelta(days=425), TODAY - timedelta(days=365))
         missing = SimpleNamespace()
         assert (followup_days(missing), followup_lookback(missing), max_sync_age_hours(missing)) == (7, 6, 3)
 
@@ -245,6 +252,13 @@ class TestSyncGate:
         stale = sync_gate(test_db_session, FIXED_NOW, _cfg())
         assert stale["ok"] is False and "3 ore fa" in stale["detail"] and stale["age_minutes"] == 181
         assert sync_gate(test_db_session, FIXED_NOW, _cfg(REMINDER_FOLLOWUP_MAX_SYNC_AGE_HOURS="5"))["ok"] is True
+
+    def test_sync_time_in_the_future_is_not_trusted(self, test_db_session):
+        _sync(test_db_session, minutes_ago=-4)   # qualche minuto di scarto tra orologi: ok
+        assert sync_gate(test_db_session, FIXED_NOW, _cfg())["ok"] is True
+        _sync(test_db_session, minutes_ago=-60)  # un'ora nel futuro: orologio sbagliato
+        skew = sync_gate(test_db_session, FIXED_NOW, _cfg())
+        assert skew["ok"] is False and "non è plausibile" in skew["detail"]
 
     def test_malformed_result_blocks(self, test_db_session):
         row = _sync(test_db_session)
@@ -307,6 +321,77 @@ class TestSelection:
         for status in ("idle", "first_contact", "second_contact"):
             c.recovery_status = status
             assert followup_extra_skip(test_db_session, inv, c) is None, status
+
+    def test_promised_invoice_is_not_chased(self, test_db_session):
+        c = _cust(test_db_session)
+        inv = _due(test_db_session, c, status="promised")
+        assert followup_extra_skip(test_db_session, inv, c) == "promessa"
+        assert followup_skip_reason(test_db_session, inv, c) == "promessa"
+        for status in ("open", "contacted", "escalated"):
+            inv.status = status
+            assert followup_extra_skip(test_db_session, inv, c) is None, status
+
+    def test_scope_comes_before_every_other_reason(self, test_db_session):
+        # Senza promemoria la fattura è fuori perimetro, qualunque altro
+        # motivo abbia (qui: cliente senza email e dall'avvocato).
+        c = _cust(test_db_session, email="", recovery_status="lawyer")
+        inv = _inv(test_db_session, c, "FUORI/1", 10.0, DUE7)
+        assert followup_skip_reason(test_db_session, inv, c) == "senza_promemoria"
+        _reminded(test_db_session, inv)
+        assert followup_skip_reason(test_db_session, inv, c) == "avvocato"
+
+    def test_other_overdue_invoices_are_only_the_certain_ones(self, test_db_session):
+        c = _cust(test_db_session)
+        trigger = _due(test_db_session, c)
+        certain = _inv(test_db_session, c, "CERTA/1", 100.0, date(2026, 10, 10))
+        maybe_paid = _inv(test_db_session, c, "FORSE/1", 200.0, date(2026, 10, 11), missing_streak=1)
+        estimated = _inv(test_db_session, c, "STIMATA/1", 300.0, date(2026, 10, 12), due_date_source="assumed")
+        promised = _inv(test_db_session, c, "PROMESSA/1", 400.0, date(2026, 10, 13), status="promised")
+        cheque = _inv(test_db_session, c, "ASSEGNO/1", 500.0, date(2026, 10, 14), payment_pending="assegno")
+        at_lawyer = _inv(test_db_session, c, "LEGALE/1", 600.0, date(2026, 9, 1))
+        _inv(test_db_session, c, "PAGATA/1", 700.0, date(2026, 10, 15), status="paid")
+        _inv(test_db_session, c, "FUTURA/1", 800.0, date(2026, 12, 1))
+        case = RecoveryCase(customer_id=c.id, status="open")
+        test_db_session.add(case)
+        test_db_session.flush()
+        handover = RecoveryAction(customer_id=c.id, case_id=case.id, action_type="lawyer", invoice_ids=[at_lawyer.id],
+                                  completed_at=datetime(2026, 11, 1, 9, 0))
+        test_db_session.add(handover)
+        test_db_session.flush()
+        test_db_session.add(RecoveryActionInvoice(action_id=handover.id, invoice_id=at_lawyer.id))
+        test_db_session.commit()
+        # Il promemoria (regola in produzione, invariata) le cita tutte tranne
+        # l'assegno in incasso; il secondo avviso solo quella certa.
+        base_nums = {i.invoice_number for i in re_mod.overdue_invoices(test_db_session, c.id, exclude_id=trigger.id)}
+        assert base_nums == {"CERTA/1", "FORSE/1", "STIMATA/1", "PROMESSA/1", "LEGALE/1"}
+        others = other_overdue_invoices(test_db_session, c.id, exclude_id=trigger.id)
+        assert [i.id for i in others] == [certain.id]
+        assert {maybe_paid.id, estimated.id, promised.id, cheque.id} & {i.id for i in others} == set()
+        # Nell'email: una sola altra scaduta, totale = avviso + certa.
+        _sync(test_db_session)
+        mailer = FakeMailer()
+        assert run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())["sent"] == 1
+        text = mailer.sent[0]["text"]
+        assert "1 altra fattura per 100,00 €. Totale da saldare: 526,76 €." in text
+        summary_pdf = _pdf_strings(mailer.sent[0]["attachments"][1][1])
+        assert "CERTA/1" in summary_pdf and "526,76 EUR" in summary_pdf
+        for num in ("FORSE/1", "STIMATA/1", "PROMESSA/1", "ASSEGNO/1", "LEGALE/1", "PAGATA/1", "FUTURA/1"):
+            assert num not in summary_pdf, num
+        row = test_db_session.query(InvoiceFollowupEmail).one()
+        assert (row.overdue_count, row.overdue_total) == (1, 100.0)
+        # Anteprima e allegato rigenerato dicono lo stesso.
+        entry = [e for e in preview_followups(test_db_session, cfg=_on_cfg()) if e["invoice_id"] == trigger.id][0]
+        assert (entry["overdue_count"], entry["grand_total"]) == (1, 526.76)
+
+    def test_no_other_certain_invoice_means_no_summary(self, test_db_session):
+        c = _cust(test_db_session)
+        _due(test_db_session, c)
+        _inv(test_db_session, c, "FORSE/1", 200.0, date(2026, 10, 11), missing_streak=1)
+        _sync(test_db_session)
+        mailer = FakeMailer()
+        run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        assert [n for n, _ in mailer.sent[0]["attachments"]] == ["copia_cortesia_fattura_2026_00001804_SAK.pdf"]
+        assert "Risult" not in mailer.sent[0]["text"] and "Totale da saldare" not in mailer.sent[0]["text"]
 
     def test_common_exclusions_come_first(self, test_db_session):
         c = _cust(test_db_session, email="")
@@ -454,6 +539,7 @@ class TestRun:
             _sync(test_db_session, now=_at(day))
             run_followups(test_db_session, now_utc=_at(day), mailer=mailer, cfg=_on_cfg())
         assert len(mailer.sent) == 1 and len(_rows(test_db_session)) == 1
+        _sync(test_db_session)
         again = run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
         assert again["already"] == 1 and again["sent"] == 0
 
@@ -488,6 +574,11 @@ class TestRun:
         assert "è scaduta da 8 giorni (scadenza 15/11/2026)" in texts["DOM/1"]
         assert "è scaduta da 7 giorni (scadenza 16/11/2026)" in texts["LUN/1"]
         assert {r.invoice_id for r in _rows(test_db_session)} == {sat.id, sun.id, mon.id}
+        # Testo e PDF contano dallo STESSO giorno (quello del giro, non l'orologio).
+        pdfs = {s["subject"].split("n. ")[1].split(" scaduta")[0]: _pdf_strings(s["attachments"][0][1]) for s in mailer.sent}
+        assert "Giorni di ritardo: 9" in pdfs["SAB/1"] and "Giorni di ritardo: 7" in pdfs["LUN/1"]
+        summary_pdf = _pdf_strings(mailer.sent[0]["attachments"][1][1])  # riepilogo: le tre scadute
+        assert all(re.search(rf"\({n}\)", summary_pdf) for n in (9, 8, 7))
 
     def test_paid_invoice_gets_nothing(self, test_db_session):
         c = _cust(test_db_session)
@@ -535,21 +626,23 @@ class TestRun:
         _sync(test_db_session)
         mailer = FakeMailer()
         first = run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
-        assert first["skipped"] == 2 and first["sent"] == 0 and mailer.calls == 0
+        assert (first["skipped"], first["out_of_scope"], first["candidates"]) == (1, 1, 1)
+        assert first["sent"] == 0 and mailer.calls == 0
         reasons = {r.invoice_id: (r.status, r.skip_reason) for r in _rows(test_db_session)}
-        assert reasons == {inv.id: ("skipped", "senza_email"), other.id: ("skipped", "senza_email")}
+        assert reasons == {inv.id: ("skipped", "senza_email")}  # l'altra è fuori perimetro: nessuna riga
         # Il giorno dopo l'email c'è: la fattura col promemoria riceve l'avviso
-        # (8 giorni), l'altra resta saltata con il SUO motivo.
+        # (8 giorni); l'altra resta fuori dal registro.
         c.email = "amministrazione@shabu.it"
         test_db_session.commit()
         next_day = _at(date(2026, 11, 19))
         _sync(test_db_session, now=next_day)
         second = run_followups(test_db_session, now_utc=next_day, mailer=mailer, cfg=_on_cfg())
-        assert second["sent"] == 1 and second["skipped"] == 1
+        assert (second["sent"], second["skipped"], second["out_of_scope"]) == (1, 0, 1)
         assert mailer.sent[0]["to"] == ["amministrazione@shabu.it"] and "da 8 giorni" in mailer.sent[0]["text"]
         reasons = {r.invoice_id: (r.status, r.skip_reason) for r in _rows(test_db_session)}
-        assert reasons == {inv.id: ("sent", None), other.id: ("skipped", "senza_promemoria")}
-        assert len(_rows(test_db_session)) == 2  # stesse righe, aggiornate
+        assert reasons == {inv.id: ("sent", None)}
+        assert len(_rows(test_db_session)) == 1  # stessa riga, aggiornata
+        assert test_db_session.query(InvoiceFollowupEmail).filter_by(invoice_id=other.id).count() == 0
 
     def test_maybe_paid_in_collection_and_waiting_are_skipped(self, test_db_session):
         maybe = _due(test_db_session, _cust(test_db_session, nome="Forse Srl", email="a@forse.it", partita_iva="00000000001"),
@@ -558,12 +651,33 @@ class TestRun:
                       num="ASSEGNO/1", payment_pending="assegno")
         waiting = _due(test_db_session, _cust(test_db_session, nome="Attesa Srl", email="a@attesa.it", partita_iva="00000000003",
                                               recovery_status="waiting"), num="ATTESA/1")
+        promised = _due(test_db_session, _cust(test_db_session, nome="Promessa Srl", email="a@promessa.it", partita_iva="00000000009"),
+                        num="PROMESSA/1", status="promised")
         _sync(test_db_session)
         mailer = FakeMailer()
         summary = run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
-        assert summary["skipped"] == 3 and mailer.calls == 0
+        assert summary["skipped"] == 4 and mailer.calls == 0
         reasons = {r.invoice_id: r.skip_reason for r in _rows(test_db_session)}
-        assert reasons == {maybe.id: "forse_pagata", cheque.id: "in_incasso", waiting.id: "in_attesa"}
+        assert reasons == {maybe.id: "forse_pagata", cheque.id: "in_incasso", waiting.id: "in_attesa",
+                           promised.id: "promessa"}
+
+    def test_invoice_paid_while_the_round_is_running_gets_nothing(self, test_db_session):
+        a = _due(test_db_session, _cust(test_db_session, nome="Alfa Srl", email="a@alfa.it", partita_iva="00000000005"), num="A/1")
+        b = _due(test_db_session, _cust(test_db_session, nome="Beta Srl", email="b@beta.it", partita_iva="00000000006"), num="B/1")
+        _sync(test_db_session)
+
+        class PaysTheOtherOne(FakeMailer):
+            """Mentre parte la prima email, il sync segna pagata la seconda."""
+            def send(self, **kwargs):
+                out = super().send(**kwargs)
+                test_db_session.query(Invoice).filter(Invoice.id == b.id).update({"status": "paid", "amount_due": 0.0})
+                return out
+
+        mailer = PaysTheOtherOne()
+        summary = run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        assert (summary["sent"], summary["settled_meanwhile"], summary["candidates"]) == (1, 1, 1)
+        assert [s["to"] for s in mailer.sent] == [["a@alfa.it"]]
+        assert {r.invoice_id for r in _rows(test_db_session)} == {a.id}
 
     def test_test_mode_goes_to_test_address_then_real_resends_to_customer(self, test_db_session):
         c = _cust(test_db_session, tags="B2B, izzo")
@@ -650,8 +764,8 @@ class TestRun:
         row = test_db_session.query(InvoiceFollowupEmail).one()
         assert (row.status, row.error_kind) == ("failed", "pdf") and mailer.calls == 0
         monkeypatch.undo()
-        monkeypatch.setattr("backend.engine.format.datetime", _FixedDatetime)
-        monkeypatch.setattr("backend.engine.followup_email.datetime", _FixedDatetime)
+        for target in ("format", "reminder_email", "followup_email"):
+            monkeypatch.setattr(f"backend.engine.{target}.datetime", _FixedDatetime)
         assert run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())["sent"] == 1
 
     def test_busy_lock_and_mode_mismatch(self, test_db_session):
@@ -735,8 +849,9 @@ class TestPreview:
         summary = run_followups(test_db_session, mailer=mailer, cfg=cfg)
         promised = {e["invoice_id"] for e in entries if e["will_process"]}
         assert {r.invoice_id for r in _rows(test_db_session) if r.status == "sent"} == promised == {send.id}
-        assert summary["sent"] == 1 and summary["skipped"] == 2
-        assert {r.invoice_id for r in _rows(test_db_session) if r.status == "skipped"} == {noprom.id, waiting.id}
+        assert (summary["sent"], summary["skipped"], summary["out_of_scope"]) == (1, 1, 1)
+        assert {r.invoice_id for r in _rows(test_db_session) if r.status == "skipped"} == {waiting.id}
+        assert test_db_session.query(InvoiceFollowupEmail).filter_by(invoice_id=noprom.id).count() == 0
         after = {e["invoice_number"]: e for e in preview_followups(test_db_session, cfg=cfg)}
         assert (after["A/1"]["already"], after["A/1"]["will_process"], after["A/1"]["why"]) == ("sent", False, "già inviata")
 
@@ -786,6 +901,36 @@ class TestRetryAndTestSend:
             retry_followup_row(test_db_session, row, mailer=mailer, cfg=_on_cfg())
         assert mailer.calls == 0 and row.status == "failed"
 
+    def test_retry_refuses_missing_or_not_overdue_invoice(self, test_db_session):
+        inv, row = self._stuck(test_db_session)
+        mailer = FakeMailer()
+        before_due = _at(date(2026, 11, 11))  # il giorno della scadenza: non è ancora scaduta
+        _sync(test_db_session, now=before_due)
+        with pytest.raises(ValueError, match="non è scaduta"):
+            retry_followup_row(test_db_session, row, mailer=mailer, cfg=_on_cfg(), now_utc=before_due)
+        _sync(test_db_session)
+        ghost = InvoiceFollowupEmail(invoice_id=987654, due_date=DUE7, status="failed", mode="reale", error_kind="network")
+        with pytest.raises(ValueError, match="non più presente"):
+            retry_followup_row(test_db_session, ghost, mailer=mailer, cfg=_on_cfg())
+        assert mailer.calls == 0
+
+    def test_retry_of_an_orphan_sending_row(self, test_db_session):
+        # Crash a metà invio: la riga resta `sending`. Il giro non la tocca,
+        # l'operatore la ritenta a mano (stessa Idempotency-Key).
+        c = _cust(test_db_session)
+        inv = _due(test_db_session, c)
+        _sync(test_db_session)
+        orphan = InvoiceFollowupEmail(invoice_id=inv.id, customer_id=c.id, due_date=DUE7, status="sending", mode="reale")
+        test_db_session.add(orphan)
+        test_db_session.commit()
+        mailer = FakeMailer()
+        untouched = run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        assert untouched["already"] == 1 and mailer.calls == 0 and orphan.status == "sending"
+        retried = retry_followup_row(test_db_session, orphan, mailer=mailer, cfg=_on_cfg())
+        assert retried["sent"] == 1 and orphan.status == "sent"
+        assert mailer.sent[0]["idempotency_key"] == f"followup-{inv.id}-2026-11-11-reale"
+        assert test_db_session.query(InvoiceFollowupEmail).count() == 1
+
     def test_retry_only_stuck_rows_and_busy(self, test_db_session):
         inv, row = self._stuck(test_db_session)
         assert re_mod._reminder_lock.acquire(blocking=False)
@@ -812,6 +957,24 @@ class TestRetryAndTestSend:
         assert sent["to"] == ["lorenzo@example.com"] and "cc" not in sent and "è scaduta da 7 giorni" in sent["text"]
         assert [n for n, _ in sent["attachments"]] == ["copia_cortesia_fattura_2026_00001804_SAK.pdf"]
         assert _rows(test_db_session) == []
+
+    def test_test_send_cites_only_certain_overdue_invoices(self, test_db_session):
+        # La prova deve mostrare ESATTAMENTE l'email che partirebbe: stesse
+        # altre scadute (solo le certe), stesso totale, stessi allegati.
+        c = _cust(test_db_session)
+        inv = _due(test_db_session, c)
+        _inv(test_db_session, c, "CERTA/1", 100.0, date(2026, 10, 10))
+        _inv(test_db_session, c, "FORSE/1", 200.0, date(2026, 10, 11), missing_streak=1)
+        _inv(test_db_session, c, "STIMATA/1", 300.0, date(2026, 10, 12), due_date_source="assumed")
+        mailer = FakeMailer()
+        send_followup_test(test_db_session, inv.id, "lorenzo@example.com", mailer=mailer, cfg=_on_cfg())
+        sent = mailer.sent[0]
+        assert "1 altra fattura per 100,00 €. Totale da saldare: 526,76 €." in sent["text"]
+        summary_pdf = _pdf_strings(sent["attachments"][1][1])
+        assert "CERTA/1" in summary_pdf and "FORSE/1" not in summary_pdf and "STIMATA/1" not in summary_pdf
+        # E coincide con l'anteprima.
+        entry = [e for e in preview_followups(test_db_session, cfg=_on_cfg()) if e["invoice_id"] == inv.id][0]
+        assert entry["text"] == sent["text"]
 
     def test_test_send_refusals(self, test_db_session):
         c = _cust(test_db_session)
@@ -916,6 +1079,26 @@ class TestApi:
         assert test_client.get("/api/reminders/email").json()["recent"][0]["kind"] == "promemoria"
         assert len(test_client.get("/api/reminders/email").json()["recent"]) == 1
 
+    def test_regenerated_attachment_uses_only_certain_overdue_invoices(self, test_client, test_db_session, monkeypatch):
+        self._enable(monkeypatch)
+        c = _cust(test_db_session)
+        _due(test_db_session, c)
+        _inv(test_db_session, c, "CERTA/1", 100.0, date(2026, 10, 10))
+        _inv(test_db_session, c, "FORSE/1", 200.0, date(2026, 10, 11), missing_streak=1)
+        _sync(test_db_session)
+        self._spy(monkeypatch)
+        assert test_client.post("/api/reminders/followup/run").json()["sent"] == 1
+        row = test_db_session.query(InvoiceFollowupEmail).one()
+        pdf = test_client.get(f"/api/reminders/followup/{row.id}/attachments/1")
+        assert pdf.status_code == 200
+        text = _pdf_strings(pdf.content)
+        assert "CERTA/1" in text and "FORSE/1" not in text and "526,76 EUR" in text
+        # Se l'unica altra scaduta diventa incerta, il riepilogo non esiste più.
+        test_db_session.query(Invoice).filter(Invoice.invoice_number == "CERTA/1").update({"missing_streak": 1})
+        test_db_session.commit()
+        assert test_client.get(f"/api/reminders/followup/{row.id}/attachments/1").status_code == 404
+        assert test_client.get(f"/api/reminders/followup/{row.id}/attachments/0").status_code == 200
+
     def test_customer_log_merges_reminders_and_followups(self, test_client, test_db_session, monkeypatch):
         self._enable(monkeypatch)
         c = _cust(test_db_session)
@@ -931,6 +1114,20 @@ class TestApi:
         assert all(i["customer_id"] == c.id for i in log["items"])
         everyone = test_client.get("/api/reminders/email/log", params={"limit": 2}).json()
         assert everyone["count"] == 2
+        # Limite più piccolo del totale (3 righe: 2 promemoria + 1 secondo
+        # avviso): i due registri sono fusi per data, dal più recente, e il
+        # taglio tiene le prime. Qui l'ordine di creazione è: promemoria del
+        # cliente, secondo avviso, promemoria di «Altro».
+        allrows = test_client.get("/api/reminders/email/log").json()
+        assert allrows["count"] == 3
+        assert [(i["kind"], i["invoice_number"]) for i in allrows["items"]] == [
+            ("promemoria", "ALTRO/1"), ("followup", "2026/00001804/SAK - Fattura"),
+            ("promemoria", "2026/00001804/SAK - Fattura")]
+        stamps = [i["created_at"] for i in allrows["items"]]
+        assert stamps == sorted(stamps, reverse=True)
+        one = test_client.get("/api/reminders/email/log", params={"limit": 1}).json()
+        assert one["count"] == 1 and one["items"][0]["invoice_number"] == "ALTRO/1"
+        assert [(i["kind"], i["id"]) for i in everyone["items"]] == [(i["kind"], i["id"]) for i in allrows["items"][:2]]
 
     def test_blocked_by_sync_and_weekend(self, test_client, test_db_session, monkeypatch):
         self._enable(monkeypatch)

@@ -46,7 +46,11 @@ export default function FollowupEmailPanel() {
 
   useEffect(() => { load() }, [load])
 
-  const copies = (d) => `${(d.cc_effective || []).length ? `, con copia a ${d.cc_effective.join(', ')}` : ''}${Object.keys(d.agent_emails || {}).length ? ' e al commerciale del cliente' : ''}`
+  const copies = (d) => {
+    const to = [...(d.cc_effective || [])]
+    if (Object.keys(d.agent_emails || {}).length) to.push('commerciale del cliente')
+    return to.length ? `, con copia a ${to.join(', ')}` : ''
+  }
 
   const runNow = async () => {
     // Stato ricaricato PRIMA della conferma: modalità, sync e anteprima
@@ -160,7 +164,7 @@ export default function FollowupEmailPanel() {
       {/* Regole e stato */}
       <div className="px-6 py-4 border-b border-dark-border text-sm space-y-2">
         <p className="text-txt-secondary">
-          Se a {data.days_after_due} giorni dalla scadenza la fattura a cui è stato inviato il promemoria risulta ancora non pagata, il cliente riceve una seconda email, più diretta: la fattura è scaduta da {data.days_after_due} giorni, chiediamo il saldo. In allegato la copia della fattura e, se ha altre scadute, il riepilogo con il totale. Una email per fattura, una volta sola; mai nel weekend.
+          Se a {data.days_after_due} giorni dalla scadenza la fattura a cui è stato inviato il promemoria risulta ancora non pagata, il cliente riceve una seconda email, più diretta: la fattura è scaduta da {data.days_after_due} giorni, chiediamo il saldo. In allegato la copia della fattura e, se ha altre scadute certe (non in conferma di pagamento, con scadenza stimata, promesse o dall'avvocato), il riepilogo con il totale. Una email per fattura, una volta sola; mai nel weekend.
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs">
           <p><span className="text-txt-muted">Mittente:</span> <span className="text-txt-primary">{data.sender || '—'}</span></p>

@@ -360,7 +360,7 @@ def followup_email_attachment(row_id: int, index: int, session: Session = Depend
     _row, invoice, customer = _followup_row(session, row_id)
     if invoice is None or customer is None:
         raise HTTPException(status_code=404, detail="Fattura o cliente non più disponibili")
-    overdue = overdue_invoices(session, customer.id, exclude_id=invoice.id)
+    overdue = followup.other_overdue_invoices(session, customer.id, exclude_id=invoice.id)
     attachments = followup.build_followup_attachments(customer, invoice, overdue)
     if index < 0 or index >= len(attachments):
         raise HTTPException(

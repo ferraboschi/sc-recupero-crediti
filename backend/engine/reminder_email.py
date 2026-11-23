@@ -91,6 +91,7 @@ SKIP_LABELS = {
     # Solo secondo avviso (backend/engine/followup_email.py):
     "senza_promemoria": "Promemoria pre-scadenza non inviato al cliente",
     "in_attesa": "Pratica in attesa (decisa dall'operatore)",
+    "promessa": "Pagamento promesso (stato impostato dall'operatore)",
 }
 
 MODE_LABELS = {
@@ -399,6 +400,12 @@ class EmailKind:
     attachments: Callable          # (customer, invoice, overdue) -> [(nome, bytes)]
     idempotency_prefix: str        # prefisso della Idempotency-Key verso Resend
     extra_skip: Optional[Callable] = None  # (session, invoice, customer) -> motivo | None
+    # True: gli allegati ricevono anche la data del giro (customer, invoice,
+    # overdue, today), così testo e PDF contano i giorni dallo stesso «oggi».
+    dated_attachments: bool = False
+    # Le ALTRE scadute del cliente da citare: (session, customer_id,
+    # exclude_id=…) -> [Invoice]. None = overdue_invoices (promemoria).
+    overdue: Optional[Callable] = None
 
 
 # compose/build_attachments sono risolti alla CHIAMATA (non qui): chi li
@@ -410,6 +417,21 @@ PROMEMORIA = EmailKind(
     attachments=lambda *a, **kw: build_attachments(*a, **kw),
     idempotency_prefix="reminder",
 )
+
+
+def kind_overdue(session: Session, kind: EmailKind, customer_id: int, exclude_id: Optional[int]) -> List[Invoice]:
+    """Le altre scadute del cliente secondo il tipo di email."""
+    if kind.overdue is not None:
+        return kind.overdue(session, customer_id, exclude_id=exclude_id)
+    return overdue_invoices(session, customer_id, exclude_id=exclude_id)
+
+
+def kind_attachments(kind: EmailKind, customer: Customer, invoice: Invoice, overdue: List[Invoice],
+                     today: Optional[date] = None) -> List[Tuple[str, bytes]]:
+    """Gli allegati del tipo di email (con la data del giro se li vuole datati)."""
+    if kind.dated_attachments:
+        return kind.attachments(customer, invoice, overdue, today or italian_today())
+    return kind.attachments(customer, invoice, overdue)
 
 
 def kind_skip_reason(session: Session, invoice: Invoice, customer: Optional[Customer],
@@ -605,8 +627,9 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
         summary["items"].append(_item(row, inv, customer))
         return row
 
-    overdue = overdue_invoices(session, customer.id, exclude_id=inv.id)
-    msg = kind.compose(customer, inv, overdue, today or italian_today())
+    overdue = kind_overdue(session, kind, customer.id, inv.id)
+    today = today or italian_today()
+    msg = kind.compose(customer, inv, overdue, today)
     real_to = normalize_email(customer.email)
     test_to = (getattr(cfg, "REMINDER_EMAIL_TEST_TO", "") or "").strip()
     row.skip_reason = None
@@ -627,7 +650,7 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
         return None
 
     try:
-        attachments = kind.attachments(customer, inv, overdue)
+        attachments = kind_attachments(kind, customer, inv, overdue, today)
     except Exception as e:  # il PDF non deve far cadere il giro
         logger.error(f"{kind.label} {inv.invoice_number}: PDF non generato: {e}", exc_info=True)
         row.status = STATUS_FAILED
@@ -803,9 +826,10 @@ def send_test(session: Session, invoice_id: int, to_address: str, *, mailer=None
         raise ValueError("l'indirizzo di prova coincide con l'email di un cliente: usare un indirizzo interno")
     if not getattr(cfg, "RESEND_API_KEY", ""):
         raise ValueError("Resend non configurato (RESEND_API_KEY)")
-    overdue = overdue_invoices(session, customer.id, exclude_id=inv.id)
-    msg = kind.compose(customer, inv, overdue, today or italian_today())
-    attachments = kind.attachments(customer, inv, overdue)
+    overdue = kind_overdue(session, kind, customer.id, inv.id)
+    today = today or italian_today()
+    msg = kind.compose(customer, inv, overdue, today)
+    attachments = kind_attachments(kind, customer, inv, overdue, today)
     own = False
     if mailer is None:
         from backend.connectors.resend_mail import ResendMailer

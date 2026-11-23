@@ -446,7 +446,7 @@ export function ReminderEmailHistory({ customerId }) {
     <div className="sc-card overflow-hidden">
       <div className="sc-card-header flex items-center justify-between gap-3 flex-wrap">
         <h2 className="text-base font-bold text-txt-primary">Email automatiche</h2>
-        <span className="text-xs text-txt-muted">Promemoria (il giorno prima della scadenza) e secondo avviso (a 7 giorni dalla scadenza, se non pagata): ultime {items.length}</span>
+        <span className="text-xs text-txt-muted">Promemoria (il giorno prima della scadenza) e secondo avviso (dopo la scadenza, se la fattura non risulta pagata): ultime {items.length}</span>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
