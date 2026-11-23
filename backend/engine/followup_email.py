@@ -24,10 +24,12 @@ Regole (ognuna ha il suo test in tests/test_followup_email.py):
   email in due giorni. Da sola, una fattura scaduta da N−1 giorni non fa
   partire nulla: aspetta il suo giorno.
 - A CHI. Solo alle fatture il cui promemoria pre-scadenza è stato inviato
-  davvero al cliente (riga `sent` in modalità reale per la stessa scadenza):
-  è un secondo avviso, mai il primo. Le altre sono FUORI PERIMETRO: il giro
-  non scrive nulla per loro (niente righe «saltata» nello storico del
-  cliente), l'anteprima le elenca col motivo («promemoria non inviato»).
+  davvero ALLO STESSO cliente (riga `sent` in modalità reale per la stessa
+  scadenza e lo stesso cliente): è un secondo avviso, mai il primo. Le
+  altre — comprese quelle riabbinate a un altro cliente dopo il promemoria
+  — sono FUORI PERIMETRO: il giro non scrive nulla per loro (niente righe
+  «saltata» nello storico del cliente), l'anteprima le elenca col motivo
+  («promemoria non inviato»).
 - IL CONTROLLO DEL PAGAMENTO. L'email afferma «non risulta saldata»: parte
   solo se l'ultimo sync delle fatture è RIUSCITO, completo e recente
   (REMINDER_FOLLOWUP_MAX_SYNC_AGE_HOURS). Altrimenti il giro si ferma senza
@@ -40,14 +42,24 @@ Regole (ognuna ha il suo test in tests/test_followup_email.py):
   email. Una fattura esclusa resta fuori dall'email; le altre partono.
 - LE ALTRE SCADUTE. L'email cita (testo, totale, riepilogo) solo le altre
   scadute CERTE del cliente: fuori quelle forse già pagate, con scadenza
-  stimata, con pagamento promesso, consegnate all'avvocato o con assegno in
-  incasso. Meglio un totale più basso che una richiesta sbagliata.
+  stimata, con pagamento promesso, con l'abbinamento al cliente da
+  verificare, consegnate all'avvocato o con assegno in incasso. Meglio un
+  totale più basso che una richiesta sbagliata.
 - UNA SOLA VOLTA. Una riga per (fattura, scadenza) in
   `invoice_followup_emails`; le righe della stessa email condividono
-  `group_key` e vengono RISERVATE insieme (status sending) prima dell'invio.
-  Stesse protezioni del promemoria (reminder_email.py): Idempotency-Key
-  verso Resend, ritento automatico solo dei fallimenti certamente senza
-  invio, un solo giro alla volta (lock condiviso).
+  `group_key` e vengono RISERVATE insieme (status sending) prima
+  dell'invio: una riga nuova è protetta dal vincolo unico, una riga già
+  esistente si prende solo se è ancora nello stato letto. Un solo giro alla
+  volta (lock condiviso col promemoria).
+- DOPO UN ERRORE. Il giro ritenta da solo soltanto ciò che CERTAMENTE non è
+  partito (PDF non generato, rifiuto di Resend). Timeout, errori del
+  provider, imprevisti e il 409 di Resend («questa chiave l'ho già vista»:
+  il primo invio gli era arrivato) sono esiti INCERTI: la riga resta ferma
+  finché un operatore non preme «Riprova», che rimanda l'email intera alle
+  sole fatture ancora da sollecitare e ancora dello stesso cliente, con la
+  chiave del primo tentativo finché le fatture sono le stesse (per 24 ore
+  Resend blocca così il doppione). Un ritento non declassa mai una riga
+  incerta a «saltata».
 - SPENTO DI DEFAULT. Senza REMINDER_FOLLOWUP_ENABLED=true la modalità è
   «off»: nessuna riga scritta, nessuna email; il pannello mostra l'anteprima
   di ciò che partirebbe. Da acceso segue la modalità del promemoria
@@ -68,9 +80,9 @@ from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, inspect as sa_inspect
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from backend.config import config
 from backend.database import (
@@ -79,8 +91,9 @@ from backend.database import (
 from backend.engine import reminder_email as base
 from backend.engine.action_invoices import delivered_invoice_ids
 from backend.engine.format import fmt_date, fmt_eur, italian_today, safe_filename
+from backend.engine.verify import verify_invoice_customer
 from backend.engine.reminder_email import (
-    ERROR_OTHER, ERROR_PDF, MODE_LABELS, MODE_PROVA, MODE_REALE, MODE_TEST, NOT_REMINDABLE_STATUSES,
+    AUTO_RETRY_KINDS, ERROR_OTHER, ERROR_PDF, ERROR_PROVIDER, ERROR_VALIDATION, MODE_LABELS, MODE_PROVA, MODE_REALE, MODE_TEST, NOT_REMINDABLE_STATUSES,
     SKIP_LABELS, STATUS_FAILED, STATUS_PREPARED, STATUS_SENDING, STATUS_SENT, STATUS_SKIPPED, ModeMismatch,
     NotFound, ReminderBusy, carbon_copies, invoice_label, needs_processing, normalize_email,
     overdue_invoices, resolve_mode, skip_reason,
@@ -221,7 +234,11 @@ def candidate_invoices(session: Session, window: Tuple[date, date],
     )
     if customer_id is not None:
         query = query.filter(Invoice.customer_id == customer_id)
-    return query.order_by(Invoice.due_date.asc(), Invoice.customer_id.asc(), Invoice.invoice_number.asc()).all()
+    return (
+        query.options(joinedload(Invoice.customer))
+        .order_by(Invoice.due_date.asc(), Invoice.customer_id.asc(), Invoice.invoice_number.asc())
+        .all()
+    )
 
 
 def by_customer(invoices: Iterable[Invoice]) -> List[List[Invoice]]:
@@ -234,16 +251,19 @@ def by_customer(invoices: Iterable[Invoice]) -> List[List[Invoice]]:
 
 
 def reminder_sent(session: Session, invoice: Invoice) -> Optional[InvoiceReminderEmail]:
-    """Il promemoria pre-scadenza inviato DAVVERO al cliente per questa
+    """Il promemoria pre-scadenza inviato DAVVERO a QUESTO cliente per questa
     fattura e questa scadenza (None se non c'è: prova, test, saltato,
-    fallito, o scadenza cambiata dopo l'invio)."""
-    if invoice.due_date is None:
+    fallito, scadenza cambiata dopo l'invio, o fattura riabbinata a un altro
+    cliente dopo l'invio: chi non ha ricevuto il primo avviso non riceve il
+    secondo)."""
+    if invoice.due_date is None or invoice.customer_id is None:
         return None
     return (
         session.query(InvoiceReminderEmail)
         .filter(
             InvoiceReminderEmail.invoice_id == invoice.id,
             InvoiceReminderEmail.due_date == invoice.due_date,
+            InvoiceReminderEmail.customer_id == invoice.customer_id,
             InvoiceReminderEmail.status == STATUS_SENT,
             InvoiceReminderEmail.mode == MODE_REALE,
         )
@@ -251,19 +271,36 @@ def reminder_sent(session: Session, invoice: Invoice) -> Optional[InvoiceReminde
     )
 
 
-def followup_extra_skip(session: Session, invoice: Invoice, customer: Optional[Customer]) -> Optional[str]:
-    """Esclusioni proprie del secondo avviso (dopo quelle comuni al
-    promemoria). Il controllo del promemoria è ripetuto qui come cintura."""
-    if reminder_sent(session, invoice) is None:
-        return "senza_promemoria"
-    # Attesa decisa dall'operatore (todo «Attesa» pendente sulla pratica) o
-    # pagamento promesso segnato sulla fattura: un accordo preso a voce non
-    # va scavalcato da un'email automatica.
+def _own_skip(invoice: Invoice, customer: Optional[Customer]) -> Optional[str]:
+    """Esclusioni proprie del secondo avviso: attesa decisa dall'operatore
+    (todo «Attesa» pendente sulla pratica) o pagamento promesso segnato sulla
+    fattura. Un accordo preso a voce non va scavalcato da un'email automatica."""
     if customer is not None and (customer.recovery_status or "") == "waiting":
         return "in_attesa"
     if (invoice.status or "") == "promised":
         return "promessa"
     return None
+
+
+def followup_extra_skip(session: Session, invoice: Invoice, customer: Optional[Customer]) -> Optional[str]:
+    """Esclusioni proprie del secondo avviso (dopo quelle comuni al
+    promemoria). Il controllo del promemoria è ripetuto qui come cintura."""
+    if reminder_sent(session, invoice) is None:
+        return "senza_promemoria"
+    return _own_skip(invoice, customer)
+
+
+def exclusion(invoice: Invoice, customer: Optional[Customer], ignore_email: bool = False) -> Optional[str]:
+    """Perché una fattura IN PERIMETRO (promemoria inviato) non parte: prima
+    le esclusioni comuni al promemoria, poi quelle proprie. Nessuna lettura
+    dal DB. `ignore_email`: l'invio di prova va a un indirizzo interno,
+    quindi l'email del cliente non serve."""
+    reason = skip_reason(invoice, customer)
+    if ignore_email and reason in EMAIL_SKIPS:
+        reason = None
+    if reason is None:
+        reason = _own_skip(invoice, customer)
+    return reason
 
 
 def followup_skip_reason(session: Session, invoice: Invoice, customer: Optional[Customer],
@@ -275,12 +312,7 @@ def followup_skip_reason(session: Session, invoice: Invoice, customer: Optional[
     indirizzo interno, quindi l'email del cliente non serve."""
     if reminder_sent(session, invoice) is None:
         return "senza_promemoria"
-    reason = skip_reason(invoice, customer)
-    if ignore_email and reason in EMAIL_SKIPS:
-        reason = None
-    if reason is None:
-        reason = followup_extra_skip(session, invoice, customer)
-    return reason
+    return exclusion(invoice, customer, ignore_email=ignore_email)
 
 
 def still_due(invoice: Invoice) -> bool:
@@ -295,9 +327,11 @@ def other_overdue_invoices(session: Session, customer_id: int,
     il secondo avviso può citare e sommare: solo quelle CERTE. Rispetto al
     promemoria (overdue_invoices) restano fuori le forse già pagate (sparite
     da FatturaPro, in conferma), quelle con scadenza stimata, quelle con
-    pagamento promesso e quelle già consegnate all'avvocato: in un'email che
-    chiede il saldo non si afferma un debito incerto né si sollecita ciò che
-    segue un'altra strada."""
+    pagamento promesso, quelle il cui abbinamento al cliente è da verificare
+    (stessa regola dell'audit: mai chiedere a un cliente la fattura di un
+    altro) e quelle già consegnate all'avvocato: in un'email che chiede il
+    saldo non si afferma un debito incerto né si sollecita ciò che segue
+    un'altra strada."""
     excluded = set(exclude_ids or ())
     others = [
         inv for inv in overdue_invoices(session, customer_id)
@@ -305,6 +339,7 @@ def other_overdue_invoices(session: Session, customer_id: int,
         and (getattr(inv, "missing_streak", None) or 0) == 0
         and (getattr(inv, "due_date_source", None) or "assumed") == "real"
         and (inv.status or "") != "promised"
+        and _match_is_sure(inv)
     ]
     if not others:
         return others
@@ -317,6 +352,17 @@ def other_overdue_invoices(session: Session, customer_id: int,
         return others
     delivered = delivered_invoice_ids(session, case, others)
     return [inv for inv in others if inv.id not in delivered]
+
+
+def _match_is_sure(invoice: Invoice) -> bool:
+    """L'abbinamento fattura→cliente è certo (verificato dall'operatore o
+    confermato dal confronto P.IVA/ragione sociale)? Un dubbio vale «no»."""
+    if getattr(invoice, "audit_reviewed_at", None) is not None:
+        return True
+    try:
+        return verify_invoice_customer(invoice, invoice.customer).get("verdict") == "ok"
+    except Exception:
+        return False
 
 
 def _existing_row(session: Session, invoice: Invoice) -> Optional[InvoiceFollowupEmail]:
@@ -345,6 +391,8 @@ class CustomerPlan:
     early_ids: Set[int] = field(default_factory=set)
     # Righe già presenti nel registro, per fattura.
     existing: Dict[int, InvoiceFollowupEmail] = field(default_factory=dict)
+    # Il promemoria inviato al cliente, per fattura in perimetro.
+    reminders: Dict[int, InvoiceReminderEmail] = field(default_factory=dict)
     # Perché una fattura dell'email viene (ri)lavorata: nuova / ritento / …
     why: Dict[int, str] = field(default_factory=dict)
     # In finestra e in perimetro ma escluse, col motivo.
@@ -360,7 +408,7 @@ class CustomerPlan:
 
 
 def plan_customer(session: Session, invoices: Iterable[Invoice], window: Tuple[date, date], mode: str,
-                  *, ignore_email: bool = False) -> CustomerPlan:
+                  today: date, *, ignore_email: bool = False) -> CustomerPlan:
     """Decide, per le fatture candidate di UN cliente, cosa succede oggi.
 
     Una fattura è PRONTA se è ancora da saldare, ha avuto il promemoria, non
@@ -368,7 +416,8 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], window: Tuple[d
     motivi di esclusione. L'email parte se almeno una pronta è NELLA finestra
     (scaduta da almeno N giorni); in quel caso porta con sé anche le pronte
     con la scadenza del giorno dopo. Le fatture del giorno dopo, da sole, non
-    producono nulla oggi: né email, né righe, né conteggi.
+    producono nulla oggi: né email, né righe, né conteggi. Una fattura non
+    ancora scaduta (`due_date >= today`) non entra mai, nemmeno da «prossima».
     """
     invoices = _in_email_order(invoices)
     plan = CustomerPlan(customer=invoices[0].customer if invoices else None)
@@ -376,14 +425,19 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], window: Tuple[d
     ready: List[Tuple[Invoice, bool]] = []
     for inv in invoices:
         early = inv.due_date > last
+        if early and inv.due_date >= today:
+            # Con N = 1 il «giorno dopo» sarebbe oggi: non è scaduta, non si sollecita.
+            continue
         if not still_due(inv):
             if not early:
                 plan.settled.append(inv)
             continue
-        if reminder_sent(session, inv) is None:
+        reminder = reminder_sent(session, inv)
+        if reminder is None:
             if not early:
                 plan.out_of_scope.append(inv)
             continue
+        plan.reminders[inv.id] = reminder
         row = _existing_row(session, inv)
         if row is not None:
             plan.existing[inv.id] = row
@@ -394,7 +448,7 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], window: Tuple[d
             if not early:
                 plan.already.append((inv, row, why))
             continue
-        reason = followup_skip_reason(session, inv, inv.customer, ignore_email=ignore_email)
+        reason = exclusion(inv, inv.customer, ignore_email=ignore_email)
         if reason:
             if not early:
                 plan.skipped.append((inv, reason))
@@ -429,13 +483,23 @@ def _join_it(items: List[str]) -> str:
     return ", ".join(items[:-1]) + " e " + items[-1]
 
 
+def _is_partial(invoice: Invoice) -> bool:
+    """Il residuo è più basso dell'importo della fattura (un acconto, una
+    nota di credito)? Allora il testo dice entrambe le cifre: «di 426,76 €»
+    non deve far credere che quello sia ancora tutto da pagare, né che il
+    residuo sia l'importo della fattura."""
+    if invoice.amount is None:
+        return False
+    return float(invoice.amount) - float(invoice.amount_due or 0) > 0.005
+
+
 def compose_followup(customer: Customer, invoices: List[Invoice], overdue: List[Invoice],
                      today: Optional[date] = None) -> dict:
     """Oggetto e testo del secondo avviso per UNA email: diretto, corto, con
     tutti i dettagli — fattura (o elenco delle fatture) con importo, scadenza
     e giorni di ritardo, eventuali altre scadute col totale, coordinate di
     pagamento, cosa fare se ha già pagato. `overdue`: le ALTRE scadute certe
-    del cliente, non elencate qui."""
+    del cliente, non elencate qui. Le cifre da saldare sono sempre i residui."""
     today = today or italian_today()
     invoices = _in_email_order(invoices)
     if not invoices:
@@ -459,42 +523,52 @@ def compose_followup(customer: Customer, invoices: List[Invoice], overdue: List[
     paragraphs = [f"Spett.le {name},"]
     if len(invoices) == 1:
         inv = invoices[0]
-        importo = fmt_eur(inv.amount_due)
+        residuo = fmt_eur(inv.amount_due)
         scadenza = fmt_date(inv.due_date)
-        subject = f"Sollecito di pagamento: fattura n. {numbers[0]} scaduta il {scadenza} ({importo})"
+        giorni = _days_text(lines[0]["days_overdue"])
+        subject = f"Sollecito di pagamento: fattura n. {numbers[0]} scaduta da {giorni} ({residuo})"
+        if _is_partial(inv):
+            stato = f"e risultano ancora da saldare {residuo}"
+            importo = fmt_eur(inv.amount)
+        else:
+            stato = "e non risulta ancora saldata"
+            importo = residuo
         paragraphs.append(
-            f"abbiamo rilevato che la fattura n. {numbers[0]} di {importo} è scaduta da "
-            f"{_days_text(lines[0]['days_overdue'])} (scadenza {scadenza}) e non risulta ancora saldata. "
-            "Copia della fattura in allegato."
+            f"abbiamo rilevato che la fattura n. {numbers[0]} di {importo} è scaduta da {giorni} "
+            f"(scadenza {scadenza}) {stato}. Copia della fattura in allegato."
         )
     else:
         subject = f"Sollecito di pagamento: {len(invoices)} fatture scadute ({fmt_eur(invoices_total)})"
-        elenco = "\n".join(
-            f"- n. {line['number']} di {fmt_eur(inv.amount_due)}, scaduta da "
-            f"{_days_text(line['days_overdue'])} (scadenza {fmt_date(inv.due_date)})"
-            for inv, line in zip(invoices, lines)
-        )
+
+        def riga(inv: Invoice, line: dict) -> str:
+            ritardo = f"scaduta da {_days_text(line['days_overdue'])} (scadenza {fmt_date(inv.due_date)})"
+            if _is_partial(inv):
+                return f"- n. {line['number']} di {fmt_eur(inv.amount)}, da saldare {fmt_eur(inv.amount_due)}, {ritardo}"
+            return f"- n. {line['number']} di {fmt_eur(inv.amount_due)}, {ritardo}"
+
+        elenco = "\n".join(riga(inv, line) for inv, line in zip(invoices, lines))
         paragraphs.append(
             "abbiamo rilevato che le seguenti fatture sono scadute e non risultano ancora saldate:\n" + elenco
         )
         # Con altre scadute il totale complessivo arriva nel paragrafo dopo:
         # qui si dice di che cosa è il totale.
         etichetta = "Totale di queste fatture" if overdue else "Totale"
-        paragraphs.append(f"{etichetta}: {fmt_eur(invoices_total)}. Copia delle fatture in allegato.")
+        paragraphs.append(f"{etichetta}: {fmt_eur(invoices_total)}. Copie delle fatture in allegato.")
     if overdue:
         n = len(overdue)
         if n == 1:
-            altre = f"Risulta inoltre scaduta e non saldata 1 altra fattura per {fmt_eur(total)}."
+            altre = f"Risulta inoltre scaduta e non saldata un'altra fattura per {fmt_eur(total)}."
         else:
             altre = f"Risultano inoltre scadute e non saldate altre {n} fatture per un totale di {fmt_eur(total)}."
         paragraphs.append(f"{altre} Totale da saldare: {fmt_eur(grand_total)}. Riepilogo in allegato.")
     saldo = f"Le chiediamo di provvedere al saldo: bonifico a {config.COMPANY_NAME}"
     if config.COMPANY_IBAN:
         saldo += f", IBAN {config.COMPANY_IBAN}"
-    if len(invoices) == 1:
-        saldo += f", causale \"Fattura {numbers[0]}\"."
-    elif len(invoices) <= MAX_NUMBERS_IN_CAUSALE:
-        saldo += f", causale \"Fatture {_join_it(numbers)}\"."
+    distinct = list(dict.fromkeys(numbers))  # due documenti con lo stesso numero: una volta sola
+    if len(distinct) == 1:
+        saldo += f", causale \"Fattura {distinct[0]}\"."
+    elif len(distinct) <= MAX_NUMBERS_IN_CAUSALE:
+        saldo += f", causale \"Fatture {_join_it(distinct)}\"."
     else:
         saldo += ", indicando nella causale i numeri delle fatture."
     paragraphs.append(saldo)
@@ -530,6 +604,21 @@ def _pdf_view(invoice: Invoice, today: date) -> SimpleNamespace:
     )
 
 
+def _unique_names(names: List[str]) -> List[str]:
+    """Nomi di file senza doppioni (due documenti con lo stesso numero
+    visibile, es. fattura e nota di debito): il secondo prende «_2»."""
+    seen: Dict[str, int] = {}
+    out = []
+    for name in names:
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] == 1:
+            out.append(name)
+            continue
+        stem, dot, ext = name.rpartition(".")
+        out.append(f"{stem}_{seen[name]}.{ext}" if dot else f"{name}_{seen[name]}")
+    return out
+
+
 def build_followup_attachments(customer: Customer, invoices: List[Invoice], overdue: List[Invoice],
                                today: Optional[date] = None) -> List[Tuple[str, bytes]]:
     """Una copia di cortesia per OGNI fattura dell'email + (se il cliente ha
@@ -540,12 +629,12 @@ def build_followup_attachments(customer: Customer, invoices: List[Invoice], over
 
     today = today or italian_today()
     invoices = _in_email_order(invoices)
+    names = _unique_names([
+        f"copia_cortesia_fattura_{safe_filename(invoice_label(inv.invoice_number))}.pdf" for inv in invoices
+    ])
     out = [
-        (
-            f"copia_cortesia_fattura_{safe_filename(invoice_label(inv.invoice_number))}.pdf",
-            bytes(_build_invoice_pdf(customer, _pdf_view(inv, today), courtesy=True)),
-        )
-        for inv in invoices
+        (name, bytes(_build_invoice_pdf(customer, _pdf_view(inv, today), courtesy=True)))
+        for name, inv in zip(names, invoices)
     ]
     if overdue:
         views = [_pdf_view(i, today) for i in list(invoices) + list(overdue)]
@@ -559,10 +648,12 @@ def build_followup_attachments(customer: Customer, invoices: List[Invoice], over
 # ── Registro: le righe della stessa email ─────────────────────────────
 
 def group_key(customer_id: int, invoices: Iterable[Invoice], today: date) -> str:
-    """Identità di UNA email: cliente, giorno, fatture (con la scadenza). La
-    stessa email ritentata lo stesso giorno ha la stessa chiave — è anche la
-    Idempotency-Key verso Resend — mentre un insieme diverso di fatture o un
-    altro giorno (testo diverso: i giorni di ritardo cambiano) ne ha un'altra."""
+    """Identità di UNA email: cliente, giorno del PRIMO tentativo, fatture
+    (con la scadenza). È anche la Idempotency-Key verso Resend. «Riprova» su
+    un invio dall'esito incerto riusa la chiave del primo tentativo finché le
+    fatture sono le stesse (retry_followup_row): se quel tentativo era in
+    realtà arrivato a Resend, per 24 ore Resend risponde 409 e non rimanda.
+    Un insieme diverso di fatture è un'altra email, con un'altra chiave."""
     parts = ",".join(
         f"{inv.id}:{inv.due_date.isoformat() if inv.due_date else ''}"
         for inv in sorted(invoices, key=lambda i: i.id)
@@ -617,8 +708,8 @@ def _item(row: InvoiceFollowupEmail, invoice: Invoice, customer: Optional[Custom
 
 # ── Anteprima ─────────────────────────────────────────────────────────
 
-def _invoice_entry(session: Session, inv: Invoice, today: date, early: bool = False) -> dict:
-    reminder = reminder_sent(session, inv)
+def _invoice_entry(inv: Invoice, today: date, reminder: Optional[InvoiceReminderEmail] = None,
+                   early: bool = False) -> dict:
     return {
         "invoice_id": inv.id,
         "invoice_number": inv.invoice_number,
@@ -631,13 +722,14 @@ def _invoice_entry(session: Session, inv: Invoice, today: date, early: bool = Fa
     }
 
 
-def _entry(session: Session, customer: Optional[Customer], invoices: List[Invoice], today: date, cfg,
-           eval_mode: str, early_ids: Iterable[int] = ()) -> dict:
+def _entry(plan: CustomerPlan, invoices: List[Invoice], today: date, cfg, eval_mode: str,
+           early_ids: Iterable[int] = ()) -> dict:
     """Una riga dell'anteprima: una email (una o più fatture) oppure una
     fattura che oggi non parte, col motivo."""
+    customer = plan.customer
     early_ids = set(early_ids)
     first = invoices[0]
-    items = [_invoice_entry(session, inv, today, early=inv.id in early_ids) for inv in invoices]
+    items = [_invoice_entry(inv, today, plan.reminders.get(inv.id), early=inv.id in early_ids) for inv in invoices]
     amount = round(sum(i["amount_due"] for i in items), 2)
     return {
         "invoice_id": first.id,
@@ -682,10 +774,10 @@ def preview_followups(session: Session, *, now_utc: Optional[datetime] = None, c
     today = italian_today(now_utc)
     out = []
     for invoices in by_customer(candidate_invoices(session, window)):
-        plan = plan_customer(session, invoices, window, eval_mode)
+        plan = plan_customer(session, invoices, window, eval_mode, today)
         customer = plan.customer
         if plan.email:
-            entry = _entry(session, customer, plan.email, today, cfg, eval_mode, plan.early_ids)
+            entry = _entry(plan, plan.email, today, cfg, eval_mode, plan.early_ids)
             overdue = other_overdue_invoices(session, customer.id, exclude_ids=[i.id for i in plan.email])
             msg = compose_followup(customer, plan.email, overdue, today)
             # Se una delle fatture ha già una riga (prova, test, fallita che
@@ -704,7 +796,7 @@ def preview_followups(session: Session, *, now_utc: Optional[datetime] = None, c
             })
             out.append(entry)
         for inv, reason in plan.skipped:
-            entry = _entry(session, customer, [inv], today, cfg, eval_mode)
+            entry = _entry(plan, [inv], today, cfg, eval_mode)
             entry.update({"skip_reason": reason, "skip_label": SKIP_LABELS.get(reason),
                           "why": SKIP_LABELS.get(reason, reason)})
             row = plan.existing.get(inv.id)
@@ -712,13 +804,13 @@ def preview_followups(session: Session, *, now_utc: Optional[datetime] = None, c
                 entry.update({"already": row.status, "already_mode": row.mode})
             out.append(entry)
         for inv in plan.out_of_scope:
-            entry = _entry(session, customer, [inv], today, cfg, eval_mode)
+            entry = _entry(plan, [inv], today, cfg, eval_mode)
             reason = "senza_promemoria"
             entry.update({"skip_reason": reason, "skip_label": SKIP_LABELS.get(reason),
                           "why": SKIP_LABELS.get(reason, reason)})
             out.append(entry)
         for inv, row, why in plan.already:
-            entry = _entry(session, customer, [inv], today, cfg, eval_mode)
+            entry = _entry(plan, [inv], today, cfg, eval_mode)
             entry.update({"already": row.status, "already_mode": row.mode, "why": why})
             out.append(entry)
     return out
@@ -788,6 +880,37 @@ def _record_skip(session: Session, inv: Invoice, row: Optional[InvoiceFollowupEm
             pass
 
 
+class _ReservationLost(Exception):
+    """Una riga già esistente non è più nello stato letto: un altro giro
+    l'ha presa nel frattempo."""
+
+
+# Resend risponde 409 quando la chiave di idempotenza è già stata usata con
+# un contenuto diverso (o la richiesta precedente è ancora in corso): vuol
+# dire che un invio con questa chiave gli è GIÀ arrivato. Non è un rifiuto
+# «certamente non partita»: è il segnale opposto.
+CONFLICT_NOTE = (
+    "Resend ha già ricevuto un invio con la stessa chiave (HTTP 409): il primo tentativo è con ogni "
+    "probabilità partito. Controllare su Resend se l'email risulta consegnata prima di riprovare."
+)
+
+
+def _is_conflict(exc: Exception) -> bool:
+    return getattr(exc, "status_code", None) == 409 or str(exc).startswith("Resend HTTP 409")
+
+
+def _report(summary: dict, rows: List[InvoiceFollowupEmail], invoices: List[Invoice],
+            customer: Optional[Customer]) -> None:
+    """Aggiunge le righe all'esito del giro. Dopo la scrittura finale nulla
+    deve poter far credere fallito un invio riuscito: un errore qui si logga
+    e basta."""
+    try:
+        for row, inv in zip(rows, invoices):
+            summary["items"].append(_item(row, inv, customer, group_size=len(rows)))
+    except Exception as e:
+        logger.error(f"{KIND_LABEL}: esito non riportato nel riepilogo del giro: {e}", exc_info=True)
+
+
 def _process_group(session: Session, customer: Customer, invoices: List[Invoice], *, key: str, mode: str,
                    mailer, cfg, summary: dict, existing: Dict[int, InvoiceFollowupEmail], today: date) -> None:
     """Compone, registra e (fuori dalla prova) invia UNA email per le fatture
@@ -795,6 +918,11 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
     `group_key`, riservate insieme PRIMA dell'invio e chiuse insieme dopo:
     le fatture di un'email hanno sempre lo stesso esito."""
     invoices = _in_email_order(invoices)
+    strangers = [inv.invoice_number for inv in invoices if inv.customer_id != customer.id]
+    if strangers:
+        # Cintura: nessuna strada deve poter mettere nell'email di un cliente
+        # la fattura di un altro.
+        raise ValueError(f"fatture di un altro cliente nell'email: {', '.join(map(str, strangers))}")
     overdue = other_overdue_invoices(session, customer.id, exclude_ids=[i.id for i in invoices])
     msg = compose_followup(customer, invoices, overdue, today)
     real_to = normalize_email(customer.email)
@@ -808,14 +936,29 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
     facts = [(inv.id, inv.due_date, float(inv.amount_due or 0)) for inv in invoices]
 
     # Riserva PRIMA di fare qualsiasi cosa costosa o irreversibile: tutte le
-    # righe dell'email passano a `sending` in UNA scrittura. Se un altro giro
-    # ha già riservato anche una sola di queste fatture il vincolo unico fa
-    # fallire l'intera riserva e l'email non parte.
+    # righe dell'email passano a `sending` in UNA transazione.
+    # - riga nuova: il vincolo unico (fattura, scadenza) la fa fallire se un
+    #   altro giro l'ha già creata;
+    # - riga già esistente (saltata da rivalutare, rifiuto da ritentare,
+    #   prova o test da inviare davvero): la si prende solo se è ANCORA nello
+    #   stato letto (UPDATE … WHERE status = quello letto).
+    # Se anche una sola fattura non si lascia riservare l'email non parte.
     rows: List[InvoiceFollowupEmail] = []
     try:
         with session.no_autoflush:
             for invoice_id, due, amount_due in facts:
-                row = existing.get(invoice_id) or InvoiceFollowupEmail(invoice_id=invoice_id, due_date=due)
+                row = existing.get(invoice_id)
+                if row is None:
+                    row = InvoiceFollowupEmail(invoice_id=invoice_id, due_date=due)
+                    session.add(row)
+                else:
+                    taken = (
+                        session.query(InvoiceFollowupEmail)
+                        .filter(InvoiceFollowupEmail.id == row.id, InvoiceFollowupEmail.status == row.status)
+                        .update({InvoiceFollowupEmail.status: STATUS_SENDING}, synchronize_session=False)
+                    )
+                    if taken != 1:
+                        raise _ReservationLost()
                 row.customer_id = customer_id
                 row.mode = mode
                 row.amount_due = amount_due
@@ -832,77 +975,85 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
                 row.group_key = key
                 row.status = STATUS_SENDING
                 row.attempted_at = attempted_at
-                session.add(row)
                 rows.append(row)
         session.commit()
-    except IntegrityError:
+    except (IntegrityError, _ReservationLost):
         session.rollback()
         summary["already"] += len(invoices)
         return
 
-    def _close() -> None:
-        for row in rows:
-            session.add(row)
-        session.commit()
-        for row, inv in zip(rows, invoices):
-            summary["items"].append(_item(row, inv, customer, group_size=len(rows)))
-
+    outcome = STATUS_FAILED
     try:
         attachments = build_followup_attachments(customer, invoices, overdue, today)
     except Exception as e:  # il PDF non deve far cadere il giro
-        logger.error(f"{KIND_LABEL} {customer.id}: PDF non generato: {e}", exc_info=True)
+        logger.error(f"{KIND_LABEL} cliente {customer_id}: PDF non generato: {e}", exc_info=True)
+        attachments = None
         for row in rows:
             row.status = STATUS_FAILED
             row.error_kind = ERROR_PDF
             row.error = f"PDF non generato: {e}"[:500]
-        summary["failed"] += 1
-        _close()
-        return
-    names = [name for name, _ in attachments]
-    for row in rows:
-        row.attachments_json = names
-
-    if mode == MODE_PROVA:
+    if attachments is not None:
+        names = [name for name, _ in attachments]
         for row in rows:
-            row.status = STATUS_PREPARED
+            row.attachments_json = names
+        if mode == MODE_PROVA:
+            outcome = STATUS_PREPARED
+            for row in rows:
+                row.status = STATUS_PREPARED
+        else:
+            try:
+                message_id = mailer.send(
+                    sender=cfg.REMINDER_EMAIL_FROM,
+                    to=[to_email],
+                    subject=msg["subject"],
+                    text=msg["text"],
+                    html=msg["html"],
+                    reply_to=(getattr(cfg, "REMINDER_EMAIL_REPLY_TO", "") or None),
+                    cc=cc or None,
+                    bcc=(getattr(cfg, "REMINDER_EMAIL_BCC", "") or None) if mode == MODE_REALE else None,
+                    attachments=attachments,
+                    idempotency_key=f"{KIND_KEY}-{key}-{mode}",
+                )
+                outcome = STATUS_SENT
+                sent_at = datetime.utcnow()
+                for row in rows:
+                    row.status = STATUS_SENT
+                    row.sent_at = sent_at
+                    row.provider_message_id = message_id or None
+            except Exception as e:  # messaggio già privo di segreti (MailSendError)
+                logger.error(f"{KIND_LABEL} cliente {customer_id}: invio fallito: {e}")
+                kind, error = base._classify_error(e), str(e)
+                if _is_conflict(e):
+                    # Mai ritentata da sola: stato incerto, decide un operatore.
+                    kind, error = ERROR_PROVIDER, f"{CONFLICT_NOTE} [{error}]"
+                for row in rows:
+                    row.status = STATUS_FAILED
+                    row.error_kind = kind
+                    row.error = error[:500]
+    for row in rows:
+        session.add(row)
+    session.commit()
+    # Solo a scrittura riuscita l'esito entra nei conteggi.
+    if outcome == STATUS_SENT:
+        summary["sent"] += 1
+        summary["invoices"] += len(rows)
+    elif outcome == STATUS_PREPARED:
         summary["prepared"] += 1
         summary["invoices"] += len(rows)
     else:
-        try:
-            message_id = mailer.send(
-                sender=cfg.REMINDER_EMAIL_FROM,
-                to=[to_email],
-                subject=msg["subject"],
-                text=msg["text"],
-                html=msg["html"],
-                reply_to=(getattr(cfg, "REMINDER_EMAIL_REPLY_TO", "") or None),
-                cc=cc or None,
-                bcc=(getattr(cfg, "REMINDER_EMAIL_BCC", "") or None) if mode == MODE_REALE else None,
-                attachments=attachments,
-                idempotency_key=f"{KIND_KEY}-{key}-{mode}",
-            )
-            sent_at = datetime.utcnow()
-            for row in rows:
-                row.status = STATUS_SENT
-                row.sent_at = sent_at
-                row.provider_message_id = message_id or None
-            summary["sent"] += 1
-            summary["invoices"] += len(rows)
-        except Exception as e:  # messaggio già privo di segreti (MailSendError)
-            logger.error(f"{KIND_LABEL} cliente {customer.id}: invio fallito: {e}")
-            for row in rows:
-                row.status = STATUS_FAILED
-                row.error_kind = base._classify_error(e)
-                row.error = str(e)[:500]
-            summary["failed"] += 1
-    _close()
+        summary["failed"] += 1
+    _report(summary, rows, invoices, customer)
 
 
 def _process_group_safely(session: Session, customer: Customer, invoices: List[Invoice], **kwargs) -> None:
     """Un cliente non deve mai far saltare gli altri: eccezioni impreviste →
     rollback, righe `failed` (other: ferme finché un operatore non le
-    ritenta) se possibile, e si prosegue."""
+    ritenta) se possibile, e si prosegue. Una riga che risulta GIÀ inviata o
+    preparata in questa modalità non viene toccata: un errore arrivato dopo
+    l'invio non deve trasformare un'email partita in un «errore» da
+    ritentare."""
     summary = kwargs["summary"]
+    mode = kwargs["mode"]
     ids = [(inv.id, inv.due_date, inv.customer_id, float(inv.amount_due or 0), inv) for inv in invoices]
     try:
         _process_group(session, customer, invoices, **kwargs)
@@ -913,19 +1064,22 @@ def _process_group_safely(session: Session, customer: Customer, invoices: List[I
             rows = []
             for invoice_id, due, customer_id, amount_due, inv in ids:
                 row = session.query(InvoiceFollowupEmail).filter_by(invoice_id=invoice_id, due_date=due).first()
+                if row is not None and row.mode == mode and row.status in (STATUS_SENT, STATUS_PREPARED):
+                    continue
                 if row is None:
                     row = InvoiceFollowupEmail(invoice_id=invoice_id, due_date=due, customer_id=customer_id,
-                                               mode=kwargs["mode"], amount_due=amount_due)
+                                               mode=mode, amount_due=amount_due)
                 row.status = STATUS_FAILED
                 row.error_kind = ERROR_OTHER
                 row.error = f"Errore imprevisto: {e}"[:500]
                 row.group_key = kwargs["key"]
                 session.add(row)
                 rows.append((row, inv))
+            if not rows:
+                return
             session.commit()
             summary["failed"] += 1
-            for row, inv in rows:
-                summary["items"].append(_item(row, inv, inv.customer, group_size=len(rows)))
+            _report(summary, [row for row, _inv in rows], [inv for _row, inv in rows], customer)
         except Exception as inner:
             logger.error(f"{KIND_LABEL}: impossibile registrare l'errore: {inner}")
             try:
@@ -940,7 +1094,7 @@ def _run_customer(session: Session, invoices: List[Invoice], window: Tuple[date,
     pronte. Lo stato delle fatture viene letto ADESSO (dopo ogni commit gli
     oggetti sono ricaricati dal DB): un sync che ne segna una pagata a giro
     in corso la toglie dall'email."""
-    plan = plan_customer(session, invoices, window, mode)
+    plan = plan_customer(session, invoices, window, mode, today)
     summary["settled_meanwhile"] += len(plan.settled)
     summary["out_of_scope"] += len(plan.out_of_scope)
     summary["candidates"] += plan.in_scope + len(plan.early_ids)
@@ -1017,13 +1171,14 @@ def run_followups(
     return summary
 
 
-def _retry_members(session: Session, row: InvoiceFollowupEmail,
+def _retry_members(session: Session, row: InvoiceFollowupEmail, inv: Invoice,
                    today: date) -> List[Tuple[Invoice, InvoiceFollowupEmail]]:
     """Le ALTRE righe della stessa email ancora ferme (fallite o interrotte)
-    e ancora da sollecitare: si ritentano insieme alla riga scelta, così il
-    cliente riceve di nuovo UNA email e non una per fattura. Una fattura nel
-    frattempo saldata, con la scadenza cambiata o non più scaduta resta
-    fuori (la sua riga non cambia)."""
+    che si possono ritentare insieme alla riga scelta, così il cliente
+    riceve di nuovo UNA email e non una per fattura. Resta fuori — e la sua
+    riga non cambia — una fattura nel frattempo saldata, con la scadenza
+    cambiata, non più scaduta, passata a un ALTRO cliente (riabbinata dopo
+    il tentativo) o con un motivo di esclusione."""
     if not row.group_key:
         return []
     others = (
@@ -1031,7 +1186,6 @@ def _retry_members(session: Session, row: InvoiceFollowupEmail,
         .filter(
             InvoiceFollowupEmail.group_key == row.group_key,
             InvoiceFollowupEmail.id != row.id,
-            InvoiceFollowupEmail.customer_id == row.customer_id,
             InvoiceFollowupEmail.status.in_((STATUS_FAILED, STATUS_SENDING)),
         )
         .order_by(InvoiceFollowupEmail.id.asc())
@@ -1039,13 +1193,29 @@ def _retry_members(session: Session, row: InvoiceFollowupEmail,
     )
     out = []
     for other in others:
-        inv = session.query(Invoice).filter(Invoice.id == other.invoice_id).first()
-        if inv is None or not still_due(inv):
+        member = session.query(Invoice).filter(Invoice.id == other.invoice_id).first()
+        if member is None or not still_due(member):
             continue
-        if inv.due_date is None or inv.due_date != other.due_date or inv.due_date >= today:
+        if member.customer_id != inv.customer_id:
             continue
-        out.append((inv, other))
+        if member.due_date is None or member.due_date != other.due_date or member.due_date >= today:
+            continue
+        if followup_skip_reason(session, member, member.customer):
+            continue
+        out.append((member, other))
     return out
+
+
+def _same_email(session: Session, row: InvoiceFollowupEmail, invoices: List[Invoice]) -> bool:
+    """Le fatture date sono ESATTAMENTE quelle dell'email a cui la riga
+    apparteneva (stesse fatture, stesse scadenze)?"""
+    if not row.group_key:
+        return False
+    original = {
+        (r.invoice_id, r.due_date) for r in
+        session.query(InvoiceFollowupEmail).filter(InvoiceFollowupEmail.group_key == row.group_key).all()
+    }
+    return original == {(inv.id, inv.due_date) for inv in invoices}
 
 
 def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=None, cfg=None,
@@ -1053,8 +1223,16 @@ def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=No
                        now_utc: Optional[datetime] = None) -> dict:
     """Ritenta UN secondo avviso fermo (`failed` o `sending` orfana), insieme
     alle altre fatture della stessa email ancora ferme. La fattura deve
-    essere ancora scaduta e non saldata, con la stessa scadenza; valgono lo
-    spento e il controllo del sync del giro."""
+    essere ancora scaduta e non saldata, con la stessa scadenza e senza
+    motivi di esclusione; valgono lo spento e il controllo del sync del giro.
+
+    Un ritento NON trasforma mai una riga dall'esito incerto in «saltata»
+    (che il giro poi rivaluterebbe da solo): se oggi non si può inviare, la
+    riga resta com'è e l'operatore legge il perché.
+
+    L'email va al cliente a cui la fattura appartiene ADESSO, con le sole
+    fatture che sono ancora sue.
+    """
     cfg = cfg or config
     if row.status not in (STATUS_FAILED, STATUS_SENDING):
         raise ValueError("si ritentano solo gli avvisi falliti o interrotti")
@@ -1080,30 +1258,37 @@ def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=No
     if not base._reminder_lock.acquire(blocking=False):
         raise ReminderBusy()
     try:
+        # Sotto il lock la riga si RILEGGE: un secondo clic arrivato mentre il
+        # primo ritento era in corso trova la riga già inviata e si ferma.
+        if sa_inspect(row).persistent:
+            session.refresh(row)
+            if row.status not in (STATUS_FAILED, STATUS_SENDING):
+                raise ValueError("si ritentano solo gli avvisi falliti o interrotti")
+        customer = inv.customer
+        reason = followup_skip_reason(session, inv, customer)
+        if reason:
+            raise ValueError(f"secondo avviso non inviabile ora: {SKIP_LABELS.get(reason, reason)}")
+        members = [(inv, row)] + _retry_members(session, row, inv, today)
+        ready = [member for member, _row in members]
+        days = followup_days(cfg)
+        if not any(days_overdue_on(member, today) >= days for member in ready):
+            raise ValueError(
+                f"la fattura è scaduta da meno di {days} giorni e le altre della stessa email non sono più "
+                "da sollecitare: si potrà ritentare dal giorno in cui compie i giorni previsti"
+            )
+        # Esito incerto del primo tentativo + stesse fatture → stessa chiave:
+        # se quel tentativo era arrivato a Resend, per 24 ore Resend non rimanda.
+        uncertain = row.status == STATUS_SENDING or (row.error_kind or ERROR_OTHER) not in AUTO_RETRY_KINDS
+        key = row.group_key if (uncertain and _same_email(session, row, ready)) else group_key(customer.id, ready, today)
         mode, _missing, mailer, own_mailer = base._resolve_runtime(cfg, mailer, mode)
         summary = _summary(mode, missing, None)
         summary["sync"] = gate
-        members = [(inv, row)] + _retry_members(session, row, today)
         summary["candidates"] = len(members)
         try:
-            ready: List[Invoice] = []
-            skipped = []
-            existing: Dict[int, InvoiceFollowupEmail] = {}
-            for member, member_row in members:
-                reason = followup_skip_reason(session, member, member.customer)
-                if reason:
-                    skipped.append((member, member_row, reason))
-                    continue
-                ready.append(member)
-                existing[member.id] = member_row
-            if ready:
-                customer = inv.customer
-                _process_group_safely(
-                    session, customer, ready, key=group_key(customer.id, ready, today), mode=mode,
-                    mailer=mailer, cfg=cfg, summary=summary, existing=existing, today=today,
-                )
-            for member, member_row, reason in skipped:
-                _record_skip(session, member, member_row, reason, mode, summary)
+            _process_group_safely(
+                session, customer, ready, key=key, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
+                existing={member.id: member_row for member, member_row in members}, today=today,
+            )
         finally:
             if own_mailer and mailer is not None:
                 mailer.close()
@@ -1122,7 +1307,8 @@ def email_group_of(session: Session, invoice: Invoice, *, now_utc: Optional[date
     if window is None:
         return [invoice]
     candidates = candidate_invoices(session, window, customer_id=invoice.customer_id)
-    plan = plan_customer(session, candidates, window, resolve_mode(cfg)[0], ignore_email=True)
+    plan = plan_customer(session, candidates, window, resolve_mode(cfg)[0], italian_today(now_utc),
+                         ignore_email=True)
     if any(inv.id == invoice.id for inv in plan.email):
         return plan.email
     return [invoice]

@@ -19,6 +19,7 @@ import {
 // cosa partirebbe e si può inviare una prova a un indirizzo interno.
 
 const OFF_STYLE = MODE_STYLE.prova
+const giorni = (n) => (n === 1 ? '1 giorno' : `${n} giorni`)
 
 export default function FollowupEmailPanel() {
   const navigate = useNavigate()
@@ -90,8 +91,11 @@ export default function FollowupEmailPanel() {
     const what = others.length
       ? `l'email unica con le fatture ${[row.invoice_number, ...others].join(', ')}`
       : `la fattura ${row.invoice_number}`
+    // L'esito del tentativo precedente è incerto: se era partito, un nuovo
+    // invio può arrivare al cliente una seconda volta (Resend lo blocca solo
+    // entro 24 ore e solo se le fatture sono le stesse). Lo si dice chiaro.
     const msg = fresh.mode === 'reale'
-      ? `Ritento ADESSO l'invio AL CLIENTE (${row.to_email}) del secondo avviso per ${what}. Se l'invio precedente fosse in realtà partito, Resend non lo duplica. Procedere?`
+      ? `Ritento ADESSO l'invio AL CLIENTE (${row.original_to || row.to_email}) del secondo avviso per ${what}.\n\nPrima controlla su Resend che l'email precedente non risulti già consegnata: in quel caso il cliente la riceverebbe due volte.\n\nProcedere?`
       : fresh.mode === 'test'
         ? `Ritento l'invio di prova a ${fresh.test_to} per ${what}. Procedere?`
         : `Ritento il secondo avviso per ${what} (modalità: ${fresh.mode_label}). Procedere?`
@@ -139,7 +143,7 @@ export default function FollowupEmailPanel() {
   const header = (
     <div className="sc-card-header bg-dark-surface flex items-center justify-between gap-3 flex-wrap">
       <div className="flex items-center gap-3 flex-wrap">
-        <h3 className="sc-section-title">Secondo avviso email (fattura scaduta{data ? ` da ${data.days_after_due} giorni` : ''})</h3>
+        <h3 className="sc-section-title">Secondo avviso email (fattura scaduta{data ? ` da ${giorni(data.days_after_due)}` : ''})</h3>
         {data && (
           <span className={`sc-badge ${data.enabled ? (MODE_STYLE[data.mode] || MODE_STYLE.prova) : OFF_STYLE}`} data-testid="followup-mode">
             {data.mode_label}
@@ -150,7 +154,7 @@ export default function FollowupEmailPanel() {
         <span className="text-xs text-txt-muted">
           Ogni giorno alle {data.schedule}, dopo i promemoria · {data.weekend
             ? 'weekend: nessun invio (le scadenze di sabato e domenica partono il lunedì)'
-            : `scadenze dal ${fmtDate(data.window[0])} al ${fmtDate(data.window[1])} (unite fino al ${fmtDate(data.merge_until)})`}
+            : `scadenze dal ${fmtDate(data.window[0])} al ${fmtDate(data.window[1])}, più quelle del ${fmtDate(data.merge_until)} se dello stesso cliente`}
         </span>
       )}
     </div>
@@ -175,7 +179,7 @@ export default function FollowupEmailPanel() {
       {/* Regole e stato */}
       <div className="px-6 py-4 border-b border-dark-border text-sm space-y-2">
         <p className="text-txt-secondary">
-          Se a {data.days_after_due} giorni dalla scadenza la fattura a cui è stato inviato il promemoria risulta ancora non pagata, il cliente riceve una seconda email, più diretta: la fattura è scaduta, chiediamo il saldo. <span className="text-txt-primary">Una sola email per cliente</span>: se ha più fatture da sollecitare, o un'altra con la scadenza del giorno dopo, partono insieme in un'unica email con l'elenco e il totale. In allegato la copia di ogni fattura e, se ha altre scadute certe (non in conferma di pagamento, con scadenza stimata, promesse o dall'avvocato), il riepilogo con il totale. Una volta sola per fattura; mai nel weekend.
+          Se a {giorni(data.days_after_due)} dalla scadenza la fattura a cui è stato inviato il promemoria risulta ancora non pagata, il cliente riceve una seconda email, più diretta: la fattura è scaduta, chiediamo il saldo. <span className="text-txt-primary">Una sola email per cliente</span>: se ha più fatture da sollecitare, o un'altra con la scadenza del giorno dopo, partono insieme in un'unica email con l'elenco e il totale. In allegato la copia di ogni fattura e, se ha altre scadute certe (non in conferma di pagamento, con scadenza stimata, promesse o dall'avvocato), il riepilogo con il totale. Una volta sola per fattura; mai nel weekend.
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs">
           <p><span className="text-txt-muted">Mittente:</span> <span className="text-txt-primary">{data.sender || '—'}</span></p>
@@ -206,7 +210,7 @@ export default function FollowupEmailPanel() {
           <div className="flex items-center gap-3 flex-wrap min-h-[2rem]">
             <p className="text-sm font-semibold text-txt-primary">
               {data.weekend ? 'Weekend: nessun avviso oggi' : `Prossimo giro: ${preview.length === 0 ? 'nessuna fattura' : toSend.length === 0 ? 'nessuna email da inviare' : `${toSend.length} email per ${toSendInvoices} fattur${toSendInvoices === 1 ? 'a' : 'e'}`}`}
-              {preview.length > 0 && <span className="text-txt-muted font-normal">{toSend.length > 0 ? ` · ${data.enabled ? 'da lavorare' : 'da inviare se acceso'}` : ''}{notSent > 0 ? ` · ${notSent} fattur${notSent === 1 ? 'a non parte' : 'e non partono'}` : ''}</span>}
+              {preview.length > 0 && <span className="text-txt-muted font-normal">{toSend.length > 0 ? ` · ${data.enabled ? 'da lavorare' : 'da inviare se acceso'}` : ''}{notSent > 0 ? ` · ${notSent} fattur${notSent === 1 ? 'a già lavorata o esclusa' : 'e già lavorate o escluse'}` : ''}</span>}
             </p>
             {runResult && (
               <span className={`text-xs ${runResult.error || runResult.blocked ? 'text-accent-red' : 'text-txt-secondary'}`} role="status">
@@ -216,7 +220,7 @@ export default function FollowupEmailPanel() {
                     ? runResult.info
                     : runResult.blocked
                       ? `Non eseguito: ${runResult.blocked_label}`
-                      : `Esito: ${runResult.sent} email inviate · ${runResult.prepared} preparate · ${runResult.invoices} fatture nelle email · ${runResult.skipped} saltate · ${runResult.failed} errori · ${runResult.already} non lavorate`}
+                      : `Esito: ${runResult.sent} email inviate · ${runResult.prepared} email preparate · ${runResult.failed} email fallite · fatture: ${runResult.invoices} nelle email, ${runResult.skipped} saltate, ${runResult.already} non lavorate`}
               </span>
             )}
           </div>
@@ -257,10 +261,10 @@ export default function FollowupEmailPanel() {
                         )}
                         <td className="py-2 pr-3 font-mono text-xs text-txt-secondary align-top">
                           {inv.invoice_number}
-                          {inv.early && <span className="block text-txt-muted font-sans">unita: scade il giorno dopo</span>}
+                          {inv.early && <span className="block text-txt-muted font-sans">unita: scadenza a un giorno</span>}
                         </td>
                         <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap align-top">
-                          {fmtDate(inv.due_date)} <span className="text-txt-muted">· {inv.days_overdue} giorni</span>
+                          {fmtDate(inv.due_date)} <span className="text-txt-muted">· {giorni(inv.days_overdue)}</span>
                           {inv.reminder_sent_at && <span className="block text-txt-muted">promemoria: {fmtDateTime(inv.reminder_sent_at)}</span>}
                         </td>
                         <td className="py-2 pr-3 text-right text-txt-primary align-top">{fmtEur(inv.amount_due)}</td>

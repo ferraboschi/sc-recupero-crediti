@@ -1,5 +1,6 @@
 """APScheduler integration for scheduled jobs."""
 
+import time
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -158,11 +159,32 @@ def run_followup_email_job():
             pass
 
 
+# Un giro avviato a mano (pulsante, «Riprova») tiene lo stesso lock del giro
+# del mattino. Invece di saltare il giro («busy») lo si riprova per qualche
+# minuto: un clic alle 09:15 non deve far perdere le email del giorno.
+EMAIL_JOB_BUSY_RETRIES = 9
+EMAIL_JOB_BUSY_WAIT_SECONDS = 30
+
+
+def _retry_while_busy(job):
+    out = job()
+    for _ in range(EMAIL_JOB_BUSY_RETRIES):
+        if not (isinstance(out, dict) and out.get("skipped") == "busy"):
+            break
+        time.sleep(EMAIL_JOB_BUSY_WAIT_SECONDS)
+        out = job()
+    return out
+
+
 def run_email_jobs():
     """Il giro email del mattino: prima i promemoria pre-scadenza, poi i
     secondi avvisi. In sequenza (condividono il lock) e isolati: ognuno
-    cattura i propri errori, quindi il guasto dell'uno non ferma l'altro."""
-    return {"reminder": run_reminder_email_job(), "followup": run_followup_email_job()}
+    cattura i propri errori, quindi il guasto dell'uno non ferma l'altro. Se
+    un giro manuale è in corso, ognuno aspetta e riprova (fino a ~5 minuti)."""
+    return {
+        "reminder": _retry_while_busy(run_reminder_email_job),
+        "followup": _retry_while_busy(run_followup_email_job),
+    }
 
 
 def run_reminder_email_catchup():

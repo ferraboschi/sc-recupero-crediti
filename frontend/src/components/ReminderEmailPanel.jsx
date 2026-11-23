@@ -111,7 +111,7 @@ export function Attachments({ row }) {
   return (
     <span className="flex flex-wrap gap-1">
       {row.attachments.map((name, i) => (
-        <button key={name} type="button" onClick={() => download(i, name)} disabled={busy !== null}
+        <button key={`${i}-${name}`} type="button" onClick={() => download(i, name)} disabled={busy !== null}
           className="text-xs text-accent-teal underline hover:text-accent-cyan disabled:opacity-50"
           title={`Scarica ${name} (rigenerato dai dati attuali)`}>
           {busy === i ? '…' : label(name, i)}
@@ -463,18 +463,26 @@ export function ReminderEmailHistory({ customerId }) {
     return () => { alive = false }
   }, [customerId])
   if (!items || items.length === 0) return null
+  // Finché il cliente non ha secondi avvisi la scheda resta quella di sempre
+  // (titolo, sottotitolo, colonne): niente «secondo avviso» a video se non
+  // ne è mai partito uno.
+  const hasFollowup = items.some(row => row.kind === 'followup')
   return (
     <div className="sc-card overflow-hidden">
       <div className="sc-card-header flex items-center justify-between gap-3 flex-wrap">
-        <h2 className="text-base font-bold text-txt-primary">Email automatiche</h2>
-        <span className="text-xs text-txt-muted">Promemoria (il giorno prima della scadenza) e secondo avviso (dopo la scadenza, se la fattura non risulta pagata): ultime {items.length}</span>
+        <h2 className="text-base font-bold text-txt-primary">{hasFollowup ? 'Email automatiche' : 'Promemoria email'}</h2>
+        <span className="text-xs text-txt-muted">
+          {hasFollowup
+            ? `Promemoria (il giorno prima della scadenza) e secondo avviso (dopo la scadenza, se la fattura non risulta pagata): ultime ${items.length}`
+            : `Registro dei promemoria automatici (il giorno prima della scadenza, il venerdì per il weekend): ultimi ${items.length}`}
+        </span>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="text-xs uppercase tracking-wider text-txt-label border-b border-dark-border">
               <th className="text-left px-6 py-2">Quando</th>
-              <th className="text-left px-3 py-2">Tipo</th>
+              {hasFollowup && <th className="text-left px-3 py-2">Tipo</th>}
               <th className="text-left px-3 py-2">Fattura</th>
               <th className="text-right px-3 py-2">Importo</th>
               <th className="text-left px-3 py-2">Stato</th>
@@ -486,7 +494,7 @@ export function ReminderEmailHistory({ customerId }) {
             {items.map(row => (
               <tr key={`${row.kind}-${row.id}`}>
                 <td className="px-6 py-2 text-xs text-txt-secondary whitespace-nowrap">{fmtDateTime(row.sent_at || row.attempted_at || row.created_at)}</td>
-                <td className="px-3 py-2 text-xs text-txt-secondary whitespace-nowrap">{KIND_LABEL[row.kind] || KIND_LABEL.promemoria}</td>
+                {hasFollowup && <td className="px-3 py-2 text-xs text-txt-secondary whitespace-nowrap">{KIND_LABEL[row.kind] || KIND_LABEL.promemoria}</td>}
                 <td className="px-3 py-2 font-mono text-xs text-txt-secondary whitespace-nowrap">
                   {row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span>
                   <GroupNote row={row} />

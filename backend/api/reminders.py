@@ -198,12 +198,20 @@ def reminder_email_log(
 ):
     items = []
     for model, kind in ((InvoiceReminderEmail, "promemoria"), (InvoiceFollowupEmail, followup.KIND_KEY)):
-        query = _rows_query(session, model)
-        if customer_id is not None:
-            query = query.filter(model.customer_id == customer_id)
-        rows = query.order_by(model.created_at.desc(), model.id.desc()).limit(limit).all()
-        groups = followup.group_members(session, [r for r, _i, _c in rows]) if kind == followup.KIND_KEY else None
-        items.extend(_serialize(r, i, c, kind, groups) for r, i, c in rows)
+        try:
+            query = _rows_query(session, model)
+            if customer_id is not None:
+                query = query.filter(model.customer_id == customer_id)
+            rows = query.order_by(model.created_at.desc(), model.id.desc()).limit(limit).all()
+            groups = followup.group_members(session, [r for r, _i, _c in rows]) if kind == followup.KIND_KEY else None
+            items.extend(_serialize(r, i, c, kind, groups) for r, i, c in rows)
+        except Exception as e:
+            if kind != followup.KIND_KEY:
+                raise
+            # Il registro dei secondi avvisi non deve mai nascondere quello dei
+            # promemoria (già letto qui sopra): si logga e si prosegue.
+            logger.error(f"Registro dei secondi avvisi non leggibile: {e}", exc_info=True)
+            session.rollback()
     # Promemoria e secondi avvisi insieme, dal più recente (le date ISO si
     # ordinano come testo; una riga senza data va in fondo).
     items.sort(key=lambda it: (it["created_at"] or "", it["kind"], it["id"]), reverse=True)
@@ -379,15 +387,30 @@ def followup_email_attachment(row_id: int, index: int, session: Session = Depend
     row, invoice, customer = _followup_row(session, row_id)
     if invoice is None or customer is None:
         raise HTTPException(status_code=404, detail="Fattura o cliente non più disponibili")
+    gone = HTTPException(
+        status_code=404,
+        detail="Allegato non più disponibile: viene rigenerato dai dati attuali e le scadute sono cambiate",
+    )
     invoices = followup.row_invoices(session, row)
     overdue = followup.other_overdue_invoices(session, customer.id, exclude_ids=[i.id for i in invoices])
     attachments = followup.build_followup_attachments(customer, invoices, overdue)
-    if index < 0 or index >= len(attachments):
-        raise HTTPException(
-            status_code=404,
-            detail="Allegato non più disponibile: viene rigenerato dai dati attuali e le scadute sono cambiate",
-        )
-    name, content = attachments[index]
+    stored = row.attachments_json or []
+    if index < 0:
+        raise gone
+    if stored:
+        # L'allegato si cerca per NOME (quello registrato all'invio), non per
+        # posizione: se nel frattempo l'ordine o l'insieme è cambiato non si
+        # consegna un altro documento sotto il nome di questo.
+        if index >= len(stored):
+            raise gone
+        found = next(((n, c) for n, c in attachments if n == stored[index]), None)
+        if found is None:
+            raise gone
+        name, content = found
+    else:
+        if index >= len(attachments):
+            raise gone
+        name, content = attachments[index]
     return StreamingResponse(
         BytesIO(content),
         media_type="application/pdf",
