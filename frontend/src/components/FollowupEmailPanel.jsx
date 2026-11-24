@@ -348,7 +348,8 @@ export default function FollowupEmailPanel() {
                         <AgentBadges agents={row.agents} className="ml-2" />
                       </td>
                       <td className="py-2 pr-3 font-mono text-xs text-txt-secondary whitespace-nowrap">
-                        {row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span>
+                        {row.invoice_number}
+                        <span className="block text-txt-muted font-sans">scad. {fmtDate(row.due_date)}</span>
                         <GroupNote row={row} />
                       </td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(row.amount_due)}</td>
