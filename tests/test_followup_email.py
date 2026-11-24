@@ -1398,12 +1398,16 @@ class TestOneEmailPerCustomer:
         p1 = _due(test_db_session, c, num="P/1", amount=11.0)
         p2 = _due(test_db_session, c, num="P/2", amount=12.0)
         p3 = _due(test_db_session, c, num="P/3", amount=13.0)
-        certain = row(p1, "failed", "chiave-2", error_kind="validation", idempotency_key="k-certa")
-        unsure = row(p2, "failed", "chiave-2", error_kind="network", idempotency_key="k-incerta")
+        certain = row(p1, "failed", "chiave-2", error_kind="validation", idempotency_key="k-certa",
+                      key_first_used_at=datetime(2026, 11, 18, 9, 0))
+        unsure = row(p2, "failed", "chiave-2", error_kind="network", idempotency_key="k-incerta",
+                     key_first_used_at=datetime(2026, 11, 18, 7, 0))
         blocked = row(p3, "failed", "chiave-2", error_kind="conflict", idempotency_key="k-incerta")
         refusing = FakeMailer(fail_times=1, kind=ERROR_VALIDATION)
         out = retry_followup_row(test_db_session, certain, mailer=refusing, cfg=_on_cfg())
         assert (out["failed"], out["candidates"]) == (1, 2) and refusing.keys == ["k-incerta"]
+        # La chiave riusata è nata alle 7: vale per tutte le righe del tentativo (il primo uso più vecchio).
+        assert certain.key_first_used_at == unsure.key_first_used_at == datetime(2026, 11, 18, 7, 0)
         assert (certain.error_kind, unsure.error_kind, blocked.error_kind) == ("other", "other", "conflict")
         assert certain.group_key == unsure.group_key != blocked.group_key
         out = retry_followup_row(test_db_session, unsure, mailer=refusing, cfg=_on_cfg())
