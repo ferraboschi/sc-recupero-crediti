@@ -91,7 +91,8 @@ export default function FollowupEmailPanel() {
     const what = others.length
       ? `l'email unica con le fatture ${[row.invoice_number, ...others].join(', ')}`
       : `la fattura ${row.invoice_number}`
-    const to = row.original_to || row.to_email
+    // A chi andrebbe ADESSO (l'email attuale del cliente), non a chi era andato il tentativo.
+    const to = row.current_to || row.original_to || row.to_email
     // Dopo un 409 di Resend, o oltre un giorno da un invio reale dall'esito
     // incerto, Resend non ferma più un doppione: il server parte solo con la
     // conferma esplicita di chi ha controllato che l'email NON è arrivata.
@@ -120,7 +121,7 @@ export default function FollowupEmailPanel() {
 
   const retryButton = (row) => (row.status === 'failed' || row.status === 'sending') && (
     <button type="button" onClick={() => retry(row)} disabled={retryingId !== null || running} className="sc-btn-secondary text-xs disabled:opacity-50"
-      title={row.retry_needs_confirmation ? 'Solo dopo aver controllato su Resend che non è arrivata' : row.needs_manual_retry ? 'Ferma finché non la ritenti tu' : 'Verrà ritentata anche al prossimo giro'}>
+      title={row.retry_needs_confirmation ? 'Solo dopo aver controllato su Resend che non è arrivata' : row.will_auto_retry ? 'Verrà ritentata anche al prossimo giro' : 'Ferma finché non la ritenti tu'}>
       {retryingId === row.id ? '…' : row.retry_needs_confirmation ? 'Invia comunque…' : 'Riprova'}
     </button>
   )
@@ -128,11 +129,13 @@ export default function FollowupEmailPanel() {
   // Cosa dire, in breve, di una riga ferma.
   const stuckReason = (row) => row.error_kind === 'conflict'
     ? 'Resend l\'aveva già ricevuta: con ogni probabilità è partita. Verifica su Resend prima di inviare di nuovo.'
-    : row.status === 'sending'
-      ? 'Invio interrotto a metà: potrebbe essere partita.'
-      : row.needs_manual_retry
-        ? `Esito incerto: potrebbe essere partita. ${row.error || ''}`
-        : `Non è partita: il giro la riprova da solo. ${row.error || ''}`
+    : row.will_auto_retry
+      ? `Il giro la riprende da solo al prossimo passaggio. ${row.error || ''}`
+      : row.status === 'sending'
+        ? 'Invio interrotto a metà: potrebbe essere partita.'
+        : (row.error_kind === 'pdf' || row.error_kind === 'validation' || row.error_kind === 'not_attempted')
+          ? `Non è partita e il giro non la riprende più (fuori dai giorni di recupero): ritentala tu. ${row.error || ''}`
+          : `Esito incerto: potrebbe essere partita. ${row.error || ''}`
 
   const sendTest = async (p) => {
     const what = (p.invoice_count || 1) > 1 ? `${p.invoice_count} fatture in un'unica email` : `fattura ${p.invoice_number}`

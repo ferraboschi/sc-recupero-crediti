@@ -19,8 +19,8 @@ from backend.engine.agents import agents_of
 from backend.connectors.resend_mail import MailSendError
 from backend.engine.reminder_email import (
     AUTO_RETRY_KINDS, MODE_LABELS, SKIP_LABELS, ModeMismatch, NotFound, ReminderBusy, agent_emails,
-    build_attachments, carbon_copies, overdue_invoices, preview, resolve_mode, retry_row, run_reminders,
-    send_test, target_due_dates,
+    build_attachments, carbon_copies, normalize_email, overdue_invoices, preview, resolve_mode, retry_row,
+    run_reminders, send_test, target_due_dates,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,7 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
     group_key = getattr(row, "group_key", None)
     members = (groups or {}).get(group_key) or [] if group_key else []
     is_followup = kind == followup.KIND_KEY
+    flags = _followup_flags(row, invoice, customer) if is_followup else {}
     return {
         "id": row.id,
         "kind": kind,
@@ -75,14 +76,18 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
         "error_kind": row.error_kind,
         # Ferma finché un operatore non preme «Riprova»? (secondo avviso: anche
         # «nessun invio tentato» si ritenta da solo)
-        "needs_manual_retry": followup._is_uncertain(row) if is_followup else (
+        "needs_manual_retry": flags["needs_manual_retry"] if is_followup else (
             row.status == "sending" or (
                 row.status == "failed" and (row.error_kind or "other") not in AUTO_RETRY_KINDS
             )
         ),
         # Secondo avviso: «Riprova» può creare un doppione che Resend non
         # fermerebbe (dopo un 409, o oltre un giorno): serve «Invia comunque».
-        "retry_needs_confirmation": bool(is_followup and followup.needs_confirmation(row)),
+        "retry_needs_confirmation": flags.get("retry_needs_confirmation", False),
+        # Secondo avviso, riga ferma: il giro la riprenderà da solo?
+        "will_auto_retry": flags.get("will_auto_retry", False),
+        # Secondo avviso: l'indirizzo a cui andrebbe un ritento ADESSO.
+        "current_to": flags.get("current_to"),
         "attempted_at": row.attempted_at.isoformat() if row.attempted_at else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "sent_at": row.sent_at.isoformat() if row.sent_at else None,
@@ -91,6 +96,30 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
         "group_key": group_key,
         "group_size": max(len(members), 1),
         "group_invoices": [m for m in members if m["row_id"] != row.id],
+    }
+
+
+def _followup_flags(row, invoice: Optional[Invoice], customer: Optional[Customer]) -> dict:
+    """Come si presenta una riga del secondo avviso nella modalità in cui si
+    invierebbe ADESSO: chi deve muoversi (operatore o giro) e con quale
+    cautela."""
+    send_mode = resolve_mode()[0]
+    in_mode = followup._in_mode(row, send_mode)
+    uncertain = followup._is_uncertain(row)
+    stuck = followup._is_stuck(row)
+    window = followup.followup_window()
+    in_window = bool(
+        window and invoice is not None and invoice.due_date is not None
+        and window[0] <= invoice.due_date <= followup.merge_until(window)
+    )
+    # Il giro la riprende da sola se è ancora nella finestra e l'esito non è
+    # incerto in questa modalità (una riga di prova/test, in reale, è nuova).
+    auto = stuck and in_window and not (uncertain and in_mode)
+    return {
+        "needs_manual_retry": bool(stuck and not auto),
+        "retry_needs_confirmation": bool(followup.needs_confirmation(row, mode=send_mode)),
+        "will_auto_retry": bool(auto),
+        "current_to": normalize_email(customer.email) if customer is not None else None,
     }
 
 

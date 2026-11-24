@@ -812,45 +812,58 @@ def preview_followups(session: Session, *, now_utc: Optional[datetime] = None, c
     today = italian_today(now_utc)
     out = []
     for customer_id, invoices in by_customer(candidate_invoices(session, window)):
-        plan = plan_customer(session, invoices, window, eval_mode, today, customer_id=customer_id)
-        customer = plan.customer
-        if plan.email:
-            entry = _entry(plan, plan.email, today, cfg, eval_mode, plan.early_ids)
-            overdue = other_overdue_invoices(session, customer.id, exclude_ids=[i.id for i in plan.email])
-            msg = compose_followup(customer, plan.email, overdue, today)
-            # Se una delle fatture ha già una riga (prova, test, fallita che
-            # si ritenta) l'anteprima dice perché riparte.
-            redo = next((plan.existing[i.id] for i in plan.email if i.id in plan.existing), None)
-            entry.update({
-                "will_process": True,
-                "why": plan.why.get(redo.invoice_id) if redo is not None else "nuova",
-                "already": redo.status if redo is not None else None,
-                "already_mode": redo.mode if redo is not None else None,
-                "overdue_count": msg["overdue_count"],
-                "overdue_total": msg["overdue_total"],
-                "grand_total": msg["grand_total"],
-                "subject": msg["subject"],
-                "text": msg["text"],
-            })
-            out.append(entry)
-        for inv, reason in plan.skipped:
-            entry = _entry(plan, [inv], today, cfg, eval_mode)
-            entry.update({"skip_reason": reason, "skip_label": SKIP_LABELS.get(reason),
-                          "why": SKIP_LABELS.get(reason, reason)})
-            row = plan.existing.get(inv.id)
-            if row is not None:
-                entry.update({"already": row.status, "already_mode": row.mode})
-            out.append(entry)
-        for inv in plan.out_of_scope:
-            entry = _entry(plan, [inv], today, cfg, eval_mode)
-            reason = "senza_promemoria"
-            entry.update({"skip_reason": reason, "skip_label": SKIP_LABELS.get(reason),
-                          "why": SKIP_LABELS.get(reason, reason)})
-            out.append(entry)
-        for inv, row, why in plan.already:
-            entry = _entry(plan, [inv], today, cfg, eval_mode)
-            entry.update({"already": row.status, "already_mode": row.mode, "why": why})
-            out.append(entry)
+        try:
+            entries = _preview_customer(session, customer_id, invoices, window, eval_mode, today, cfg)
+        except Exception as e:  # un cliente non deve far cadere il pannello
+            logger.error(f"{KIND_LABEL} cliente {customer_id}: anteprima non calcolabile: {e}", exc_info=True)
+            continue
+        out.extend(entries)
+    return out
+
+
+def _preview_customer(session: Session, customer_id: int, invoices: List[Invoice], window: Tuple[date, date],
+                      eval_mode: str, today: date, cfg) -> List[dict]:
+    """Le righe dell'anteprima per UN cliente."""
+    out: List[dict] = []
+    plan = plan_customer(session, invoices, window, eval_mode, today, customer_id=customer_id)
+    customer = plan.customer
+    if plan.email:
+        entry = _entry(plan, plan.email, today, cfg, eval_mode, plan.early_ids)
+        overdue = other_overdue_invoices(session, customer.id, exclude_ids=[i.id for i in plan.email])
+        msg = compose_followup(customer, plan.email, overdue, today)
+        # Se una delle fatture ha già una riga (prova, test, fallita che
+        # si ritenta) l'anteprima dice perché riparte.
+        redo = next((plan.existing[i.id] for i in plan.email if i.id in plan.existing), None)
+        entry.update({
+            "will_process": True,
+            "why": plan.why.get(redo.invoice_id) if redo is not None else "nuova",
+            "already": redo.status if redo is not None else None,
+            "already_mode": redo.mode if redo is not None else None,
+            "overdue_count": msg["overdue_count"],
+            "overdue_total": msg["overdue_total"],
+            "grand_total": msg["grand_total"],
+            "subject": msg["subject"],
+            "text": msg["text"],
+        })
+        out.append(entry)
+    for inv, reason in plan.skipped:
+        entry = _entry(plan, [inv], today, cfg, eval_mode)
+        entry.update({"skip_reason": reason, "skip_label": SKIP_LABELS.get(reason),
+                      "why": SKIP_LABELS.get(reason, reason)})
+        row = plan.existing.get(inv.id)
+        if row is not None:
+            entry.update({"already": row.status, "already_mode": row.mode})
+        out.append(entry)
+    for inv in plan.out_of_scope:
+        entry = _entry(plan, [inv], today, cfg, eval_mode)
+        reason = "senza_promemoria"
+        entry.update({"skip_reason": reason, "skip_label": SKIP_LABELS.get(reason),
+                      "why": SKIP_LABELS.get(reason, reason)})
+        out.append(entry)
+    for inv, row, why in plan.already:
+        entry = _entry(plan, [inv], today, cfg, eval_mode)
+        entry.update({"already": row.status, "already_mode": row.mode, "why": why})
+        out.append(entry)
     return out
 
 
@@ -1015,6 +1028,14 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
     attempted_at = datetime.utcnow()
     customer_id = customer.id
     facts = [(inv.id, inv.due_date, float(inv.amount_due or 0)) for inv in invoices]
+    # Resend ricorda una chiave per 24 ore dal suo PRIMO uso: è da lì che si
+    # misura se un ritento è ancora protetto, non dall'ultimo tentativo (un
+    # ritento che non arriva a Resend non «ringiovanisce» la chiave).
+    key_born = attempted_at
+    if reused:
+        earlier = [born for born in (_key_born(r) for r in existing.values()) if born is not None]
+        if earlier:
+            key_born = min(earlier)
 
     # Riserva PRIMA di fare qualsiasi cosa costosa o irreversibile: tutte le
     # righe dell'email passano a `sending` in UNA transazione.
@@ -1062,6 +1083,7 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
                 row.cc_json = cc
                 row.group_key = key
                 row.idempotency_key = idempotency_key
+                row.key_first_used_at = key_born
                 row.status = STATUS_SENDING
                 row.attempted_at = attempted_at
                 rows.append(row)
@@ -1122,7 +1144,7 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
                     row.status = STATUS_FAILED
                     row.error_kind = kind
                     row.error = error[:500]
-    if outcome == STATUS_SENT and reused:
+    if outcome == STATUS_SENT and reused and attempted_at - key_born < RESEND_KEY_MEMORY:
         _release_siblings(session, idempotency_key, [row.id for row in rows])
     for row in rows:
         session.add(row)
@@ -1140,11 +1162,13 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
 
 
 def _release_siblings(session: Session, key: str, sent_ids: List[int]) -> None:
-    """Un ritento ha RIUSATO la chiave `key` ed è stato accettato: le altre
-    righe che la portano ancora (fatture della stessa email rimaste fuori da
-    questo ritento) non devono più usarla, o al loro ritento Resend
-    risponderebbe 409 per l'email appena partita — che di loro non parla.
-    Restano ferme (decide un operatore), ma con una chiave loro."""
+    """Un ritento ha RIUSATO la chiave `key`, nata da meno di un giorno, ed è
+    stato accettato: Resend non l'aveva mai vista, quindi nessun tentativo
+    con quella chiave gli era arrivato. Le altre righe che la portano ancora
+    (fatture della stessa email rimaste fuori da questo ritento) non devono
+    più usarla, o al loro ritento Resend risponderebbe 409 per l'email
+    appena partita — che di loro non parla. Restano ferme (decide un
+    operatore), ma senza quella chiave."""
     siblings = (
         session.query(InvoiceFollowupEmail)
         .filter(InvoiceFollowupEmail.idempotency_key == key, InvoiceFollowupEmail.id.notin_(sent_ids),
@@ -1153,6 +1177,7 @@ def _release_siblings(session: Session, key: str, sent_ids: List[int]) -> None:
     )
     for sibling in siblings:
         sibling.idempotency_key = None
+        sibling.key_first_used_at = None
         session.add(sibling)
 
 
@@ -1168,8 +1193,11 @@ def _process_group_safely(session: Session, customer: Customer, invoices: List[I
       un operatore non la ritenta;
     - riga già inviata o preparata da questo tentativo (errore arrivato DOPO
       la scrittura finale): non si tocca;
-    - riga che esisteva e non è stata riservata (errore prima di qualunque
-      invio): non si tocca — il suo stato di prima è ancora vero;
+    - riga ferma (fallita o interrotta) che esisteva e non è stata riservata
+      (errore prima di qualunque invio): non si tocca — il suo stato di
+      prima è ancora vero, in particolare un esito incerto resta incerto;
+    - riga «a riposo» che esisteva (saltata, preparata, inviata in test):
+      diventa `failed/not_attempted`, visibile, e il giro la riprova da solo;
     - fattura senza riga: nasce `failed/not_attempted` (visibile, e il giro la
       riprova da solo: nulla era partito).
 
@@ -1196,14 +1224,24 @@ def _process_group_safely(session: Session, customer: Customer, invoices: List[I
                                                mode=mode, amount_due=amount_due, status=STATUS_FAILED,
                                                error_kind=ERROR_NOT_ATTEMPTED)
                     row.error = f"Errore imprevisto prima dell'invio (nulla è partito): {e}"[:500]
+                elif row.idempotency_key == attempt_key and row.status in (STATUS_SENT, STATUS_PREPARED):
+                    done += 1   # scritta da QUESTO tentativo: l'errore è arrivato dopo
+                    continue
                 elif row.status == STATUS_SENDING and row.idempotency_key == attempt_key:
                     row.status = STATUS_FAILED
                     row.error_kind = ERROR_OTHER
                     row.error = f"Errore imprevisto: {e}"[:500]
+                elif row.status in (STATUS_SKIPPED, STATUS_PREPARED) or (
+                        row.status == STATUS_SENT and not _in_mode(row, mode)):
+                    # Riga «a riposo» (saltata, preparata, inviata in test) che
+                    # questo giro stava per lavorare: nulla è partito, ma senza
+                    # un segno resterebbe col motivo vecchio e fuori da «Da
+                    # gestire». Visibile, e il giro la riprova da solo.
+                    row.status = STATUS_FAILED
+                    row.error_kind = ERROR_NOT_ATTEMPTED
+                    row.error = f"Errore imprevisto prima dell'invio (nulla è partito): {e}"[:500]
                 else:
-                    if row.idempotency_key == attempt_key and row.status in (STATUS_SENT, STATUS_PREPARED):
-                        done += 1
-                    continue
+                    continue    # ferma da prima: il suo stato è ancora vero
                 session.add(row)
                 marked.append((row, inv))
             if marked:
@@ -1329,25 +1367,43 @@ def _is_uncertain(row: InvoiceFollowupEmail) -> bool:
     return row.status == STATUS_FAILED and (row.error_kind or ERROR_OTHER) not in CERTAIN_KINDS
 
 
+def _key_born(row: InvoiceFollowupEmail) -> Optional[datetime]:
+    """Quando è stata usata per la prima volta la chiave che la riga porta
+    verso Resend (per le righe più vecchie della colonna: l'ultimo
+    tentativo; in mancanza, la nascita della riga)."""
+    return row.key_first_used_at or row.attempted_at or row.created_at
+
+
 def _utc_now(now_utc: Optional[datetime] = None) -> datetime:
     """L'istante dato (o adesso) in UTC senza fuso, come le date del registro."""
     now = now_utc or datetime.now(timezone.utc)
     return now.astimezone(timezone.utc).replace(tzinfo=None) if now.tzinfo is not None else now
 
 
-def needs_confirmation(row: InvoiceFollowupEmail, now: Optional[datetime] = None) -> bool:
+def needs_confirmation(row: InvoiceFollowupEmail, now: Optional[datetime] = None,
+                       mode: Optional[str] = None) -> bool:
     """«Riprova» su questa riga può far arrivare al cliente un DOPPIONE che
     Resend non fermerebbe? Sì dopo un 409 (gli era già arrivata) e per un
-    invio reale dall'esito incerto più vecchio di un giorno (Resend ha
-    dimenticato la chiave). In questi casi serve la conferma esplicita di
-    chi ha controllato su Resend che l'email NON è stata consegnata."""
+    invio reale dall'esito incerto la cui chiave è nata da più di un giorno
+    (Resend l'ha dimenticata; conta il PRIMO uso della chiave, non l'ultimo
+    tentativo). In questi casi serve la conferma esplicita di chi ha
+    controllato su Resend che l'email NON è stata consegnata.
+
+    `mode`: la modalità in cui si ritenterebbe. Una riga nata in un'altra
+    modalità (prova/test vista dal reale) non chiede conferma: lì il
+    ritento è un invio nuovo, il cliente non aveva ricevuto nulla."""
     if not _is_uncertain(row):
+        return False
+    if mode is not None and not _in_mode(row, mode):
         return False
     if row.error_kind == ERROR_CONFLICT:
         return True
-    if (row.mode or MODE_REALE) != MODE_REALE or row.attempted_at is None:
+    if (row.mode or MODE_REALE) != MODE_REALE:
         return False
-    return (now or _utc_now()) - row.attempted_at > RESEND_KEY_MEMORY
+    born = _key_born(row)
+    if born is None:
+        return True  # età ignota: non si può contare su Resend
+    return (now or _utc_now()) - born > RESEND_KEY_MEMORY
 
 
 def stuck_rows(session: Session, limit: int = 200):
@@ -1358,12 +1414,18 @@ def stuck_rows(session: Session, limit: int = 200):
         session.query(InvoiceFollowupEmail, Invoice, Customer)
         .join(Invoice, Invoice.id == InvoiceFollowupEmail.invoice_id)
         .outerjoin(Customer, Customer.id == InvoiceFollowupEmail.customer_id)
-        .filter(InvoiceFollowupEmail.status.in_((STATUS_FAILED, STATUS_SENDING)))
-        .order_by(InvoiceFollowupEmail.attempted_at.desc(), InvoiceFollowupEmail.id.desc())
+        .filter(
+            InvoiceFollowupEmail.status.in_((STATUS_FAILED, STATUS_SENDING)),
+            # Il limite deve valere sulle sole righe ancora da gestire: le
+            # ferme di fatture ormai pagate non devono nascondere le altre.
+            Invoice.status.notin_(NOT_REMINDABLE_STATUSES),
+            Invoice.amount_due > 0,
+        )
+        .order_by(InvoiceFollowupEmail.id.desc())
         .limit(limit)
         .all()
     )
-    return [(row, inv, customer) for row, inv, customer in found if still_due(inv)]
+    return [(row, inv, customer) for row, inv, customer in found]
 
 
 def _retry_members(session: Session, row: InvoiceFollowupEmail, inv: Invoice, today: date, *,
@@ -1390,7 +1452,7 @@ def _retry_members(session: Session, row: InvoiceFollowupEmail, inv: Invoice, to
     for other in others:
         if not _is_stuck(other):
             continue
-        if not force and _in_mode(other, mode) and needs_confirmation(other, now):
+        if not force and needs_confirmation(other, now, mode):
             continue
         member = session.query(Invoice).filter(Invoice.id == other.invoice_id).first()
         if member is None or not still_due(member):
@@ -1478,7 +1540,7 @@ def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=No
             session.refresh(row)
             if not _is_stuck(row):
                 raise ValueError("si ritentano solo gli avvisi falliti o interrotti")
-        if _in_mode(row, mode) and needs_confirmation(row, now) and not force:
+        if needs_confirmation(row, now, mode) and not force:
             raise ValueError(CONFIRMATION_NEEDED)
         customer = inv.customer
         reason = followup_skip_reason(session, inv, customer)
@@ -1509,10 +1571,10 @@ def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=No
         # chiave nuova, ma resta «da non ritentare da soli» se fallisce.
         uncertain = [r for r in rows if _in_mode(r, mode) and _is_uncertain(r)]
         idem = None
-        if uncertain and not (force and any(needs_confirmation(r, now) for r in uncertain)):
-            first = uncertain[0]
-            # Una riga interrotta prima di avere una chiave ne prende una stabile, dal suo id.
-            idem = first.idempotency_key or f"{KIND_KEY}-riga{first.id}-{first.mode or mode}"
+        if uncertain and not (force and any(needs_confirmation(r, now, mode) for r in uncertain)):
+            # Una riga incerta senza chiave (liberata da un ritento parziale, o
+            # nata prima della colonna) non ha nulla da riusare: chiave nuova.
+            idem = next((r.idempotency_key for r in uncertain if r.idempotency_key), None)
         mode, _missing, mailer, own_mailer = base._resolve_runtime(cfg, mailer, mode)
         summary = _summary(mode, missing, None)
         summary["sync"] = gate

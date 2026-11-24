@@ -413,6 +413,7 @@ class InvoiceFollowupEmail(Base):
     sent_at = Column(DateTime, nullable=True)
     group_key = Column(String, nullable=True, index=True)        # uguale per le fatture della stessa email
     idempotency_key = Column(String, nullable=True)              # chiave usata verso Resend nell'ultimo tentativo
+    key_first_used_at = Column(DateTime, nullable=True)          # primo uso di quella chiave (Resend la ricorda 24 ore da lì)
 
 
 class SyncState(Base):
@@ -596,6 +597,7 @@ def _run_migrations(engine):
         # con la prima stesura).
         "ALTER TABLE invoice_followup_emails ADD COLUMN group_key VARCHAR",
         "ALTER TABLE invoice_followup_emails ADD COLUMN idempotency_key VARCHAR",
+        "ALTER TABLE invoice_followup_emails ADD COLUMN key_first_used_at TIMESTAMP",
         # Riconciliazione: data di pagamento vera + residuo all'atto del
         # pagamento. NESSUN backfill: le righe già 'paid' non hanno una data
         # di pagamento vera (updated_at non lo è) né un residuo recuperabile
