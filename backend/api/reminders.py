@@ -4,6 +4,7 @@ anteprima, esecuzione, ritento, registro. Le regole stanno in
 backend/engine/reminder_email.py e backend/engine/followup_email.py; qui
 solo trasporto."""
 import logging
+from datetime import datetime, time, timedelta, timezone
 from io import BytesIO
 from typing import Optional
 
@@ -18,7 +19,7 @@ from backend.engine import followup_email as followup
 from backend.engine.agents import agents_of
 from backend.connectors.resend_mail import MailSendError
 from backend.engine.reminder_email import (
-    AUTO_RETRY_KINDS, MODE_LABELS, SKIP_LABELS, ModeMismatch, NotFound, ReminderBusy, agent_emails,
+    AUTO_RETRY_KINDS, MODE_LABELS, MODE_REALE, SKIP_LABELS, ModeMismatch, NotFound, ReminderBusy, agent_emails,
     build_attachments, carbon_copies, normalize_email, overdue_invoices, preview, resolve_mode, retry_row,
     run_reminders, send_test, target_due_dates,
 )
@@ -104,22 +105,30 @@ def _followup_flags(row, invoice: Optional[Invoice], customer: Optional[Customer
     invierebbe ADESSO: chi deve muoversi (operatore o giro) e con quale
     cautela."""
     send_mode = resolve_mode()[0]
-    in_mode = followup._in_mode(row, send_mode)
     uncertain = followup._is_uncertain(row)
     stuck = followup._is_stuck(row)
+    # La finestra del prossimo giro: oggi, o lunedì se oggi è weekend.
     window = followup.followup_window()
+    if window is None:
+        today = followup.italian_today()
+        monday = datetime.combine(today + timedelta(days=7 - today.weekday()), time(10, 0), tzinfo=timezone.utc)
+        window = followup.followup_window(monday)
     in_window = bool(
         window and invoice is not None and invoice.due_date is not None
         and window[0] <= invoice.due_date <= followup.merge_until(window)
     )
-    # Il giro la riprende da sola se è ancora nella finestra e l'esito non è
-    # incerto in questa modalità (una riga di prova/test, in reale, è nuova).
-    auto = stuck and in_window and not (uncertain and in_mode)
+    # Il giro la riprende da sola se è ancora nella finestra e: l'esito è
+    # «certamente non partita», oppure è una riga di prova/test e si invia in
+    # reale (lì è un invio nuovo). Un incerto resta dell'operatore.
+    fresh_in_real = send_mode == MODE_REALE and (row.mode or MODE_REALE) != MODE_REALE
+    auto = stuck and in_window and (not uncertain or fresh_in_real)
+    # A chi andrebbe un ritento ADESSO: il cliente a cui la fattura appartiene ora.
+    owner = invoice.customer if invoice is not None and invoice.customer is not None else customer
     return {
         "needs_manual_retry": bool(stuck and not auto),
         "retry_needs_confirmation": bool(followup.needs_confirmation(row, mode=send_mode)),
         "will_auto_retry": bool(auto),
-        "current_to": normalize_email(customer.email) if customer is not None else None,
+        "current_to": normalize_email(owner.email) if owner is not None else None,
     }
 
 

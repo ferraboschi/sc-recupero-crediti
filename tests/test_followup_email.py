@@ -2223,6 +2223,25 @@ class TestOneEmailPerCustomer:
         monkeypatch.setattr(fu, "compose_followup", real)
         assert run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())["sent"] == 1 and row.status == "sent"
 
+    def test_a_row_sent_for_real_never_becomes_retryable(self, test_db_session, monkeypatch):
+        # Cintura: qualunque strada porti al ripiego degli imprevisti (qui un
+        # tentativo in test su una riga già inviata in REALE, come potrebbe
+        # fare un secondo processo in un'altra modalità), una riga inviata
+        # davvero al cliente resta inviata.
+        c = _cust(test_db_session)
+        inv = _due(test_db_session, c)
+        _sync(test_db_session)
+        mailer = FakeMailer()
+        assert run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())["sent"] == 1
+        row = _rows(test_db_session)[0]
+        monkeypatch.setattr(fu, "compose_followup", lambda *x, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        summary = fu._summary(MODE_TEST, [], None)
+        fu._process_group_safely(test_db_session, c, [inv], key="k", mode=MODE_TEST, mailer=mailer,
+                                 cfg=_on_cfg(REMINDER_EMAIL_TEST_TO="lorenzo@example.com"), summary=summary,
+                                 existing={inv.id: row}, today=TODAY)
+        test_db_session.refresh(row)
+        assert (row.status, row.mode, row.error_kind) == ("sent", "reale", None) and mailer.calls == 1
+
     def test_test_mode_outcomes_never_block_the_real_email(self, test_db_session):
         # In prova/test il cliente non riceve nulla: in reale ogni riga di
         # test è un invio nuovo, anche se era incerta o in conflitto con Resend.
@@ -2898,6 +2917,40 @@ class TestApi:
         test_db_session.commit()
         item = test_client.get(f"/api/reminders/followup/{row.id}").json()
         assert (item["needs_manual_retry"], item["retry_needs_confirmation"], item["will_auto_retry"]) == (True, True, False)
+        # Mentre si invia in TEST una riga incerta REALE resta dell'operatore (il giro non la tocca).
+        row.error_kind = "network"
+        test_db_session.commit()
+        monkeypatch.setattr("backend.config.config.REMINDER_EMAIL_TEST_TO", "lorenzo@example.com")
+        item = test_client.get(f"/api/reminders/followup/{row.id}").json()
+        assert (item["needs_manual_retry"], item["will_auto_retry"]) == (True, False)
+        # Lo stesso per una riga incerta di TEST vista in test: lì non è «un invio nuovo».
+        row.mode = "test"
+        test_db_session.commit()
+        item = test_client.get(f"/api/reminders/followup/{row.id}").json()
+        assert (item["needs_manual_retry"], item["will_auto_retry"]) == (True, False)
+        row.mode = "reale"
+        test_db_session.commit()
+        monkeypatch.setattr("backend.config.config.REMINDER_EMAIL_TEST_TO", "")
+        # Nel weekend vale la finestra di lunedì: un rifiuto certo è ancora «del giro».
+        row.error_kind = "validation"
+        test_db_session.commit()
+        monkeypatch.setattr("backend.engine.followup_email.italian_today", lambda *a, **k: date(2026, 11, 21))
+        monkeypatch.setattr("backend.engine.followup_email.followup_window",
+                            lambda now=None, cfg=None: None if now is None else (date(2026, 11, 10), date(2026, 11, 16)))
+        item = test_client.get(f"/api/reminders/followup/{row.id}").json()
+        assert (item["needs_manual_retry"], item["will_auto_retry"]) == (False, True)
+        monkeypatch.undo()
+        for target in ("format", "reminder_email", "followup_email"):
+            monkeypatch.setattr(f"backend.engine.{target}.datetime", _FixedDatetime)
+        self._enable(monkeypatch)
+        # L'indirizzo mostrato è quello del cliente a cui la fattura appartiene ORA.
+        newowner = _other(test_db_session, 77)
+        a.customer_id = newowner.id
+        test_db_session.commit()
+        assert test_client.get(f"/api/reminders/followup/{row.id}").json()["current_to"] == "amministrazione@cliente77.it"
+        a.customer_id = c.id
+        row.error_kind, row.mode = "conflict", "reale"
+        test_db_session.commit()
         # Il limite dell'elenco vale sulle sole righe ancora da gestire.
         for n in range(8):
             gone = _due(test_db_session, _other(test_db_session, 300 + n), num=f"SALDATA/{n}")

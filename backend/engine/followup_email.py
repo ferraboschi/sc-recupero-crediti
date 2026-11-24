@@ -1197,7 +1197,9 @@ def _process_group_safely(session: Session, customer: Customer, invoices: List[I
       (errore prima di qualunque invio): non si tocca — il suo stato di
       prima è ancora vero, in particolare un esito incerto resta incerto;
     - riga «a riposo» che esisteva (saltata, preparata, inviata in test):
-      diventa `failed/not_attempted`, visibile, e il giro la riprova da solo;
+      diventa `failed/not_attempted`, visibile, e il giro la riprova da solo
+      (mai una riga inviata in REALE: quella resta inviata, qualunque cosa
+      accada dopo);
     - fattura senza riga: nasce `failed/not_attempted` (visibile, e il giro la
       riprova da solo: nulla era partito).
 
@@ -1232,7 +1234,7 @@ def _process_group_safely(session: Session, customer: Customer, invoices: List[I
                     row.error_kind = ERROR_OTHER
                     row.error = f"Errore imprevisto: {e}"[:500]
                 elif row.status in (STATUS_SKIPPED, STATUS_PREPARED) or (
-                        row.status == STATUS_SENT and not _in_mode(row, mode)):
+                        row.status == STATUS_SENT and (row.mode or MODE_REALE) != MODE_REALE):
                     # Riga «a riposo» (saltata, preparata, inviata in test) che
                     # questo giro stava per lavorare: nulla è partito, ma senza
                     # un segno resterebbe col motivo vecchio e fuori da «Da
