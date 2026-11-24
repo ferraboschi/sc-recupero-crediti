@@ -52,16 +52,19 @@ Regole (ognuna ha il suo test in tests/test_followup_email.py):
   esistente si prende solo se è ancora nello stato letto. Un solo giro alla
   volta (lock condiviso col promemoria).
 - DOPO UN ERRORE. Il giro ritenta da solo soltanto ciò che CERTAMENTE non è
-  partito (PDF non generato, rifiuto di Resend). Timeout, errori del
-  provider, imprevisti e il 409 di Resend («questa chiave l'ho già vista»:
-  il primo invio gli era arrivato) sono esiti INCERTI: la riga resta ferma
-  finché un operatore non preme «Riprova», che rimanda l'email intera alle
-  sole fatture ancora da sollecitare e ancora dello stesso cliente, SEMPRE
-  con la chiave del primo tentativo (per 24 ore Resend blocca così il
-  doppione, qualunque siano oggi testo e fatture). Un esito incerto resta
-  incerto finché l'email non parte davvero: un ritento non lo trasforma mai
-  in qualcosa che il giro rimanderebbe da solo. Dopo un 409 di Resend (il
-  primo invio gli era arrivato) non si rimanda più, né da soli né a mano.
+  partito (PDF non generato, rifiuto di Resend, errore prima di qualunque
+  invio). Timeout, errori del provider, imprevisti a invio avviato e il 409
+  di Resend («questa chiave l'ho già vista») sono esiti INCERTI: la riga
+  resta ferma finché un operatore non preme «Riprova», che rimanda l'email
+  intera alle sole fatture ancora da sollecitare e ancora dello stesso
+  cliente, con la chiave del tentativo incerto (per 24 ore Resend blocca
+  così il doppione, qualunque siano oggi testo e fatture). Un esito incerto
+  resta incerto finché l'email non parte davvero: un ritento non lo
+  trasforma mai in qualcosa che il giro rimanderebbe da solo. Quando Resend
+  non può più proteggere (dopo un 409, o oltre un giorno dal tentativo)
+  serve la conferma esplicita dell'operatore «ho controllato su Resend, non
+  è arrivata». L'incertezza vale per la modalità in cui è nata: in reale
+  una riga di prova o di test è sempre un invio nuovo.
 - SPENTO DI DEFAULT. Senza REMINDER_FOLLOWUP_ENABLED=true la modalità è
   «off»: nessuna riga scritta, nessuna email; il pannello mostra l'anteprima
   di ciò che partirebbe. Da acceso segue la modalità del promemoria
@@ -473,7 +476,7 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], window: Tuple[d
             plan.existing[inv.id] = row
         if not early:
             plan.in_scope += 1
-        will, why = needs_processing(row, mode)
+        will, why = _needs_processing(row, mode)
         if not will:
             if not early:
                 plan.already.append((inv, row, why))
@@ -641,13 +644,17 @@ def _unique_names(names: List[str], ids: List[int]) -> List[str]:
     counts: Dict[str, int] = {}
     for name in names:
         counts[name] = counts.get(name, 0) + 1
-    out = []
+    out: List[str] = []
     for name, ident in zip(names, ids):
-        if counts[name] == 1:
-            out.append(name)
-            continue
-        stem, dot, ext = name.rpartition(".")
-        out.append(f"{stem}_{ident}.{ext}" if dot else f"{name}_{ident}")
+        if counts[name] > 1:
+            stem, dot, ext = name.rpartition(".")
+            name = f"{stem}_{ident}.{ext}" if dot else f"{name}_{ident}"
+        candidate, n = name, 1
+        while candidate in out:  # un nome già «con l'id» di un altro documento: caso di scuola
+            n += 1
+            stem, dot, ext = name.rpartition(".")
+            candidate = f"{stem}_{n}.{ext}" if dot else f"{name}_{n}"
+        out.append(candidate)
     return out
 
 
@@ -924,12 +931,38 @@ class _ReservationLost(Exception):
 # dire che un invio con questa chiave gli è GIÀ arrivato. Non è un rifiuto
 # «certamente non partita»: è il segnale opposto.
 CONFLICT_NOTE = (
-    "Resend ha già ricevuto un invio con la stessa chiave (HTTP 409): il primo tentativo è con ogni "
-    "probabilità partito, quindi non si rimanda. Controllare su Resend se l'email risulta consegnata; "
-    "se non risulta, sollecitare il cliente a mano."
+    "Resend ha già ricevuto un invio con la stessa chiave (HTTP 409): il tentativo precedente gli era "
+    "arrivato ed è con ogni probabilità partito, quindi non si rimanda da solo. Controllare su Resend se "
+    "l'email risulta consegnata: solo se NON risulta, «Invia comunque»."
 )
-# Tipo di errore proprio del secondo avviso: né ritento automatico né «Riprova».
+# Tipi di errore propri del secondo avviso.
+# - conflict: Resend aveva già la chiave → mai ritentata da sola; a mano solo
+#   con la conferma esplicita di chi ha controllato su Resend.
+# - not_attempted: errore imprevisto PRIMA di qualunque invio, su una fattura
+#   che non aveva ancora una riga → il giro la riprova da solo.
 ERROR_CONFLICT = "conflict"
+ERROR_NOT_ATTEMPTED = "not_attempted"
+# Fallimenti «certamente non partita»: gli unici che il giro ritenta da solo.
+CERTAIN_KINDS = tuple(AUTO_RETRY_KINDS) + (ERROR_NOT_ATTEMPTED,)
+# Resend ricorda una chiave per 24 ore: oltre, un ritento con la stessa chiave
+# non è più protetto dal doppione (margine di un'ora).
+RESEND_KEY_MEMORY = timedelta(hours=23)
+
+
+def _needs_processing(row: Optional[InvoiceFollowupEmail], mode: str) -> Tuple[bool, str]:
+    """`needs_processing` del promemoria più le regole proprie del secondo
+    avviso. Fuori dal reale il cliente non ha ricevuto nulla: in REALE una
+    riga di prova o di test è un invio nuovo, QUALUNQUE esito abbia avuto
+    (anche incerto, anche in conflitto con Resend: riguardava l'indirizzo di
+    prova)."""
+    if row is not None:
+        if mode == MODE_REALE and row.mode in (MODE_PROVA, MODE_TEST) and row.status in (STATUS_FAILED, STATUS_SENDING):
+            return True, "invio reale dopo la prova" if row.mode == MODE_PROVA else "invio reale dopo il test"
+        if row.status == STATUS_FAILED and row.error_kind == ERROR_NOT_ATTEMPTED:
+            return True, "ritento"
+        if row.status == STATUS_FAILED and row.error_kind == ERROR_CONFLICT:
+            return False, "Resend l'aveva già ricevuta: decide un operatore"
+    return needs_processing(row, mode)
 
 
 def _is_conflict(exc: Exception) -> bool:
@@ -950,19 +983,20 @@ def _report(summary: dict, rows: List[InvoiceFollowupEmail], invoices: List[Invo
 
 def _process_group(session: Session, customer: Customer, invoices: List[Invoice], *, key: str, mode: str,
                    mailer, cfg, summary: dict, existing: Dict[int, InvoiceFollowupEmail], today: date,
-                   idem: Optional[str] = None) -> None:
+                   idempotency_key: str, sticky: bool = False, reused: bool = False) -> None:
     """Compone, registra e (fuori dalla prova) invia UNA email per le fatture
     date dello stesso cliente. Una riga per fattura, tutte con lo stesso
     `group_key`, riservate insieme PRIMA dell'invio e chiuse insieme dopo:
     le fatture di un'email hanno sempre lo stesso esito.
 
-    `idem`: la Idempotency-Key di un tentativo PRECEDENTE dall'esito incerto
-    (solo «Riprova»). Con `idem` il tentativo è la continuazione di quello:
-    stessa chiave verso Resend — se il primo gli era arrivato risponde 409 e
-    non rimanda, qualunque siano oggi testo e fatture — e, se anche questo
-    fallisce, l'esito resta INCERTO (mai un fallimento «ritentabile da solo»:
-    il primo invio potrebbe essere arrivato). Senza `idem` la chiave è nuova
-    per ogni tentativo: un rifiuto certo ritentato non può prendere un 409.
+    `idempotency_key`: la chiave verso Resend di questo tentativo. Nuova per
+    ogni tentativo nuovo (un rifiuto certo ritentato non può prendere un
+    409); `reused` = è quella di un tentativo PRECEDENTE dall'esito incerto
+    («Riprova»): se quello gli era arrivato Resend risponde 409 e non
+    rimanda, qualunque siano oggi testo e fatture.
+    `sticky`: questo tentativo continua un esito incerto → se fallisce resta
+    INCERTO (mai un fallimento «ritentabile da solo»: l'invio precedente
+    potrebbe essere arrivato).
     """
     invoices = _in_email_order(invoices)
     strangers = [inv.invoice_number for inv in invoices if inv.customer_id != customer.id]
@@ -981,8 +1015,6 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
     attempted_at = datetime.utcnow()
     customer_id = customer.id
     facts = [(inv.id, inv.due_date, float(inv.amount_due or 0)) for inv in invoices]
-    sticky = idem is not None
-    idempotency_key = idem or f"{KIND_KEY}-{key}-{mode}-{attempted_at.strftime('%H%M%S%f')}"
 
     # Riserva PRIMA di fare qualsiasi cosa costosa o irreversibile: tutte le
     # righe dell'email passano a `sending` in UNA transazione.
@@ -1090,6 +1122,8 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
                     row.status = STATUS_FAILED
                     row.error_kind = kind
                     row.error = error[:500]
+    if outcome == STATUS_SENT and reused:
+        _release_siblings(session, idempotency_key, [row.id for row in rows])
     for row in rows:
         session.add(row)
     session.commit()
@@ -1105,41 +1139,80 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
     _report(summary, rows, invoices, customer)
 
 
-def _process_group_safely(session: Session, customer: Customer, invoices: List[Invoice], **kwargs) -> None:
+def _release_siblings(session: Session, key: str, sent_ids: List[int]) -> None:
+    """Un ritento ha RIUSATO la chiave `key` ed è stato accettato: le altre
+    righe che la portano ancora (fatture della stessa email rimaste fuori da
+    questo ritento) non devono più usarla, o al loro ritento Resend
+    risponderebbe 409 per l'email appena partita — che di loro non parla.
+    Restano ferme (decide un operatore), ma con una chiave loro."""
+    siblings = (
+        session.query(InvoiceFollowupEmail)
+        .filter(InvoiceFollowupEmail.idempotency_key == key, InvoiceFollowupEmail.id.notin_(sent_ids),
+                InvoiceFollowupEmail.status.in_((STATUS_FAILED, STATUS_SENDING)))
+        .all()
+    )
+    for sibling in siblings:
+        sibling.idempotency_key = None
+        session.add(sibling)
+
+
+def _process_group_safely(session: Session, customer: Customer, invoices: List[Invoice], *, key: str, mode: str,
+                          mailer, cfg, summary: dict, existing: Dict[int, InvoiceFollowupEmail], today: date,
+                          idem: Optional[str] = None, sticky: Optional[bool] = None) -> None:
     """Un cliente non deve mai far saltare gli altri: eccezioni impreviste →
-    rollback, righe `failed` (other: ferme finché un operatore non le
-    ritenta) se possibile, e si prosegue. Una riga che risulta GIÀ inviata o
-    preparata in questa modalità non viene toccata: un errore arrivato dopo
-    l'invio non deve trasformare un'email partita in un «errore» da
-    ritentare."""
-    summary = kwargs["summary"]
-    mode = kwargs["mode"]
+    rollback, e si prosegue. Dopo un'eccezione ogni riga dice la verità su
+    ciò che è successo:
+
+    - riga RISERVATA da questo tentativo (era arrivata a `sending` con la sua
+      chiave): l'email potrebbe essere partita → `failed/other`, ferma finché
+      un operatore non la ritenta;
+    - riga già inviata o preparata da questo tentativo (errore arrivato DOPO
+      la scrittura finale): non si tocca;
+    - riga che esisteva e non è stata riservata (errore prima di qualunque
+      invio): non si tocca — il suo stato di prima è ancora vero;
+    - fattura senza riga: nasce `failed/not_attempted` (visibile, e il giro la
+      riprova da solo: nulla era partito).
+
+    `idem`: chiave di un tentativo precedente dall'esito incerto da riusare
+    («Riprova»); senza, la chiave è nuova. `sticky`: vedi _process_group
+    (default: vero se si riusa una chiave).
+    """
+    attempt_key = idem or f"{KIND_KEY}-{key}-{mode}-{datetime.utcnow().strftime('%H%M%S%f')}"
+    sticky = (idem is not None) if sticky is None else bool(sticky)
     ids = [(inv.id, inv.due_date, inv.customer_id, float(inv.amount_due or 0), inv) for inv in invoices]
     try:
-        _process_group(session, customer, invoices, **kwargs)
+        _process_group(session, customer, invoices, key=key, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
+                       existing=existing, today=today, idempotency_key=attempt_key, sticky=sticky,
+                       reused=idem is not None)
     except Exception as e:
         logger.error(f"{KIND_LABEL} cliente {ids[0][2] if ids else '?'}: errore imprevisto: {e}", exc_info=True)
         try:
             session.rollback()
-            rows = []
+            marked, done = [], 0
             for invoice_id, due, customer_id, amount_due, inv in ids:
                 row = session.query(InvoiceFollowupEmail).filter_by(invoice_id=invoice_id, due_date=due).first()
-                if row is not None and row.mode == mode and row.status in (STATUS_SENT, STATUS_PREPARED):
-                    continue
                 if row is None:
                     row = InvoiceFollowupEmail(invoice_id=invoice_id, due_date=due, customer_id=customer_id,
-                                               mode=mode, amount_due=amount_due)
-                row.status = STATUS_FAILED
-                row.error_kind = ERROR_OTHER
-                row.error = f"Errore imprevisto: {e}"[:500]
-                row.group_key = kwargs["key"]
+                                               mode=mode, amount_due=amount_due, status=STATUS_FAILED,
+                                               error_kind=ERROR_NOT_ATTEMPTED)
+                    row.error = f"Errore imprevisto prima dell'invio (nulla è partito): {e}"[:500]
+                elif row.status == STATUS_SENDING and row.idempotency_key == attempt_key:
+                    row.status = STATUS_FAILED
+                    row.error_kind = ERROR_OTHER
+                    row.error = f"Errore imprevisto: {e}"[:500]
+                else:
+                    if row.idempotency_key == attempt_key and row.status in (STATUS_SENT, STATUS_PREPARED):
+                        done += 1
+                    continue
                 session.add(row)
-                rows.append((row, inv))
-            if not rows:
-                return
-            session.commit()
-            summary["failed"] += 1
-            _report(summary, [row for row, _inv in rows], [inv for _row, inv in rows], customer)
+                marked.append((row, inv))
+            if marked:
+                session.commit()
+                _report(summary, [row for row, _inv in marked], [inv for _row, inv in marked], customer)
+            if done < len(ids):
+                # Se tutte le righe risultano già inviate/preparate da questo
+                # tentativo l'errore è arrivato dopo: l'email è contata come tale.
+                summary["failed"] += 1
         except Exception as inner:
             logger.error(f"{KIND_LABEL}: impossibile registrare l'errore: {inner}")
             try:
@@ -1241,30 +1314,67 @@ def run_followups(
 
 
 def _is_stuck(row: InvoiceFollowupEmail) -> bool:
-    """Riga ferma che un operatore può ritentare: fallita o interrotta, ma
-    non dopo un 409 di Resend (lì il primo invio gli era arrivato)."""
-    if row.status == STATUS_SENDING:
-        return True
-    return row.status == STATUS_FAILED and row.error_kind != ERROR_CONFLICT
+    """Riga ferma: fallita o interrotta a metà invio."""
+    return row.status in (STATUS_FAILED, STATUS_SENDING)
 
 
 def _is_uncertain(row: InvoiceFollowupEmail) -> bool:
-    """L'ultimo tentativo della riga potrebbe essere arrivato al cliente?
-    Sì per una riga interrotta a metà invio e per ogni fallimento che non
-    sia «certamente non partita» (PDF non generato, rifiuto di Resend)."""
+    """L'ultimo tentativo della riga potrebbe essere arrivato al
+    destinatario? Sì per una riga interrotta a metà invio e per ogni
+    fallimento che non sia «certamente non partita» (PDF non generato,
+    rifiuto di Resend, nessun invio tentato). Il 409 di Resend è il caso più
+    forte: gli era arrivato."""
     if row.status == STATUS_SENDING:
         return True
-    return row.status == STATUS_FAILED and (row.error_kind or ERROR_OTHER) not in AUTO_RETRY_KINDS
+    return row.status == STATUS_FAILED and (row.error_kind or ERROR_OTHER) not in CERTAIN_KINDS
 
 
-def _retry_members(session: Session, row: InvoiceFollowupEmail, inv: Invoice,
-                   today: date) -> List[Tuple[Invoice, InvoiceFollowupEmail]]:
+def _utc_now(now_utc: Optional[datetime] = None) -> datetime:
+    """L'istante dato (o adesso) in UTC senza fuso, come le date del registro."""
+    now = now_utc or datetime.now(timezone.utc)
+    return now.astimezone(timezone.utc).replace(tzinfo=None) if now.tzinfo is not None else now
+
+
+def needs_confirmation(row: InvoiceFollowupEmail, now: Optional[datetime] = None) -> bool:
+    """«Riprova» su questa riga può far arrivare al cliente un DOPPIONE che
+    Resend non fermerebbe? Sì dopo un 409 (gli era già arrivata) e per un
+    invio reale dall'esito incerto più vecchio di un giorno (Resend ha
+    dimenticato la chiave). In questi casi serve la conferma esplicita di
+    chi ha controllato su Resend che l'email NON è stata consegnata."""
+    if not _is_uncertain(row):
+        return False
+    if row.error_kind == ERROR_CONFLICT:
+        return True
+    if (row.mode or MODE_REALE) != MODE_REALE or row.attempted_at is None:
+        return False
+    return (now or _utc_now()) - row.attempted_at > RESEND_KEY_MEMORY
+
+
+def stuck_rows(session: Session, limit: int = 200):
+    """Tutte le righe FERME (fallite o interrotte) di fatture ancora da
+    sollecitare, dalla più recente, qualunque età abbiano: è l'elenco «da
+    gestire» del pannello. [(riga, fattura, cliente)]."""
+    found = (
+        session.query(InvoiceFollowupEmail, Invoice, Customer)
+        .join(Invoice, Invoice.id == InvoiceFollowupEmail.invoice_id)
+        .outerjoin(Customer, Customer.id == InvoiceFollowupEmail.customer_id)
+        .filter(InvoiceFollowupEmail.status.in_((STATUS_FAILED, STATUS_SENDING)))
+        .order_by(InvoiceFollowupEmail.attempted_at.desc(), InvoiceFollowupEmail.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [(row, inv, customer) for row, inv, customer in found if still_due(inv)]
+
+
+def _retry_members(session: Session, row: InvoiceFollowupEmail, inv: Invoice, today: date, *,
+                   mode: str, force: bool, now: datetime) -> List[Tuple[Invoice, InvoiceFollowupEmail]]:
     """Le ALTRE righe della stessa email ancora ferme (fallite o interrotte)
     che si possono ritentare insieme alla riga scelta, così il cliente
     riceve di nuovo UNA email e non una per fattura. Resta fuori — e la sua
     riga non cambia — una fattura nel frattempo saldata, con la scadenza
     cambiata, non più scaduta, passata a un ALTRO cliente (riabbinata dopo
-    il tentativo) o con un motivo di esclusione."""
+    il tentativo), con un motivo di esclusione, oppure che richiederebbe la
+    conferma «ho controllato su Resend» quando l'operatore non l'ha data."""
     if not row.group_key:
         return []
     others = (
@@ -1280,6 +1390,8 @@ def _retry_members(session: Session, row: InvoiceFollowupEmail, inv: Invoice,
     for other in others:
         if not _is_stuck(other):
             continue
+        if not force and _in_mode(other, mode) and needs_confirmation(other, now):
+            continue
         member = session.query(Invoice).filter(Invoice.id == other.invoice_id).first()
         if member is None or not still_due(member):
             continue
@@ -1293,32 +1405,48 @@ def _retry_members(session: Session, row: InvoiceFollowupEmail, inv: Invoice,
     return out
 
 
+def _in_mode(row: InvoiceFollowupEmail, mode: str) -> bool:
+    """La riga viene da un tentativo fatto nella modalità data? Una riga di
+    prova o di test non dice nulla su ciò che il CLIENTE ha ricevuto."""
+    return (row.mode or MODE_REALE) == mode
+
+
+CONFIRMATION_NEEDED = (
+    "questo invio potrebbe essere già arrivato al cliente e Resend non fermerebbe più un doppione: "
+    "controllare su Resend se l'email risulta consegnata e, solo se NON risulta, confermare «Invia comunque»"
+)
+
+
 def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=None, cfg=None,
                        mode: Optional[str] = None, expected_mode: Optional[str] = None,
-                       now_utc: Optional[datetime] = None) -> dict:
+                       now_utc: Optional[datetime] = None, force: bool = False) -> dict:
     """Ritenta UN secondo avviso fermo (`failed` o `sending` orfana), insieme
     alle altre fatture della stessa email ancora ferme. La fattura deve
     essere ancora scaduta e non saldata, con la stessa scadenza e senza
-    motivi di esclusione; valgono lo spento e il controllo del sync del giro.
+    motivi di esclusione; valgono lo spento, il weekend e il controllo del
+    sync del giro.
 
     Un esito incerto resta tale finché l'email non parte davvero: un ritento
     NON trasforma mai la riga in qualcosa che il giro rimanderebbe da solo
     («saltata», fallimento ritentabile, preparata, inviata in test). Se oggi
     non si può inviare, la riga resta com'è e l'operatore legge il perché.
-    Dopo un 409 di Resend (il primo invio gli era arrivato) non si ritenta
-    più.
+
+    L'incertezza riguarda la modalità in cui è nata: un invio REALE incerto
+    si ritenta solo in reale e continua quel tentativo (stessa chiave verso
+    Resend); una riga di prova o di test ritentata in reale è un invio nuovo
+    (il cliente non aveva ricevuto nulla).
+
+    `force`: l'operatore conferma di aver controllato su Resend che l'email
+    NON è stata consegnata. Serve dopo un 409 e per un invio reale incerto
+    più vecchio di un giorno (needs_confirmation): senza, niente invio. Con
+    la conferma parte un tentativo nuovo, con una chiave nuova.
 
     L'email va al cliente a cui la fattura appartiene ADESSO, con le sole
     fatture che sono ancora sue.
     """
     cfg = cfg or config
-    if row.status not in (STATUS_FAILED, STATUS_SENDING):
-        raise ValueError("si ritentano solo gli avvisi falliti o interrotti")
     if not _is_stuck(row):
-        raise ValueError(
-            "Resend risulta aver già ricevuto questa email: non si rimanda. Controllare su Resend se è "
-            "stata consegnata; se non risulta, sollecitare il cliente a mano"
-        )
+        raise ValueError("si ritentano solo gli avvisi falliti o interrotti")
     inv = session.query(Invoice).filter(Invoice.id == row.invoice_id).first()
     if inv is None:
         raise ValueError("fattura non più presente")
@@ -1335,9 +1463,12 @@ def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=No
         raise ModeMismatch(mode, expected_mode)
     if mode == MODE_OFF:
         raise ValueError("secondo avviso spento (REMINDER_FOLLOWUP_ENABLED)")
+    if today.weekday() >= 5:
+        raise ValueError("nel weekend non si inviano avvisi: riprova da lunedì")
     gate = sync_gate(session, now_utc, cfg)
     if not gate["ok"]:
         raise ValueError(f"sync fatture non aggiornato ({gate['detail']}): riprova dopo un sync riuscito")
+    now = _utc_now(now_utc)
     if not base._reminder_lock.acquire(blocking=False):
         raise ReminderBusy()
     try:
@@ -1347,11 +1478,13 @@ def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=No
             session.refresh(row)
             if not _is_stuck(row):
                 raise ValueError("si ritentano solo gli avvisi falliti o interrotti")
+        if _in_mode(row, mode) and needs_confirmation(row, now) and not force:
+            raise ValueError(CONFIRMATION_NEEDED)
         customer = inv.customer
         reason = followup_skip_reason(session, inv, customer)
         if reason:
             raise ValueError(f"secondo avviso non inviabile ora: {SKIP_LABELS.get(reason, reason)}")
-        members = [(inv, row)] + _retry_members(session, row, inv, today)
+        members = [(inv, row)] + _retry_members(session, row, inv, today, mode=mode, force=force, now=now)
         ready = [member for member, _row in members]
         days = followup_days(cfg)
         if not any(days_overdue_on(member, today) >= days for member in ready):
@@ -1359,19 +1492,24 @@ def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=No
                 f"la fattura è scaduta da meno di {days} giorni e le altre della stessa email non sono più "
                 "da sollecitare: si potrà ritentare dal giorno in cui compie i giorni previsti"
             )
-        # Se anche una sola delle righe viene da un tentativo dall'esito
-        # INCERTO (potrebbe essere arrivato), questo ritento ne è la
-        # continuazione: stessa chiave verso Resend — qualunque siano oggi le
-        # fatture: se il primo invio gli era arrivato, per 24 ore risponde 409
-        # e non rimanda — e solo in modalità reale se quello era reale.
-        uncertain = [member_row for _member, member_row in members if _is_uncertain(member_row)]
+        rows = [member_row for _member, member_row in members]
+        # Un invio REALE dall'esito incerto non si «ritenta» in prova o in
+        # test: la riga diventerebbe preparata / inviata-in-test e il giro
+        # reale la manderebbe poi da solo.
+        if mode != MODE_REALE and any(_in_mode(r, MODE_REALE) and _is_uncertain(r) for r in rows):
+            raise ValueError(
+                "questo avviso era un invio REALE dall'esito incerto: si ritenta solo in modalità reale "
+                f"(ora: {FOLLOWUP_MODE_LABELS.get(mode, mode)})"
+            )
+        # Righe incerte nate in QUESTA modalità: il ritento continua quel
+        # tentativo. Stessa chiave verso Resend — qualunque siano oggi le
+        # fatture: se gli era arrivato, per 24 ore risponde 409 e non rimanda
+        # — e, se fallisce di nuovo, l'esito resta incerto. Con la conferma
+        # dell'operatore (`force`) il tentativo è invece nuovo, con una
+        # chiave nuova, ma resta «da non ritentare da soli» se fallisce.
+        uncertain = [r for r in rows if _in_mode(r, mode) and _is_uncertain(r)]
         idem = None
-        if uncertain:
-            if mode != MODE_REALE and any((r.mode or MODE_REALE) == MODE_REALE for r in uncertain):
-                raise ValueError(
-                    "questo avviso era un invio REALE dall'esito incerto: si ritenta solo in modalità reale "
-                    f"(ora: {FOLLOWUP_MODE_LABELS.get(mode, mode)})"
-                )
+        if uncertain and not (force and any(needs_confirmation(r, now) for r in uncertain)):
             first = uncertain[0]
             # Una riga interrotta prima di avere una chiave ne prende una stabile, dal suo id.
             idem = first.idempotency_key or f"{KIND_KEY}-riga{first.id}-{first.mode or mode}"
@@ -1383,7 +1521,7 @@ def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=No
             _process_group_safely(
                 session, customer, ready, key=group_key(customer.id, ready, today), mode=mode, mailer=mailer,
                 cfg=cfg, summary=summary, existing={member.id: member_row for member, member_row in members},
-                today=today, idem=idem,
+                today=today, idem=idem, sticky=bool(uncertain),
             )
         finally:
             if own_mailer and mailer is not None:

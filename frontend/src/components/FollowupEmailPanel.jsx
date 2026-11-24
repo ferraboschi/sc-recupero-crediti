@@ -91,19 +91,23 @@ export default function FollowupEmailPanel() {
     const what = others.length
       ? `l'email unica con le fatture ${[row.invoice_number, ...others].join(', ')}`
       : `la fattura ${row.invoice_number}`
-    // L'esito del tentativo precedente è incerto: se era partito, un nuovo
-    // invio può arrivare al cliente una seconda volta (Resend lo blocca solo
-    // entro 24 ore e solo se le fatture sono le stesse). Lo si dice chiaro.
-    const msg = fresh.mode === 'reale'
-      ? `Ritento ADESSO l'invio AL CLIENTE (${row.original_to || row.to_email}) del secondo avviso per ${what}.\n\nPrima controlla su Resend che l'email precedente non risulti già consegnata: in quel caso il cliente la riceverebbe due volte.\n\nProcedere?`
-      : fresh.mode === 'test'
-        ? `Ritento l'invio di prova a ${fresh.test_to} per ${what}. Procedere?`
-        : `Ritento il secondo avviso per ${what} (modalità: ${fresh.mode_label}). Procedere?`
+    const to = row.original_to || row.to_email
+    // Dopo un 409 di Resend, o oltre un giorno da un invio reale dall'esito
+    // incerto, Resend non ferma più un doppione: il server parte solo con la
+    // conferma esplicita di chi ha controllato che l'email NON è arrivata.
+    const force = !!row.retry_needs_confirmation
+    const msg = force
+      ? `ATTENZIONE: il secondo avviso per ${what} potrebbe essere GIÀ arrivato al cliente (${to}), e Resend non fermerebbe più un doppione.\n\nHai controllato su Resend che l'email NON risulta consegnata?\n\nOK = sì, ho controllato: invia comunque.\nAnnulla = non inviare.`
+      : fresh.mode === 'reale'
+        ? `Ritento ADESSO l'invio AL CLIENTE (${to}) del secondo avviso per ${what}.\n\nSe l'invio precedente fosse in realtà arrivato, Resend lo riconosce e non lo rimanda (vale per 24 ore).\n\nProcedere?`
+        : fresh.mode === 'test'
+          ? `Ritento l'invio di prova a ${fresh.test_to} per ${what}. Procedere?`
+          : `Ritento il secondo avviso per ${what} (modalità: ${fresh.mode_label}). Procedere?`
     if (!window.confirm(msg)) return
     setRetryingId(row.id)
     setRunResult(null)
     try {
-      const res = await client.post(`${rowPath(row)}/retry`, { expected_mode: fresh.mode }, { noRetry: true, timeout: 120000 })
+      const res = await client.post(`${rowPath(row)}/retry`, { expected_mode: fresh.mode, force }, { noRetry: true, timeout: 120000 })
       setRunResult(res.data)
       await load()
     } catch (e) {
@@ -113,6 +117,22 @@ export default function FollowupEmailPanel() {
       setRetryingId(null)
     }
   }
+
+  const retryButton = (row) => (row.status === 'failed' || row.status === 'sending') && (
+    <button type="button" onClick={() => retry(row)} disabled={retryingId !== null || running} className="sc-btn-secondary text-xs disabled:opacity-50"
+      title={row.retry_needs_confirmation ? 'Solo dopo aver controllato su Resend che non è arrivata' : row.needs_manual_retry ? 'Ferma finché non la ritenti tu' : 'Verrà ritentata anche al prossimo giro'}>
+      {retryingId === row.id ? '…' : row.retry_needs_confirmation ? 'Invia comunque…' : 'Riprova'}
+    </button>
+  )
+
+  // Cosa dire, in breve, di una riga ferma.
+  const stuckReason = (row) => row.error_kind === 'conflict'
+    ? 'Resend l\'aveva già ricevuta: con ogni probabilità è partita. Verifica su Resend prima di inviare di nuovo.'
+    : row.status === 'sending'
+      ? 'Invio interrotto a metà: potrebbe essere partita.'
+      : row.needs_manual_retry
+        ? `Esito incerto: potrebbe essere partita. ${row.error || ''}`
+        : `Non è partita: il giro la riprova da solo. ${row.error || ''}`
 
   const sendTest = async (p) => {
     const what = (p.invoice_count || 1) > 1 ? `${p.invoice_count} fatture in un'unica email` : `fattura ${p.invoice_number}`
@@ -168,6 +188,7 @@ export default function FollowupEmailPanel() {
   const toSendInvoices = toSend.reduce((sum, p) => sum + (p.invoice_count || 1), 0)
   const notSent = preview.length - toSend.length
   const recent = data.recent || []
+  const stuck = data.stuck || []
   const sync = data.sync || {}
   const canRun = data.enabled && !data.weekend && sync.ok && toSend.length > 0
   const plannedLabel = !data.enabled ? 'Partirebbe (ora spento)' : data.mode === 'prova' ? 'Da preparare' : 'Da inviare'
@@ -318,6 +339,47 @@ export default function FollowupEmailPanel() {
         )}
       </div>
 
+      {/* Da gestire: tutte le righe ferme, qualunque età abbiano */}
+      {stuck.length > 0 && (
+        <div className="px-6 py-4 border-b border-dark-border" data-testid="followup-stuck">
+          <p className="text-sm font-semibold text-accent-amber mb-1">Da gestire: {stuck.length} avvis{stuck.length === 1 ? 'o fermo' : 'i fermi'}</p>
+          <p className="text-xs text-txt-muted mb-3">Invii falliti o interrotti di fatture ancora da saldare. Restano qui finché l'email non parte o la fattura viene pagata.</p>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-xs uppercase tracking-wider text-txt-label border-b border-dark-border">
+                  <th className="text-left py-2 pr-3">Tentativo</th>
+                  <th className="text-left py-2 pr-3">Cliente</th>
+                  <th className="text-left py-2 pr-3">Fattura</th>
+                  <th className="text-right py-2 pr-3">Importo</th>
+                  <th className="text-left py-2 pr-3">Cosa è successo</th>
+                  <th className="text-left py-2">Azioni</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-dark-border">
+                {stuck.map(row => (
+                  <tr key={row.id}>
+                    <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap align-top">{fmtDateTime(row.attempted_at || row.created_at)}{row.mode !== 'reale' && <span className="block text-txt-muted">({row.mode})</span>}</td>
+                    <td className="py-2 pr-3 align-top">
+                      <CustomerName id={row.customer_id} name={row.ragione_sociale} navigate={navigate} />
+                      <span className="block text-xs text-txt-muted font-mono">{row.original_to || row.to_email || '—'}</span>
+                    </td>
+                    <td className="py-2 pr-3 font-mono text-xs text-txt-secondary whitespace-nowrap align-top">
+                      {row.invoice_number}
+                      <span className="block text-txt-muted font-sans">scad. {fmtDate(row.due_date)}</span>
+                      <GroupNote row={row} />
+                    </td>
+                    <td className="py-2 pr-3 text-right text-txt-primary align-top">{fmtEur(row.amount_due)}</td>
+                    <td className="py-2 pr-3 text-xs text-txt-secondary align-top max-w-[22rem]">{stuckReason(row)}</td>
+                    <td className="py-2 align-top">{retryButton(row)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* Registro */}
       <div className="px-6 py-4">
         <p className="text-sm font-semibold text-txt-primary mb-3">Ultimi secondi avvisi registrati <span className="text-txt-muted font-normal">· una riga per fattura</span></p>
@@ -364,7 +426,7 @@ export default function FollowupEmailPanel() {
                           )
                           : <ReminderStatusBadge row={row} />}
                         {row.mode === 'test' && <span className="ml-1 text-xs text-txt-muted">(test)</span>}
-                        {row.error_kind === 'conflict' && <span className="block text-xs text-txt-muted mt-1 max-w-[15rem]">Resend l'aveva già ricevuta: non si rimanda. Verifica su Resend.</span>}
+                        {row.error_kind === 'conflict' && <span className="block text-xs text-txt-muted mt-1 max-w-[15rem]">Resend l'aveva già ricevuta: verifica su Resend.</span>}
                       </td>
                       <td className="py-2 pr-3 text-xs font-mono text-txt-secondary">
                         {row.to_email || '—'}
@@ -379,11 +441,7 @@ export default function FollowupEmailPanel() {
                               {detail?.id === row.id ? 'Chiudi' : 'Testo'}
                             </button>
                           )}
-                          {(row.status === 'sending' || (row.status === 'failed' && row.error_kind !== 'conflict')) && (
-                            <button type="button" onClick={() => retry(row)} disabled={retryingId !== null || running} className="sc-btn-secondary text-xs disabled:opacity-50" title={row.needs_manual_retry ? 'Ferma finché non la ritenti tu' : 'Verrà ritentata anche al prossimo giro'}>
-                              {retryingId === row.id ? '…' : 'Riprova'}
-                            </button>
-                          )}
+                          {retryButton(row)}
                         </span>
                       </td>
                     </tr>

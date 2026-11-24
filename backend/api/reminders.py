@@ -36,6 +36,9 @@ class RunBody(BaseModel):
     # La modalità che l'operatore ha letto e confermato a video: se il server
     # ne risolve un'altra (env cambiate), 409 — mai un invio "a sorpresa".
     expected_mode: Optional[str] = None
+    # Solo «Riprova» del secondo avviso: l'operatore conferma di aver
+    # controllato su Resend che l'email NON è stata consegnata.
+    force: bool = False
 
 
 def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], kind: str = "promemoria",
@@ -45,6 +48,7 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
     `group_key` — una email con più fatture ha una riga per fattura."""
     group_key = getattr(row, "group_key", None)
     members = (groups or {}).get(group_key) or [] if group_key else []
+    is_followup = kind == followup.KIND_KEY
     return {
         "id": row.id,
         "kind": kind,
@@ -69,10 +73,16 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
         "provider_message_id": row.provider_message_id,
         "error": row.error,
         "error_kind": row.error_kind,
-        # Ferma finché un operatore non preme «Riprova»?
-        "needs_manual_retry": row.status == "sending" or (
-            row.status == "failed" and (row.error_kind or "other") not in AUTO_RETRY_KINDS
+        # Ferma finché un operatore non preme «Riprova»? (secondo avviso: anche
+        # «nessun invio tentato» si ritenta da solo)
+        "needs_manual_retry": followup._is_uncertain(row) if is_followup else (
+            row.status == "sending" or (
+                row.status == "failed" and (row.error_kind or "other") not in AUTO_RETRY_KINDS
+            )
         ),
+        # Secondo avviso: «Riprova» può creare un doppione che Resend non
+        # fermerebbe (dopo un 409, o oltre un giorno): serve «Invia comunque».
+        "retry_needs_confirmation": bool(is_followup and followup.needs_confirmation(row)),
         "attempted_at": row.attempted_at.isoformat() if row.attempted_at else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "sent_at": row.sent_at.isoformat() if row.sent_at else None,
@@ -293,7 +303,8 @@ def followup_email_status(
         .limit(limit)
         .all()
     )
-    groups = followup.group_members(session, [r for r, _i, _c in rows])
+    stuck = followup.stuck_rows(session)
+    groups = followup.group_members(session, [r for r, _i, _c in rows] + [r for r, _i, _c in stuck])
     return {
         "enabled": mode != followup.MODE_OFF,
         "mode": mode,
@@ -318,6 +329,10 @@ def followup_email_status(
         "agent_emails": agent_emails(),
         "preview": followup.preview_followups(session, mode=mode),
         "recent": [_serialize(r, i, c, followup.KIND_KEY, groups) for r, i, c in rows],
+        # TUTTE le righe ferme (fallite o interrotte) di fatture ancora da
+        # sollecitare, qualunque età abbiano: non devono uscire di vista
+        # quando il registro qui sopra si riempie.
+        "stuck": [_serialize(r, i, c, followup.KIND_KEY, groups) for r, i, c in stuck],
     }
 
 
@@ -361,7 +376,7 @@ def followup_email_retry(row_id: int, body: Optional[RunBody] = None, session: S
     row, _invoice, _customer = _followup_row(session, row_id)
     expected = body.expected_mode if body else None
     try:
-        return followup.retry_followup_row(session, row, expected_mode=expected)
+        return followup.retry_followup_row(session, row, expected_mode=expected, force=bool(body and body.force))
     except ReminderBusy:
         raise HTTPException(status_code=409, detail="Un giro di email è già in corso")
     except ModeMismatch as e:

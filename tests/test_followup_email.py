@@ -828,8 +828,13 @@ class TestRun:
         summary = run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
         assert summary["failed"] == 1 and summary["sent"] == 1
         rows = {r.invoice_id: r for r in _rows(test_db_session)}
-        assert rows[a.id].status == "failed" and rows[a.id].error_kind == "other" and "boom" in rows[a.id].error
+        # Errore PRIMA di qualunque invio: visibile, e il giro la riprova da solo.
+        assert rows[a.id].status == "failed" and rows[a.id].error_kind == "not_attempted" and "boom" in rows[a.id].error
+        assert "nulla è partito" in rows[a.id].error and rows[a.id].idempotency_key is None
         assert rows[b.id].status == "sent"
+        monkeypatch.setattr(fu, "compose_followup", real)
+        again = run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        assert (again["sent"], again["failed"]) == (1, 0) and rows[a.id].status == "sent"
         # L'errore del secondo avviso sta nel SUO registro, non in quello dei promemoria.
         assert test_db_session.query(InvoiceReminderEmail).filter_by(status="failed").count() == 0
 
@@ -1456,7 +1461,7 @@ class TestOneEmailPerCustomer:
         fu._process_group_safely(s, ics, [a, x], key="k", mode=MODE_REALE, mailer=mailer, cfg=_on_cfg(),
                                  summary=summary, existing={}, today=TODAY)
         assert mailer.calls == 0 and summary["sent"] == 0 and summary["failed"] == 1
-        assert {(r.status, r.error_kind) for r in _rows(s)} == {("failed", "other")}
+        assert {(r.status, r.error_kind) for r in _rows(s)} == {("failed", "not_attempted")}
         assert all("altro cliente" in r.error for r in _rows(s))
 
     def test_retry_refuses_a_lone_invoice_not_yet_at_seven_days(self, test_db_session):
@@ -1552,7 +1557,7 @@ class TestOneEmailPerCustomer:
         assert test_db_session.query(InvoiceFollowupEmail).one().status == "sending"  # com'era stata lasciata
         assert inv.status == "open"
 
-    def test_conflict_from_resend_is_never_sent_again(self, test_db_session):
+    def test_conflict_from_resend_needs_an_explicit_confirmation(self, test_db_session):
         c, a, b = self._pair(test_db_session)
 
         class Conflict(FakeMailer):
@@ -1567,20 +1572,81 @@ class TestOneEmailPerCustomer:
         # 409 = «un invio con questa chiave mi è già arrivato»: NON è un rifiuto certo.
         assert [(r.status, r.error_kind) for r in rows] == [("failed", "conflict")] * 2
         assert all(r.error.startswith("Resend ha già ricevuto un invio con la stessa chiave") for r in rows)
-        assert "Resend HTTP 409" in rows[0].error and "sollecitare il cliente a mano" in rows[0].error
+        assert "Resend HTTP 409" in rows[0].error and "«Invia comunque»" in rows[0].error
         for day in (TODAY, date(2026, 11, 19), date(2026, 11, 20)):
             _sync(test_db_session, now=_at(day))
             again = run_followups(test_db_session, now_utc=_at(day), mailer=mailer, cfg=_on_cfg())
             assert (again["sent"], again["failed"]) == (0, 0), day
         assert mailer.calls == 1  # mai ritentata da sola…
         _sync(test_db_session)
-        for row in rows:        # …e nemmeno a mano: il primo invio era arrivato a Resend
-            with pytest.raises(ValueError, match="non si rimanda"):
-                retry_followup_row(test_db_session, row, mailer=FakeMailer(), cfg=_on_cfg())
+        plain = FakeMailer()
+        for row in rows:        # …e a mano solo con la conferma «ho controllato su Resend, non è arrivata»
+            assert fu.needs_confirmation(row) is True
+            with pytest.raises(ValueError, match="solo se NON risulta, confermare «Invia comunque»"):
+                retry_followup_row(test_db_session, row, mailer=plain, cfg=_on_cfg())
+        assert plain.calls == 0
         assert [(r.status, r.error_kind) for r in _rows(test_db_session)] == [("failed", "conflict")] * 2
+        old_key = rows[0].idempotency_key
+        out = retry_followup_row(test_db_session, rows[1], mailer=plain, cfg=_on_cfg(), force=True)
+        assert (out["sent"], out["invoices"]) == (1, 2) and "2 fatture scadute" in plain.sent[0]["subject"]
+        assert plain.sent[0]["idempotency_key"] != old_key  # tentativo nuovo: chiave nuova
+        assert {r.status for r in _rows(test_db_session)} == {"sent"}
         # Un vero rifiuto (422) resta «certamente non partita» e si ritenta da solo.
         assert fu._is_conflict(MailSendError("Resend HTTP 422: invalid recipient", kind="validation")) is False
         assert fu._is_conflict(MailSendError("Resend non raggiungibile: ReadTimeout", kind="network")) is False
+
+    def test_a_forced_attempt_that_fails_is_still_never_retried_alone(self, test_db_session):
+        # «Invia comunque» dopo un 409, e l'invio fallisce con un rifiuto: la
+        # riga resta ferma (il tentativo di prima potrebbe essere arrivato).
+        c = _cust(test_db_session)
+        _due(test_db_session, c, num="A/1")
+        _sync(test_db_session)
+        mailer = self._Resend()
+        run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        row = _rows(test_db_session)[0]
+        retry_followup_row(test_db_session, row, mailer=mailer, cfg=_on_cfg())           # 409 → conflitto
+        refused = FakeMailer(fail_times=1, kind=ERROR_VALIDATION)
+        out = retry_followup_row(test_db_session, row, mailer=refused, cfg=_on_cfg(), force=True)
+        assert out["failed"] == 1 and (row.status, row.error_kind) == ("failed", "other")
+        assert run_followups(test_db_session, mailer=refused, cfg=_on_cfg())["sent"] == 0 and refused.calls == 1
+
+    def test_an_old_uncertain_real_send_needs_the_confirmation_too(self, test_db_session):
+        # Oltre un giorno dal tentativo Resend ha dimenticato la chiave: un
+        # ritento non sarebbe più protetto. Serve la conferma esplicita.
+        c, a, b = self._pair(test_db_session)
+        mailer = FakeMailer(fail_times=1, kind=ERROR_NETWORK)
+        run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        row_a, row_b = _rows(test_db_session)
+        now = datetime(2026, 11, 18, 10, 0)
+        for hours, expected in ((1, False), (22, False), (24, True), (72, True)):
+            row_a.attempted_at = now - timedelta(hours=hours)
+            assert fu.needs_confirmation(row_a, now) is expected, hours
+        row_a.attempted_at = row_b.attempted_at = now - timedelta(hours=30)
+        test_db_session.commit()
+        with pytest.raises(ValueError, match="Resend non fermerebbe più un doppione"):
+            retry_followup_row(test_db_session, row_a, mailer=mailer, cfg=_on_cfg())
+        assert mailer.calls == 1 and row_a.status == "failed"
+        first_key = row_a.idempotency_key
+        out = retry_followup_row(test_db_session, row_a, mailer=mailer, cfg=_on_cfg(), force=True)
+        assert (out["sent"], out["invoices"]) == (1, 2) and mailer.sent[0]["idempotency_key"] != first_key
+        # Mai per le righe di prova/test (non riguardano il cliente) né per un rifiuto certo.
+        row_a.status, row_a.error_kind, row_a.mode = "failed", "network", "test"
+        assert fu.needs_confirmation(row_a, now + timedelta(days=9)) is False
+        row_a.mode, row_a.error_kind = "reale", "validation"
+        assert fu.needs_confirmation(row_a, now + timedelta(days=9)) is False
+        row_a.error_kind, row_a.attempted_at = "network", None
+        assert fu.needs_confirmation(row_a, now + timedelta(days=9)) is False
+
+    def test_manual_retry_never_sends_in_the_weekend(self, test_db_session):
+        c, a, b = self._pair(test_db_session)
+        mailer = FakeMailer(fail_times=1, kind=ERROR_NETWORK)
+        run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        row = _rows(test_db_session)[0]
+        for day in (date(2026, 11, 21), date(2026, 11, 22)):
+            _sync(test_db_session, now=_at(day))
+            with pytest.raises(ValueError, match="nel weekend non si inviano avvisi"):
+                retry_followup_row(test_db_session, row, mailer=mailer, cfg=_on_cfg(), now_utc=_at(day))
+        assert mailer.calls == 1
 
     def test_real_connector_409_is_recognised_as_conflict(self):
         # Il riconoscimento del 409 dipende dal testo che produce il connettore:
@@ -1640,7 +1706,7 @@ class TestOneEmailPerCustomer:
         assert len(mailer.delivered) == 1 and mailer.calls == 2 and len(set(mailer.keys)) == 1
         next_day = _at(date(2026, 11, 19))
         _sync(test_db_session, now=next_day)
-        with pytest.raises(ValueError, match="non si rimanda"):
+        with pytest.raises(ValueError, match="«Invia comunque»"):
             retry_followup_row(test_db_session, row, mailer=mailer, cfg=_on_cfg(), now_utc=next_day)
         assert len(mailer.delivered) == 1
 
@@ -1956,6 +2022,8 @@ class TestOneEmailPerCustomer:
         assert fu._unique_names(["a.pdf", "a.pdf", "b", "c", "a.pdf"], [1, 2, 3, 4, 5]) == [
             "a_1.pdf", "a_2.pdf", "b", "c", "a_5.pdf"]
         assert fu._unique_names(["x", "x"], [7, 8]) == ["x_7", "x_8"]
+        # Caso di scuola: un nome che coincide col nome «con l'id» di un altro resta comunque unico.
+        assert fu._unique_names(["a.pdf", "a.pdf", "a_5.pdf"], [5, 6, 7]) == ["a_5.pdf", "a_6.pdf", "a_5_2.pdf"]
 
     def test_refused_email_is_retried_whole_at_the_next_round(self, test_db_session):
         c, a, b = self._pair(test_db_session)
@@ -1967,7 +2035,7 @@ class TestOneEmailPerCustomer:
         assert "2 fatture scadute" in refused.sent[0]["subject"]
         assert {r.status for r in _rows(test_db_session)} == {"sent"} and len(_rows(test_db_session)) == 2
 
-    def test_unexpected_error_marks_every_invoice_of_the_email(self, test_db_session, monkeypatch):
+    def test_unexpected_error_before_sending_is_visible_and_retried_by_the_round(self, test_db_session, monkeypatch):
         c, a, b = self._pair(test_db_session)
         other = _due(test_db_session, _other(test_db_session, 9), num="X/1")
         real = fu.compose_followup
@@ -1982,14 +2050,178 @@ class TestOneEmailPerCustomer:
         summary = run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
         assert (summary["failed"], summary["sent"], summary["invoices"]) == (1, 1, 1)
         rows = {r.invoice_id: r for r in _rows(test_db_session)}
-        assert [(rows[i.id].status, rows[i.id].error_kind) for i in (a, b)] == [("failed", "other")] * 2
-        assert "boom" in rows[a.id].error and rows[a.id].group_key == rows[b.id].group_key == group_key(c.id, [a, b], TODAY)
+        # Nulla era partito (errore prima della riserva): righe visibili, non «incerte».
+        assert [(rows[i.id].status, rows[i.id].error_kind) for i in (a, b)] == [("failed", "not_attempted")] * 2
+        assert "boom" in rows[a.id].error and fu._is_uncertain(rows[a.id]) is False
         assert rows[other.id].status == "sent"
         monkeypatch.setattr(fu, "compose_followup", real)
-        # Errore imprevisto = stato incerto: ferme finché un operatore non le ritenta, insieme.
-        assert run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())["sent"] == 0
-        retried = retry_followup_row(test_db_session, rows[a.id], mailer=mailer, cfg=_on_cfg())
-        assert (retried["sent"], retried["invoices"]) == (1, 2) and "2 fatture scadute" in mailer.sent[-1]["subject"]
+        second = run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())   # il giro le riprova da solo
+        assert (second["sent"], second["invoices"]) == (1, 2) and "2 fatture scadute" in mailer.sent[-1]["subject"]
+
+    def test_unexpected_error_after_the_reservation_is_uncertain(self, test_db_session, monkeypatch):
+        # L'eccezione arriva a invio avviato (righe già riservate): l'email
+        # potrebbe essere partita → ferme finché un operatore non le ritenta.
+        c, a, b = self._pair(test_db_session)
+
+        class Explodes(FakeMailer):
+            def send(self, **kwargs):
+                self.calls += 1
+                self.keys.append(kwargs["idempotency_key"])
+                raise RuntimeError("processo interrotto a metà")   # non è un MailSendError
+
+        mailer = Explodes()
+        summary = run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        rows = _rows(test_db_session)
+        assert summary["failed"] == 1 and [(r.status, r.error_kind) for r in rows] == [("failed", "other")] * 2
+        assert {r.idempotency_key for r in rows} == {mailer.keys[0]} and fu._is_uncertain(rows[0])
+        plain = FakeMailer()
+        assert run_followups(test_db_session, mailer=plain, cfg=_on_cfg())["sent"] == 0 and plain.calls == 0
+        out = retry_followup_row(test_db_session, rows[0], mailer=plain, cfg=_on_cfg())
+        assert (out["sent"], out["invoices"]) == (1, 2) and plain.sent[0]["idempotency_key"] == mailer.keys[0]
+
+    def test_error_after_the_send_but_before_the_final_write_is_uncertain_and_never_duplicates(
+            self, test_db_session, monkeypatch):
+        # L'email è partita ma la scrittura finale salta: le righe (riservate
+        # da questo tentativo) restano incerte; il ritento riusa la chiave e
+        # Resend risponde 409 → nessun doppione, decide un operatore.
+        c, a, b = self._pair(test_db_session)
+        resend = self._Resend(lost=1)
+        run_followups(test_db_session, mailer=resend, cfg=_on_cfg())               # 1° tentativo: timeout, non arrivata? arrivata.
+        rows = _rows(test_db_session)
+        resend2 = self._Resend(lost=0)                                             # un altro Resend «pulito»: non ha mai visto la chiave
+        monkeypatch.setattr(fu, "_release_siblings", lambda *x, **k: (_ for _ in ()).throw(RuntimeError("db caduto")))
+        out = retry_followup_row(test_db_session, rows[0], mailer=resend2, cfg=_on_cfg())
+        assert len(resend2.delivered) == 1 and out["sent"] == 0 and out["failed"] == 1
+        assert [(r.status, r.error_kind) for r in _rows(test_db_session)] == [("failed", "other")] * 2
+        assert {r.idempotency_key for r in _rows(test_db_session)} == {resend2.keys[0]} == {resend.keys[0]}
+        monkeypatch.undo()
+        for target in ("format", "reminder_email", "followup_email"):
+            monkeypatch.setattr(f"backend.engine.{target}.datetime", _FixedDatetime)
+        assert run_followups(test_db_session, mailer=resend2, cfg=_on_cfg())["sent"] == 0
+        out = retry_followup_row(test_db_session, _rows(test_db_session)[0], mailer=resend2, cfg=_on_cfg())
+        assert out["failed"] == 1 and len(resend2.delivered) == 1                   # 409: non riparte
+        assert {r.error_kind for r in _rows(test_db_session)} == {"conflict"}
+
+    def test_an_error_before_the_reservation_never_changes_existing_rows(self, test_db_session, monkeypatch):
+        # Errore prima di qualunque invio: lo stato di prima delle righe è
+        # ancora vero e non si tocca (un incerto resta incerto, un rifiuto
+        # certo resta ritentabile dal giro, un invio in test resta tale).
+        real = fu.compose_followup
+        boom = lambda *x, **k: (_ for _ in ()).throw(RuntimeError("boom"))   # noqa: E731
+        # a) riga incerta ritentata a mano
+        c, a, b = self._pair(test_db_session)
+        timeout = FakeMailer(fail_times=1, kind=ERROR_NETWORK)
+        run_followups(test_db_session, mailer=timeout, cfg=_on_cfg())
+        before = [(r.status, r.error_kind, r.idempotency_key, r.error) for r in _rows(test_db_session)]
+        monkeypatch.setattr(fu, "compose_followup", boom)
+        out = retry_followup_row(test_db_session, _rows(test_db_session)[0], mailer=timeout, cfg=_on_cfg())
+        assert out["failed"] == 1 and timeout.calls == 1
+        assert [(r.status, r.error_kind, r.idempotency_key, r.error) for r in _rows(test_db_session)] == before
+        # b) rifiuto certo: dopo l'imprevisto il giro lo ritenta ancora da solo
+        c2 = _other(test_db_session, 2)
+        _due(test_db_session, c2, num="V/1")
+        monkeypatch.setattr(fu, "compose_followup", real)
+        refused = FakeMailer(fail_times=1, kind=ERROR_VALIDATION)
+        run_followups(test_db_session, mailer=refused, cfg=_on_cfg())
+        row = test_db_session.query(InvoiceFollowupEmail).filter_by(customer_id=c2.id).one()
+        monkeypatch.setattr(fu, "compose_followup", boom)
+        run_followups(test_db_session, mailer=refused, cfg=_on_cfg())
+        assert (row.status, row.error_kind) == ("failed", "validation")
+        monkeypatch.setattr(fu, "compose_followup", real)
+        assert run_followups(test_db_session, mailer=refused, cfg=_on_cfg())["sent"] == 1
+        # c) inviata in TEST, poi un giro reale che si rompe prima dell'invio: resta «inviata in test»
+        c3 = _other(test_db_session, 3)
+        _due(test_db_session, c3, num="T/1")
+        test_cfg = _on_cfg(REMINDER_EMAIL_TEST_TO="lorenzo@example.com")
+        mailer = FakeMailer()
+        run_followups(test_db_session, mailer=mailer, cfg=test_cfg)
+        row = test_db_session.query(InvoiceFollowupEmail).filter_by(customer_id=c3.id).one()
+        monkeypatch.setattr(fu, "compose_followup", boom)
+        run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        assert (row.status, row.mode) == ("sent", "test")
+        monkeypatch.setattr(fu, "compose_followup", real)
+        assert run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())["sent"] == 1
+        assert mailer.sent[-1]["to"] == ["amministrazione@cliente3.it"]
+
+    def test_test_mode_outcomes_never_block_the_real_email(self, test_db_session):
+        # In prova/test il cliente non riceve nulla: in reale ogni riga di
+        # test è un invio nuovo, anche se era incerta o in conflitto con Resend.
+        test_cfg = _on_cfg(REMINDER_EMAIL_TEST_TO="lorenzo@example.com")
+        # a) timeout in test (ma accettata), «Riprova» in test → 409 → conflitto in test
+        c1 = _other(test_db_session, 1)
+        _due(test_db_session, c1, num="T/1")
+        _sync(test_db_session)
+        resend = self._Resend()
+        run_followups(test_db_session, mailer=resend, cfg=test_cfg)
+        row = test_db_session.query(InvoiceFollowupEmail).filter_by(customer_id=c1.id).one()
+        retry_followup_row(test_db_session, row, mailer=resend, cfg=test_cfg)
+        assert (row.status, row.mode, row.error_kind) == ("failed", "test", "conflict")
+        real = run_followups(test_db_session, mailer=resend, cfg=_on_cfg())
+        assert real["sent"] == 1 and resend.delivered[-1]["to"] == ["amministrazione@cliente1.it"]
+        assert (row.status, row.mode) == ("sent", "reale") and len(set(resend.keys)) == 2
+        # b) timeout in test, poi «Riprova» direttamente in REALE: chiave nuova (non quella del test), parte
+        c2 = _other(test_db_session, 2)
+        _due(test_db_session, c2, num="T/2")
+        resend2 = self._Resend()
+        run_followups(test_db_session, mailer=resend2, cfg=test_cfg)
+        row2 = test_db_session.query(InvoiceFollowupEmail).filter_by(customer_id=c2.id).one()
+        assert (row2.status, row2.mode, row2.error_kind) == ("failed", "test", "network")
+        out = retry_followup_row(test_db_session, row2, mailer=resend2, cfg=_on_cfg())
+        assert out["sent"] == 1 and resend2.keys[0] != resend2.keys[1]
+        assert resend2.delivered[-1]["to"] == ["amministrazione@cliente2.it"] and (row2.status, row2.mode) == ("sent", "reale")
+        # c) riga interrotta a metà in test: in reale il giro la manda da solo
+        c3 = _other(test_db_session, 3)
+        inv3 = _due(test_db_session, c3, num="T/3")
+        orphan = InvoiceFollowupEmail(invoice_id=inv3.id, customer_id=c3.id, due_date=DUE7, status="sending", mode="test")
+        test_db_session.add(orphan)
+        test_db_session.commit()
+        assert fu._needs_processing(orphan, MODE_TEST) == (False, "invio interrotto: serve «Riprova»")
+        assert fu._needs_processing(orphan, MODE_REALE) == (True, "invio reale dopo il test")
+        plain = FakeMailer()
+        assert run_followups(test_db_session, mailer=plain, cfg=_on_cfg())["sent"] == 1 and orphan.status == "sent"
+        # In reale, invece, un incerto REALE resta fermo.
+        orphan.status, orphan.mode = "sending", "reale"
+        assert fu._needs_processing(orphan, MODE_REALE)[0] is False
+
+    def test_a_split_retry_does_not_burn_the_key_of_the_invoice_left_out(self, test_db_session):
+        # {A, B} fallisce senza mai arrivare a Resend. Al ritento B è esclusa
+        # (promessa): A parte da sola con la chiave del primo tentativo. Poi B
+        # torna sollecitabile: il suo ritento NON deve prendere un 409 per
+        # l'email di A (che di B non parlava).
+        class DownOnce(TestOneEmailPerCustomer._Resend):
+            def __init__(self):
+                super().__init__(lost=0)
+                self.down = 1
+
+            def send(self, **kwargs):
+                if self.down:
+                    self.down -= 1
+                    self.calls += 1
+                    self.keys.append(kwargs["idempotency_key"])
+                    raise MailSendError("Resend non raggiungibile: ConnectError", kind="network")
+                return super().send(**kwargs)
+
+        c = _cust(test_db_session)
+        a = _due(test_db_session, c, num="A/1", amount=100.0)
+        b = _due(test_db_session, c, num="B/2", amount=200.0, due=date(2026, 11, 10))
+        _sync(test_db_session)
+        mailer = DownOnce()
+        run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        row_a = test_db_session.query(InvoiceFollowupEmail).filter_by(invoice_id=a.id).one()
+        row_b = test_db_session.query(InvoiceFollowupEmail).filter_by(invoice_id=b.id).one()
+        assert row_a.idempotency_key == row_b.idempotency_key == mailer.keys[0]
+        b.status = "promised"
+        test_db_session.commit()
+        assert retry_followup_row(test_db_session, row_a, mailer=mailer, cfg=_on_cfg())["sent"] == 1
+        assert mailer.keys[1] == mailer.keys[0]                      # A: continua il primo tentativo
+        assert (row_b.status, row_b.error_kind, row_b.idempotency_key) == ("failed", "network", None)
+        b.status = "open"
+        test_db_session.commit()
+        out = retry_followup_row(test_db_session, row_b, mailer=mailer, cfg=_on_cfg())
+        assert out["sent"] == 1 and (row_b.status, row_b.error_kind) == ("sent", None)
+        assert mailer.keys[2] == f"followup-riga{row_b.id}-reale" != mailer.keys[0]
+        assert [d["subject"].split(" scaduta")[0] for d in mailer.delivered] == [
+            "Sollecito di pagamento: fattura n. A/1", "Sollecito di pagamento: fattura n. B/2"]
 
     def test_pdf_failure_marks_every_invoice_and_is_retried(self, test_db_session, monkeypatch):
         c, a, b = self._pair(test_db_session)
@@ -2494,6 +2726,57 @@ class TestApi:
         assert test_client.get(f"/api/reminders/followup/{lone.id}/attachments/1").status_code == 200
         assert test_client.get(f"/api/reminders/followup/{lone.id}/attachments/2").status_code == 404
         assert other.id != inv.id
+
+    def test_stuck_rows_never_drop_out_of_sight(self, test_client, test_db_session, monkeypatch):
+        # Le righe ferme restano in un elenco a parte, qualunque età abbiano e
+        # per quanto il registro si riempia: è lì che l'operatore le ritenta.
+        self._enable(monkeypatch)
+        c = _cust(test_db_session)
+        a = _due(test_db_session, c, num="FERMA/1", amount=100.0)
+        _sync(test_db_session)
+        self._spy(monkeypatch, fail_times=1, kind=ERROR_NETWORK)
+        assert test_client.post("/api/reminders/followup/run").json()["failed"] == 1
+        paid = _due(test_db_session, _other(test_db_session, 2), num="PAGATA/1")
+        test_db_session.add(InvoiceFollowupEmail(invoice_id=paid.id, customer_id=paid.customer_id, due_date=DUE7,
+                                                 status="failed", mode="reale", error_kind="network"))
+        paid.status, paid.amount_due = "paid", 0.0
+        conflict = _due(test_db_session, _other(test_db_session, 3), num="CONFLITTO/1")
+        test_db_session.add(InvoiceFollowupEmail(invoice_id=conflict.id, customer_id=conflict.customer_id, due_date=DUE7,
+                                                 status="failed", mode="reale", error_kind="conflict",
+                                                 attempted_at=datetime(2026, 11, 18, 9, 0)))
+        for n in range(40):   # il registro si riempie di invii riusciti più recenti
+            inv = _due(test_db_session, _other(test_db_session, 100 + n), num=f"OK/{n}")
+            test_db_session.add(InvoiceFollowupEmail(invoice_id=inv.id, customer_id=inv.customer_id, due_date=DUE7,
+                                                     status="sent", mode="reale",
+                                                     created_at=datetime(2026, 12, 1, 12, n)))
+        test_db_session.commit()
+        data = test_client.get("/api/reminders/followup").json()
+        assert len(data["recent"]) == 30 and {r["status"] for r in data["recent"]} == {"sent"}
+        stuck = {r["invoice_number"]: r for r in data["stuck"]}
+        assert set(stuck) == {"FERMA/1", "CONFLITTO/1"}            # la pagata non è più «da gestire»
+        assert (stuck["FERMA/1"]["needs_manual_retry"], stuck["FERMA/1"]["retry_needs_confirmation"]) == (True, False)
+        assert (stuck["CONFLITTO/1"]["needs_manual_retry"], stuck["CONFLITTO/1"]["retry_needs_confirmation"]) == (True, True)
+        assert stuck["FERMA/1"]["invoice_id"] == a.id
+        # «Riprova» su una riga che chiede la conferma: senza, 409 con la spiegazione; con, parte.
+        row_id = stuck["CONFLITTO/1"]["id"]
+        created = self._spy(monkeypatch)
+        refused = test_client.post(f"/api/reminders/followup/{row_id}/retry", json={"expected_mode": "reale"})
+        assert refused.status_code == 409 and "Invia comunque" in refused.json()["detail"] and created == []
+        forced = test_client.post(f"/api/reminders/followup/{row_id}/retry", json={"expected_mode": "reale", "force": True})
+        assert forced.status_code == 200 and forced.json()["sent"] == 1
+        assert created[0].sent[0]["to"] == ["amministrazione@cliente3.it"]
+        after = test_client.get("/api/reminders/followup").json()
+        assert [r["invoice_number"] for r in after["stuck"]] == ["FERMA/1"]
+        # Un fallimento «certo» non chiede l'operatore (il giro lo riprova da solo).
+        row = test_db_session.query(InvoiceFollowupEmail).filter_by(invoice_id=a.id).one()
+        for kind, manual in (("validation", False), ("pdf", False), ("not_attempted", False), ("network", True),
+                             ("provider", True), ("other", True)):
+            row.error_kind = kind
+            test_db_session.commit()
+            item = test_client.get(f"/api/reminders/followup/{row.id}").json()
+            assert item["needs_manual_retry"] is manual, kind
+        # Le righe del promemoria non hanno il concetto di conferma.
+        assert test_client.get("/api/reminders/email").json()["recent"][0]["retry_needs_confirmation"] is False
 
     def test_attachment_is_resolved_by_its_stored_name(self, test_client, test_db_session, monkeypatch):
         # L'allegato n-esimo è quello REGISTRATO all'invio, cercato per nome:
