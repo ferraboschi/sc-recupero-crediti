@@ -1578,6 +1578,7 @@ class TestOneEmailPerCustomer:
             again = run_followups(test_db_session, now_utc=_at(day), mailer=mailer, cfg=_on_cfg())
             assert (again["sent"], again["failed"]) == (0, 0), day
         assert mailer.calls == 1  # mai ritentata da sola…
+        assert fu._needs_processing(rows[0], MODE_REALE) == (False, "Resend l'aveva già ricevuta: decide un operatore")
         _sync(test_db_session)
         plain = FakeMailer()
         for row in rows:        # …e a mano solo con la conferma «ho controllato su Resend, non è arrivata»
@@ -2204,6 +2205,12 @@ class TestOneEmailPerCustomer:
         c = _cust(test_db_session)
         a = _due(test_db_session, c, num="A/1", amount=100.0)
         b = _due(test_db_session, c, num="B/2", amount=200.0, due=date(2026, 11, 10))
+        # Un altro cliente con un invio fermo suo (un'altra chiave): non c'entra e non va toccato.
+        stranger = _due(test_db_session, _other(test_db_session, 7), num="Z/9")
+        foreign = InvoiceFollowupEmail(invoice_id=stranger.id, customer_id=stranger.customer_id, due_date=DUE7,
+                                       status="failed", mode="reale", error_kind="network", idempotency_key="chiave-di-un-altro")
+        test_db_session.add(foreign)
+        test_db_session.commit()
         _sync(test_db_session)
         mailer = DownOnce()
         run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
@@ -2215,6 +2222,7 @@ class TestOneEmailPerCustomer:
         assert retry_followup_row(test_db_session, row_a, mailer=mailer, cfg=_on_cfg())["sent"] == 1
         assert mailer.keys[1] == mailer.keys[0]                      # A: continua il primo tentativo
         assert (row_b.status, row_b.error_kind, row_b.idempotency_key) == ("failed", "network", None)
+        assert foreign.idempotency_key == "chiave-di-un-altro"       # le righe con un'altra chiave restano com'erano
         b.status = "open"
         test_db_session.commit()
         out = retry_followup_row(test_db_session, row_b, mailer=mailer, cfg=_on_cfg())
