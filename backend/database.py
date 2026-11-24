@@ -378,7 +378,8 @@ class InvoiceFollowupEmail(Base):
 
     UNA EMAIL PER CLIENTE (decisione owner 24/11/2026): più fatture dello
     stesso cliente partono in un'unica email; ognuna ha la sua riga e le
-    righe della stessa email condividono `group_key`.
+    righe della stessa email condividono `group_key`. `idempotency_key` è la
+    chiave usata verso Resend: un ritento dopo un esito incerto la riusa.
 
     Tabella NUOVA: la crea create_all (nessuna ALTER); la RLS la copre perché
     derivata dai modelli.
@@ -411,6 +412,7 @@ class InvoiceFollowupEmail(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     sent_at = Column(DateTime, nullable=True)
     group_key = Column(String, nullable=True, index=True)        # uguale per le fatture della stessa email
+    idempotency_key = Column(String, nullable=True)              # chiave usata verso Resend nell'ultimo tentativo
 
 
 class SyncState(Base):
@@ -593,6 +595,7 @@ def _run_migrations(engine):
         # nuova nasce già completa da create_all; qui per i DB locali creati
         # con la prima stesura).
         "ALTER TABLE invoice_followup_emails ADD COLUMN group_key VARCHAR",
+        "ALTER TABLE invoice_followup_emails ADD COLUMN idempotency_key VARCHAR",
         # Riconciliazione: data di pagamento vera + residuo all'atto del
         # pagamento. NESSUN backfill: le righe già 'paid' non hanno una data
         # di pagamento vera (updated_at non lo è) né un residuo recuperabile

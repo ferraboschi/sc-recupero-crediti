@@ -220,7 +220,7 @@ export default function FollowupEmailPanel() {
                     ? runResult.info
                     : runResult.blocked
                       ? `Non eseguito: ${runResult.blocked_label}`
-                      : `Esito: ${runResult.sent} email inviate · ${runResult.prepared} email preparate · ${runResult.failed} email fallite · fatture: ${runResult.invoices} nelle email, ${runResult.skipped} saltate, ${runResult.already} non lavorate`}
+                      : `Esito: ${runResult.sent} email inviate · ${runResult.prepared} email preparate · ${runResult.failed} email fallite · fatture: ${runResult.invoices} nelle email, ${runResult.skipped} saltate, ${runResult.already} non lavorate${runResult.broken > 0 ? ` · ${runResult.broken} client${runResult.broken === 1 ? 'e non lavorato' : 'i non lavorati'} per un errore (si riprova domani)` : ''}`}
               </span>
             )}
           </div>
@@ -352,7 +352,19 @@ export default function FollowupEmailPanel() {
                         <GroupNote row={row} />
                       </td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(row.amount_due)}</td>
-                      <td className="py-2 pr-3"><ReminderStatusBadge row={row} />{row.mode === 'test' && <span className="ml-1 text-xs text-txt-muted">(test)</span>}</td>
+                      <td className="py-2 pr-3">
+                        {/* Il motivo va sotto il badge (a capo): la tabella resta nella larghezza della scheda. */}
+                        {row.status === 'skipped'
+                          ? (
+                            <>
+                              <span className="sc-badge whitespace-nowrap bg-accent-amber/15 text-accent-amber">Saltata</span>
+                              <span className="block text-xs text-txt-muted mt-1 max-w-[15rem]">{row.skip_label}</span>
+                            </>
+                          )
+                          : <ReminderStatusBadge row={row} />}
+                        {row.mode === 'test' && <span className="ml-1 text-xs text-txt-muted">(test)</span>}
+                        {row.error_kind === 'conflict' && <span className="block text-xs text-txt-muted mt-1 max-w-[15rem]">Resend l'aveva già ricevuta: non si rimanda. Verifica su Resend.</span>}
+                      </td>
                       <td className="py-2 pr-3 text-xs font-mono text-txt-secondary">
                         {row.to_email || '—'}
                         {row.original_to && row.original_to !== row.to_email && <span className="block text-txt-muted">vero: {row.original_to}</span>}
@@ -366,7 +378,7 @@ export default function FollowupEmailPanel() {
                               {detail?.id === row.id ? 'Chiudi' : 'Testo'}
                             </button>
                           )}
-                          {(row.status === 'failed' || row.status === 'sending') && (
+                          {(row.status === 'sending' || (row.status === 'failed' && row.error_kind !== 'conflict')) && (
                             <button type="button" onClick={() => retry(row)} disabled={retryingId !== null || running} className="sc-btn-secondary text-xs disabled:opacity-50" title={row.needs_manual_retry ? 'Ferma finché non la ritenti tu' : 'Verrà ritentata anche al prossimo giro'}>
                               {retryingId === row.id ? '…' : 'Riprova'}
                             </button>
