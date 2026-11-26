@@ -48,7 +48,7 @@ from backend.engine.agents import agents_of
 from backend.engine.format import italian_today
 from backend.engine.reminder_email import (
     MODE_REALE, NOT_REMINDABLE_STATUSES, STATUS_FAILED, STATUS_SENDING, STATUS_SENT, STATUS_SKIPPED,
-    WEEKDAYS_IT, invoice_label, resolve_mode, target_due_dates,
+    WEEKDAYS_IT, invoice_label, is_uncertain, resolve_mode, skip_reason, target_due_dates,
 )
 
 logger = logging.getLogger(__name__)
@@ -244,11 +244,19 @@ def reminder_mode(cfg=None) -> str:
     return resolve_mode(cfg or config)[0]
 
 
-def reminder_retriable(row, today: date) -> bool:
-    """Un promemoria non riuscito si può ancora riprendere da Sistema? Solo
-    finché la scadenza non è passata (reminder_email.retry_row): dopo non è
-    più un promemoria, e nessun giro lo manderà."""
-    return row.due_date is not None and row.due_date >= today
+def reminder_retriable(row, inv, today: date, mode: str) -> bool:
+    """Un promemoria non riuscito si può ancora riprendere da Sistema? Stessa
+    regola di reminder_email.retry_row. Solo finché la scadenza non è passata:
+    dopo non è più un promemoria, e nessun giro lo manderà. E un invio
+    dall'esito incerto si riprende solo in modalità reale e solo se oggi il
+    promemoria è inviabile: altrimenti «Riprova» rifiuta e lascia la riga
+    com'è (per un 409 o un invio vecchio chiede prima una conferma, ma lo
+    accetta). `mode`: la modalità del promemoria adesso (reminder_mode)."""
+    if row.due_date is None or row.due_date < today:
+        return False
+    if is_uncertain(row):
+        return mode == MODE_REALE and skip_reason(inv, inv.customer) is None
+    return True
 
 
 # ── Clienti uniti ──────────────────────────────────────────────────
@@ -423,10 +431,9 @@ def _reminder_items(entries: List[Tuple[Invoice, list]], today: date, now: datet
             if r.status == STATUS_SENT:
                 sent.append((inv, r))
             elif was_attempted(r) and not in_flight(r, now):
-                # Tentato e non concluso. Il registro dei promemoria ricorda
-                # solo l'ULTIMO errore, e un «Riprova» può riscrivere la riga
-                # (anche come «saltata»): non si può mai dire «non partito».
-                if r is current and r.status in STUCK_STATUSES and reminder_retriable(r, today):
+                # Tentato e non concluso: non si può mai dire «non partito».
+                # «Fermo» (da gestire) solo se «Riprova» lo accetta adesso.
+                if r is current and r.status in STUCK_STATUSES and reminder_retriable(r, inv, today, mode):
                     stuck.append((inv, r))
                 else:
                     uncertain.append((inv, r))
@@ -741,7 +748,7 @@ def _log_state(merged: Dict[int, int], reminded: set, kind: str, row, inv: Optio
         return CLOSED, "Non conclusa: fattura non più da saldare"
     ours = row.due_date == inv.due_date and same_customer(merged, row.customer_id, inv.customer_id)
     if kind == KIND_REMINDER:
-        if ours and row.status in STUCK_STATUSES and reminder_retriable(row, today):
+        if ours and row.status in STUCK_STATUSES and reminder_retriable(row, inv, today, reminder_mode(cfg)):
             return STUCK, "Ferma: da gestire"
         # Solo l'ultimo errore è registrato: non si può dire «non partita».
         return MISSING, "Esito incerto: da verificare su Resend"
