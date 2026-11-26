@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from backend.config import config
 from backend.database import get_session, Customer, Invoice, InvoiceFollowupEmail, InvoiceReminderEmail
+from backend.engine import email_status
 from backend.engine import followup_email as followup
 from backend.engine.agents import agents_of
 from backend.connectors.resend_mail import MailSendError
@@ -165,6 +166,20 @@ def reminder_email_status(
         .limit(limit)
         .all()
     )
+    # I promemoria FERMI che «Riprova» accetta ancora (scadenza non passata)
+    # si vedono sempre, anche oltre le ultime `limit` righe: «Da gestire in
+    # Sistema» non deve mai puntare a una riga che qui non c'è.
+    listed = {r.id for r, _i, _c in rows}
+    stuck = (
+        _rows_query(session)
+        .filter(
+            InvoiceReminderEmail.status.in_(("failed", "sending")),
+            InvoiceReminderEmail.due_date >= followup.italian_today(),
+        )
+        .order_by(InvoiceReminderEmail.created_at.desc(), InvoiceReminderEmail.id.desc())
+        .all()
+    )
+    rows = [found for found in stuck if found[0].id not in listed] + rows
     return {
         "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),
@@ -265,6 +280,24 @@ def reminder_email_log(
     items.sort(key=lambda it: (it["created_at"] or "", it["kind"], it["id"]), reverse=True)
     items = items[:limit]
     return {"items": items, "count": len(items)}
+
+
+@router.get("/email/customer-status")
+def email_customer_status(session: Session = Depends(get_session)):
+    """Le email automatiche da mostrare sotto il nome di ogni cliente
+    (promemoria e secondo avviso delle fatture ancora da saldare). Sola
+    lettura: regole in backend/engine/email_status.py."""
+    return email_status.customer_status(session)
+
+
+@router.get("/email/sent")
+def email_sent_log(
+    days: int = Query(14, ge=email_status.MIN_LOG_DAYS, le=email_status.MAX_LOG_DAYS),
+    session: Session = Depends(get_session),
+):
+    """Registro unico «Email inviate»: promemoria e secondi avvisi reali,
+    giorno per giorno, più le email ferme da gestire. Sola lettura."""
+    return email_status.sent_log(session, days=days)
 
 
 @router.get("/email/{row_id}")
