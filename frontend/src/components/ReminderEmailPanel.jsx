@@ -205,8 +205,10 @@ export default function ReminderEmailPanel() {
     // Una email per cliente: «Riprova» rimanda l'email INTERA, con le altre
     // fatture della stessa email ancora ferme.
     const together = (current.group_invoices || []).map(m => m.invoice_number)
+    // Non si promette l'elenco: una fattura nel frattempo saldata, o oggi
+    // non inviabile, resta fuori dal ritento.
     const which = together.length > 0
-      ? `delle fatture ${[row.invoice_number, ...together].join(', ')} (stessa email)`
+      ? `della fattura ${row.invoice_number} — riparte l'email intera, con le altre sue fatture ancora ferme (erano insieme: ${together.join(', ')})`
       : `della fattura ${row.invoice_number}`
     const msg = force
       ? `ATTENZIONE: il promemoria ${which} potrebbe essere GIÀ arrivato al cliente (${row.to_email}), e Resend non fermerebbe più un doppione.\n\nHai controllato su Resend che l'email NON risulta consegnata?\n\nOK = sì, ho controllato: invia comunque.\nAnnulla = non inviare.`
@@ -326,7 +328,7 @@ export default function ReminderEmailPanel() {
                   ? `Errore: ${runResult.error}`
                   : runResult.info
                     ? runResult.info
-                    : `Esito: ${runResult.sent} email inviate · ${runResult.prepared} preparate${runResult.invoices > 0 ? ` (${plural(runResult.invoices, 'fattura', 'fatture')})` : ''} · ${runResult.skipped} saltate · ${runResult.failed} errori · ${runResult.already} non lavorate`}
+                    : `Esito: email inviate ${runResult.sent} · preparate ${runResult.prepared}${runResult.invoices > 0 ? ` (${plural(runResult.invoices, 'fattura', 'fatture')} in tutto)` : ''} · email con errore ${runResult.failed} · fatture saltate ${runResult.skipped} · fatture non lavorate ${runResult.already}`}
               </span>
             )}
           </div>
@@ -368,7 +370,7 @@ export default function ReminderEmailPanel() {
                       </td>
                       <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap">
                         {p.due_label || fmtDate(p.due_date)}
-                        {p.merged_early && <span className="block text-txt-muted whitespace-normal">unita: scade il giorno dopo</span>}
+                        {p.merged_early && <span className="block text-txt-muted whitespace-normal">unita: scade il giorno dopo le scadenze del giro</span>}
                       </td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(p.amount_due)}</td>
                       <td className="py-2 pr-3 text-right text-txt-secondary">{p.overdue_count > 0 ? `${p.overdue_count} · ${fmtEur(p.overdue_total)}` : '—'}</td>
@@ -412,7 +414,7 @@ export default function ReminderEmailPanel() {
 
       {/* Registro */}
       <div className="px-6 py-4">
-        <p className="text-sm font-semibold text-txt-primary mb-3">Ultime email registrate</p>
+        <p className="text-sm font-semibold text-txt-primary mb-3">Ultime email registrate <span className="text-txt-muted font-normal">· una riga per fattura</span></p>
         {recent.length === 0 ? (
           <p className="text-sm text-txt-muted">Nessuna email ancora registrata.</p>
         ) : (
@@ -439,7 +441,10 @@ export default function ReminderEmailPanel() {
                         <CustomerName id={row.customer_id} name={row.ragione_sociale} navigate={navigate} />
                         <AgentBadges agents={row.agents} className="ml-2" />
                       </td>
-                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary whitespace-nowrap">{row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span></td>
+                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary whitespace-nowrap">
+                        {row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span>
+                        <GroupNote row={row} />
+                      </td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(row.amount_due)}</td>
                       <td className="py-2 pr-3"><ReminderStatusBadge row={row} />{row.mode === 'test' && <span className="ml-1 text-xs text-txt-muted">(test)</span>}</td>
                       <td className="py-2 pr-3 text-xs font-mono text-txt-secondary">

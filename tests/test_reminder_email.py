@@ -2199,3 +2199,97 @@ class TestOneEmailPerCustomerBelts:
         assert mailer.sent[0]["to"] == ["amministrazione@shabu.it"]
         assert {(r.status, r.mode) for r in _rows(test_db_session).values()} == {("sent", "reale")}
         assert b.id in _rows(test_db_session)
+
+
+class TestOneEmailPerCustomerAfterTheRound:
+    """Dopo il giro: ciò che si mostra (anteprima, prova, allegati) è l'email
+    partita, con le fatture che aveva — non una ricomposta oggi."""
+
+    def _sent_together(self, s):
+        c = _cust(s)
+        a = _inv(s, c, "A/1", 100.0, TOMORROW)
+        b = _inv(s, c, "B/1", 50.0, TOMORROW)
+        early = _inv(s, c, "C/1", 30.0, DAY_AFTER)
+        _summary, mailer = _real_round(s)
+        assert len(mailer.sent) == 1
+        return c, a, b, early, mailer.sent[0]
+
+    def test_the_preview_after_the_round_shows_the_email_that_left(self, test_db_session):
+        _c, a, b, early, sent = self._sent_together(test_db_session)
+        items = {e["invoice_id"]: e for e in preview(test_db_session, due_date=TOMORROW, mode=MODE_REALE, cfg=_real_cfg())}
+        assert set(items) == {a.id, b.id}
+        for inv, others in ((a, ["B/1", "C/1"]), (b, ["A/1", "C/1"])):
+            entry = items[inv.id]
+            assert entry["already"] == "sent" and not entry["will_process"]
+            assert (entry["subject"], entry["text"]) == (sent["subject"], sent["text"])
+            assert entry["group_size"] == 3 and entry["group_invoices"] == others
+        # Il giorno dopo la fattura unita è «del giro»: stessa email, non un testo suo.
+        nxt = preview(test_db_session, due_date=DAY_AFTER, mode=MODE_REALE, cfg=_real_cfg())
+        [entry] = nxt
+        assert entry["invoice_id"] == early.id and entry["subject"] == sent["subject"] == "Promemoria: 3 fatture in scadenza (180,00 €)"
+        assert entry["group_invoices"] == ["A/1", "B/1"]
+
+    def test_the_preview_of_a_single_email_already_sent_is_its_own_text(self, test_db_session):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        _summary, mailer = _real_round(test_db_session)
+        [entry] = preview(test_db_session, due_date=TOMORROW, mode=MODE_REALE, cfg=_real_cfg())
+        assert (entry["subject"], entry["text"]) == (mailer.sent[0]["subject"], mailer.sent[0]["text"])
+        assert entry["group_size"] == 1 and entry["group_invoices"] == [] and a.id == entry["invoice_id"]
+
+    def test_the_test_send_after_the_round_is_the_email_that_left(self, test_db_session):
+        _c, a, b, early, sent = self._sent_together(test_db_session)
+        mailer = FakeMailer()
+        out = send_test(test_db_session, a.id, "lorenzo@ef-ti.com", mailer=mailer, cfg=_real_cfg())
+        assert out["invoices"] == ["A/1", "B/1", "C/1"] and out["subject"] == f"[PROVA] {sent['subject']}"
+        assert mailer.sent[0]["text"] == sent["text"] and len(mailer.sent[0]["attachments"]) == 3
+        # Una nel frattempo saldata non c'è più: si prova con quelle ancora da pagare.
+        b.status, b.amount_due = "paid", 0
+        test_db_session.commit()
+        again = send_test(test_db_session, early.id, "lorenzo@ef-ti.com", mailer=mailer, cfg=_real_cfg())
+        assert again["invoices"] == ["A/1", "C/1"]
+
+    def test_an_attachment_of_one_email_is_always_the_document_with_that_name(self, test_client, test_db_session, monkeypatch):
+        from backend.config import config as real_config
+        from backend.engine.merge import merge_customers
+        monkeypatch.setattr(real_config, "REMINDER_EMAIL_ENABLED", False)
+        monkeypatch.setattr(real_config, "RESEND_API_KEY", "")
+        c, a, b, early, _sent = self._sent_together(test_db_session)
+        rows = _rows(test_db_session)
+        names = rows[b.id].attachments_json
+        assert names == ["copia_cortesia_fattura_A_1.pdf", "copia_cortesia_fattura_B_1.pdf", "copia_cortesia_fattura_C_1.pdf"]
+
+        def fetch(invoice, index):
+            return test_client.get(f"/api/reminders/email/{_rows(test_db_session)[invoice.id].id}/attachments/{index}")
+
+        def number_in(response):
+            return next(n for n in ("A/1", "B/1", "C/1") if n in _pdf_strings(response.content))
+
+        # Da qualunque riga dell'email, il pulsante n dà il documento n.
+        for invoice in (a, b, early):
+            assert [number_in(fetch(invoice, i)) for i in range(3)] == ["A/1", "B/1", "C/1"]
+            assert f'filename="{names[1]}"' in fetch(invoice, 1).headers["content-disposition"]
+            assert fetch(invoice, 3).status_code == 404
+        # Scheda unita a un'altra: le fatture cambiano cliente, i nomi no.
+        survivor = _cust(test_db_session, "Shabu Casatenovo Srl", "amministrazione@shabu.it", partita_iva="01234567897")
+        merge_customers(test_db_session, survivor, c)
+        test_db_session.commit()
+        assert [number_in(fetch(b, i)) for i in range(3)] == ["A/1", "B/1", "C/1"]
+        # Una fattura sparita dal DB: il suo allegato non c'è più, e nessun altro documento ne prende il nome.
+        test_db_session.query(Invoice).filter(Invoice.id == a.id).delete()
+        test_db_session.commit()
+        assert fetch(b, 0).status_code == 404
+        assert number_in(fetch(b, 1)) == "B/1" and number_in(fetch(b, 2)) == "C/1"
+
+    def test_the_registry_api_says_which_invoices_travelled_together(self, test_client, test_db_session, monkeypatch):
+        from backend.config import config as real_config
+        monkeypatch.setattr(real_config, "REMINDER_EMAIL_ENABLED", False)
+        monkeypatch.setattr(real_config, "RESEND_API_KEY", "")
+        c, a, b, early, _sent = self._sent_together(test_db_session)
+        recent = {r["invoice_id"]: r for r in test_client.get("/api/reminders/email").json()["recent"]}
+        assert recent[a.id]["group_size"] == 3
+        assert [m["invoice_number"] for m in recent[a.id]["group_invoices"]] == ["B/1", "C/1"]
+        log = {r["invoice_id"]: r for r in test_client.get("/api/reminders/email/log", params={"customer_id": c.id}).json()["items"]}
+        assert [m["invoice_number"] for m in log[early.id]["group_invoices"]] == ["A/1", "B/1"]
+        detail = test_client.get(f"/api/reminders/email/{recent[b.id]['id']}").json()
+        assert detail["group_size"] == 3 and "sono in scadenza le seguenti fatture" in detail["body_text"]

@@ -332,17 +332,18 @@ def reminder_email_attachment(row_id: int, index: int, session: Session = Depend
         status_code=404,
         detail="Allegato non più disponibile: viene rigenerato dai dati attuali e le scadute sono cambiate",
     )
-    invoices = [inv for inv in row_invoices(session, row) if inv.customer_id == customer.id] or [invoice]
+    invoices = row_invoices(session, row) or [invoice]
     overdue = overdue_invoices(session, customer.id, exclude_ids=[inv.id for inv in invoices])
     attachments = build_group_attachments(customer, invoices, overdue)
     stored = row.attachments_json or []
     if index < 0:
         raise gone
-    if len(invoices) > 1 and stored:
+    if row.group_key and stored:
         # Email con più fatture: l'allegato si cerca per NOME (quello
-        # registrato all'invio), non per posizione — se nel frattempo
-        # l'insieme è cambiato non si consegna un altro documento sotto il
-        # nome di questo.
+        # registrato all'invio), mai per posizione — se nel frattempo
+        # l'insieme è cambiato (fattura pagata, passata a un altro cliente,
+        # scheda unita) non si consegna un altro documento sotto il nome di
+        # questo.
         if index >= len(stored):
             raise gone
         match = next(((n, c) for n, c in attachments if n == stored[index]), None)

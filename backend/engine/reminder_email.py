@@ -12,10 +12,13 @@ due mail; in caso di scadenze prossime unire le mail e adeguare il testo;
 scadenza prossima significa ± un giorno»): tutte le fatture di un cliente
 che il giro di oggi deve ricordare partono in UN'UNICA email (elenco, totale,
 una copia di cortesia per ciascuna). Nella stessa email entra anche una sua
-fattura che scade il giorno dopo l'ultima scadenza del giro: così due
-scadenze a un giorno di distanza non producono due email in due giorni. Da
-sola, quella fattura non fa partire nulla: aspetta il suo giorno. Con una
-sola fattura l'email è quella di sempre, parola per parola.
+fattura che scade il giorno dopo l'ultima scadenza del giro, che così
+l'indomani non riceve un'email a parte. Da sola, quella fattura non fa
+partire nulla: aspetta il suo giorno. «± un giorno» è applicato alla
+lettera, non a catena: tre scadenze in tre giorni di fila producono due
+email (stessa regola del secondo avviso; es. giovedì parte venerdì+sabato,
+venerdì parte domenica). Con una sola fattura l'email è quella di sempre,
+parola per parola.
 
 Modalità (risolta dalla configurazione, mai implicita):
 - prova  → le email vengono COMPOSTE e REGISTRATE (status prepared) ma non
@@ -918,6 +921,20 @@ def _preview_customer(session: Session, customer_id: int, invoices: List[Invoice
                 "group_invoices": [other.invoice_number for other in plan.email if other.id != inv.id],
                 "merged_early": inv.id in plan.early_ids,
             })
+        elif existing is not None and existing.status != STATUS_SKIPPED and existing.subject:
+            # Già lavorata (inviata, ferma, preparata…): si mostra l'email
+            # scritta ALLORA, con le fatture che aveva — non un testo
+            # ricomposto oggi, che il cliente non ha mai ricevuto.
+            others = [m["invoice_number"] for m in group_members(session, [existing]).get(existing.group_key, [])
+                      if m["row_id"] != existing.id]
+            entry.update({
+                "overdue_count": existing.overdue_count or 0,
+                "overdue_total": float(existing.overdue_total or 0),
+                "subject": existing.subject,
+                "text": existing.body_text,
+                "group_size": 1 + len(others),
+                "group_invoices": others,
+            })
         elif not reason:
             overdue = overdue_invoices(session, customer.id, exclude_id=inv.id)
             msg = compose(customer, inv, overdue, today)
@@ -1336,19 +1353,31 @@ def run_reminders(
 
 def email_group_of(session: Session, invoice: Invoice, *, now_utc: Optional[datetime] = None,
                    cfg=None) -> List[Invoice]:
-    """Le fatture dell'email che il cliente riceverebbe OGGI per la fattura
-    data: se il giro di oggi la manderebbe insieme ad altre fatture dello
-    stesso cliente, tutte; altrimenti lei sola. L'email del cliente non
-    conta (serve all'invio di prova, che va a un indirizzo interno)."""
+    """Le fatture dell'email del cliente per la fattura data: se il giro di
+    oggi la manderebbe insieme ad altre fatture dello stesso cliente, tutte;
+    se è già partita (o è ferma) in un'email con altre fatture, quelle che
+    sono ancora sue e ancora da saldare; altrimenti lei sola. L'email del
+    cliente non conta (serve all'invio di prova, che va a un indirizzo
+    interno)."""
     cfg = cfg or config
-    dates = target_due_dates(now_utc)
-    if not dates or invoice.customer_id is None:
+    if invoice.customer_id is None:
         return [invoice]
-    mine = [inv for inv in _round_invoices(session, dates) if inv.customer_id == invoice.customer_id]
-    plan = plan_customer(session, mine, dates, resolve_mode(cfg)[0], customer_id=invoice.customer_id,
-                         ignore_email=True)
-    if any(inv.id == invoice.id for inv in plan.email):
-        return list(plan.email)
+    dates = target_due_dates(now_utc)
+    if dates:
+        mine = [inv for inv in _round_invoices(session, dates) if inv.customer_id == invoice.customer_id]
+        plan = plan_customer(session, mine, dates, resolve_mode(cfg)[0], customer_id=invoice.customer_id,
+                             ignore_email=True)
+        if any(inv.id == invoice.id for inv in plan.email):
+            return list(plan.email)
+    row = _existing_row(session, invoice)
+    if row is not None and row.group_key and row.status != STATUS_SKIPPED:
+        together = [
+            inv for inv in row_invoices(session, row)
+            if inv.customer_id == invoice.customer_id and inv.status not in NOT_REMINDABLE_STATUSES
+            and float(inv.amount_due or 0) > 0
+        ]
+        if any(inv.id == invoice.id for inv in together):
+            return together
     return [invoice]
 
 
