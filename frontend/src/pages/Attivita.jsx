@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 import AgentBadges from '../components/AgentBadges'
+import { EmailLegend, EmailStatusLine, useEmailStatus } from '../components/EmailStatus'
 
 const ACTION_LABELS = {
   first_contact: 'I Contatto',
@@ -49,6 +50,8 @@ const PIPELINE_STAGES = [
 
 export default function Attivita() {
   const navigate = useNavigate()
+  // Email automatiche (promemoria e 2° avviso) sotto il nome di ogni cliente.
+  const emailStatus = useEmailStatus()
   const now = new Date()
 
   // Calendar state
@@ -344,6 +347,7 @@ export default function Attivita() {
                               {c.overdue_count} fatture scadute
                               {c.last_contact_date ? ` — ultimo contatto: ${formatDate(c.last_contact_date)}` : ''}
                             </p>
+                            <EmailStatusLine status={emailStatus} customerId={c.id} />
                           </div>
                           <p className="text-sm font-bold text-accent-red">{formatCurrency(c.total_overdue)}</p>
                         </div>
@@ -561,6 +565,7 @@ export default function Attivita() {
                 </div>
               ) : (
                 <div className="overflow-x-auto">
+                  <EmailLegend status={emailStatus} flush className="mb-3" />
                   <table className="w-full">
                     <thead>
                       <tr className="text-left text-xs text-txt-muted uppercase tracking-wider border-b border-dark-border">
@@ -585,6 +590,7 @@ export default function Attivita() {
                             <td className="py-3 pr-4">
                               <p className="text-sm font-medium text-txt-primary">{c.ragione_sociale}<AgentBadges agents={c.agents} className="ml-2" /></p>
                               {c.partita_iva && <p className="text-xs text-txt-muted font-mono">{c.partita_iva}</p>}
+                              <EmailStatusLine status={emailStatus} customerId={c.id} />
                             </td>
                             <td className="py-3 pr-4">
                               <span className={`${statusColor} sc-badge inline-block`}>

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from backend.config import config
 from backend.database import get_session, Customer, Invoice, InvoiceFollowupEmail, InvoiceReminderEmail
+from backend.engine import email_status
 from backend.engine import followup_email as followup
 from backend.engine.agents import agents_of
 from backend.connectors.resend_mail import MailSendError
@@ -105,23 +106,10 @@ def _followup_flags(row, invoice: Optional[Invoice], customer: Optional[Customer
     invierebbe ADESSO: chi deve muoversi (operatore o giro) e con quale
     cautela."""
     send_mode = resolve_mode()[0]
-    uncertain = followup._is_uncertain(row)
     stuck = followup._is_stuck(row)
-    # La finestra del prossimo giro: oggi, o lunedì se oggi è weekend.
-    window = followup.followup_window()
-    if window is None:
-        today = followup.italian_today()
-        monday = datetime.combine(today + timedelta(days=7 - today.weekday()), time(10, 0), tzinfo=timezone.utc)
-        window = followup.followup_window(monday)
-    in_window = bool(
-        window and invoice is not None and invoice.due_date is not None
-        and window[0] <= invoice.due_date <= followup.merge_until(window)
-    )
-    # Il giro la riprende da sola se è ancora nella finestra e: l'esito è
-    # «certamente non partita», oppure è una riga di prova/test e si invia in
-    # reale (lì è un invio nuovo). Un incerto resta dell'operatore.
-    fresh_in_real = send_mode == MODE_REALE and (row.mode or MODE_REALE) != MODE_REALE
-    auto = stuck and in_window and (not uncertain or fresh_in_real)
+    # Il giro la riprende da sola? (finestra, esito certo, prova→reale:
+    # la regola sta nel motore, la usa anche lo stato accanto al cliente)
+    auto = followup.will_auto_retry(row, invoice, send_mode)
     # A chi andrebbe un ritento ADESSO: il cliente a cui la fattura appartiene ora.
     owner = invoice.customer if invoice is not None and invoice.customer is not None else customer
     return {
@@ -265,6 +253,24 @@ def reminder_email_log(
     items.sort(key=lambda it: (it["created_at"] or "", it["kind"], it["id"]), reverse=True)
     items = items[:limit]
     return {"items": items, "count": len(items)}
+
+
+@router.get("/email/customer-status")
+def email_customer_status(session: Session = Depends(get_session)):
+    """Le email automatiche da mostrare sotto il nome di ogni cliente
+    (promemoria e secondo avviso delle fatture ancora da saldare). Sola
+    lettura: regole in backend/engine/email_status.py."""
+    return email_status.customer_status(session)
+
+
+@router.get("/email/sent")
+def email_sent_log(
+    days: int = Query(14, ge=email_status.MIN_LOG_DAYS, le=email_status.MAX_LOG_DAYS),
+    session: Session = Depends(get_session),
+):
+    """Registro unico «Email inviate»: promemoria e secondi avvisi reali,
+    giorno per giorno, più le email ferme da gestire. Sola lettura."""
+    return email_status.sent_log(session, days=days)
 
 
 @router.get("/email/{row_id}")
