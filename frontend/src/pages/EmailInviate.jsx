@@ -138,15 +138,24 @@ export default function EmailInviate() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [attempt, setAttempt] = useState(0)  // una nuova lettura anche a parità di giorni (dopo un errore)
+  const [refreshFailed, setRefreshFailed] = useState(false)  // l'ultima rilettura automatica non è riuscita
   const [filter, setFilter] = useState('all')
   const [search, setSearch] = useState('')
 
   useEffect(() => {
     let alive = true
     let latest = 0
+    let foreground = false   // una lettura «vera» (apertura, altri giorni) è in corso
     const read = (quiet) => {
+      // Una rilettura automatica non scavalca mai una lettura vera in corso:
+      // se fallisse subito ne butterebbe via la risposta buona, lasciando la
+      // pagina senza dati e senza un errore.
+      if (quiet && foreground) return
       const mine = ++latest   // vale solo la risposta dell'ultima lettura partita
-      if (!quiet) setLoading(true)
+      if (!quiet) {
+        foreground = true
+        setLoading(true)
+      }
       client.get('/reminders/email/sent', { params: { days }, noRetry: quiet })
         .then(res => {
           if (!alive || mine !== latest) return
@@ -154,12 +163,19 @@ export default function EmailInviate() {
           if (!Array.isArray(res.data?.days) || !Array.isArray(res.data?.stuck)) throw new Error('risposta non valida')
           setData(res.data)
           setError(null)
+          setRefreshFailed(false)
         })
         .catch(() => {
-          // Una rilettura automatica fallita non cancella ciò che c'è: lo dice l'ora di lettura.
-          if (alive && mine === latest && !quiet) setError('Elenco delle email non disponibile: ricarica la pagina.')
+          if (!alive || mine !== latest) return
+          // Una rilettura automatica fallita non cancella ciò che c'è, ma lo dice.
+          if (quiet) setRefreshFailed(true)
+          else setError('Elenco delle email non disponibile: ricarica la pagina.')
         })
-        .finally(() => { if (alive && mine === latest) setLoading(false) })
+        .finally(() => {
+          if (quiet) return
+          foreground = false
+          if (alive) setLoading(false)
+        })
     }
     read(false)
     const timer = setInterval(() => read(true), REFRESH_MS)
@@ -239,6 +255,11 @@ export default function EmailInviate() {
       </div>
 
       {error && <div className="sc-card p-5 text-accent-red" role="alert">{error}</div>}
+      {data && refreshFailed && (
+        <div className="sc-card p-4 text-sm text-accent-amber" role="status" data-testid="email-sent-stale">
+          L'aggiornamento automatico non è riuscito: i dati sono quelli letti alle {data.read_at}. Ricarica la pagina.
+        </div>
+      )}
       {data && data.followup_readable === false && (
         <div className="sc-card p-4 text-sm text-accent-amber" role="status">
           Secondi avvisi non leggibili in questo momento: l'elenco mostra solo i promemoria.

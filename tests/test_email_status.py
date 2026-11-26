@@ -532,25 +532,72 @@ class TestReminderNextToTheName:
         assert _labels(test_db_session, c) == ["Promemoria 10/11", "Promemoria non ancora partito: email non valida"]
 
     @pytest.mark.parametrize("due,label", [
-        (TODAY + timedelta(days=1), "Promemoria non ancora partito: senza email"),
-        (TODAY, "Promemoria non ancora partito: senza email"),
+        (TODAY + timedelta(days=2), "Promemoria non ancora partito: senza email"),   # lo guarda il giro di domani
+        (TODAY + timedelta(days=1), "Promemoria non ancora partito: senza email"),   # lo guarda un giro di oggi
+        (TODAY, "Promemoria non partito: senza email"),                               # nessun giro lo guarda più
         (TODAY - timedelta(days=1), "Promemoria non partito: senza email"),
     ])
-    def test_until_the_due_date_a_skipped_reminder_can_still_leave(self, test_db_session, due, label):
-        """Saltato alle 09:15 per l'email mancante, email aggiunta alle 10: un
-        giro più tardi (basta un riavvio) lo manda. Finché può, è «non ancora»."""
+    def test_a_skipped_reminder_can_leave_only_while_a_round_still_looks_at_it(self, test_db_session, due, label):
+        """Il giro guarda solo le scadenze dei giorni dopo: saltato alle 09:15
+        per l'email mancante, email aggiunta alle 10, un giro più tardi lo
+        stesso giorno lo manda. Nel giorno della scadenza nessun giro lo
+        guarda più: scrivere «può ancora partire» sarebbe falso."""
         c = _cust(test_db_session, email=None)
         _rem(test_db_session, _inv(test_db_session, c, due=due), status="skipped", skip_reason="senza_email",
              when=datetime(2026, 11, 17, 8, 15))
         [item] = _items(test_db_session, c, now=LATE)
         assert (item["state"], item["label"]) == ("missing", label)
+        assert ("può ancora mandarlo" in item["title"]) is label.startswith("Promemoria non ancora")
+
+    @pytest.mark.parametrize("now,due,can", [
+        (_at(date(2026, 11, 20), 11), date(2026, 11, 23), True),    # venerdì: il giro guarda fino a lunedì
+        (_at(date(2026, 11, 20), 11), date(2026, 11, 21), True),
+        (_at(date(2026, 11, 21), 11), date(2026, 11, 23), False),   # sabato: per lunedì non c'è più nessun giro
+        (_at(date(2026, 11, 22), 11), date(2026, 11, 23), False),
+        (_at(date(2026, 11, 21), 11), date(2026, 11, 24), True),    # sabato, scadenza martedì: lo guarda lunedì
+        (_at(date(2026, 11, 23), 11), date(2026, 11, 23), False),   # il giorno della scadenza
+    ])
+    def test_which_rounds_still_look_at_a_due_date(self, now, due, can):
+        assert es.reminder_can_still_leave(due, now.date()) is can
+        assert es.reminder_can_still_leave(None, now.date()) is False
+
+    def test_the_round_really_sends_what_is_said_to_be_still_possible(self, test_db_session):
+        """Col motore vero: saltato per l'email mancante la vigilia, email
+        aggiunta, un giro più tardi lo stesso giorno lo manda. Il giorno della
+        scadenza invece nessun giro lo prende."""
+        s = test_db_session
+        c = _cust(s, email=None)
+        _inv(s, c, due=date(2026, 11, 19))
+        late = _cust(s, "Tardi Srl", None, partita_iva="01234567897")
+        _inv(s, late, "2026/00001900/SAK", due=date(2026, 11, 19))
+        at_round = _at(TODAY, 8, 15)
+        CLOCK["now"] = at_round
+        rem.run_reminders(s, now_utc=at_round, mailer=_Mailer(), cfg=_off())
+        assert _labels(s, c, now=LATE) == ["Promemoria non ancora partito: senza email"]
+        c.email = "amministrazione@shabu.it"
+        s.commit()
+        CLOCK["now"] = _at(TODAY, 13)
+        mailer = _Mailer()
+        rem.run_reminders(s, now_utc=_at(TODAY, 13), mailer=mailer, cfg=_off())
+        assert [m["to"] for m in mailer.sent] == [["amministrazione@shabu.it"]]
+        assert _labels(s, c, now=_at(TODAY, 13)) == ["Promemoria 18/11"]
+        # L'altro cliente sistema l'email solo il giorno della scadenza: nessun giro la guarda più.
+        late.email = "info@tardi.it"
+        s.commit()
+        due_day = _at(date(2026, 11, 19), 8, 15)
+        CLOCK["now"] = due_day
+        assert _labels(s, late, now=due_day) == ["Promemoria non partito: senza email"]
+        mailer = _Mailer()
+        rem.run_reminders(s, now_utc=due_day, mailer=mailer, cfg=_off())
+        assert mailer.sent == []
 
     def test_several_reminders_that_can_still_leave(self, test_db_session):
         c = _cust(test_db_session, email=None)
         for num in ("2026/00001804/SAK", "2026/00001805/SAK"):
-            _rem(test_db_session, _inv(test_db_session, c, num, due=TODAY), status="skipped", skip_reason="senza_email")
+            _rem(test_db_session, _inv(test_db_session, c, num, due=TODAY + timedelta(days=1)), status="skipped",
+                 skip_reason="senza_email")
         [item] = _items(test_db_session, c)
-        assert item["label"] == "2 promemoria non ancora partiti: senza email" and "può ancora partire" in item["title"]
+        assert item["label"] == "2 promemoria non ancora partiti: senza email" and "può ancora mandarlo" in item["title"]
 
     def test_a_reminder_being_sent_right_now_is_neither_stuck_nor_uncertain(self, test_db_session):
         c = _cust(test_db_session)
@@ -746,7 +793,26 @@ class TestFollowupNextToTheName:
         assert _labels(test_db_session, other, _on(), now=at_0920)[1] == "2° avviso: nuovo tentativo 19/11"
         log = _log(test_db_session, cfg=_on(), now=at_0920)
         assert sorted(e["state_label"] for d in log["days"] for e in d["items"] if e["kind"] == "followup") == [
-            "Ferma: da gestire", "Non riuscita: il giro ritenta il 19/11"]
+            "Ferma: da gestire", "Non riuscita: il giro la ritenta"]
+
+    def test_a_row_already_tried_today_is_not_pulled_back_to_today_by_another_invoice(self, test_db_session):
+        """Alle 09:20: una fattura rifiutata dal giro di oggi (riparte domani) e
+        un'altra dello stesso cliente ancora «prevista oggi» per il margine.
+        La prima non può partire oggi: non la si scrive insieme all'altra."""
+        c = _cust(test_db_session)
+        tried = _inv(test_db_session, c, "2026/00001804/SAK")
+        _rem(test_db_session, tried)
+        _fol(test_db_session, tried, status="failed", error_kind="validation", when=datetime(2026, 11, 18, 8, 16))
+        _rem(test_db_session, _inv(test_db_session, c, "2026/00001812/SAK", due=date(2026, 11, 10)))
+        item = _items(test_db_session, c, _on(), now=_at(TODAY, 8, 20))[1]
+        assert item["label"] == "2° avviso previsto 18/11"
+        assert "2026/00001804/SAK: invio non riuscito, il giro ritenta il 19/11/2026" in item["title"]
+        assert "2026/00001812/SAK: secondo avviso previsto il 18/11/2026" in item["title"]
+        inv = lambda n, due: SimpleNamespace(id=n, due_date=due)  # noqa: E731
+        a, b = inv(1, DUE7), inv(2, date(2026, 11, 10))
+        tomorrow = date(2026, 11, 19)
+        assert es.leave_days([(a, tomorrow), (b, TODAY)], _on(), {1: tomorrow}) == {1: tomorrow, 2: TODAY}
+        assert es.leave_days([(a, tomorrow), (b, TODAY)], _on()) == {1: TODAY, 2: TODAY}
 
     def test_a_second_notice_being_sent_right_now_is_not_stuck_and_not_promised_again(self, test_db_session):
         c = _cust(test_db_session)
@@ -1477,10 +1543,7 @@ class TestSentLog:
         on = _log(test_db_session, cfg=_on())
         assert on["stuck"] == []
         retried = [e for d in on["days"] for e in d["items"] if e["kind"] == "followup"][0]
-        assert (retried["state"], retried["state_label"]) == ("planned", "Non riuscita: il giro ritenta il 19/11")
-        early = _log(test_db_session, cfg=_on(), now=EARLY)
-        assert [e["state_label"] for d in early["days"] for e in d["items"] if e["kind"] == "followup"] == [
-            "Non riuscita: il giro ritenta il 18/11"]
+        assert (retried["state"], retried["state_label"]) == ("planned", "Non riuscita: il giro la ritenta")
         off = _log(test_db_session, cfg=_off())
         assert [e["state_label"] for e in off["stuck"]] == ["Ferma: da gestire"]
 
@@ -1677,7 +1740,7 @@ class TestSentLog:
         saturday = _at(date(2026, 11, 21), 9)
         data = _log(test_db_session, cfg=_on(), now=saturday)
         assert data["today"] == "2026-11-21" and data["stuck"] == []
-        assert data["days"][0]["items"][0]["state_label"] == "Non riuscita: il giro ritenta il 23/11"
+        assert data["days"][0]["items"][0]["state_label"] == "Non riuscita: il giro la ritenta"
         assert _labels(test_db_session, c, _on(), now=saturday)[1] == "2° avviso: nuovo tentativo 23/11"
 
 

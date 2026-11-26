@@ -66,10 +66,13 @@ export function useEmailStatus() {
   useEffect(() => {
     let alive = true
     let latest = 0
+    let inFlight = false
     const read = () => {
-      // Vale solo la risposta dell'ULTIMA lettura partita: una vecchia che
-      // arriva tardi (il client riprova da solo per decine di secondi) non
-      // deve coprire una più nuova.
+      // Una lettura alla volta: finché una è in corso (il client riprova da
+      // solo per decine di secondi) non ne parte un'altra che, fallendo
+      // subito, ne butterebbe via la risposta buona.
+      if (inFlight) return
+      inFlight = true
       const mine = ++latest
       client.get('/reminders/email/customer-status', { timeout: STATUS_TIMEOUT_MS })
         .then(res => {
@@ -92,6 +95,7 @@ export function useEmailStatus() {
           // Meglio nessuna riga, e dirlo, che righe che potrebbero non valere più.
           if (alive && mine === latest) setStatus({ byCustomer: {}, loading: false, error: true, followupReadable: true, readAt: null })
         })
+        .finally(() => { inFlight = false })
     }
     read()
     const timer = setInterval(read, STATUS_REFRESH_MS)
