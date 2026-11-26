@@ -21,8 +21,8 @@ from backend.engine.agents import agents_of
 from backend.connectors.resend_mail import MailSendError
 from backend.engine.reminder_email import (
     AUTO_RETRY_KINDS, MODE_LABELS, MODE_REALE, SKIP_LABELS, ModeMismatch, NotFound, ReminderBusy, agent_emails,
-    build_attachments, carbon_copies, normalize_email, overdue_invoices, preview, resolve_mode, retry_row,
-    run_reminders, send_test, target_due_dates,
+    build_attachments, carbon_copies, needs_confirmation, normalize_email, overdue_invoices, preview, resolve_mode,
+    retry_row, run_reminders, send_test, target_due_dates,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,8 +38,8 @@ class RunBody(BaseModel):
     # La modalità che l'operatore ha letto e confermato a video: se il server
     # ne risolve un'altra (env cambiate), 409 — mai un invio "a sorpresa".
     expected_mode: Optional[str] = None
-    # Solo «Riprova» del secondo avviso: l'operatore conferma di aver
-    # controllato su Resend che l'email NON è stata consegnata.
+    # Solo «Riprova» (promemoria e secondo avviso): l'operatore conferma di
+    # aver controllato su Resend che l'email NON è stata consegnata.
     force: bool = False
 
 
@@ -83,9 +83,12 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
                 row.status == "failed" and (row.error_kind or "other") not in AUTO_RETRY_KINDS
             )
         ),
-        # Secondo avviso: «Riprova» può creare un doppione che Resend non
-        # fermerebbe (dopo un 409, o oltre un giorno): serve «Invia comunque».
-        "retry_needs_confirmation": flags.get("retry_needs_confirmation", False),
+        # «Riprova» può creare un doppione che Resend non fermerebbe (dopo un
+        # 409, o oltre un giorno da un invio reale incerto): serve «Invia comunque».
+        "retry_needs_confirmation": flags.get("retry_needs_confirmation", False) if is_followup else (
+            needs_confirmation(row) and resolve_mode()[0] == MODE_REALE
+            and row.due_date is not None and row.due_date >= followup.italian_today()
+        ),
         # Secondo avviso, riga ferma: il giro la riprenderà da solo?
         "will_auto_retry": flags.get("will_auto_retry", False),
         # Secondo avviso: l'indirizzo a cui andrebbe un ritento ADESSO.
@@ -244,7 +247,7 @@ def reminder_email_retry(row_id: int, body: Optional[RunBody] = None, session: S
         raise HTTPException(status_code=404, detail="Promemoria non trovato")
     expected = body.expected_mode if body else None
     try:
-        return retry_row(session, row, expected_mode=expected)
+        return retry_row(session, row, expected_mode=expected, force=bool(body and body.force))
     except ReminderBusy:
         raise HTTPException(status_code=409, detail="Un giro di promemoria è già in corso")
     except ModeMismatch as e:

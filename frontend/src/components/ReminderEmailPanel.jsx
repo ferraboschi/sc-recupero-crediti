@@ -189,8 +189,15 @@ export default function ReminderEmailPanel() {
   const retry = async (row) => {
     const fresh = await load()
     if (!fresh) return
-    const msg = fresh.mode === 'reale'
-      ? `Ritento ADESSO l'invio AL CLIENTE (${row.to_email}) della fattura ${row.invoice_number}. Se l'invio precedente fosse in realtà partito, Resend non lo duplica. Procedere?`
+    // Dopo un «già ricevuta» di Resend (409), o oltre un giorno da un invio
+    // reale dall'esito incerto, Resend non ferma più un doppione: il server
+    // parte solo con la conferma di chi ha controllato che NON è arrivata.
+    const current = (fresh.recent || []).find(r => r.id === row.id) || row
+    const force = fresh.mode === 'reale' && !!current.retry_needs_confirmation
+    const msg = force
+      ? `ATTENZIONE: il promemoria della fattura ${row.invoice_number} potrebbe essere GIÀ arrivato al cliente (${row.to_email}), e Resend non fermerebbe più un doppione.\n\nHai controllato su Resend che l'email NON risulta consegnata?\n\nOK = sì, ho controllato: invia comunque.\nAnnulla = non inviare.`
+      : fresh.mode === 'reale'
+      ? `Ritento ADESSO l'invio AL CLIENTE (${row.to_email}) della fattura ${row.invoice_number}.\n\nSe l'invio precedente fosse in realtà arrivato, Resend lo riconosce e non lo rimanda (vale per 24 ore).\n\nProcedere?`
       : fresh.mode === 'test'
         ? `Ritento l'invio di prova a ${fresh.test_to} per la fattura ${row.invoice_number}. Procedere?`
         : `Modalità prova: preparo di nuovo il promemoria della fattura ${row.invoice_number} senza inviarlo. Procedere?`
@@ -198,7 +205,7 @@ export default function ReminderEmailPanel() {
     setRetryingId(row.id)
     setRunResult(null)
     try {
-      const res = await client.post(`/reminders/email/${row.id}/retry`, { expected_mode: fresh.mode }, { noRetry: true, timeout: 120000 })
+      const res = await client.post(`/reminders/email/${row.id}/retry`, { expected_mode: fresh.mode, force }, { noRetry: true, timeout: 120000 })
       setRunResult(res.data)
       await load()
     } catch (e) {
@@ -425,7 +432,7 @@ export default function ReminderEmailPanel() {
                           )}
                           {(row.status === 'failed' || row.status === 'sending') && (
                             <button type="button" onClick={() => retry(row)} disabled={retryingId !== null || running} className="sc-btn-secondary text-xs disabled:opacity-50" title={row.needs_manual_retry ? 'Ferma finché non la ritenti tu' : 'Verrà ritentata anche al prossimo giro'}>
-                              {retryingId === row.id ? '…' : 'Riprova'}
+                              {retryingId === row.id ? '…' : row.retry_needs_confirmation ? 'Invia comunque…' : 'Riprova'}
                             </button>
                           )}
                         </span>

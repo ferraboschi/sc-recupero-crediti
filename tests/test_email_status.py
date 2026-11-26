@@ -293,10 +293,39 @@ class TestRules:
         assert es.leave_days([], cfg) == {}
 
     def test_a_reminder_can_be_retried_until_its_due_date(self):
-        row = lambda due: SimpleNamespace(due_date=due)  # noqa: E731
-        assert es.reminder_retriable(row(TODAY), TODAY) and es.reminder_retriable(row(TODAY + timedelta(days=1)), TODAY)
-        assert not es.reminder_retriable(row(TODAY - timedelta(days=1)), TODAY)
-        assert not es.reminder_retriable(row(None), TODAY)
+        row = lambda due, kind="pdf": SimpleNamespace(due_date=due, status="failed", error_kind=kind, mode="reale")  # noqa: E731
+        ok = SimpleNamespace(email="a@b.it", merged_into=None, excluded=False, recovery_status="idle")
+        inv = SimpleNamespace(customer=ok, due_date_source="real", missing_streak=0, payment_pending=None,
+                              bounced_at=None, audit_reviewed_at=datetime(2026, 1, 1))
+        for kind in ("pdf", "network"):
+            assert es.reminder_retriable(row(TODAY, kind), inv, TODAY, "reale")
+            assert es.reminder_retriable(row(TODAY + timedelta(days=1), kind), inv, TODAY, "reale")
+            assert not es.reminder_retriable(row(TODAY - timedelta(days=1), kind), inv, TODAY, "reale")
+            assert not es.reminder_retriable(row(None, kind), inv, TODAY, "reale")
+
+    def test_a_reminder_in_doubt_can_be_retried_only_in_real_mode_and_only_if_sendable_today(self):
+        """Stessa regola di «Riprova»: un rifiuto certo si riprende sempre; un
+        esito incerto solo in reale e solo se oggi il promemoria è inviabile."""
+        row = lambda kind, status="failed": SimpleNamespace(  # noqa: E731
+            due_date=TODAY, status=status, error_kind=kind, mode="reale")
+        customer = lambda **kw: SimpleNamespace(  # noqa: E731
+            **{**dict(email="a@b.it", merged_into=None, excluded=False, recovery_status="idle"), **kw})
+        invoice = lambda cust, **kw: SimpleNamespace(  # noqa: E731
+            customer=cust, **{**dict(due_date_source="real", missing_streak=0, payment_pending=None,
+                                     bounced_at=None, audit_reviewed_at=datetime(2026, 1, 1)), **kw})
+        fine = invoice(customer())
+        no_email = invoice(customer(email=""))
+        maybe_paid = invoice(customer(), missing_streak=1)
+        for doubt in (row("network"), row("provider"), row("conflict"), row(None), row(None, "sending")):
+            assert es.reminder_retriable(doubt, fine, TODAY, "reale")
+            assert not es.reminder_retriable(doubt, fine, TODAY, "test")
+            assert not es.reminder_retriable(doubt, fine, TODAY, "prova")
+            assert not es.reminder_retriable(doubt, no_email, TODAY, "reale")
+            assert not es.reminder_retriable(doubt, maybe_paid, TODAY, "reale")
+        for certain in (row("pdf"), row("validation")):
+            for inv in (fine, no_email, maybe_paid):
+                for mode in ("reale", "test", "prova"):
+                    assert es.reminder_retriable(certain, inv, TODAY, mode)
 
 
 class TestMergedCards:
@@ -1334,14 +1363,18 @@ class TestAgainstTheRealEngines:
         assert len(mailer.sent) == 1 and _labels(test_db_session, c, now=LATE) == ["Promemoria 18/11"]
 
     def test_a_retry_answered_already_received_is_never_shown_as_not_sent(self, test_db_session):
-        """Il difetto trovato in revisione: timeout (arrivata), «Riprova», Resend
-        risponde 409 e il motore scrive «validation». A scadenza passata non si
-        può dire «non partito»."""
+        """Timeout (arrivata), «Riprova», Resend risponde 409: il motore scrive
+        «conflict». Finché la scadenza non passa resta da gestire («Invia
+        comunque», con conferma); dopo non si può dire «non partito»."""
         c, _inv_, row = self._reminder_in_doubt(test_db_session)
         CLOCK["now"] = LATE
         rem.retry_row(test_db_session, row, mailer=_Mailer(ALREADY()), cfg=_off())
         test_db_session.refresh(row)
-        assert (row.status, row.error_kind) == ("failed", "validation")
+        assert (row.status, row.error_kind) == ("failed", "conflict")
+        assert _pairs(test_db_session, c, now=LATE) == [("stuck", "Promemoria fermo 18/11")]
+        assert [e["state_label"] for e in _log(test_db_session, now=LATE)["stuck"]] == ["Ferma: da gestire"]
+        with pytest.raises(ValueError):   # senza conferma «Riprova» non manda un possibile doppione
+            rem.retry_row(test_db_session, row, mailer=_Mailer(), cfg=_off())
         after = _at(date(2026, 11, 20), 7)
         CLOCK["now"] = after
         [item] = _items(test_db_session, c, now=after)
@@ -1350,25 +1383,99 @@ class TestAgainstTheRealEngines:
         log = _log(test_db_session, now=after)
         assert [e["state_label"] for d in log["days"] for e in d["items"]] == ["Esito incerto: da verificare su Resend"]
         assert log["stuck"] == []
-        with pytest.raises(ValueError):   # e infatti «Riprova» non la accetta più
-            rem.retry_row(test_db_session, row, mailer=_Mailer(), cfg=_off())
+        with pytest.raises(ValueError):   # e infatti «Riprova» non la accetta più, nemmeno con la conferma
+            rem.retry_row(test_db_session, row, mailer=_Mailer(), cfg=_off(), force=True)
 
-    def test_a_retry_that_turns_the_row_into_skipped_is_never_shown_as_not_sent(self, test_db_session):
+    def test_a_doubt_riprova_refuses_today_is_uncertain_not_to_handle(self, test_db_session):
         """Timeout (arrivata), poi la fattura sparisce da FatturaPro («forse
-        pagata») e l'operatore preme «Riprova»: il motore riscrive la riga come
-        saltata. Il cliente l'aveva ricevuta."""
+        pagata»): «Riprova» rifiuta e lascia la riga com'è. Finché è così non
+        è «da gestire» (da Sistema non si può fare nulla): è un esito incerto.
+        Se il motivo sparisce prima della scadenza, torna da gestire."""
         c, inv, row = self._reminder_in_doubt(test_db_session)
         inv.missing_streak = 1
         test_db_session.commit()
         CLOCK["now"] = LATE
-        rem.retry_row(test_db_session, row, mailer=_Mailer(), cfg=_off())
+        with pytest.raises(ValueError):
+            rem.retry_row(test_db_session, row, mailer=_Mailer(), cfg=_off())
         test_db_session.refresh(row)
-        assert (row.status, row.skip_reason) == ("skipped", "forse_pagata") and row.attempted_at is not None
+        assert (row.status, row.error_kind, row.skip_reason) == ("failed", "network", None)
         for now in (LATE, _at(date(2026, 11, 20), 7)):
             CLOCK["now"] = now
             assert _pairs(test_db_session, c, now=now) == [("missing", "Promemoria dall'esito incerto 18/11")]
             log = _log(test_db_session, now=now)
             assert [e["state_label"] for d in log["days"] for e in d["items"]] == ["Esito incerto: da verificare su Resend"]
+            assert log["stuck"] == []
+        inv.missing_streak = 0
+        test_db_session.commit()
+        CLOCK["now"] = LATE
+        assert _pairs(test_db_session, c, now=LATE) == [("stuck", "Promemoria fermo 18/11")]
+        mailer = _Mailer()
+        rem.retry_row(test_db_session, row, mailer=mailer, cfg=_off())
+        assert len(mailer.sent) == 1 and _labels(test_db_session, c, now=LATE) == ["Promemoria 18/11"]
+
+    def test_a_real_doubt_is_not_to_handle_while_the_reminder_is_not_in_real_mode(self, test_db_session):
+        """Un invio reale incerto si riprende solo in modalità reale: se ora il
+        promemoria è in test o in prova, «Riprova» rifiuta — non è «da gestire»."""
+        c, _inv_, row = self._reminder_in_doubt(test_db_session)
+        CLOCK["now"] = LATE
+        in_test = _cfg(REMINDER_EMAIL_ENABLED=True, RESEND_API_KEY="re_test_key",
+                       REMINDER_EMAIL_TEST_TO="prova@sakecompany.com")
+        for cfg in (in_test, _cfg()):
+            assert _pairs(test_db_session, c, cfg, now=LATE) == [("missing", "Promemoria dall'esito incerto 18/11")]
+            assert sent_log(test_db_session, now_utc=LATE, cfg=cfg)["stuck"] == []
+            with pytest.raises(ValueError):
+                rem.retry_row(test_db_session, row, mailer=_Mailer(), cfg=cfg)
+        assert _pairs(test_db_session, c, now=LATE) == [("stuck", "Promemoria fermo 18/11")]
+
+    @pytest.mark.parametrize("status,kind", [
+        ("failed", "network"), ("failed", "provider"), ("failed", "other"), ("failed", "conflict"),
+        ("failed", "validation"), ("failed", "pdf"), ("failed", None), ("sending", None),
+    ])
+    @pytest.mark.parametrize("mode", ["reale", "test", "prova"])
+    def test_to_handle_is_exactly_what_riprova_accepts(self, test_db_session, status, kind, mode):
+        """Per ogni riga ferma, motivo di oggi, modalità, scadenza ed età:
+        «da gestire» se e solo se il vero «Riprova» (con la conferma, quando
+        la chiede) non rifiuta."""
+        s = test_db_session
+        cfg = {"reale": _off(),
+               "test": _cfg(REMINDER_EMAIL_ENABLED=True, RESEND_API_KEY="re_test_key",
+                            REMINDER_EMAIL_TEST_TO="prova@sakecompany.com"),
+               "prova": _cfg()}[mode]
+        CLOCK["now"] = LATE
+        cases = []
+        for n, (trouble, due_in, age_hours) in enumerate(
+                (t, d, a) for t in (None, "senza_email", "forse_pagata", "avvocato", "in_incasso")
+                for d in (-1, 0, 1) for a in (1, 30)):
+            c = _cust(s, nome=f"Cliente {n}", partita_iva=f"{10000000000 + n}")
+            inv = _inv(s, c, num=f"2026/{n:08d}/SAK - Fattura", due=TODAY + timedelta(days=due_in))
+            row = _rem(s, inv, status=status, when=LATE.replace(tzinfo=None) - timedelta(hours=age_hours),
+                       error_kind=kind, error="Resend: timeout")
+            if trouble == "senza_email":
+                c.email = None
+            elif trouble == "forse_pagata":
+                inv.missing_streak = 1
+            elif trouble == "avvocato":
+                c.recovery_status = "lawyer"
+            elif trouble == "in_incasso":
+                inv.payment_pending = "assegno"
+            s.commit()
+            cases.append((c.id, row.id, (trouble, due_in, age_hours)))
+        shown = customer_status(s, now_utc=LATE, cfg=cfg)["customers"]
+        listed = {e["customer_id"] for e in sent_log(s, now_utc=LATE, cfg=cfg)["stuck"]}
+        seen = set()
+        for customer_id, row_id, case in cases:
+            to_handle = [it["state"] for it in shown.get(customer_id, [])] == ["stuck"]
+            assert (customer_id in listed) is to_handle, case
+            row = s.get(InvoiceReminderEmail, row_id)
+            try:
+                rem.retry_row(s, row, mailer=_Mailer(), cfg=cfg, force=True, now_utc=LATE)
+                accepted = True
+            except ValueError:
+                accepted = False
+            assert to_handle is accepted, (case, shown.get(customer_id))
+            seen.add(accepted)
+        if status == "sending" or kind not in ("validation", "pdf"):
+            assert seen == ({True, False} if mode == "reale" else {False})   # guarda davvero entrambi i casi
 
     def test_after_the_round_tried_a_customer_the_rest_of_theirs_leaves_with_the_next_round(self, test_db_session):
         """Giro delle 09:15: Resend rifiuta la fattura A (422), la B è saltata
