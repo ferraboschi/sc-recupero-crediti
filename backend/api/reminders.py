@@ -166,6 +166,20 @@ def reminder_email_status(
         .limit(limit)
         .all()
     )
+    # I promemoria FERMI che «Riprova» accetta ancora (scadenza non passata)
+    # si vedono sempre, anche oltre le ultime `limit` righe: «Da gestire in
+    # Sistema» non deve mai puntare a una riga che qui non c'è.
+    listed = {r.id for r, _i, _c in rows}
+    stuck = (
+        _rows_query(session)
+        .filter(
+            InvoiceReminderEmail.status.in_(("failed", "sending")),
+            InvoiceReminderEmail.due_date >= followup.italian_today(),
+        )
+        .order_by(InvoiceReminderEmail.created_at.desc(), InvoiceReminderEmail.id.desc())
+        .all()
+    )
+    rows = [found for found in stuck if found[0].id not in listed] + rows
     return {
         "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),

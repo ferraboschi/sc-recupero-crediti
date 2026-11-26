@@ -192,8 +192,8 @@ class TestRules:
         (datetime(2026, 11, 18, 7, 0, tzinfo=timezone.utc), date(2026, 11, 18)),    # 08:00: oggi
         (datetime(2026, 11, 18, 8, 14, tzinfo=timezone.utc), date(2026, 11, 18)),   # 09:14: oggi
         (datetime(2026, 11, 18, 8, 15, tzinfo=timezone.utc), date(2026, 11, 18)),   # 09:15: il giro sta partendo
-        (datetime(2026, 11, 18, 8, 44, tzinfo=timezone.utc), date(2026, 11, 18)),   # 09:44: ancora nel margine
-        (datetime(2026, 11, 18, 8, 45, tzinfo=timezone.utc), date(2026, 11, 19)),   # 09:45: per oggi è passato
+        (datetime(2026, 11, 18, 8, 24, tzinfo=timezone.utc), date(2026, 11, 18)),   # 09:24: ancora nel margine
+        (datetime(2026, 11, 18, 8, 25, tzinfo=timezone.utc), date(2026, 11, 19)),   # 09:25: per oggi è passato
         (datetime(2026, 11, 18, 22, 30, tzinfo=timezone.utc), date(2026, 11, 19)),  # 23:30: domani
         (datetime(2026, 11, 18, 23, 30, tzinfo=timezone.utc), date(2026, 11, 19)),  # 00:30 del 19: è già «oggi»
         (datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc), date(2026, 11, 23)),   # venerdì dopo il giro: lunedì
@@ -206,7 +206,7 @@ class TestRules:
     def test_first_round_day_follows_the_configured_hour(self):
         assert first_round_day(LATE, _on(REMINDER_EMAIL_HOUR=12, REMINDER_EMAIL_MINUTE=0)) == TODAY
         assert first_round_day(EARLY, _on(REMINDER_EMAIL_HOUR=7, REMINDER_EMAIL_MINUTE=30)) == date(2026, 11, 19)
-        assert first_round_day(EARLY, _on(REMINDER_EMAIL_HOUR=7, REMINDER_EMAIL_MINUTE=31)) == TODAY  # 08:00 < 08:01
+        assert first_round_day(EARLY, _on(REMINDER_EMAIL_HOUR=7, REMINDER_EMAIL_MINUTE=51)) == TODAY  # 08:00 < 08:01
 
     def test_first_round_day_reads_the_clock_when_no_time_is_given(self):
         CLOCK["now"] = LATE
@@ -256,6 +256,41 @@ class TestRules:
         assert not es.was_attempted(row())
         assert es.was_attempted(row(attempted_at=datetime(2026, 11, 10, 8, 15)))   # tentata, poi saltata
         assert es.was_attempted(row(status="failed")) and es.was_attempted(row(status="sending"))
+
+    def test_a_row_attempted_today_after_the_round_time_has_had_todays_round(self):
+        """La prova batte l'orologio: per QUESTA riga il giro di oggi è passato,
+        anche se il margine direbbe ancora «oggi»."""
+        cfg = _on()
+        row = lambda moment: SimpleNamespace(attempted_at=moment)  # noqa: E731
+        tomorrow = date(2026, 11, 19)
+        assert es.start_after(row(datetime(2026, 11, 18, 8, 16)), TODAY, TODAY, cfg) == tomorrow   # 09:16 di oggi
+        assert es.start_after(row(datetime(2026, 11, 18, 8, 15)), TODAY, TODAY, cfg) == tomorrow   # 09:15 in punto
+        assert es.start_after(row(datetime(2026, 11, 18, 7, 0)), TODAY, TODAY, cfg) == TODAY       # 08:00: giro a mano prima dell'ora
+        assert es.start_after(row(datetime(2026, 11, 17, 8, 16)), TODAY, TODAY, cfg) == TODAY      # ieri
+        assert es.start_after(row(None), TODAY, TODAY, cfg) == TODAY
+        assert es.start_after(row(datetime(2026, 11, 18, 8, 16)), TODAY, tomorrow, cfg) == tomorrow
+        friday = date(2026, 11, 20)
+        assert es.start_after(row(datetime(2026, 11, 20, 8, 16)), friday, friday, cfg) == date(2026, 11, 23)
+
+    def test_a_row_being_sent_right_now_is_in_flight(self):
+        now = datetime(2026, 11, 18, 8, 16)
+        row = lambda **kw: SimpleNamespace(**dict(dict(status="sending", attempted_at=now - timedelta(minutes=1)), **kw))  # noqa: E731
+        assert es.in_flight(row(), now)
+        assert not es.in_flight(row(attempted_at=now - timedelta(minutes=3)), now)    # orfana di un giro caduto
+        assert not es.in_flight(row(attempted_at=now + timedelta(minutes=1)), now)
+        assert not es.in_flight(row(status="failed"), now) and not es.in_flight(row(attempted_at=None), now)
+
+    def test_each_invoice_leaves_with_the_first_email_that_takes_it(self):
+        """Una email per cliente, a ogni giro: la prima porta con sé le fatture a
+        un giorno dalla soglia; le altre fanno lo stesso tra loro."""
+        cfg = _on()
+        inv = lambda n, due: SimpleNamespace(id=n, due_date=due)  # noqa: E731
+        a, b, c = inv(1, date(2026, 11, 9)), inv(2, date(2026, 11, 13)), inv(3, date(2026, 11, 14))
+        monday = date(2026, 11, 16)
+        own = [(i, planned_day(i.due_date, monday, cfg)) for i in (a, b, c)]
+        assert [day for _i, day in own] == [monday, date(2026, 11, 20), date(2026, 11, 23)]
+        assert es.leave_days(own, cfg) == {1: monday, 2: date(2026, 11, 20), 3: date(2026, 11, 20)}
+        assert es.leave_days([], cfg) == {}
 
     def test_a_reminder_can_be_retried_until_its_due_date(self):
         row = lambda due: SimpleNamespace(due_date=due)  # noqa: E731
@@ -458,7 +493,19 @@ class TestReminderNextToTheName:
         assert (item["state"], item["label"]) == ("missing", "Promemoria dall'esito incerto 10/11")
         assert "non partito" not in item["label"]
         assert "Non si sa se il cliente l'ha ricevuto" in item["title"] and "Resend HTTP 409" in item["title"]
-        assert "non si può più ritentare" in item["title"]
+        assert "il secondo avviso automatico non parte" in item["title"]
+
+    def test_the_second_notice_is_not_denied_when_the_reminder_for_this_due_date_was_sent(self, test_db_session):
+        """Timeout sul promemoria della vecchia scadenza, poi scadenza spostata
+        e promemoria inviato: il secondo avviso PARTE. Non si scrive il contrario."""
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c)
+        _rem(test_db_session, inv, due=date(2026, 11, 10), status="failed", error_kind="network")
+        _rem(test_db_session, inv)
+        items = _items(test_db_session, c, _on())
+        assert [it["label"] for it in items] == [
+            "Promemoria 10/11", "Promemoria dall'esito incerto 09/11", "2° avviso previsto 18/11"]
+        assert "secondo avviso" not in items[1]["title"] and "Non si sa se il cliente" in items[1]["title"]
 
     def test_an_attempt_later_rewritten_as_skipped_is_still_uncertain(self, test_db_session):
         """Timeout (forse arrivato), poi «Riprova» quando la fattura è «forse
@@ -482,7 +529,39 @@ class TestReminderNextToTheName:
         inv = _inv(test_db_session, c, due=date(2026, 11, 20))
         _rem(test_db_session, inv, due=DUE7)
         _rem(test_db_session, inv, status="skipped", skip_reason="email_non_valida")
-        assert _labels(test_db_session, c) == ["Promemoria 10/11", "Promemoria non partito: email non valida"]
+        assert _labels(test_db_session, c) == ["Promemoria 10/11", "Promemoria non ancora partito: email non valida"]
+
+    @pytest.mark.parametrize("due,label", [
+        (TODAY + timedelta(days=1), "Promemoria non ancora partito: senza email"),
+        (TODAY, "Promemoria non ancora partito: senza email"),
+        (TODAY - timedelta(days=1), "Promemoria non partito: senza email"),
+    ])
+    def test_until_the_due_date_a_skipped_reminder_can_still_leave(self, test_db_session, due, label):
+        """Saltato alle 09:15 per l'email mancante, email aggiunta alle 10: un
+        giro più tardi (basta un riavvio) lo manda. Finché può, è «non ancora»."""
+        c = _cust(test_db_session, email=None)
+        _rem(test_db_session, _inv(test_db_session, c, due=due), status="skipped", skip_reason="senza_email",
+             when=datetime(2026, 11, 17, 8, 15))
+        [item] = _items(test_db_session, c, now=LATE)
+        assert (item["state"], item["label"]) == ("missing", label)
+
+    def test_several_reminders_that_can_still_leave(self, test_db_session):
+        c = _cust(test_db_session, email=None)
+        for num in ("2026/00001804/SAK", "2026/00001805/SAK"):
+            _rem(test_db_session, _inv(test_db_session, c, num, due=TODAY), status="skipped", skip_reason="senza_email")
+        [item] = _items(test_db_session, c)
+        assert item["label"] == "2 promemoria non ancora partiti: senza email" and "può ancora partire" in item["title"]
+
+    def test_a_reminder_being_sent_right_now_is_neither_stuck_nor_uncertain(self, test_db_session):
+        c = _cust(test_db_session)
+        _rem(test_db_session, _inv(test_db_session, c, due=date(2026, 11, 19)), status="sending",
+             when=datetime(2026, 11, 18, 9, 59))
+        assert _items(test_db_session, c, now=LATE) == []
+        log = _log(test_db_session)
+        assert log["stuck"] == [] and [e["state_label"] for e in log["days"][0]["items"]] == ["Invio in corso"]
+        later = _at(TODAY, 10, 5)
+        assert _labels(test_db_session, c, now=later) == ["Promemoria fermo 18/11"]
+        assert [e["state_label"] for e in _log(test_db_session, now=later)["stuck"]] == ["Ferma: da gestire"]
 
     def test_the_reason_is_the_one_of_the_current_due_date(self, test_db_session):
         """Scadenza ANTICIPATA dopo un mancato invio: per la scadenza di adesso
@@ -638,13 +717,47 @@ class TestFollowupNextToTheName:
         assert "invio non riuscito" in _items(test_db_session, c, _off())[1]["title"]
 
     def test_a_certain_failure_with_no_round_left_is_for_the_operator(self, test_db_session):
-        """Ultimo giorno utile, giro già passato: nessun giro la riprenderà."""
+        """Ultimo giorno utile: prima dell'ora del giro la riprende quello di oggi; dopo, nessuno."""
         c = _cust(test_db_session)
         inv = _inv(test_db_session, c, due=date(2026, 11, 5))
         _rem(test_db_session, inv)
-        _fol(test_db_session, inv, status="failed", error_kind="pdf")
+        _fol(test_db_session, inv, status="failed", error_kind="pdf", when=datetime(2026, 11, 17, 8, 16))
         assert _labels(test_db_session, c, _on(), now=EARLY)[1] == "2° avviso: nuovo tentativo 18/11"
-        assert _pairs(test_db_session, c, _on(), now=LATE)[1] == ("stuck", "2° avviso fermo 18/11")
+        assert _pairs(test_db_session, c, _on(), now=LATE)[1] == ("stuck", "2° avviso fermo 17/11")
+
+    def test_a_failure_of_todays_round_is_not_promised_to_todays_round(self, test_db_session):
+        """Alle 09:20 l'orologio direbbe ancora «oggi» (il giro può essere in
+        corso), ma questa riga è stata tentata alle 09:16: per lei il giro di
+        oggi è passato. All'ultimo giorno utile è subito «ferma, da gestire»."""
+        c = _cust(test_db_session)
+        last = _inv(test_db_session, c, "2026/00001804/SAK", due=date(2026, 11, 5))
+        _rem(test_db_session, last)
+        _fol(test_db_session, last, status="failed", error_kind="validation", when=datetime(2026, 11, 18, 8, 16))
+        at_0920 = _at(TODAY, 8, 20)
+        assert first_round_day(at_0920, _on()) == TODAY
+        assert _pairs(test_db_session, c, _on(), now=at_0920)[1] == ("stuck", "2° avviso fermo 18/11")
+        log = _log(test_db_session, cfg=_on(), now=at_0920)
+        assert [e["state_label"] for e in log["stuck"]] == ["Ferma: da gestire"]
+        # Con altri giorni utili davanti: il prossimo giro in programma è domani.
+        other = _cust(test_db_session, "Altro Srl", "info@altro.it", partita_iva="01234567897")
+        inv = _inv(test_db_session, other, "2026/00001812/SAK")
+        _rem(test_db_session, inv)
+        _fol(test_db_session, inv, status="failed", error_kind="validation", when=datetime(2026, 11, 18, 8, 16))
+        assert _labels(test_db_session, other, _on(), now=at_0920)[1] == "2° avviso: nuovo tentativo 19/11"
+        log = _log(test_db_session, cfg=_on(), now=at_0920)
+        assert sorted(e["state_label"] for d in log["days"] for e in d["items"] if e["kind"] == "followup") == [
+            "Ferma: da gestire", "Non riuscita: il giro ritenta il 19/11"]
+
+    def test_a_second_notice_being_sent_right_now_is_not_stuck_and_not_promised_again(self, test_db_session):
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c)
+        _rem(test_db_session, inv)
+        _fol(test_db_session, inv, status="sending", when=datetime(2026, 11, 18, 8, 16))
+        at_0917 = _at(TODAY, 8, 17)
+        assert _labels(test_db_session, c, _on(), now=at_0917) == ["Promemoria 10/11"]
+        log = _log(test_db_session, cfg=_on(), now=at_0917)
+        assert log["stuck"] == [] and [e["state_label"] for e in log["days"][0]["items"]] == ["Invio in corso"]
+        assert _labels(test_db_session, c, _on(), now=LATE)[1] == "2° avviso fermo 18/11"
 
     def test_a_certain_failure_out_of_the_window_is_for_the_operator(self, test_db_session):
         c = _cust(test_db_session)
@@ -718,7 +831,7 @@ class TestFollowupNextToTheName:
         assert "«Esegui ora»" in item["title"] and "da domani non partirà più" in item["title"]
         # Dal giorno dopo è fuori dai giorni utili: una regola, non un guasto.
         tomorrow = _at(date(2026, 11, 19), 7)
-        assert _pairs(test_db_session, c, _on(), now=tomorrow)[1] == ("closed", "2° avviso non previsto: oltre 13 giorni")
+        assert _pairs(test_db_session, c, _on(), now=tomorrow)[1] == ("closed", "2° avviso non previsto: giorni utili passati")
 
     def test_a_wait_removed_late_on_the_last_day(self, test_db_session):
         """Ultimo giorno utile: alle 09:15 il giro scrive «saltata: in attesa»;
@@ -757,11 +870,20 @@ class TestFollowupNextToTheName:
         _rem(test_db_session, _inv(test_db_session, c, due=date(2026, 11, 4)))
         items = _items(test_db_session, c, _on())
         assert [(it["state"], it["label"]) for it in items] == [
-            ("sent", "Promemoria 03/11"), ("closed", "2° avviso non previsto: oltre 13 giorni")]
-        assert "tra il 7° e il 13° giorno dopo la scadenza" in items[1]["title"]
+            ("sent", "Promemoria 03/11"), ("closed", "2° avviso non previsto: giorni utili passati")]
+        assert "dal 7° al 13°, mai nel weekend" in items[1]["title"]
         assert _labels(test_db_session, c, _off()) == ["Promemoria 03/11"]
         cfg = _on(REMINDER_FOLLOWUP_DAYS="10", REMINDER_FOLLOWUP_LOOKBACK_DAYS="2")
-        assert _labels(test_db_session, c, cfg)[1] == "2° avviso non previsto: oltre 12 giorni"
+        assert "dal 10° al 12°" in _items(test_db_session, c, cfg)[1]["title"]
+
+    def test_useful_days_that_end_on_a_weekend(self, test_db_session):
+        """Scadenza 9/11: i giorni utili arrivano a domenica 22, ma il giro non
+        parte nel weekend. Sabato 21 (12 giorni) è già fuori: non si scrive
+        «oltre 13 giorni», che non sarebbe vero."""
+        c = _cust(test_db_session)
+        _rem(test_db_session, _inv(test_db_session, c, due=date(2026, 11, 9)))
+        saturday = _at(date(2026, 11, 21), 9)
+        assert _labels(test_db_session, c, _on(), now=saturday)[1] == "2° avviso non previsto: giorni utili passati"
 
     def test_nothing_planned_without_the_reminder_for_this_due_date(self, test_db_session):
         c = _cust(test_db_session)
@@ -793,6 +915,19 @@ class TestFollowupNextToTheName:
         item = _items(test_db_session, c, _on(), now=_at(date(2026, 11, 12), 7))[1]
         assert item["label"] == "2° avviso previsto 13/11"
         assert item["title"].count("previsto il 13/11/2026") == 2 and "16/11/2026" not in item["title"]
+
+    def test_three_invoices_two_emails(self, test_db_session):
+        """Scadenze 9, 13 e 14/11 lette lunedì 16: oggi parte la prima; venerdì 20
+        partono INSIEME la seconda e la terza (non una il 20 e una il 23)."""
+        c = _cust(test_db_session)
+        for num, due in (("2026/00001801/SAK", date(2026, 11, 9)), ("2026/00001802/SAK", date(2026, 11, 13)),
+                         ("2026/00001803/SAK", date(2026, 11, 14))):
+            _rem(test_db_session, _inv(test_db_session, c, num, due=due))
+        item = [it for it in _items(test_db_session, c, _on(), now=_at(date(2026, 11, 16), 7)) if it["state"] == "planned"][0]
+        assert item["label"] == "2° avviso previsto 16/11"
+        assert "2026/00001801/SAK: secondo avviso previsto il 16/11/2026" in item["title"]
+        assert "2026/00001802/SAK: secondo avviso previsto il 20/11/2026" in item["title"]
+        assert "2026/00001803/SAK: secondo avviso previsto il 20/11/2026" in item["title"]
 
     def test_a_retry_today_comes_before_a_notice_planned_later(self, test_db_session):
         c = _cust(test_db_session)
@@ -910,7 +1045,7 @@ class TestFollowupNextToTheName:
         assert [(it["state"], it["label"]) for it in items] == [
             ("sent", "Promemoria 09/11"), ("planned", "2° avviso previsto 18/11"),
             ("missing", "2° avviso dall'esito incerto 16/11")]
-        assert "non si può più ritentare" in items[2]["title"] and "potrebbe essere arrivato" in items[2]["title"]
+        assert "da Sistema non si ritenta" in items[2]["title"] and "potrebbe essere arrivato" in items[2]["title"]
 
     def test_a_skip_the_round_will_not_reconsider_keeps_its_written_reason(self, test_db_session):
         """Saltata nei giorni utili, ma senza il promemoria per questa scadenza:
@@ -1088,7 +1223,7 @@ class TestAgainstTheRealEngines:
         assert (item["state"], item["label"]) == ("missing", "Promemoria dall'esito incerto 18/11")
         assert "non partito" not in item["label"] and "Resend HTTP 409" in item["title"]
         log = _log(test_db_session, now=after)
-        assert [e["state_label"] for d in log["days"] for e in d["items"]] == ["Esito incerto: non ritentabile"]
+        assert [e["state_label"] for d in log["days"] for e in d["items"]] == ["Esito incerto: da verificare su Resend"]
         assert log["stuck"] == []
         with pytest.raises(ValueError):   # e infatti «Riprova» non la accetta più
             rem.retry_row(test_db_session, row, mailer=_Mailer(), cfg=_off())
@@ -1108,7 +1243,7 @@ class TestAgainstTheRealEngines:
             CLOCK["now"] = now
             assert _pairs(test_db_session, c, now=now) == [("missing", "Promemoria dall'esito incerto 18/11")]
             log = _log(test_db_session, now=now)
-            assert [e["state_label"] for d in log["days"] for e in d["items"]] == ["Esito incerto: non ritentabile"]
+            assert [e["state_label"] for d in log["days"] for e in d["items"]] == ["Esito incerto: da verificare su Resend"]
 
     def test_a_second_notice_in_doubt_is_stuck_and_riprova_accepts_it(self, test_db_session):
         s = test_db_session
@@ -1295,7 +1430,7 @@ class TestSentLog:
              when=datetime(2026, 11, 16, 8, 15), attempted_at=datetime(2026, 11, 16, 8, 15))
         data = _log(test_db_session)
         [entry] = data["days"][0]["items"]
-        assert (entry["state"], entry["state_label"]) == ("missing", "Esito incerto: non ritentabile")
+        assert (entry["state"], entry["state_label"]) == ("missing", "Esito incerto: da verificare su Resend")
         assert data["stuck"] == []
 
     def test_a_stuck_email_is_in_its_day_and_in_the_to_do_list(self, test_db_session):
@@ -1379,12 +1514,12 @@ class TestSentLog:
         c = _cust(test_db_session)
         inv = _inv(test_db_session, c, due=date(2026, 11, 5))   # oggi è l'ultimo giorno utile
         _rem(test_db_session, inv)
-        _fol(test_db_session, inv, status="failed", error_kind="pdf")
+        _fol(test_db_session, inv, status="failed", error_kind="pdf", when=datetime(2026, 11, 17, 8, 16))
         assert _log(test_db_session, cfg=_on(), now=EARLY)["stuck"] == []
         assert [e["state_label"] for e in _log(test_db_session, cfg=_on(), now=LATE)["stuck"]] == ["Ferma: da gestire"]
 
     @pytest.mark.parametrize("kind,state,label", [("pdf", "closed", "Non partita: invio non riuscito"),
-                                                  ("network", "missing", "Esito incerto: non ritentabile")])
+                                                  ("network", "missing", "Esito incerto: da verificare su Resend")])
     @pytest.mark.parametrize("reminder", ["nessuno", "saltato", "in test", "altra scadenza", "altro cliente"])
     def test_without_the_reminder_a_failed_notice_is_not_to_do(self, test_db_session, kind, state, label, reminder):
         """«Riprova» la rifiuterebbe per sempre («promemoria non inviato»): vale
@@ -1415,7 +1550,7 @@ class TestSentLog:
              when=datetime(2026, 11, 13, 8, 15))
         data = _log(test_db_session)
         [entry] = data["days"][0]["items"]
-        assert (entry["state"], entry["state_label"]) == ("missing", "Esito incerto: non ritentabile")
+        assert (entry["state"], entry["state_label"]) == ("missing", "Esito incerto: da verificare su Resend")
         assert data["stuck"] == [] and data["totals"]["week_missing"] == 1
 
     def test_a_stuck_reminder_of_another_due_date_or_customer_is_not_to_do(self, test_db_session):
@@ -1431,9 +1566,9 @@ class TestSentLog:
              customer_id=c.id)
         data = _log(test_db_session)
         assert data["stuck"] == []
-        assert [e["state_label"] for e in data["days"][0]["items"]] == ["Esito incerto: non ritentabile"] * 2
+        assert [e["state_label"] for e in data["days"][0]["items"]] == ["Esito incerto: da verificare su Resend"] * 2
 
-    @pytest.mark.parametrize("kind,state,label", [("network", "missing", "Esito incerto: non ritentabile"),
+    @pytest.mark.parametrize("kind,state,label", [("network", "missing", "Esito incerto: da verificare su Resend"),
                                                   ("pdf", "closed", "Non partita: invio non riuscito")])
     def test_a_stuck_notice_that_riprova_would_refuse_is_not_to_do(self, test_db_session, kind, state, label):
         """Scadenza cambiata, o fattura passata a un altro cliente: «Riprova»
@@ -1700,6 +1835,27 @@ class TestApi:
         row = _rem(test_db_session, _inv(test_db_session, c))
         assert test_client.get(f"/api/reminders/email/{row.id}").status_code == 200
         assert test_client.get("/api/reminders/email/log").status_code == 200
+
+    def test_sistema_always_lists_the_reminders_that_can_still_be_retried(self, test_client, test_db_session, monkeypatch):
+        """«Da gestire in Sistema» non deve puntare a una riga che Sistema non
+        elenca: il pannello mostra le ultime 30, ma un giro di fine mese ne
+        scrive di più. I promemoria fermi ancora ritentabili ci sono sempre."""
+        self._real(monkeypatch)
+        s = test_db_session
+        c = _cust(s)
+        stuck = _rem(s, _inv(s, c, "2026/00001700/SAK", due=TODAY), status="failed", error_kind="network",
+                     when=datetime(2026, 11, 17, 8, 15))
+        past = _rem(s, _inv(s, c, "2026/00001701/SAK", due=date(2026, 11, 10)), status="failed", error_kind="network",
+                    when=datetime(2026, 11, 9, 8, 15))
+        for n in range(35):
+            _rem(s, _inv(s, c, f"2026/000018{n:02d}/SAK", due=date(2026, 11, 19)),
+                 when=datetime(2026, 11, 18, 8, 15) + timedelta(seconds=n))
+        ids = [r["id"] for r in test_client.get("/api/reminders/email").json()["recent"]]
+        assert len(ids) == 31 and len(set(ids)) == 31
+        assert ids[0] == stuck.id and past.id not in ids   # a scadenza passata «Riprova» non la accetta
+        # Se è già tra le ultime, non compare due volte.
+        ids = [r["id"] for r in test_client.get("/api/reminders/email", params={"limit": 200}).json()["recent"]]
+        assert ids.count(stuck.id) == 1 and len(ids) == 37
 
     def test_reading_writes_nothing(self, test_client, test_db_session, monkeypatch):
         self._real(monkeypatch, followup=True)

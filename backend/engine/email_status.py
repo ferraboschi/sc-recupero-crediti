@@ -16,10 +16,12 @@ successa attorno. Quindi:
 - accanto al nome si parla delle sole fatture ANCORA DA SALDARE; il registro
   «Email inviate» elenca ciò che è successo, giorno per giorno;
 - «inviato» si dice solo di una riga inviata; «non partito» solo di ciò che
-  NON È MAI STATO TENTATO (il motivo è quello scritto dal giro, detto come un
-  fatto passato, senza confrontarlo con l'oggi); di un invio tentato e non
-  concluso si dice «esito incerto» — per il promemoria sempre, perché il suo
-  registro ricorda solo l'ultimo errore e un «Riprova» può riscriverlo;
+  CERTAMENTE non è partito (per il promemoria: mai tentato), col motivo
+  scritto dal giro detto come un fatto passato, senza confrontarlo con
+  l'oggi; finché un giro può ancora mandarlo si dice «non ancora partito»;
+  di un invio tentato e non concluso si dice «esito incerto» — per il
+  promemoria sempre, perché il suo registro ricorda solo l'ultimo errore e
+  un «Riprova» può riscriverlo;
 - «ferma, da gestire» solo ciò che «Riprova» in Sistema accetta;
 - del futuro si dicono due sole cose, e solo a secondo avviso acceso in
   reale: il giorno del prossimo giro IN PROGRAMMA che prenderà la fattura
@@ -91,8 +93,11 @@ PAUSE_REASONS = frozenset((
 
 # Il giro del mattino parte all'ora in programma, ma può aspettare qualche
 # minuto un giro avviato a mano e impiega il suo tempo: per questo margine
-# «oggi» resta il giorno del giro.
-ROUND_GRACE_MINUTES = 30
+# «oggi» resta il giorno del giro (salvo prova contraria: una riga tentata
+# oggi dopo l'ora del giro dice che per lei il giro di oggi è già passato).
+ROUND_GRACE_MINUTES = 10
+# Una riga «in invio» da meno di così è un invio IN CORSO, non una riga ferma.
+IN_FLIGHT_MINUTES = 3
 
 MIN_LOG_DAYS = 7
 MAX_LOG_DAYS = 90
@@ -157,18 +162,47 @@ def was_attempted(row) -> bool:
     return row.attempted_at is not None or row.status in STUCK_STATUSES
 
 
+def round_minutes(cfg=None) -> int:
+    """L'ora del giro in programma, in minuti dalla mezzanotte italiana."""
+    cfg = cfg or config
+    return int(getattr(cfg, "REMINDER_EMAIL_HOUR", 9)) * 60 + int(getattr(cfg, "REMINDER_EMAIL_MINUTE", 15))
+
+
+def next_working_day(day: date) -> date:
+    """Il primo giorno lavorativo DOPO `day`."""
+    day += timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
+
+
+def start_after(row, today: date, start: date, cfg=None) -> date:
+    """Il primo giro in programma che può ancora riprendere QUESTA riga: se è
+    stata tentata oggi dall'ora del giro in poi, il giro di oggi per lei è
+    già passato (qualunque cosa dica l'orologio col suo margine)."""
+    local = _local(row.attempted_at)
+    if local is not None and local.date() == today and local.hour * 60 + local.minute >= round_minutes(cfg):
+        return max(start, next_working_day(today))
+    return start
+
+
+def in_flight(row, now: datetime) -> bool:
+    """Riga «in invio» da pochissimo: il giro la sta mandando in questo
+    momento. Non è ferma e non è incerta: tra un attimo dirà com'è andata."""
+    if row.status != STATUS_SENDING or row.attempted_at is None:
+        return False
+    return timedelta(0) <= now - row.attempted_at < timedelta(minutes=IN_FLIGHT_MINUTES)
+
+
 def first_round_day(now_utc: Optional[datetime] = None, cfg=None) -> date:
     """Il primo giorno il cui giro IN PROGRAMMA deve ancora partire: oggi, se
     è un giorno lavorativo e l'ora del giro (REMINDER_EMAIL_HOUR:MINUTE, ora
     italiana, più un margine) non è passata; altrimenti il prossimo giorno
     lavorativo. Dopo quell'ora un giro può ancora partire oggi (a mano, o in
     ritardo dopo un riavvio), ma non è in programma: non lo si promette."""
-    cfg = cfg or config
     local = _local(followup._utc_now(now_utc))
     day = local.date()
-    scheduled = (int(getattr(cfg, "REMINDER_EMAIL_HOUR", 9)) * 60 + int(getattr(cfg, "REMINDER_EMAIL_MINUTE", 15))
-                 + ROUND_GRACE_MINUTES)
-    if local.hour * 60 + local.minute >= scheduled:
+    if local.hour * 60 + local.minute >= round_minutes(cfg) + ROUND_GRACE_MINUTES:
         day += timedelta(days=1)
     while day.weekday() >= 5:
         day += timedelta(days=1)
@@ -334,20 +368,39 @@ def _by_reason(pairs: List[Tuple[Invoice, Optional[str]]]) -> Dict[Optional[str]
     return grouped
 
 
+def leave_days(pairs: List[Tuple[Invoice, date]], cfg=None) -> Dict[int, date]:
+    """{id fattura: giorno in cui parte davvero}. Una email per cliente: il
+    giorno della prima porta con sé le fatture che quel giorno sono al più a
+    un giorno dalla soglia (scadenza prossima); le altre fanno lo stesso tra
+    loro, alla loro prima data. `pairs`: (fattura, il suo giorno da sola)."""
+    reach = timedelta(days=followup.NEAR_DUE_DAYS) - timedelta(days=followup.followup_days(cfg))
+    remaining = list(pairs)
+    out: Dict[int, date] = {}
+    while remaining:
+        first = min(day for _inv, day in remaining)
+        for inv, _own in remaining:
+            if inv.due_date <= first + reach:
+                out[inv.id] = first
+        remaining = [(inv, own) for inv, own in remaining if inv.id not in out]
+    return out
+
+
 # ── Promemoria accanto al nome ─────────────────────────────────────
 
-def _reminder_items(entries: List[Tuple[Invoice, list]], today: date) -> List[dict]:
-    """Promemoria pre-scadenza delle fatture ancora da saldare di un cliente."""
+def _reminder_items(entries: List[Tuple[Invoice, list]], today: date, now: datetime) -> List[dict]:
+    """Promemoria pre-scadenza delle fatture ancora da saldare di un cliente.
+    `now`: adesso, in UTC senza fuso (come le date del registro)."""
+    reminded = reminded_ids(entries)
     sent: List[Tuple[Invoice, InvoiceReminderEmail]] = []
     stuck: List[Tuple[Invoice, InvoiceReminderEmail]] = []
     uncertain: List[Tuple[Invoice, InvoiceReminderEmail]] = []
-    skipped: List[Tuple[Invoice, Optional[str]]] = []
+    skipped: List[Tuple[Invoice, Tuple[Optional[str], bool]]] = []
     for inv, rows in entries:
         current = _current(rows, inv)
         for r in rows:
             if r.status == STATUS_SENT:
                 sent.append((inv, r))
-            elif was_attempted(r):
+            elif was_attempted(r) and not in_flight(r, now):
                 # Tentato e non concluso. Il registro dei promemoria ricorda
                 # solo l'ULTIMO errore, e un «Riprova» può riscrivere la riga
                 # (anche come «saltata»): non si può mai dire «non partito».
@@ -356,7 +409,9 @@ def _reminder_items(entries: List[Tuple[Invoice, list]], today: date) -> List[di
                 else:
                     uncertain.append((inv, r))
         if current is not None and current.status == STATUS_SKIPPED and not was_attempted(current):
-            skipped.append((inv, current.skip_reason))
+            # Finché la scadenza non è passata il giro lo rivaluta (e un giro
+            # più tardi, oggi stesso, può mandarlo): «non ancora».
+            skipped.append((inv, (current.skip_reason or None, reminder_retriable(current, today))))
     items: List[dict] = []
     if sent:
         days = {event_day(r) for _i, r in sent}
@@ -378,24 +433,33 @@ def _reminder_items(entries: List[Tuple[Invoice, list]], today: date) -> List[di
         ))
     if uncertain:
         days = {event_day(r) for _i, r in uncertain}
+        notes = ["Non si sa se il cliente l'ha ricevuto: si può verificare su Resend."]
+        if any(i.id not in reminded for i, _r in uncertain):
+            # Vero solo se per la scadenza di adesso non c'è un promemoria inviato.
+            notes.append("Senza un promemoria inviato per la scadenza attuale il secondo avviso automatico non parte.")
         items.append(_item(
             KIND_REMINDER, MISSING,
             _counted(len(uncertain), days, "Promemoria dall'esito incerto", "promemoria dall'esito incerto", today),
             (f"Fattura {invoice_label(i.invoice_number)}: ultimo tentativo {_when_text(event_time(r))}, non concluso"
              f"{' (' + r.error[:120] + ')' if r.error else ''}" for i, r in uncertain),
-            ["Non si sa se il cliente l'ha ricevuto: si può verificare su Resend. Da Sistema non si può più "
-             "ritentare; il secondo avviso automatico non partirà."],
-            day=_latest(days), count=len(uncertain),
+            notes, day=_latest(days), count=len(uncertain),
         ))
-    for reason, invoices in _by_reason(skipped).items():
+    grouped: Dict[Tuple[Optional[str], bool], List[Invoice]] = {}
+    for inv, key in skipped:
+        grouped.setdefault(key, []).append(inv)
+    for (reason, pending), invoices in grouped.items():
         n = len(invoices)
         words = reason_text(reason)
+        if pending:
+            label = f"Promemoria non ancora partito: {words}" if n == 1 else f"{n} promemoria non ancora partiti: {words}"
+            notes = ["Il giro lo rivaluta finché la scadenza non è passata: può ancora partire."]
+        else:
+            label = f"Promemoria non partito: {words}" if n == 1 else f"{n} promemoria non partiti: {words}"
+            notes = ["È il motivo scritto dal giro quel giorno. Senza promemoria il secondo avviso automatico non parte."]
         items.append(_item(
-            KIND_REMINDER, fact_state(reason),
-            f"Promemoria non partito: {words}" if n == 1 else f"{n} promemoria non partiti: {words}",
+            KIND_REMINDER, fact_state(reason), label,
             (f"Fattura {invoice_label(i.invoice_number)}: promemoria non inviato ({words})" for i in invoices),
-            ["È il motivo scritto dal giro quel giorno. Senza promemoria il secondo avviso automatico non parte."],
-            count=n,
+            notes, count=n,
         ))
     return items
 
@@ -421,13 +485,15 @@ def reminded_ids(reminders: Iterable[Tuple[Invoice, list]]) -> set:
 
 
 def _followup_items(reminders: List[Tuple[Invoice, list]], followups: List[Tuple[Invoice, list]], today: date,
-                    start: date, mode: str, cfg) -> List[dict]:
+                    start: date, mode: str, cfg, now: datetime) -> List[dict]:
     """Secondo avviso delle fatture ancora da saldare di un cliente: ciò che
     è partito, ciò che è fermo e — solo da acceso in reale — ciò che il giro
-    farà. `start`: il primo giorno il cui giro in programma deve ancora partire."""
+    farà. `start`: il primo giorno il cui giro in programma deve ancora
+    partire; `now`: adesso, in UTC senza fuso."""
     live = mode == MODE_REALE
     reminded = reminded_ids(reminders)
-    useful_days = followup.followup_days(cfg) + followup.followup_lookback(cfg)
+    first_useful = followup.followup_days(cfg)
+    last_useful = first_useful + followup.followup_lookback(cfg)
     sent: Dict[str, list] = {}
     stuck: Dict[str, list] = {}
     orphans: Dict[str, list] = {}   # incerte che «Riprova» non accetta più
@@ -446,6 +512,11 @@ def _followup_items(reminders: List[Tuple[Invoice, list]], followups: List[Tuple
                 continue
             if r.status not in STUCK_STATUSES:
                 continue
+            if in_flight(r, now):
+                # Il giro la sta mandando adesso: non è ferma, e non va ripromessa.
+                if r is current:
+                    blocked_ids.add(inv.id)
+                continue
             uncertain = followup._is_uncertain(r)
             # «Riprova» accetta solo la riga della scadenza attuale di una
             # fattura col suo promemoria (followup_email.retry_followup_row).
@@ -456,7 +527,7 @@ def _followup_items(reminders: List[Tuple[Invoice, list]], followups: List[Tuple
             blocked_ids.add(inv.id)
             # Il giro riprende da solo ciò che CERTAMENTE non è partito, se ha
             # ancora un giro in programma nei giorni utili.
-            day = planned_day(inv.due_date, start, cfg) if (live and not uncertain) else None
+            day = planned_day(inv.due_date, start_after(r, today, start, cfg), cfg) if (live and not uncertain) else None
             if day is None:
                 stuck.setdefault(_email_key(r), []).append((inv, r))
                 continue
@@ -536,26 +607,21 @@ def _followup_items(reminders: List[Tuple[Invoice, list]], followups: List[Tuple
             KIND_FOLLOWUP, MISSING,
             _counted(len(orphans), days, "2° avviso dall'esito incerto", "secondi avvisi dall'esito incerto", today),
             lines,
-            ["Da Sistema non si può più ritentare (la scadenza o il promemoria della fattura sono cambiati). "
+            ["Riguarda una scadenza o un promemoria che la fattura non ha più: da Sistema non si ritenta. "
              "Si può verificare su Resend."],
             day=_latest(days), count=len(orphans),
         ))
     if planned or retrying:
-        first = min(day for _i, day in planned + retrying)
-        # Una email per cliente: con la prima partono anche le fatture che
-        # quel giorno sono a un giorno dalla soglia (scadenza prossima).
-        merged_until = first - timedelta(days=followup.followup_days(cfg)) + timedelta(days=followup.NEAR_DUE_DAYS)
-
-        def leaves(inv: Invoice, own: date) -> date:
-            return first if inv.due_date <= merged_until else own
-
+        leaves = leave_days(planned + retrying, cfg)
+        first = min(leaves.values())
         lines = [f"Fattura {invoice_label(i.invoice_number)}: invio non riuscito, il giro ritenta il "
-                 f"{leaves(i, own).strftime('%d/%m/%Y')}" for i, own in retrying]
+                 f"{leaves[i.id].strftime('%d/%m/%Y')}" for i, _own in retrying]
         lines += [f"Fattura {invoice_label(i.invoice_number)}: secondo avviso previsto il "
-                  f"{leaves(i, own).strftime('%d/%m/%Y')}" for i, own in planned]
-        # Una fattura da ritentare è già nei suoi giorni utili: riparte al
-        # primo giro, quindi il primo giorno è sempre il suo.
-        label = f"2° avviso: nuovo tentativo {short_date(first, today)}" if retrying else (
+                  f"{leaves[i.id].strftime('%d/%m/%Y')}" for i, _own in planned]
+        # Il primo giorno è di un nuovo tentativo se una delle fatture che
+        # partono quel giorno è da ritentare.
+        retry_first = any(leaves[i.id] == first for i, _own in retrying)
+        label = f"2° avviso: nuovo tentativo {short_date(first, today)}" if retry_first else (
             f"2° avviso previsto {short_date(first, today)}")
         items.append(_item(
             KIND_FOLLOWUP, PLANNED, label, lines,
@@ -568,8 +634,8 @@ def _followup_items(reminders: List[Tuple[Invoice, list]], followups: List[Tuple
         words = reason_text(reason)
         items.append(_item(
             KIND_FOLLOWUP, state, f"2° avviso {'sospeso' if state == PAUSED else 'non previsto'}: {words}",
-            (f"Fattura {invoice_label(i.invoice_number)}: adesso il giro la salterebbe ({words})" for i in invoices),
-            ["Vale finché vale questo motivo, e solo nei giorni utili della fattura."],
+            (f"Fattura {invoice_label(i.invoice_number)}: nei suoi giorni utili il giro la salta ({words})" for i in invoices),
+            ["Vale finché vale questo motivo."],
             count=len(invoices),
         ))
     for reason, invoices in _by_reason(list(written.values())).items():
@@ -582,10 +648,10 @@ def _followup_items(reminders: List[Tuple[Invoice, list]], followups: List[Tuple
         ))
     if expired:
         items.append(_item(
-            KIND_FOLLOWUP, CLOSED, f"2° avviso non previsto: oltre {useful_days} giorni",
-            (f"Fattura {invoice_label(i.invoice_number)}: scaduta da più di {useful_days} giorni" for i in expired),
-            [f"Il secondo avviso automatico parte solo tra il {followup.followup_days(cfg)}° e il {useful_days}° "
-             "giorno dopo la scadenza."],
+            KIND_FOLLOWUP, CLOSED, "2° avviso non previsto: giorni utili passati",
+            (f"Fattura {invoice_label(i.invoice_number)}: i suoi giorni utili sono passati" for i in expired),
+            [f"Il secondo avviso automatico parte solo nei giorni utili dopo la scadenza (dal {first_useful}° al "
+             f"{last_useful}°, mai nel weekend)."],
             count=len(expired),
         ))
     return items
@@ -597,6 +663,7 @@ def customer_status(session: Session, now_utc: Optional[datetime] = None, cfg=No
     (promemoria, poi secondo avviso). {customers: {id: [voce]}, followup_mode}."""
     today = italian_today(now_utc)
     start = first_round_day(now_utc, cfg)
+    now = followup._utc_now(now_utc)
     mode = followup.resolve_followup_mode(cfg)[0]
     merged = merge_map(session)
     # Prima il registro dei secondi avvisi: se non è leggibile, il rollback
@@ -611,28 +678,30 @@ def customer_status(session: Session, now_utc: Optional[datetime] = None, cfg=No
     order = {key: n for n, key in enumerate(ITEM_ORDER)}
     customers: Dict[int, List[dict]] = {}
     for customer_id, found in per_customer.items():
-        items = _reminder_items(found["rem"], today) if found["rem"] else []
+        items = _reminder_items(found["rem"], today, now) if found["rem"] else []
         # Senza il registro dei secondi avvisi non si sa cosa è già partito:
         # nessuna voce sul secondo avviso, solo i promemoria (e la legenda lo dice).
         if readable:
-            items += _followup_items(found["rem"], found["fol"], today, start, mode, cfg)
+            items += _followup_items(found["rem"], found["fol"], today, start, mode, cfg, now)
         if items:
             items.sort(key=lambda it: order.get((it["kind"], it["state"]), len(order)))
             customers[customer_id] = items
     return {
         "customers": customers, "followup_mode": mode, "followup_readable": readable,
         "today": today.isoformat(), "next_round": start.isoformat(),
-        "read_at": _local(followup._utc_now(now_utc)).strftime("%H:%M"),
+        "read_at": _local(now).strftime("%H:%M"),
     }
 
 
 # ── Registro «Email inviate» ───────────────────────────────────────
 
 def _log_state(merged: Dict[int, int], reminded: set, kind: str, row, inv: Optional[Invoice], mode: str,
-               today: date, start: date, cfg) -> Tuple[str, str]:
+               today: date, start: date, cfg, now: datetime) -> Tuple[str, str]:
     """(stato, etichetta) di una riga nel registro: un fatto di quel giorno."""
     if row.status == STATUS_SENT:
         return SENT, "Inviata"
+    if in_flight(row, now):
+        return PLANNED, "Invio in corso"
     if not was_attempted(row):
         # Mai tentata: il giro l'ha saltata, col motivo scritto.
         return fact_state(row.skip_reason), f"Non partita: {reason_text(row.skip_reason)}"
@@ -643,7 +712,7 @@ def _log_state(merged: Dict[int, int], reminded: set, kind: str, row, inv: Optio
         if ours and row.status in STUCK_STATUSES and reminder_retriable(row, today):
             return STUCK, "Ferma: da gestire"
         # Solo l'ultimo errore è registrato: non si può dire «non partita».
-        return MISSING, "Esito incerto: non ritentabile"
+        return MISSING, "Esito incerto: da verificare su Resend"
     if row.status == STATUS_SKIPPED:
         # Il motore non riscrive mai come «saltata» un invio incerto: questo
         # era un rifiuto certo, e a un giro successivo è stata saltata.
@@ -652,9 +721,10 @@ def _log_state(merged: Dict[int, int], reminded: set, kind: str, row, inv: Optio
     # «Riprova» accetta solo la riga della scadenza attuale, del cliente a cui
     # la fattura appartiene ancora e col suo promemoria (retry_followup_row).
     if not ours or inv.id not in reminded:
-        return (MISSING, "Esito incerto: non ritentabile") if uncertain else (CLOSED, "Non partita: invio non riuscito")
+        return (MISSING, "Esito incerto: da verificare su Resend") if uncertain else (
+            CLOSED, "Non partita: invio non riuscito")
     if mode == MODE_REALE and not uncertain:
-        day = planned_day(inv.due_date, start, cfg)
+        day = planned_day(inv.due_date, start_after(row, today, start, cfg), cfg)
         if day is not None:
             reason = followup.exclusion(inv, inv.customer)
             if reason is None:
@@ -690,12 +760,12 @@ def _reminded_for(session: Session, merged: Dict[int, int], invoices: Dict[int, 
 
 
 def _entries(merged: Dict[int, int], reminded: set, kind: str, found: list, mode: str, today: date, start: date,
-             cfg) -> List[dict]:
+             cfg, now: datetime) -> List[dict]:
     """Le righe (riga, fattura, cliente) come voci del registro: un promemoria
     è una voce; le fatture di uno stesso secondo avviso sono una voce sola."""
     groups: Dict[tuple, list] = {}
     for row, inv, customer in found:
-        state, label = _log_state(merged, reminded, kind, row, inv, mode, today, start, cfg)
+        state, label = _log_state(merged, reminded, kind, row, inv, mode, today, start, cfg, now)
         # Una email è di UN cliente: stessa chiave su clienti diversi = email diverse.
         key = (_email_key(row) if kind == KIND_FOLLOWUP else f"riga-{row.id}", row.customer_id, state, label)
         groups.setdefault(key, []).append((row, inv, customer))
@@ -759,6 +829,7 @@ def sent_log(session: Session, days: int = 14, now_utc: Optional[datetime] = Non
     days = max(MIN_LOG_DAYS, min(int(days or MIN_LOG_DAYS), MAX_LOG_DAYS))
     today = italian_today(now_utc)
     start = first_round_day(now_utc, cfg)
+    now = followup._utc_now(now_utc)
     first_day = today - timedelta(days=days - 1)
     since = (
         datetime.combine(first_day, time.min, tzinfo=ZoneInfo(config.TIMEZONE))
@@ -794,9 +865,9 @@ def sent_log(session: Session, days: int = 14, now_utc: Optional[datetime] = Non
                 inv.id: inv for row, inv, _c in recent + halted if inv is not None and row.status in STUCK_STATUSES
             })
         return (
-            [e for e in _entries(merged, reminded, kind, recent, mode, today, start, cfg)
+            [e for e in _entries(merged, reminded, kind, recent, mode, today, start, cfg, now)
              if e["day"] and e["day"] >= first_day.isoformat()],
-            [e for e in _entries(merged, reminded, kind, halted, mode, today, start, cfg) if e["state"] == STUCK],
+            [e for e in _entries(merged, reminded, kind, halted, mode, today, start, cfg, now) if e["state"] == STUCK],
         )
 
     entries: List[dict] = []
@@ -840,5 +911,5 @@ def sent_log(session: Session, days: int = 14, now_utc: Optional[datetime] = Non
         "followup_mode": mode,
         "followup_readable": readable,
         "today": today.isoformat(),
-        "read_at": _local(followup._utc_now(now_utc)).strftime("%H:%M"),
+        "read_at": _local(now).strftime("%H:%M"),
     }

@@ -11,6 +11,9 @@ import { EmailItem } from '../components/EmailStatus'
 // Sistema). Le azioni sulle email ferme restano in Sistema.
 
 const STEP_DAYS = 14
+// L'elenco cambia col giro del mattino: una scheda lasciata aperta lo rilegge
+// da sola (ogni 5 minuti, e quando torna in primo piano).
+const REFRESH_MS = 5 * 60 * 1000
 
 const FILTERS = [
   ['all', 'Tutte'],
@@ -140,12 +143,33 @@ export default function EmailInviate() {
 
   useEffect(() => {
     let alive = true
-    setLoading(true)
-    client.get('/reminders/email/sent', { params: { days } })
-      .then(res => { if (alive) { setData(res.data); setError(null) } })
-      .catch(() => { if (alive) setError('Elenco delle email non disponibile: ricarica la pagina.') })
-      .finally(() => { if (alive) setLoading(false) })
-    return () => { alive = false }
+    let latest = 0
+    const read = (quiet) => {
+      const mine = ++latest   // vale solo la risposta dell'ultima lettura partita
+      if (!quiet) setLoading(true)
+      client.get('/reminders/email/sent', { params: { days }, noRetry: quiet })
+        .then(res => {
+          if (!alive || mine !== latest) return
+          // Una risposta che non è l'elenco (es. una pagina d'errore con 200) è un errore.
+          if (!Array.isArray(res.data?.days) || !Array.isArray(res.data?.stuck)) throw new Error('risposta non valida')
+          setData(res.data)
+          setError(null)
+        })
+        .catch(() => {
+          // Una rilettura automatica fallita non cancella ciò che c'è: lo dice l'ora di lettura.
+          if (alive && mine === latest && !quiet) setError('Elenco delle email non disponibile: ricarica la pagina.')
+        })
+        .finally(() => { if (alive && mine === latest) setLoading(false) })
+    }
+    read(false)
+    const timer = setInterval(() => read(true), REFRESH_MS)
+    const onVisible = () => { if (document.visibilityState === 'visible') read(true) }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      alive = false
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [days, attempt])
 
   const q = search.trim().toLowerCase()
@@ -241,6 +265,7 @@ export default function EmailInviate() {
           <p className="px-5 py-3 text-xs text-txt-muted border-t border-dark-border">
             Solo ciò che si può riprendere da Sistema: secondi avvisi fermi di fatture ancora da saldare (di qualunque
             data) e promemoria fermi la cui scadenza non è ancora passata. Nessun giro in programma li riprenderà.
+            {data.read_at ? ` Letto alle ${data.read_at}.` : ''}
           </p>
         </div>
       )}

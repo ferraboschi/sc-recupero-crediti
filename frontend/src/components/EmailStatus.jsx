@@ -65,10 +65,15 @@ export function useEmailStatus() {
   const [status, setStatus] = useState({ byCustomer: {}, loading: true, error: false, followupReadable: true, readAt: null })
   useEffect(() => {
     let alive = true
+    let latest = 0
     const read = () => {
+      // Vale solo la risposta dell'ULTIMA lettura partita: una vecchia che
+      // arriva tardi (il client riprova da solo per decine di secondi) non
+      // deve coprire una più nuova.
+      const mine = ++latest
       client.get('/reminders/email/customer-status', { timeout: STATUS_TIMEOUT_MS })
         .then(res => {
-          if (!alive) return
+          if (!alive || mine !== latest) return
           const customers = res.data?.customers
           if (!customers || typeof customers !== 'object' || Array.isArray(customers)) {
             // Risposta che non è lo stato (es. pagina d'errore con 200): è un errore.
@@ -85,7 +90,7 @@ export function useEmailStatus() {
         })
         .catch(() => {
           // Meglio nessuna riga, e dirlo, che righe che potrebbero non valere più.
-          if (alive) setStatus({ byCustomer: {}, loading: false, error: true, followupReadable: true, readAt: null })
+          if (alive && mine === latest) setStatus({ byCustomer: {}, loading: false, error: true, followupReadable: true, readAt: null })
         })
     }
     read()
@@ -149,10 +154,15 @@ export function EmailLegend({ status, flush = false, className = '' }) {
 // Dove la legenda non c'è (elenchi nei riquadri): almeno dire se lo stato
 // delle email non è ancora arrivato o non è disponibile.
 export function EmailStatusNote({ status, className = '' }) {
-  if (!status?.loading && !status?.error) return null
+  const unreadable = !status?.loading && !status?.error && status?.followupReadable === false
+  if (!status?.loading && !status?.error && !unreadable) return null
   return (
-    <p className={`text-xs ${status.error ? 'font-semibold text-accent-amber' : 'text-txt-muted'} ${className}`} role="status">
-      {status.error ? 'Stato delle email non disponibile: ricarica la pagina.' : 'Lettura dello stato delle email in corso…'}
+    <p className={`text-xs ${status.loading ? 'text-txt-muted' : 'font-semibold text-accent-amber'} ${className}`} role="status">
+      {status.error
+        ? 'Stato delle email non disponibile: ricarica la pagina.'
+        : unreadable
+          ? 'Secondi avvisi non leggibili: sotto i nomi solo i promemoria.'
+          : 'Lettura dello stato delle email in corso…'}
     </p>
   )
 }
