@@ -3318,3 +3318,24 @@ class TestChainedDueDates:
         mailer = FakeMailer()
         run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
         assert (entry["subject"], entry["text"]) == (mailer.sent[0]["subject"], mailer.sent[0]["text"])
+
+
+class TestChainedDueDatesAcrossTheWeekend:
+    def test_friday_and_monday_due_dates_are_in_a_row(self, test_db_session):
+        """Nel weekend non parte nessuna email: una scadenza di venerdì e una
+        di lunedì sono «di fila». Venerdì 20 parte UNA email con tutte e due
+        (scadute da 7 e da 4 giorni); lunedì 23 nulla."""
+        c = _cust(test_db_session)
+        _due(test_db_session, c, num="VEN/1", due=date(2026, 11, 13))
+        _due(test_db_session, c, num="LUN/1", due=date(2026, 11, 16))
+        later = _due(test_db_session, c, num="MER/1", due=date(2026, 11, 18))   # martedì 17 vuoto: aspetta
+        mailer = FakeMailer()
+        friday, monday = date(2026, 11, 20), date(2026, 11, 23)
+        _sync(test_db_session, now=_at(friday))
+        fri = run_followups(test_db_session, now_utc=_at(friday), mailer=mailer, cfg=_on_cfg())
+        assert fri["sent"] == 1 and fri["invoices"] == 2 and fri["merged_early"] == 1
+        assert "scaduta da 7 giorni" in mailer.sent[0]["text"] and "scaduta da 4 giorni" in mailer.sent[0]["text"]
+        assert later.id not in {r.invoice_id for r in _rows(test_db_session)}
+        _sync(test_db_session, now=_at(monday))
+        mon = run_followups(test_db_session, now_utc=_at(monday), mailer=mailer, cfg=_on_cfg())
+        assert mon["sent"] == 0 and len(mailer.sent) == 1
