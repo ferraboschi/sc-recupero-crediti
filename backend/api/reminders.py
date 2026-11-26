@@ -78,9 +78,15 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
         "error_kind": row.error_kind,
         # Ferma finché un operatore non preme «Riprova»? (secondo avviso: anche
         # «nessun invio tentato» si ritenta da solo)
+        # Promemoria: ciò che certamente non è partito lo riprende un giro,
+        # ma solo nel giorno di giro di quella scadenza — dopo, nessun giro la
+        # guarda più: resta ferma finché non la riprende un operatore.
         "needs_manual_retry": flags["needs_manual_retry"] if is_followup else (
             row.status == "sending" or (
-                row.status == "failed" and (row.error_kind or "other") not in AUTO_RETRY_KINDS
+                row.status == "failed" and not (
+                    (row.error_kind or "other") in AUTO_RETRY_KINDS
+                    and email_status.reminder_round_day(row.due_date, followup.italian_today()) is not None
+                )
             )
         ),
         # «Riprova» può creare un doppione che Resend non fermerebbe (dopo un

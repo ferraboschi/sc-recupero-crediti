@@ -1401,6 +1401,25 @@ class TestAgainstTheRealEngines:
         assert "00001812" not in item["title"]
         assert a.id and len([e for d in _log(s, now=LATE)["days"] for e in d["items"]]) == 1
 
+    def test_an_invoice_whose_send_never_started_is_not_shown_as_maybe_received(self, test_db_session):
+        """Il motore scrive «not_attempted» solo quando nulla è partito: a
+        scadenza passata non è un «esito incerto» da verificare su Resend."""
+        s = test_db_session
+        c = _cust(s)
+        inv = _inv(s, c, due=date(2026, 11, 19))
+        _rem(s, inv, status="failed", error_kind="not_attempted", when=datetime(2026, 11, 18, 8, 15),
+             error="Errore imprevisto prima dell'invio (nulla è partito): boom")
+        # Finché «Riprova» lo accetta: da gestire.
+        assert _pairs(s, c, now=LATE) == [("stuck", "Promemoria fermo 18/11")]
+        after = _at(date(2026, 11, 20), 7)
+        CLOCK["now"] = after
+        [item] = _items(s, c, now=after)
+        assert (item["state"], item["label"]) == ("closed", "Promemoria non partito: invio non riuscito")
+        assert "nulla è partito" in item["title"] and "Resend" not in item["title"]
+        log = _log(s, now=after)
+        assert [e["state_label"] for d in log["days"] for e in d["items"]] == ["Non partita: invio non riuscito"]
+        assert log["stuck"] == []
+
     def test_a_reminder_in_doubt_is_retriable_and_riprova_accepts_it(self, test_db_session):
         c, _inv_, row = self._reminder_in_doubt(test_db_session)
         assert _pairs(test_db_session, c, now=LATE) == [("stuck", "Promemoria fermo 18/11")]
