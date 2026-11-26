@@ -7,8 +7,9 @@ import client from '../api/client'
 // saldare); qui solo colore e disposizione.
 //
 // Un colore = un significato, lo stesso in ogni pagina: verde = inviata,
-// grigio = in programma, ambra = ferma (serve un operatore), rosso = non
-// partita (c'è un dato da sistemare), viola = sospesa (come «In Attesa»).
+// grigio = in programma, ambra = ferma (un operatore può riprenderla da
+// Sistema), rosso = non partita o dall'esito incerto (il cliente potrebbe non
+// averla), viola = non partita per una scelta che vale ancora («In Attesa»).
 const DOT = {
   sent: 'bg-accent-green',
   planned: 'border border-txt-muted',
@@ -31,7 +32,7 @@ const LEGEND = [
   ['sent', 'inviata'],
   ['planned', 'in programma'],
   ['stuck', 'ferma, da gestire'],
-  ['missing', 'non partita'],
+  ['missing', 'non partita o incerta'],
   ['paused', 'sospesa'],
 ]
 
@@ -50,18 +51,26 @@ export function EmailItem({ tone, title, children }) {
   )
 }
 
-// Una sola lettura per pagina: {id cliente: [voci]}. Se la lettura fallisce
-// la pagina resta com'è e la legenda lo dice: l'assenza della riga non deve
-// mai sembrare «nessuna email».
+// Una sola lettura per pagina: {id cliente: [voci]}. La pagina non la
+// aspetta. Finché la risposta non c'è, o se non arriva, la legenda lo DICE:
+// l'assenza della riga sotto un nome non deve mai sembrare «nessuna email».
+const STATUS_TIMEOUT_MS = 30000
+
 export function useEmailStatus() {
   const [status, setStatus] = useState({ byCustomer: {}, loading: true, error: false, followupReadable: true })
   useEffect(() => {
     let alive = true
-    client.get('/reminders/email/customer-status')
+    client.get('/reminders/email/customer-status', { timeout: STATUS_TIMEOUT_MS })
       .then(res => {
         if (!alive) return
+        const customers = res.data?.customers
+        if (!customers || typeof customers !== 'object' || Array.isArray(customers)) {
+          // Risposta che non è lo stato (es. pagina d'errore con 200): è un errore.
+          setStatus({ byCustomer: {}, loading: false, error: true, followupReadable: true })
+          return
+        }
         setStatus({
-          byCustomer: res.data.customers || {},
+          byCustomer: customers,
           loading: false,
           error: false,
           followupReadable: res.data.followup_readable !== false,
@@ -80,8 +89,8 @@ export function EmailStatusLine({ status, customerId, className = 'mt-1' }) {
   if (!Array.isArray(items) || items.length === 0) return null
   return (
     <div className={`flex flex-wrap items-center gap-x-3 gap-y-0.5 ${className}`} data-testid="email-status-line">
-      {items.map(item => (
-        <EmailItem key={`${item.kind}-${item.state}-${item.label}`} tone={item.state} title={item.title}>
+      {items.map((item, i) => (
+        <EmailItem key={`${i}-${item.kind}-${item.state}`} tone={item.state} title={item.title}>
           {item.label}
         </EmailItem>
       ))}
@@ -98,12 +107,17 @@ export function EmailLegend({ status, flush = false, className = '' }) {
     >
       <span className="text-xs font-semibold uppercase tracking-wider text-txt-label">Email automatiche sotto il nome</span>
       {LEGEND.map(([tone, label]) => <EmailItem key={tone} tone={tone}>{label}</EmailItem>)}
+      {status?.loading && (
+        <span className="text-xs text-txt-muted" role="status" data-testid="email-status-loading">
+          Lettura dello stato delle email in corso…
+        </span>
+      )}
       {status?.error && (
         <span className="text-xs font-semibold text-accent-amber" role="status">
           Stato delle email non disponibile: ricarica la pagina.
         </span>
       )}
-      {!status?.error && status?.followupReadable === false && (
+      {!status?.loading && !status?.error && status?.followupReadable === false && (
         <span className="text-xs font-semibold text-accent-amber" role="status">
           Secondi avvisi non leggibili: qui sotto solo i promemoria.
         </span>

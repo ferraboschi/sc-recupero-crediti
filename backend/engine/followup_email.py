@@ -1369,28 +1369,6 @@ def _is_uncertain(row: InvoiceFollowupEmail) -> bool:
     return row.status == STATUS_FAILED and (row.error_kind or ERROR_OTHER) not in CERTAIN_KINDS
 
 
-def will_auto_retry(row: InvoiceFollowupEmail, invoice: Optional[Invoice], send_mode: str,
-                    now_utc: Optional[datetime] = None, cfg=None) -> bool:
-    """Una riga FERMA verrà ripresa dal giro, senza un operatore? Sì se la
-    fattura è ancora nella finestra del prossimo giro (oggi, o lunedì se oggi
-    è weekend) e l'esito è «certamente non partita», oppure è una riga di
-    prova/test e si invia in reale (lì è un invio nuovo). Un esito incerto
-    resta dell'operatore. `send_mode`: la modalità in cui si invierebbe ora."""
-    if not _is_stuck(row):
-        return False
-    window = followup_window(now_utc, cfg)
-    if window is None:
-        today = italian_today(now_utc)
-        monday = today + timedelta(days=7 - today.weekday())
-        window = followup_window(datetime(monday.year, monday.month, monday.day, 10, 0, tzinfo=timezone.utc), cfg)
-    in_window = bool(
-        window and invoice is not None and invoice.due_date is not None
-        and window[0] <= invoice.due_date <= merge_until(window)
-    )
-    fresh_in_real = send_mode == MODE_REALE and (row.mode or MODE_REALE) != MODE_REALE
-    return bool(in_window and (not _is_uncertain(row) or fresh_in_real))
-
-
 def _key_born(row: InvoiceFollowupEmail) -> Optional[datetime]:
     """Quando è stata usata per la prima volta la chiave che la riga porta
     verso Resend (per le righe più vecchie della colonna: l'ultimo

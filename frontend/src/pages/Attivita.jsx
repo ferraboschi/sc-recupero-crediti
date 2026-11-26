@@ -564,8 +564,9 @@ export default function Attivita() {
                   <p className="text-sm text-txt-muted">Vai nella scheda cliente e registra la prima azione per iniziare il recupero.</p>
                 </div>
               ) : (
+                <>
+                <EmailLegend status={emailStatus} flush className="mb-3" />
                 <div className="overflow-x-auto">
-                  <EmailLegend status={emailStatus} flush className="mb-3" />
                   <table className="w-full">
                     <thead>
                       <tr className="text-left text-xs text-txt-muted uppercase tracking-wider border-b border-dark-border">
@@ -641,6 +642,7 @@ export default function Attivita() {
                     </tbody>
                   </table>
                 </div>
+                </>
               )}
             </>
           )}

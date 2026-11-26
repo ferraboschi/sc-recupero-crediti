@@ -35,11 +35,10 @@ const formatDay = (iso) => {
   return `${d}/${m}/${y}`
 }
 
-function invoicesText(invoices) {
+function InvoiceNumbers({ invoices }) {
   const numbers = (invoices || []).map(i => i.number).filter(Boolean)
-  if (numbers.length === 0) return '—'
-  if (numbers.length === 1) return `Fattura ${numbers[0]}`
-  return `Fatture ${numbers.slice(0, -1).join(', ')} e ${numbers[numbers.length - 1]}`
+  if (numbers.length === 0) return <span>—</span>
+  return numbers.map((number, i) => <span key={`${i}-${number}`} className="block whitespace-nowrap">{number}</span>)
 }
 
 function matches(entry, q) {
@@ -56,7 +55,7 @@ function daySummary(items) {
   const stuck = count('stuck')
   if (stuck) parts.push(`${stuck} ${stuck === 1 ? 'ferma' : 'ferme'}`)
   const missing = count('missing')
-  if (missing) parts.push(`${missing} non ${missing === 1 ? 'partita' : 'partite'}`)
+  if (missing) parts.push(`${missing} non ${missing === 1 ? 'partita o incerta' : 'partite o incerte'}`)
   const paused = count('paused')
   if (paused) parts.push(`${paused} ${paused === 1 ? 'sospesa' : 'sospese'}`)
   return parts.length ? parts.join(' · ') : 'nessuna email inviata'
@@ -67,8 +66,10 @@ function EntriesTable({ items, withDay = false }) {
     <div className="overflow-x-auto">
       <table className="w-full table-fixed min-w-[980px]">
         <colgroup>
-          {/* Strette e fisse le colonne dal contenuto corto; il cliente prende il resto. */}
-          {[withDay ? '108px' : '88px', '132px', undefined, '20%', '116px', '19%', '15%'].map((w, i) => (
+          {/* Fisse le colonne dal contenuto corto (ora, tipo, numero fattura, importo,
+              esito); il destinatario cresce con lo schermo; il cliente prende il resto
+              (a 1280 con la barra laterale aperta: circa 150 px). */}
+          {[withDay ? '104px' : '80px', '128px', undefined, '164px', '120px', '19%', '168px'].map((w, i) => (
             <col key={i} style={w ? { width: w } : undefined} />
           ))}
         </colgroup>
@@ -85,8 +86,8 @@ function EntriesTable({ items, withDay = false }) {
           </tr>
         </thead>
         <tbody>
-          {items.map(entry => (
-            <tr key={entry.key} className="sc-table-row align-top" data-testid="email-sent-row" data-state={entry.state}>
+          {items.map((entry, i) => (
+            <tr key={`${i}-${entry.key}`} className="sc-table-row align-top" data-testid="email-sent-row" data-state={entry.state}>
               <td className="px-4 py-3 text-sm text-txt-muted font-mono">
                 {withDay && <span className="block text-xs">{formatDay(entry.day)}</span>}
                 {entry.time || '—'}
@@ -106,7 +107,7 @@ function EntriesTable({ items, withDay = false }) {
                 )}
                 <AgentBadges agents={entry.agents} className="ml-2" />
               </td>
-              <td className="px-4 py-3 text-sm text-txt-secondary break-words">{invoicesText(entry.invoices)}</td>
+              <td className="px-4 py-3 text-sm text-txt-secondary"><InvoiceNumbers invoices={entry.invoices} /></td>
               <td className="px-4 py-3 text-sm text-right font-bold text-txt-primary whitespace-nowrap">
                 {formatCurrency(entry.amount)}
               </td>
@@ -135,6 +136,7 @@ export default function EmailInviate() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [attempt, setAttempt] = useState(0)  // una nuova lettura anche a parità di giorni (dopo un errore)
   const [filter, setFilter] = useState('all')
   const [search, setSearch] = useState('')
 
@@ -146,7 +148,7 @@ export default function EmailInviate() {
       .catch(() => { if (alive) setError('Elenco delle email non disponibile: ricarica la pagina.') })
       .finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
-  }, [days])
+  }, [days, attempt])
 
   const q = search.trim().toLowerCase()
   const visibleDays = useMemo(() => {
@@ -166,7 +168,7 @@ export default function EmailInviate() {
     ['Oggi', totals.today_sent ?? 0, 'email inviate', 'text-txt-primary'],
     ['Ultimi 7 giorni', totals.week_sent ?? 0, 'email inviate', 'text-txt-primary'],
     ['Ferme', totals.stuck ?? 0, 'da gestire', (totals.stuck || 0) > 0 ? 'text-accent-amber' : 'text-txt-primary'],
-    ['Non partite', totals.week_missing ?? 0, 'negli ultimi 7 giorni', (totals.week_missing || 0) > 0 ? 'text-accent-red' : 'text-txt-primary'],
+    ['Non partite o incerte', totals.week_missing ?? 0, 'negli ultimi 7 giorni', (totals.week_missing || 0) > 0 ? 'text-accent-red' : 'text-txt-primary'],
   ]
 
   return (
@@ -237,7 +239,8 @@ export default function EmailInviate() {
             <EntriesTable items={stuck} withDay />
           )}
           <p className="px-5 py-3 text-xs text-txt-muted border-t border-dark-border">
-            Email non riuscite di fatture ancora da saldare, di qualunque data. Un invio fermo non viene ritentato da solo.
+            Solo ciò che si può riprendere da Sistema: secondi avvisi fermi di fatture ancora da saldare (di qualunque
+            data) e promemoria fermi la cui scadenza non è ancora passata. Un invio fermo non viene ritentato da solo.
           </p>
         </div>
       )}
@@ -268,7 +271,7 @@ export default function EmailInviate() {
                 type="button"
                 className="sc-btn-secondary"
                 disabled={loading}
-                onClick={() => setDays(Math.min(data.range.days + STEP_DAYS, maxDays))}
+                onClick={() => { setDays(Math.min(data.range.days + STEP_DAYS, maxDays)); setAttempt(n => n + 1) }}
               >
                 {loading ? 'Caricamento…' : `Mostra altri ${Math.min(STEP_DAYS, maxDays - data.range.days)} giorni`}
               </button>
