@@ -145,17 +145,14 @@ export default function EmailInviate() {
   useEffect(() => {
     let alive = true
     let latest = 0
-    let foreground = false   // una lettura «vera» (apertura, altri giorni) è in corso
+    let busy = false   // una lettura (la prima o una rilettura) è in corso
     const read = (quiet) => {
-      // Una rilettura automatica non scavalca mai una lettura vera in corso:
-      // se fallisse subito ne butterebbe via la risposta buona, lasciando la
-      // pagina senza dati e senza un errore.
-      if (quiet && foreground) return
+      // Una rilettura automatica non parte mai mentre un'altra lettura è in
+      // corso: se fallisse subito ne butterebbe via la risposta buona.
+      if (quiet && busy) return
+      busy = true
       const mine = ++latest   // vale solo la risposta dell'ultima lettura partita
-      if (!quiet) {
-        foreground = true
-        setLoading(true)
-      }
+      if (!quiet) setLoading(true)
       client.get('/reminders/email/sent', { params: { days }, noRetry: quiet })
         .then(res => {
           if (!alive || mine !== latest) return
@@ -172,9 +169,8 @@ export default function EmailInviate() {
           else setError('Elenco delle email non disponibile: ricarica la pagina.')
         })
         .finally(() => {
-          if (quiet) return
-          foreground = false
-          if (alive) setLoading(false)
+          busy = false
+          if (!quiet && alive) setLoading(false)
         })
     }
     read(false)
@@ -257,7 +253,8 @@ export default function EmailInviate() {
       {error && <div className="sc-card p-5 text-accent-red" role="alert">{error}</div>}
       {data && refreshFailed && (
         <div className="sc-card p-4 text-sm text-accent-amber" role="status" data-testid="email-sent-stale">
-          L'aggiornamento automatico non è riuscito: i dati sono quelli letti alle {data.read_at}. Ricarica la pagina.
+          L'aggiornamento automatico non è riuscito: i dati sono quelli letti alle {data.read_at}
+          {data.today ? ` del ${formatDay(data.today)}` : ''}. Ricarica la pagina.
         </div>
       )}
       {data && data.followup_readable === false && (
