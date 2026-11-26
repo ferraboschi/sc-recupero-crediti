@@ -17,9 +17,12 @@ finché le scadenze sono di fila (il giorno dopo, poi quello dopo ancora…):
 così l'indomani non ricevono un'email a parte. «± un giorno» vale A CATENA
 (decisione owner 26/11/2026: «unite, non diventiamo assillanti»): con
 scadenze venerdì, sabato e domenica, giovedì parte UNA email con tutte e
-tre. La catena si ferma al primo giorno senza una sua fattura pronta. Da
-sole, quelle fatture non fanno partire nulla: aspettano il loro giorno. Con
-una sola fattura l'email è quella di sempre, parola per parola.
+tre. La catena si ferma al primo giorno LAVORATIVO senza una sua fattura
+pronta; un sabato o una domenica vuoti non la interrompono (nel weekend
+non parte nessuna email: con scadenze venerdì e lunedì, giovedì parte una
+sola email). Da sole, quelle fatture non fanno partire nulla: aspettano il
+loro giorno. Con una sola fattura l'email è quella di sempre, parola per
+parola.
 
 Modalità (risolta dalla configurazione, mai implicita):
 - prova  → le email vengono COMPOSTE e REGISTRATE (status prepared) ma non
@@ -663,15 +666,26 @@ def _existing_row(session: Session, invoice: Invoice) -> Optional[InvoiceReminde
 def chain_after(last: date, later: Iterable[Invoice]) -> List[Invoice]:
     """La catena: delle fatture che scadono DOPO l'ultima scadenza del giro,
     quelle che si uniscono all'email di oggi — il giorno dopo, poi quello dopo
-    ancora, finché ogni giorno ne ha almeno una. Al primo giorno vuoto la
-    catena si ferma: le altre aspettano il loro giorno."""
+    ancora, finché ogni giorno ne ha almeno una. Al primo giorno LAVORATIVO
+    vuoto la catena si ferma: le altre aspettano il loro giorno. Un sabato o
+    una domenica vuoti non la interrompono: nel weekend non parte nessuna
+    email, quindi venerdì e lunedì sono «di fila» (senza questo, con una
+    scadenza venerdì e una lunedì il cliente riceverebbe un'email giovedì e
+    una venerdì)."""
     by_due: Dict[date, List[Invoice]] = {}
     for inv in later:
-        by_due.setdefault(inv.due_date, []).append(inv)
+        if inv.due_date is not None and inv.due_date > last:
+            by_due.setdefault(inv.due_date, []).append(inv)
     chained: List[Invoice] = []
+    if not by_due:
+        return chained
+    end = max(by_due)
     day = last + timedelta(days=NEAR_DUE_DAYS)
-    while day in by_due:
-        chained.extend(by_due[day])
+    while day <= end:
+        if day in by_due:
+            chained.extend(by_due[day])
+        elif day.weekday() < 5:
+            break
         day += timedelta(days=NEAR_DUE_DAYS)
     return chained
 
@@ -871,8 +885,10 @@ def _round_invoices(session: Session, dates: List[date]) -> List[Invoice]:
     """Le fatture che il giro guarda: quelle con una scadenza del giro, più
     quelle degli STESSI clienti che scadono nei giorni subito dopo (si
     possono unire all'email di oggi, a catena). Si legge un giorno alla
-    volta e ci si ferma al primo giorno in cui nessuno di quei clienti ha
-    una fattura: oltre, nessuna catena può proseguire."""
+    volta, e ogni giorno lavorativo si prosegue solo per i clienti che quel
+    giorno hanno una fattura: per gli altri la catena è finita (un sabato o
+    una domenica vuoti non contano: vedi chain_after). Ci si ferma quando
+    non resta nessun cliente."""
     out: List[Invoice] = []
     for due in dates:
         out.extend(candidate_invoices(session, due))
@@ -883,9 +899,12 @@ def _round_invoices(session: Session, dates: List[date]) -> List[Invoice]:
     for _ in range(CHAIN_SAFETY_DAYS):
         day += timedelta(days=NEAR_DUE_DAYS)
         found = [inv for inv in candidate_invoices(session, day) if inv.customer_id in customers]
-        if not found:
-            break
         out.extend(found)
+        if day.weekday() >= 5:
+            continue
+        customers = {inv.customer_id for inv in found}
+        if not customers:
+            break
     return out
 
 

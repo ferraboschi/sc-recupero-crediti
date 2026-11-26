@@ -2978,8 +2978,44 @@ class TestOneEmailPerCustomerChainAndBrokenCopies:
         assert mailer.sent[0]["subject"].startswith("Promemoria: fattura n. A/1")
         assert set(_rows(test_db_session)) == {a.id}
 
-    def test_chain_after_stops_at_the_first_empty_day(self):
+    def test_chain_after_stops_at_the_first_empty_working_day(self):
         inv = lambda n, day: SimpleNamespace(id=n, due_date=date(2026, 11, day))  # noqa: E731
-        later = [inv(1, 12), inv(2, 12), inv(3, 13), inv(4, 15)]
-        assert [i.id for i in re_mod.chain_after(TOMORROW, later)] == [1, 2, 3]
-        assert re_mod.chain_after(TOMORROW, [inv(5, 13)]) == [] and re_mod.chain_after(TOMORROW, []) == []
+        # Dopo mercoledì 11: giovedì 12 e venerdì 13 ci sono; lunedì 16 anche (il weekend vuoto non interrompe);
+        # martedì 17 è vuoto: la fattura di mercoledì 18 resta fuori.
+        later = [inv(1, 12), inv(2, 12), inv(3, 13), inv(4, 16), inv(5, 18)]
+        assert [i.id for i in re_mod.chain_after(TOMORROW, later)] == [1, 2, 3, 4]
+        # Un giorno lavorativo vuoto (giovedì 12) ferma tutto.
+        assert re_mod.chain_after(TOMORROW, [inv(6, 13)]) == [] and re_mod.chain_after(TOMORROW, []) == []
+        # Solo sabato o solo domenica: si uniscono a venerdì.
+        friday = date(2026, 11, 13)
+        assert [i.id for i in re_mod.chain_after(friday, [inv(7, 15)])] == [7]
+        assert [i.id for i in re_mod.chain_after(friday, [inv(8, 14), inv(9, 16), inv(10, 17)])] == [8, 9, 10]
+        # Scadenze non successive all'ultima del giro non entrano mai.
+        assert re_mod.chain_after(friday, [inv(11, 13), inv(12, 10)]) == []
+
+    def test_friday_and_monday_due_dates_make_one_email_on_thursday(self, test_db_session):
+        """Nel weekend non parte nessuna email: venerdì e lunedì sono «di
+        fila». Giovedì parte UNA email; venerdì il giro non manda nulla."""
+        c = _cust(test_db_session)
+        _inv(test_db_session, c, "VEN/1", 10.0, date(2026, 11, 13))
+        _inv(test_db_session, c, "LUN/1", 20.0, date(2026, 11, 16))
+        far = _inv(test_db_session, c, "MER/1", 30.0, date(2026, 11, 18))   # martedì 17 vuoto: aspetta
+        mailer = FakeMailer()
+        thu = run_reminders(test_db_session, now_utc=datetime(2026, 11, 12, 10, tzinfo=timezone.utc), mailer=mailer, cfg=_real_cfg())
+        assert thu["sent"] == 1 and thu["invoices"] == 2 and thu["merged_early"] == 1
+        assert "- n. VEN/1 di" in mailer.sent[0]["text"] and "- n. LUN/1 di 20,00 €, scade lunedì 16/11/2026" in mailer.sent[0]["text"]
+        assert "MER/1" not in mailer.sent[0]["text"] and far.id not in _rows(test_db_session)
+        fri = run_reminders(test_db_session, now_utc=datetime(2026, 11, 13, 10, tzinfo=timezone.utc), mailer=mailer, cfg=_real_cfg())
+        assert fri["sent"] == 0 and fri["already"] == 1 and len(mailer.sent) == 1
+
+    def test_the_round_reads_across_an_empty_weekend_only_for_who_can_still_chain(self, test_db_session):
+        c = _cust(test_db_session)
+        other = _cust(test_db_session, "Altro Srl", "info@altro.it", partita_iva="01234567897")
+        friday = date(2026, 11, 13)
+        _inv(test_db_session, c, "VEN/1", 10.0, friday)
+        _inv(test_db_session, c, "LUN/1", 20.0, date(2026, 11, 16))
+        _inv(test_db_session, c, "MER/1", 30.0, date(2026, 11, 18))        # oltre il martedì vuoto: non letta
+        _inv(test_db_session, other, "X/VEN", 10.0, friday)
+        _inv(test_db_session, other, "X/MAR", 20.0, date(2026, 11, 17))    # lunedì vuoto per lui: non letta
+        loaded = {inv.invoice_number for inv in re_mod._round_invoices(test_db_session, [friday])}
+        assert loaded == {"VEN/1", "LUN/1", "X/VEN"}
