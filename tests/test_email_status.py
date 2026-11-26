@@ -301,6 +301,7 @@ class TestReminderNextToTheName:
         data = _status(test_db_session)
         assert data["customers"] == {} and data["followup_mode"] == "off" and data["followup_readable"] is True
         assert data["today"] == "2026-11-18" and data["next_round"] == "2026-11-18"
+        assert data["read_at"] == "08:00"   # le 07:00 UTC
 
     def test_one_reminder_sent(self, test_db_session):
         c = _cust(test_db_session)
@@ -311,6 +312,11 @@ class TestReminderNextToTheName:
         assert item["date"] == "2026-11-10" and item["count"] == 1
         assert item["title"] == ("Fattura 2026/00001804/SAK: promemoria inviato il 10/11/2026 alle 09:15 "
                                  "a amministrazione@shabu.it")
+
+    def test_a_sent_row_without_an_attempt_time_is_still_just_sent(self, test_db_session):
+        c = _cust(test_db_session)
+        _rem(test_db_session, _inv(test_db_session, c), attempted_at=None)
+        assert _pairs(test_db_session, c) == [("sent", "Promemoria 10/11")]
 
     def test_two_reminders_the_same_day(self, test_db_session):
         c = _cust(test_db_session)
@@ -727,7 +733,8 @@ class TestFollowupNextToTheName:
         # Dal giorno dopo resta il motivo scritto dal giro, come un fatto.
         tomorrow = _at(date(2026, 11, 19), 7)
         items = _items(test_db_session, c, _on(), now=tomorrow)
-        assert (items[1]["state"], items[1]["label"]) == ("closed", "2° avviso non partito: in attesa")
+        assert [(it["state"], it["label"]) for it in items] == [
+            ("sent", "Promemoria 04/11"), ("closed", "2° avviso non partito: in attesa")]
         assert "ultimo motivo scritto dal giro" in items[1]["title"]
 
     def test_planned_on_a_weekend_is_monday(self, test_db_session):
@@ -1179,7 +1186,7 @@ class TestSentLog:
         assert data["days"] == [] and data["stuck"] == []
         assert data["totals"] == {"today_sent": 0, "week_sent": 0, "week_missing": 0, "stuck": 0}
         assert data["range"] == {"from": "2026-11-05", "to": "2026-11-18", "days": 14, "max_days": 90}
-        assert data["followup_readable"] is True and data["today"] == "2026-11-18"
+        assert data["followup_readable"] is True and data["today"] == "2026-11-18" and data["read_at"] == "11:00"
 
     def test_both_kinds_together_by_italian_day_newest_first(self, test_db_session):
         c = _cust(test_db_session, tags="B2B, scotti")
@@ -1361,7 +1368,7 @@ class TestSentLog:
         data = _log(test_db_session, cfg=_on())
         [entry] = [e for d in data["days"] for e in d["items"] if e["kind"] == "followup"]
         assert (entry["state"], entry["state_label"]) == ("paused", "Non riuscita, ora sospeso: in attesa")
-        assert data["stuck"] == []
+        assert data["stuck"] == [] and data["totals"]["week_missing"] == 0
         c.recovery_status = "idle"
         c.email = None
         test_db_session.commit()
@@ -1378,13 +1385,27 @@ class TestSentLog:
 
     @pytest.mark.parametrize("kind,state,label", [("pdf", "closed", "Non partita: invio non riuscito"),
                                                   ("network", "missing", "Esito incerto: non ritentabile")])
-    def test_without_the_reminder_a_failed_notice_is_not_to_do(self, test_db_session, kind, state, label):
-        """«Riprova» la rifiuterebbe per sempre («promemoria non inviato»)."""
+    @pytest.mark.parametrize("reminder", ["nessuno", "saltato", "in test", "altra scadenza", "altro cliente"])
+    def test_without_the_reminder_a_failed_notice_is_not_to_do(self, test_db_session, kind, state, label, reminder):
+        """«Riprova» la rifiuterebbe per sempre («promemoria non inviato»): vale
+        solo il promemoria REALE, INVIATO, per QUESTA scadenza, a QUESTO cliente."""
         c = _cust(test_db_session)
-        _fol(test_db_session, _inv(test_db_session, c), status="failed", error_kind=kind)
+        inv = _inv(test_db_session, c)
+        early = datetime(2026, 11, 3, 8, 15)
+        if reminder == "saltato":
+            _rem(test_db_session, inv, status="skipped", skip_reason="senza_email", when=early)
+        elif reminder == "in test":
+            _rem(test_db_session, inv, mode="test", when=early)
+        elif reminder == "altra scadenza":
+            _rem(test_db_session, inv, due=date(2026, 11, 2), when=early)
+        elif reminder == "altro cliente":
+            other = _cust(test_db_session, "Altro Srl", "info@altro.it", partita_iva="01234567897")
+            _rem(test_db_session, inv, customer_id=other.id, when=early)
+        _fol(test_db_session, inv, status="failed", error_kind=kind)
         data = _log(test_db_session, cfg=_on(), now=EARLY)
         assert data["stuck"] == []
-        assert [(e["state"], e["state_label"]) for e in data["days"][0]["items"]] == [(state, label)]
+        assert [(e["state"], e["state_label"]) for e in data["days"][0]["items"] if e["kind"] == "followup"] == [
+            (state, label)]
 
     @pytest.mark.parametrize("status,kind", [("failed", "pdf"), ("failed", "validation"), ("failed", "network"),
                                              ("sending", None)])
@@ -1418,14 +1439,17 @@ class TestSentLog:
         """Scadenza cambiata, o fattura passata a un altro cliente: «Riprova»
         rifiuta per sempre. Non deve restare tra le «da gestire»."""
         c = _cust(test_db_session)
-        moved = _inv(test_db_session, c, "2026/00001804/SAK", due=date(2026, 12, 15))
+        moved = _inv(test_db_session, c, "2026/00001804/SAK", due=date(2026, 11, 10))
+        _rem(test_db_session, moved)   # il promemoria per la scadenza di adesso c'è
         _fol(test_db_session, moved, due=date(2026, 11, 9), status="failed", error_kind=kind)
         other = _cust(test_db_session, "Altro Srl", "info@altro.it", partita_iva="01234567897")
         rematched = _inv(test_db_session, other, "2026/00001812/SAK")
+        _rem(test_db_session, rematched)   # e anche qui, al nuovo cliente
         _fol(test_db_session, rematched, status="failed", error_kind=kind, customer_id=c.id)
         data = _log(test_db_session, cfg=_on())
         assert data["stuck"] == [] and data["totals"]["stuck"] == 0
-        assert [(e["state"], e["state_label"]) for e in data["days"][0]["items"]] == [(state, label)] * 2
+        assert [(e["state"], e["state_label"]) for e in data["days"][0]["items"] if e["kind"] == "followup"] == [
+            (state, label)] * 2
 
     def test_the_range_is_whole_italian_days(self, test_db_session):
         c = _cust(test_db_session)
