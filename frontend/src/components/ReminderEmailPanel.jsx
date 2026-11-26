@@ -11,8 +11,8 @@ import AgentBadges from './AgentBadges'
 // esecuzione chiede conferma citando la modalità, che il server ricontrolla
 // (409 se nel frattempo è cambiata).
 
-const fmtEur = (v) => new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(v || 0)
-const fmtDate = (s) => {
+export const fmtEur = (v) => new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(v || 0)
+export const fmtDate = (s) => {
   if (!s) return '—'
   const d = s.length === 10 ? new Date(s + 'T00:00:00') : new Date(s)
   return d.toLocaleDateString('it-IT')
@@ -20,14 +20,14 @@ const fmtDate = (s) => {
 // I timestamp del server sono UTC senza suffisso: va dichiarato, altrimenti
 // il browser li legge come ora locale (−1/−2 ore).
 const asUtc = (s) => (s.endsWith('Z') || /[+-]\d\d:\d\d$/.test(s) ? s : s + 'Z')
-const fmtDateTime = (s) => (s ? new Date(asUtc(s)).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—')
+export const fmtDateTime = (s) => (s ? new Date(asUtc(s)).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—')
 
-const MODE_STYLE = {
+export const MODE_STYLE = {
   prova: 'bg-[rgba(148,163,184,0.15)] text-txt-secondary',
   test: 'bg-accent-amber/15 text-accent-amber',
   reale: 'bg-accent-green/15 text-accent-green',
 }
-const RUN_LABEL = {
+export const RUN_LABEL = {
   prova: 'Prepara ora (senza inviare)',
   test: 'Invia ora (indirizzo di prova)',
   reale: 'Invia ora ai clienti',
@@ -39,7 +39,7 @@ const STATUS_LABEL = {
   failed: ['Errore', 'bg-accent-red/15 text-accent-red'],
   skipped: ['Saltata', 'bg-accent-amber/15 text-accent-amber'],
 }
-const PLANNED_STYLE = 'bg-accent-blue/15 text-accent-blue'
+export const PLANNED_STYLE = 'bg-accent-blue/15 text-accent-blue'
 
 export function ReminderStatusBadge({ row }) {
   const [label, cls] = STATUS_LABEL[row.status] || [row.status, STATUS_LABEL.prepared[1]]
@@ -51,7 +51,7 @@ export function ReminderStatusBadge({ row }) {
   )
 }
 
-async function errorDetail(e) {
+export async function errorDetail(e) {
   // Con responseType blob la risposta d'errore è un Blob: va letta.
   let detail = e.message
   try {
@@ -62,13 +62,31 @@ async function errorDetail(e) {
   return detail
 }
 
-function Attachments({ row }) {
+// Il registro è uno per tipo di email: promemoria (/email) e secondo avviso
+// (/followup). Gli id sono per registro, quindi il percorso dipende dal tipo.
+export const rowPath = (row) => `/reminders/${row.kind === 'followup' ? 'followup' : 'email'}/${row.id}`
+export const KIND_LABEL = { promemoria: 'Promemoria', followup: 'Secondo avviso' }
+
+// Secondo avviso: una email può riguardare più fatture dello stesso cliente
+// (una riga del registro per fattura). Sotto il numero dice con quali altre
+// fatture ha viaggiato, così due righe non sembrano due email.
+export function GroupNote({ row }) {
+  const others = row.group_invoices || []
+  if (others.length === 0) return null
+  return (
+    <span className="block text-txt-muted font-sans whitespace-normal" data-testid="email-group-note">
+      stessa email di {others.map(m => m.invoice_number).join(', ')}
+    </span>
+  )
+}
+
+export function Attachments({ row }) {
   const [busy, setBusy] = useState(null)
   const download = async (index, name) => {
     if (busy !== null) return
     setBusy(index)
     try {
-      const res = await client.get(`/reminders/email/${row.id}/attachments/${index}`, { responseType: 'blob' })
+      const res = await client.get(`${rowPath(row)}/attachments/${index}`, { responseType: 'blob' })
       const url = URL.createObjectURL(res.data)
       const a = document.createElement('a')
       a.href = url
@@ -82,20 +100,28 @@ function Attachments({ row }) {
     }
   }
   if (!row.attachments || row.attachments.length === 0) return <span className="text-txt-muted">—</span>
+  // L'etichetta viene dal nome del file: un secondo avviso con più fatture ha
+  // una copia di cortesia per ciascuna (numerate), poi l'eventuale riepilogo.
+  const isCopy = (name) => name.startsWith('copia_cortesia')
+  const copies = row.attachments.filter(isCopy).length
+  const label = (name, i) => {
+    if (!isCopy(name)) return 'Riepilogo scadute'
+    return copies > 1 ? `Copia di cortesia ${row.attachments.slice(0, i + 1).filter(isCopy).length}` : 'Copia di cortesia'
+  }
   return (
     <span className="flex flex-wrap gap-1">
       {row.attachments.map((name, i) => (
-        <button key={name} type="button" onClick={() => download(i, name)} disabled={busy !== null}
+        <button key={`${i}-${name}`} type="button" onClick={() => download(i, name)} disabled={busy !== null}
           className="text-xs text-accent-teal underline hover:text-accent-cyan disabled:opacity-50"
-          title="Scarica il PDF (rigenerato dai dati attuali)">
-          {busy === i ? '…' : i === 0 ? 'Copia di cortesia' : 'Riepilogo scadute'}
+          title={`Scarica ${name} (rigenerato dai dati attuali)`}>
+          {busy === i ? '…' : label(name, i)}
         </button>
       ))}
     </span>
   )
 }
 
-function CustomerName({ id, name, navigate }) {
+export function CustomerName({ id, name, navigate }) {
   if (!id) return <span className="text-txt-primary">{name || '—'}</span>
   return (
     <button type="button" onClick={() => navigate(`/customers/${id}`)} className="text-accent-teal hover:text-accent-cyan text-left">
@@ -425,7 +451,8 @@ export default function ReminderEmailPanel() {
   )
 }
 
-// Scheda cliente: le email di promemoria che riguardano QUESTO cliente.
+// Scheda cliente: le email automatiche (promemoria e secondi avvisi) che
+// riguardano QUESTO cliente, dalla più recente.
 export function ReminderEmailHistory({ customerId }) {
   const [items, setItems] = useState(null)
   useEffect(() => {
@@ -436,17 +463,26 @@ export function ReminderEmailHistory({ customerId }) {
     return () => { alive = false }
   }, [customerId])
   if (!items || items.length === 0) return null
+  // Finché il cliente non ha secondi avvisi la scheda resta quella di sempre
+  // (titolo, sottotitolo, colonne): niente «secondo avviso» a video se non
+  // ne è mai partito uno.
+  const hasFollowup = items.some(row => row.kind === 'followup')
   return (
     <div className="sc-card overflow-hidden">
       <div className="sc-card-header flex items-center justify-between gap-3 flex-wrap">
-        <h2 className="text-base font-bold text-txt-primary">Promemoria email</h2>
-        <span className="text-xs text-txt-muted">Registro dei promemoria automatici (il giorno prima della scadenza, il venerdì per il weekend): ultimi {items.length}</span>
+        <h2 className="text-base font-bold text-txt-primary">{hasFollowup ? 'Email automatiche' : 'Promemoria email'}</h2>
+        <span className="text-xs text-txt-muted">
+          {hasFollowup
+            ? `Promemoria (il giorno prima della scadenza) e secondo avviso (dopo la scadenza, se la fattura non risulta pagata): ultime ${items.length}`
+            : `Registro dei promemoria automatici (il giorno prima della scadenza, il venerdì per il weekend): ultimi ${items.length}`}
+        </span>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="text-xs uppercase tracking-wider text-txt-label border-b border-dark-border">
               <th className="text-left px-6 py-2">Quando</th>
+              {hasFollowup && <th className="text-left px-3 py-2">Tipo</th>}
               <th className="text-left px-3 py-2">Fattura</th>
               <th className="text-right px-3 py-2">Importo</th>
               <th className="text-left px-3 py-2">Stato</th>
@@ -456,9 +492,13 @@ export function ReminderEmailHistory({ customerId }) {
           </thead>
           <tbody className="divide-y divide-dark-border">
             {items.map(row => (
-              <tr key={row.id}>
+              <tr key={`${row.kind}-${row.id}`}>
                 <td className="px-6 py-2 text-xs text-txt-secondary whitespace-nowrap">{fmtDateTime(row.sent_at || row.attempted_at || row.created_at)}</td>
-                <td className="px-3 py-2 font-mono text-xs text-txt-secondary whitespace-nowrap">{row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span></td>
+                {hasFollowup && <td className="px-3 py-2 text-xs text-txt-secondary whitespace-nowrap">{KIND_LABEL[row.kind] || KIND_LABEL.promemoria}</td>}
+                <td className="px-3 py-2 font-mono text-xs text-txt-secondary whitespace-nowrap">
+                  {row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span>
+                  <GroupNote row={row} />
+                </td>
                 <td className="px-3 py-2 text-right text-txt-primary">{fmtEur(row.amount_due)}</td>
                 <td className="px-3 py-2"><ReminderStatusBadge row={row} />{row.mode === 'test' && <span className="ml-1 text-xs text-txt-muted">(test)</span>}</td>
                 <td className="px-3 py-2 text-xs font-mono text-txt-secondary">{row.to_email || '—'}</td>

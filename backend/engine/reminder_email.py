@@ -87,6 +87,10 @@ SKIP_LABELS = {
     "abbinamento_da_verificare": "Abbinamento fattura→cliente da verificare (audit)",
     "senza_email": "Cliente senza email",
     "email_non_valida": "Email del cliente non valida",
+    # Solo secondo avviso (backend/engine/followup_email.py):
+    "senza_promemoria": "Promemoria pre-scadenza non inviato al cliente",
+    "in_attesa": "Pratica in attesa (decisa dall'operatore)",
+    "promessa": "Pagamento promesso (stato impostato dall'operatore)",
 }
 
 MODE_LABELS = {

@@ -937,4 +937,5 @@ class TestSchedulerJob:
         assert sched.run_reminder_email_catchup() == {"skipped": "window"}
         monkeypatch.setattr("backend.engine.reminder_email.in_catchup_window", lambda: True)
         monkeypatch.setattr(sched, "run_reminder_email_job", lambda: {"ran": True})
-        assert sched.run_reminder_email_catchup() == {"ran": True}
+        monkeypatch.setattr(sched, "run_followup_email_job", lambda: {"ran": "followup"})
+        assert sched.run_reminder_email_catchup() == {"reminder": {"ran": True}, "followup": {"ran": "followup"}}

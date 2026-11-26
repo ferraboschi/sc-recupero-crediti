@@ -1,5 +1,6 @@
 """APScheduler integration for scheduled jobs."""
 
+import time
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -131,16 +132,72 @@ def run_reminder_email_job():
             pass
 
 
+def run_followup_email_job():
+    """Secondo avviso email: fattura scaduta da N giorni e ancora non saldata
+    (backend/engine/followup_email.py). Spento finché l'owner non imposta
+    REMINDER_FOLLOWUP_ENABLED: in quel caso non scrive e non invia nulla."""
+    from backend.database import get_session_direct
+    from backend.engine.followup_email import run_followups
+    from backend.engine.reminder_email import ReminderBusy
+
+    session = get_session_direct()
+    try:
+        summary = run_followups(session)
+        brief = {k: v for k, v in summary.items() if k != "items"}
+        logger.info(f"Follow-up email job completed: {brief}")
+        return summary
+    except ReminderBusy:
+        logger.warning("Follow-up email job skipped: un giro è già in corso")
+        return {"skipped": "busy"}
+    except Exception as e:
+        logger.error(f"Follow-up email job failed: {e}", exc_info=True)
+        return {"error": str(e)}
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+# Un giro avviato a mano (pulsante, «Riprova») tiene lo stesso lock del giro
+# del mattino. Invece di saltare il giro («busy») lo si riprova per qualche
+# minuto: un clic alle 09:15 non deve far perdere le email del giorno.
+EMAIL_JOB_BUSY_RETRIES = 9
+EMAIL_JOB_BUSY_WAIT_SECONDS = 30
+
+
+def _retry_while_busy(job):
+    out = job()
+    for _ in range(EMAIL_JOB_BUSY_RETRIES):
+        if not (isinstance(out, dict) and out.get("skipped") == "busy"):
+            break
+        time.sleep(EMAIL_JOB_BUSY_WAIT_SECONDS)
+        out = job()
+    return out
+
+
+def run_email_jobs():
+    """Il giro email del mattino: prima i promemoria pre-scadenza, poi i
+    secondi avvisi. In sequenza (condividono il lock) e isolati: ognuno
+    cattura i propri errori, quindi il guasto dell'uno non ferma l'altro. Se
+    un giro manuale è in corso, ognuno aspetta e riprova (fino a ~5 minuti)."""
+    return {
+        "reminder": _retry_while_busy(run_reminder_email_job),
+        "followup": _retry_while_busy(run_followup_email_job),
+    }
+
+
 def run_reminder_email_catchup():
     """Dopo un riavvio (deploy, cold start) recupera il giro delle 09:15 se è
     saltato, ma solo in orario d'ufficio italiano: idempotente per
-    costruzione (le righe già lavorate non si rifanno)."""
+    costruzione (le righe già lavorate non si rifanno). Vale per promemoria e
+    secondi avvisi."""
     from backend.engine.reminder_email import in_catchup_window
 
     if not in_catchup_window():
         logger.info("Reminder email catch-up skipped (fuori dalla finestra 09-18)")
         return {"skipped": "window"}
-    return run_reminder_email_job()
+    return run_email_jobs()
 
 
 def start_scheduler():
@@ -197,7 +254,8 @@ def start_scheduler():
         logger.error(f"Failed to schedule hourly job: {e}", exc_info=True)
         raise
 
-    # Promemoria email pre-scadenza: giornaliero, dopo il sync delle 08:30.
+    # Promemoria email pre-scadenza e secondo avviso (fattura scaduta da 7
+    # giorni): un solo job giornaliero, dopo il sync delle 08:30.
     try:
         reminder_trigger = CronTrigger(
             hour=config.REMINDER_EMAIL_HOUR,
@@ -205,10 +263,10 @@ def start_scheduler():
             timezone=config.TIMEZONE,
         )
         _scheduler.add_job(
-            run_reminder_email_job,
+            run_email_jobs,
             trigger=reminder_trigger,
             id="reminder_email_job",
-            name="Promemoria email pre-scadenza",
+            name="Email del mattino: promemoria pre-scadenza + secondo avviso",
             replace_existing=True,
             max_instances=1,
             misfire_grace_time=6 * 3600,  # un riavvio alle 09:15 non deve far saltare il giro

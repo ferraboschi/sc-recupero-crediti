@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom'
 import { API_BASE as API } from '../utils/api'
 import AgentBadges from '../components/AgentBadges'
 import ReminderEmailPanel from '../components/ReminderEmailPanel'
+import FollowupEmailPanel from '../components/FollowupEmailPanel'
 
 function StatusBadge({ status }) {
   const colors = {
@@ -546,6 +547,9 @@ export default function System() {
 
       {/* Promemoria email pre-scadenza */}
       <ReminderEmailPanel />
+
+      {/* Secondo avviso email: fattura scaduta da 7 giorni e non saldata */}
+      <FollowupEmailPanel />
 
       {/* Data Integrity */}
       <div className="sc-card overflow-hidden">

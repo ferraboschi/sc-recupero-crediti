@@ -2465,7 +2465,7 @@ export default function ClientDetail() {
         )}
       </div>
 
-      {/* Promemoria email automatici (giorno prima della scadenza) */}
+      {/* Email automatiche: promemoria (giorno prima) e secondo avviso (7 giorni dopo) */}
       <ReminderEmailHistory customerId={customerId} />
 
       {/* SEZIONE FATTURE PAGATE */}
