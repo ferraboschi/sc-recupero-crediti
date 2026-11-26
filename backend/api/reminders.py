@@ -86,6 +86,7 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
         # 409, o oltre un giorno da un invio reale incerto): serve «Invia comunque».
         "retry_needs_confirmation": flags.get("retry_needs_confirmation", False) if is_followup else (
             needs_confirmation(row) and resolve_mode()[0] == MODE_REALE
+            and row.due_date is not None and row.due_date >= followup.italian_today()
         ),
         # Secondo avviso, riga ferma: il giro la riprenderà da solo?
         "will_auto_retry": flags.get("will_auto_retry", False),

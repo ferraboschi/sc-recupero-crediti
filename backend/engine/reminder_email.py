@@ -86,8 +86,11 @@ CONFLICT_NOTE = (
     "controllare su Resend se è stata consegnata."
 )
 CONFIRMATION_NEEDED = (
-    "questo promemoria potrebbe essere già arrivato al cliente e Resend non fermerebbe più un doppione: "
+    "questo promemoria potrebbe essere già arrivato al cliente e Resend potrebbe non fermare più un doppione: "
     "si invia solo confermando di aver controllato su Resend che NON è stato consegnato"
+)
+REAL_DOUBT_ONLY_IN_REAL = (
+    "questo promemoria era un invio REALE dall'esito incerto: si ritenta solo in modalità reale"
 )
 
 # Stati fattura che NON sono crediti da ricordare.
@@ -439,6 +442,25 @@ def needs_confirmation(row: InvoiceReminderEmail, now: Optional[datetime] = None
     return (now or _utc_now()) - born > RESEND_KEY_MEMORY
 
 
+def _carried_doubt(existing: Optional[InvoiceReminderEmail], mode: str) -> Optional[str]:
+    """Il tipo di esito incerto che un nuovo tentativo REALE eredita da quello
+    precedente (None se non c'è nulla da ereditare): la riga era un invio
+    reale che potrebbe essere arrivato."""
+    if existing is None or mode != MODE_REALE or existing.mode != MODE_REALE or not is_uncertain(existing):
+        return None
+    return (existing.error_kind or ERROR_OTHER) if existing.status == STATUS_FAILED else ERROR_OTHER
+
+
+def _kind_after(carried: Optional[str], kind: str) -> str:
+    """Il tipo di errore da scrivere dopo un tentativo fallito: un 409 visto
+    una volta resta; un dubbio non diventa mai un rifiuto «certo»."""
+    if carried == ERROR_CONFLICT:
+        return ERROR_CONFLICT
+    if carried and kind in AUTO_RETRY_KINDS:
+        return carried
+    return kind
+
+
 def needs_processing(existing: Optional[InvoiceReminderEmail], mode: str) -> Tuple[bool, str]:
     """Se una riga esistente va (ri)lavorata nel giro di oggi e perché.
 
@@ -599,13 +621,14 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
     Un esito incerto resta incerto finché l'email non parte davvero: se la
     riga aveva un tentativo che potrebbe essere arrivato (stessa modalità),
     un nuovo fallimento «certo» (PDF, rifiuto) NON la trasforma in qualcosa
-    che il giro ritenterebbe da solo. `key_suffix`: solo per un ritento
-    confermato dall'operatore, che deve partire con una chiave nuova."""
+    che il giro ritenterebbe da solo; e dopo un 409 resta «conflict» qualunque
+    cosa succeda poi. Vale solo in REALE: in prova e in test il cliente non
+    riceve nulla, e lì tutto resta com'era. `key_suffix`: solo per un ritento
+    confermato dall'operatore dopo un 409, che deve partire con una chiave
+    nuova."""
     customer = inv.customer
     row = existing or InvoiceReminderEmail(invoice_id=inv.id, due_date=due)
-    carried = None
-    if existing is not None and existing.mode == mode and is_uncertain(existing):
-        carried = (existing.error_kind or ERROR_OTHER) if existing.status == STATUS_FAILED else ERROR_OTHER
+    carried = _carried_doubt(existing, mode)
     row.customer_id = customer.id if customer else None
     row.mode = mode
     row.amount_due = float(inv.amount_due or 0)
@@ -654,7 +677,7 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
     except Exception as e:  # il PDF non deve far cadere il giro
         logger.error(f"Promemoria {inv.invoice_number}: PDF non generato: {e}", exc_info=True)
         row.status = STATUS_FAILED
-        row.error_kind = carried or ERROR_PDF
+        row.error_kind = _kind_after(carried, ERROR_PDF)
         row.error = f"PDF non generato: {e}"[:500]
         session.add(row)
         session.commit()
@@ -687,12 +710,11 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
         except Exception as e:  # messaggio già privo di segreti (MailSendError)
             logger.error(f"Promemoria {inv.invoice_number}: invio fallito: {e}")
             row.status = STATUS_FAILED
-            if is_conflict(e):
+            if is_conflict(e) and mode == MODE_REALE:
                 row.error_kind = ERROR_CONFLICT
                 row.error = (str(e)[:500 - len(CONFLICT_NOTE)] + CONFLICT_NOTE)
             else:
-                kind = _classify_error(e)
-                row.error_kind = carried if (carried and kind in AUTO_RETRY_KINDS) else kind
+                row.error_kind = _kind_after(carried, _classify_error(e))
                 row.error = str(e)[:500]
             summary["failed"] += 1
     session.add(row)
@@ -705,6 +727,7 @@ def _process_safely(session, inv, due, **kwargs) -> None:
     """Una fattura non deve mai far saltare le altre: eccezioni impreviste
     → rollback, riga `failed` (other) se possibile, e si prosegue."""
     summary = kwargs["summary"]
+    carried = _carried_doubt(kwargs.get("existing"), kwargs["mode"])
     try:
         _process_invoice(session, inv, due, **kwargs)
     except Exception as e:
@@ -716,7 +739,7 @@ def _process_safely(session, inv, due, **kwargs) -> None:
                 row = InvoiceReminderEmail(invoice_id=inv.id, due_date=due, customer_id=inv.customer_id,
                                            mode=kwargs["mode"], amount_due=float(inv.amount_due or 0))
             row.status = STATUS_FAILED
-            row.error_kind = ERROR_OTHER
+            row.error_kind = _kind_after(carried, ERROR_OTHER)
             row.error = f"Errore imprevisto: {e}"[:500]
             session.add(row)
             session.commit()
@@ -882,23 +905,32 @@ def retry_row(session: Session, row: InvoiceReminderEmail, *, mailer=None, cfg=N
         raise ReminderBusy()
     try:
         mode, missing, mailer, own_mailer = _resolve_runtime(cfg, mailer, mode)
-        if expected_mode and expected_mode != mode:
-            raise ModeMismatch(mode, expected_mode)
-        key_suffix = ""
-        # L'incertezza riguarda la modalità in cui è nata: una riga di prova o
-        # di test ritentata in reale è un invio nuovo.
-        if is_uncertain(row) and row.mode == mode:
-            reason = skip_reason(inv, inv.customer)
-            if reason:
-                raise ValueError(f"promemoria non inviabile ora: {SKIP_LABELS.get(reason, reason)}")
-            now = _utc_now(now_utc)
-            if needs_confirmation(row, now):
-                if not force:
-                    raise ValueError(CONFIRMATION_NEEDED)
-                key_suffix = f"-f{now.strftime('%Y%m%d%H%M%S%f')}"
-        summary = _empty_summary(row.due_date, mode, missing)
-        summary["candidates"] = 1
         try:
+            if expected_mode and expected_mode != mode:
+                raise ModeMismatch(mode, expected_mode)
+            key_suffix = ""
+            if is_uncertain(row) and row.mode == MODE_REALE:
+                # Un invio REALE incerto non si «ritenta» in prova o in test:
+                # la riga cambierebbe modalità e perderebbe il suo dubbio, e
+                # il prossimo ritento reale partirebbe senza nessuna cautela.
+                if mode != MODE_REALE:
+                    raise ValueError(f"{REAL_DOUBT_ONLY_IN_REAL} (ora: {MODE_LABELS.get(mode, mode)})")
+                reason = skip_reason(inv, inv.customer)
+                if reason:
+                    raise ValueError(f"promemoria non inviabile ora: {SKIP_LABELS.get(reason, reason)}")
+                now = _utc_now(now_utc)
+                if needs_confirmation(row, now):
+                    if not force:
+                        raise ValueError(CONFIRMATION_NEEDED)
+                    # Dopo un 409 la chiave di sempre è bruciata (Resend
+                    # risponderebbe ancora 409): serve una chiave nuova. Se
+                    # invece si conferma solo per l'età, si riusa la chiave
+                    # di sempre: se Resend la ricorda ancora, ferma lui il
+                    # doppione (409) e lo si viene a sapere.
+                    if row.error_kind == ERROR_CONFLICT:
+                        key_suffix = f"-f{now.strftime('%Y%m%d%H%M%S%f')}"
+            summary = _empty_summary(row.due_date, mode, missing)
+            summary["candidates"] = 1
             _process_safely(session, inv, row.due_date, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
                             existing=row, key_suffix=key_suffix)
         finally:

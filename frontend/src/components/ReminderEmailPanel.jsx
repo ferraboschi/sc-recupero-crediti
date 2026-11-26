@@ -192,7 +192,8 @@ export default function ReminderEmailPanel() {
     // Dopo un «già ricevuta» di Resend (409), o oltre un giorno da un invio
     // reale dall'esito incerto, Resend non ferma più un doppione: il server
     // parte solo con la conferma di chi ha controllato che NON è arrivata.
-    const force = fresh.mode === 'reale' && !!row.retry_needs_confirmation
+    const current = (fresh.recent || []).find(r => r.id === row.id) || row
+    const force = fresh.mode === 'reale' && !!current.retry_needs_confirmation
     const msg = force
       ? `ATTENZIONE: il promemoria della fattura ${row.invoice_number} potrebbe essere GIÀ arrivato al cliente (${row.to_email}), e Resend non fermerebbe più un doppione.\n\nHai controllato su Resend che l'email NON risulta consegnata?\n\nOK = sì, ho controllato: invia comunque.\nAnnulla = non inviare.`
       : fresh.mode === 'reale'
