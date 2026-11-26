@@ -469,6 +469,11 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], window: Tuple[d
         if early and inv.due_date >= today:
             # Con N = 1 il «giorno dopo» sarebbe oggi: non è scaduta, non si sollecita.
             continue
+        if early and not ready:
+            # Le fatture arrivano dalla scadenza più vecchia: se nessuna della
+            # finestra è pronta, oggi non parte nulla e queste aspettano il
+            # loro giorno — inutile leggerne promemoria e registro.
+            continue
         if not still_due(inv):
             if not early:
                 plan.settled.append(inv)
@@ -1562,8 +1567,8 @@ def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=No
         days = followup_days(cfg)
         if not any(days_overdue_on(member, today) >= days for member in ready):
             raise ValueError(
-                f"la fattura è scaduta da meno di {days} giorni e le altre della stessa email non sono più "
-                "da sollecitare: si potrà ritentare dal giorno in cui compie i giorni previsti"
+                f"la fattura è scaduta da meno di {days} giorni e nessun'altra della stessa email si può "
+                "rimandare oggi con lei: si potrà ritentare dal giorno in cui compie i giorni previsti"
             )
         rows = [member_row for _member, member_row in members]
         # Un invio REALE dall'esito incerto non si «ritenta» in prova o in

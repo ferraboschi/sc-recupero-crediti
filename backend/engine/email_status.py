@@ -728,7 +728,8 @@ def _followup_items(reminders: List[Tuple[Invoice, list]], followups: List[Tuple
             KIND_FOLLOWUP, CLOSED, "2° avviso non previsto: giorni utili passati",
             (f"Fattura {invoice_label(i.invoice_number)}: i suoi giorni utili sono passati" for i in expired),
             [f"Il secondo avviso automatico parte solo nei giorni utili dopo la scadenza (dal {first_useful}° al "
-             f"{last_useful}°, mai nel weekend)."],
+             f"{last_useful}°, mai nel weekend; prima solo insieme a un'altra fattura dello stesso cliente con "
+             "le scadenze di fila)."],
             count=len(expired),
         ))
     return items

@@ -10,8 +10,9 @@ import {
 // Secondo avviso email (backend/engine/followup_email.py): a N giorni dalla
 // scadenza, se la fattura del promemoria risulta ancora non pagata, il
 // cliente riceve una seconda email, più diretta. UNA email per cliente: più
-// fatture da sollecitare (o con la scadenza a un giorno di distanza) partono
-// insieme; nel registro restano una riga per fattura. Pannello di controllo
+// fatture da sollecitare (comprese quelle già scadute dei giorni subito
+// dopo, a catena finché le scadenze sono di fila) partono insieme; nel
+// registro restano una riga per fattura. Pannello di controllo
 // (pagina Sistema), gemello di quello dei promemoria: acceso/spento,
 // affidabilità del dato «non pagata» (ultimo sync delle fatture), anteprima
 // del prossimo giro col testo, esecuzione manuale e registro. SPENTO finché
@@ -130,7 +131,7 @@ export default function FollowupEmailPanel() {
   const stuckReason = (row) => row.error_kind === 'conflict'
     ? 'Resend l\'aveva già ricevuta: con ogni probabilità è partita. Verifica su Resend prima di inviare di nuovo.'
     : row.will_auto_retry
-      ? `Il giro la riprende da solo al prossimo passaggio. ${row.error || ''}`
+      ? `Il giro la riprende da solo (al prossimo passaggio o nel suo giorno). ${row.error || ''}`
       : row.status === 'sending'
         ? 'Invio interrotto a metà: potrebbe essere partita.'
         : (row.error_kind === 'pdf' || row.error_kind === 'validation' || row.error_kind === 'not_attempted')
@@ -203,7 +204,7 @@ export default function FollowupEmailPanel() {
       {/* Regole e stato */}
       <div className="px-6 py-4 border-b border-dark-border text-sm space-y-2">
         <p className="text-txt-secondary">
-          Se a {giorni(data.days_after_due)} dalla scadenza la fattura a cui è stato inviato il promemoria risulta ancora non pagata, il cliente riceve una seconda email, più diretta: la fattura è scaduta, chiediamo il saldo. <span className="text-txt-primary">Una sola email per cliente</span>: se ha più fatture da sollecitare, o un'altra con la scadenza del giorno dopo, partono insieme in un'unica email con l'elenco e il totale. In allegato la copia di ogni fattura e, se ha altre scadute certe (non in conferma di pagamento, con scadenza stimata, promesse o dall'avvocato), il riepilogo con il totale. Una volta sola per fattura; mai nel weekend.
+          Se a {giorni(data.days_after_due)} dalla scadenza la fattura a cui è stato inviato il promemoria risulta ancora non pagata, il cliente riceve una seconda email, più diretta: la fattura è scaduta, chiediamo il saldo. <span className="text-txt-primary">Una sola email per cliente</span>: se ha più fatture da sollecitare, comprese quelle già scadute dei giorni subito dopo (finché le scadenze sono di fila), partono insieme in un'unica email con l'elenco e il totale. In allegato la copia di ogni fattura e, se ha altre scadute certe (non in conferma di pagamento, con scadenza stimata, promesse o dall'avvocato), il riepilogo con il totale. Una volta sola per fattura; mai nel weekend.
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs">
           <p><span className="text-txt-muted">Mittente:</span> <span className="text-txt-primary">{data.sender || '—'}</span></p>
@@ -285,7 +286,7 @@ export default function FollowupEmailPanel() {
                         )}
                         <td className="py-2 pr-3 font-mono text-xs text-txt-secondary align-top">
                           {inv.invoice_number}
-                          {inv.early && <span className="block text-txt-muted font-sans">unita: scadenza a un giorno</span>}
+                          {inv.early && <span className="block text-txt-muted font-sans">unita: scadenza di fila con le altre</span>}
                         </td>
                         <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap align-top">
                           {fmtDate(inv.due_date)} <span className="text-txt-muted">· {giorni(inv.days_overdue)}</span>
