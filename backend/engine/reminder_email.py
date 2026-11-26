@@ -1229,13 +1229,17 @@ def _process_group_safely(session: Session, customer: Customer, invoices: List[I
 
 
 def _record_skip_safely(session: Session, inv: Invoice, row: Optional[InvoiceReminderEmail], reason: str,
-                        mode: str, summary: dict, carried: Optional[str] = None) -> None:
+                        mode: str, summary: dict) -> None:
+    """Come sopra per una fattura esclusa. Qui non c'è mai un dubbio da
+    custodire: si registra «saltata» solo ciò che certamente non era partito
+    (le righe dall'esito incerto non arrivano fin qui, né dal giro né da
+    «Riprova»)."""
     facts = _facts([inv])
     try:
         _record_skip(session, inv, row, reason, mode, summary)
     except Exception as e:
         logger.error(f"Promemoria {facts[0][4].invoice_number}: errore imprevisto: {e}", exc_info=True)
-        _mark_unexpected(session, facts, mode, carried, e, summary, inv.customer)
+        _mark_unexpected(session, facts, mode, None, e, summary, inv.customer)
 
 
 def _run_customer(session: Session, customer_id: int, invoices: List[Invoice], dates: List[date], *, mode: str,
@@ -1250,14 +1254,14 @@ def _run_customer(session: Session, customer_id: int, invoices: List[Invoice], d
     if plan.email:
         summary["merged_early"] = summary.get("merged_early", 0) + len(plan.early_ids)
         key = group_key(plan.customer.id, plan.email, today)
-        rows = [plan.existing.get(inv.id) for inv in plan.email]
+        # Nessun dubbio ereditato: il giro rilavora solo righe che certamente
+        # non erano partite (needs_processing lascia ferme le incerte).
         _process_group_safely(
             session, plan.customer, plan.email, key=key, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
             existing=plan.existing, today=today, idempotency_key=attempt_key(plan.email, mode, key),
-            carried=_carried_doubt_many(rows, mode),
         )
     for inv, row, reason in skipped:
-        _record_skip_safely(session, inv, row, reason, mode, summary, carried=_carried_doubt(row, mode))
+        _record_skip_safely(session, inv, row, reason, mode, summary)
 
 
 def run_reminders(
@@ -1508,7 +1512,7 @@ def retry_row(session: Session, row: InvoiceReminderEmail, *, mailer=None, cfg=N
                 # Solo per ciò che CERTAMENTE non era partito (o fuori dal
                 # reale): come nel giro, la riga dice perché oggi non parte.
                 summary["candidates"] = 1
-                _record_skip_safely(session, inv, row, reason, mode, summary, carried=_carried_doubt(row, mode))
+                _record_skip_safely(session, inv, row, reason, mode, summary)
                 return summary
             members = [(inv, row)] + _retry_members(session, row, inv, today, mode=mode, force=force, now=now)
             ready = [member for member, _row in members]

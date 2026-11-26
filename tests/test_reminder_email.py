@@ -1972,3 +1972,230 @@ class TestOneEmailPerCustomerPreviewAndTest:
         mailer = FakeMailer()
         out = send_test(test_db_session, far.id, "lorenzo@ef-ti.com", mailer=mailer, cfg=_real_cfg())
         assert out["invoices"] == ["FAR/1"] and out["subject"].startswith("[PROVA] Promemoria: fattura n. FAR/1")
+
+
+class TestOneEmailPerCustomerBelts:
+    """Le cinture: ognuna chiude una strada che i test sopra non percorrono."""
+
+    def _in_doubt(self, s, third=False):
+        c = _cust(s)
+        a = _inv(s, c, "A/1", 100.0, TOMORROW)
+        b = _inv(s, c, "B/1", 50.0, DAY_AFTER)
+        first = _Scripted(_timeout())
+        run_reminders(s, due_date=TOMORROW, mailer=first, cfg=_real_cfg())
+        return c, a, b, first.keys[0]
+
+    def _mixed(self, s):
+        """Cintura: due righe della STESSA email con esiti diversi — A «già
+        ricevuta» (409), B in dubbio semplice. Il motore non lo produce (le
+        righe di un'email si chiudono insieme, e un ritento parziale le
+        stacca dal gruppo): si scrive a mano."""
+        c, a, b, key = self._in_doubt(s)
+        rows = _rows(s)
+        rows[a.id].error_kind = "conflict"
+        s.commit()
+        rows = _rows(s)
+        assert rows[a.id].group_key == rows[b.id].group_key
+        return c, a, b, key
+
+    def test_rows_retried_on_their_own_leave_the_email_they_were_in(self, test_db_session):
+        """Un ritento parziale stacca le righe dal gruppo: le altre non le
+        trascinano più con sé."""
+        _c, a, b, key = self._in_doubt(test_db_session)
+        b.missing_streak = 1
+        test_db_session.commit()
+        retry_row(test_db_session, _rows(test_db_session)[a.id], mailer=_Scripted(_already_received()), cfg=_real_cfg())
+        b.missing_streak = 0
+        test_db_session.commit()
+        rows = _rows(test_db_session)
+        assert (rows[a.id].error_kind, rows[a.id].group_key) == ("conflict", None) and rows[b.id].group_key
+        mailer = _Scripted()
+        out = retry_row(test_db_session, rows[b.id], mailer=mailer, cfg=_real_cfg())
+        assert out["invoices"] == 1 and "A/1" not in mailer.sent[0]["text"] and mailer.keys == [key]
+        assert _rows(test_db_session)[a.id].error_kind == "conflict"
+
+    def test_a_received_mark_wins_over_a_simple_doubt(self):
+        row = lambda kind: SimpleNamespace(status="failed", error_kind=kind, mode="reale")  # noqa: E731
+        assert re_mod._carried_doubt_many([row("network"), row("conflict")], MODE_REALE) == "conflict"
+        assert re_mod._carried_doubt_many([row("network"), None, row("provider")], MODE_REALE) == "network"
+        assert re_mod._carried_doubt_many([row("pdf"), None], MODE_REALE) is None
+        assert re_mod._carried_doubt_many([row("conflict")], MODE_TEST) is None
+
+    def test_an_invoice_with_another_due_date_never_enters_the_plan(self, test_db_session):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        far = _inv(test_db_session, c, "FAR/1", 50.0, date(2026, 11, 20))
+        past = _inv(test_db_session, c, "PAST/1", 50.0, TODAY)
+        plan = re_mod.plan_customer(test_db_session, [a, far, past], [TOMORROW], MODE_REALE)
+        assert [i.id for i in plan.email] == [a.id] and plan.candidates == 1 and plan.skipped == []
+
+    def test_the_test_send_groups_the_invoices_even_without_the_customer_email(self, test_db_session):
+        c = _cust(test_db_session, email=None)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        _inv(test_db_session, c, "B/1", 50.0, TOMORROW)
+        mailer = FakeMailer()
+        out = send_test(test_db_session, a.id, "lorenzo@ef-ti.com", mailer=mailer, cfg=_real_cfg())
+        assert out["invoices"] == ["A/1", "B/1"] and len(mailer.sent[0]["attachments"]) == 2
+
+    def test_the_invoices_of_the_email_are_never_counted_among_the_overdue_ones(self, test_db_session):
+        """Anche se il campo dei giorni di ritardo è rimasto indietro."""
+        c = _cust(test_db_session)
+        _inv(test_db_session, c, "A/1", 100.0, TOMORROW, days_overdue=3)
+        _inv(test_db_session, c, "B/1", 50.0, TOMORROW, days_overdue=3)
+        _summary, mailer = _real_round(test_db_session)
+        assert "scadut" not in mailer.sent[0]["text"] and len(mailer.sent[0]["attachments"]) == 2
+        assert "Totale: 150,00 €." in mailer.sent[0]["text"]
+
+    def test_attachments_follow_the_order_of_the_list(self, test_db_session):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        names = [name for name, _ in re_mod.build_group_attachments(c, [b, a], [])]
+        assert names == ["copia_cortesia_fattura_A_1.pdf", "copia_cortesia_fattura_B_1.pdf"]
+
+    def test_a_skipped_invoice_no_longer_belongs_to_the_failed_email(self, test_db_session):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, TOMORROW)
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_refused()), cfg=_real_cfg())
+        assert all(r.group_key and r.idempotency_key for r in _rows(test_db_session).values())
+        b.missing_streak = 1
+        test_db_session.commit()
+        summary, mailer = _real_round(test_db_session)
+        rows = _rows(test_db_session)
+        assert summary["sent"] == 1 and summary["skipped"] == 1 and "B/1" not in mailer.sent[0]["text"]
+        assert (rows[b.id].status, rows[b.id].group_key, rows[b.id].idempotency_key) == ("skipped", None, None)
+        assert (rows[a.id].status, rows[a.id].group_key) == ("sent", None)
+
+    def test_an_error_after_the_email_has_left_never_turns_it_into_a_failure(self, test_db_session, monkeypatch):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, TOMORROW)
+        original, state = re_mod._item, {"n": 0}
+
+        def flaky(row, invoice, customer):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise RuntimeError("riepilogo rotto")
+            return original(row, invoice, customer)
+
+        monkeypatch.setattr(re_mod, "_item", flaky)
+        summary, mailer = _real_round(test_db_session)
+        rows = _rows(test_db_session)
+        assert mailer.calls == 1 and {rows[a.id].status, rows[b.id].status} == {"sent"}
+        assert summary["sent"] == 1 and summary["failed"] == 0
+
+    def test_a_received_mark_on_one_row_holds_for_the_whole_retried_email(self, test_db_session):
+        """Ritento confermato scelto dalla riga in dubbio semplice, con dentro
+        quella «già ricevuta»: se fallisce ancora, restano TUTTE «già ricevute»."""
+        _c, a, b, key = self._mixed(test_db_session)
+        mailer = _Scripted(_timeout())
+        retry_row(test_db_session, _rows(test_db_session)[b.id], mailer=mailer, cfg=_real_cfg(), force=True)
+        assert mailer.keys[0] != key and "-f2026" in mailer.keys[0]
+        assert {(r.status, r.error_kind) for r in _rows(test_db_session).values()} == {("failed", "conflict")}
+
+    def test_without_the_confirmation_a_received_row_stays_out_of_the_retry(self, test_db_session):
+        _c, a, b, key = self._mixed(test_db_session)
+        mailer = _Scripted()
+        out = retry_row(test_db_session, _rows(test_db_session)[b.id], mailer=mailer, cfg=_real_cfg())
+        assert out["invoices"] == 1 and "A/1" not in mailer.sent[0]["text"] and mailer.keys == [key]
+        rows = _rows(test_db_session)
+        assert (rows[a.id].status, rows[a.id].error_kind) == ("failed", "conflict") and rows[b.id].status == "sent"
+
+    def test_an_accepted_retry_keeps_the_key_on_the_rows_it_sent(self, test_db_session):
+        _c, a, b, key = self._in_doubt(test_db_session)
+        a.missing_streak = 1
+        test_db_session.commit()
+        retry_row(test_db_session, _rows(test_db_session)[b.id], mailer=_Scripted(), cfg=_real_cfg())
+        rows = _rows(test_db_session)
+        assert rows[b.id].idempotency_key == key and rows[a.id].idempotency_key is None
+
+    def test_after_a_day_an_accepted_retry_does_not_free_the_key_of_the_row_left_out(self, test_db_session):
+        """Oltre le 24 ore Resend può aver dimenticato la chiave: che accetti il
+        ritento non prova che il primo tentativo non fosse arrivato."""
+        _c, a, b, key = self._in_doubt(test_db_session)
+        for row in _rows(test_db_session).values():
+            row.created_at = FIXED_NOW.replace(tzinfo=None)
+        a.missing_streak = 1
+        test_db_session.commit()
+        later = FIXED_NOW + timedelta(hours=23, minutes=30)
+        mailer = _Scripted()
+        out = retry_row(test_db_session, _rows(test_db_session)[b.id], mailer=mailer, cfg=_real_cfg(), force=True,
+                        now_utc=later)
+        assert out["sent"] == 1 and mailer.keys == [key]
+        rows = _rows(test_db_session)
+        assert (rows[a.id].status, rows[a.id].error_kind, rows[a.id].idempotency_key) == ("failed", "network", key)
+
+    def test_a_row_already_sent_is_never_resent_by_the_retry_of_another(self, test_db_session):
+        """Cintura: due righe con la stessa chiave d'email ma esiti diversi
+        (non dovrebbe accadere) — quella inviata non riparte."""
+        _c, a, b, key = self._in_doubt(test_db_session)
+        rows = _rows(test_db_session)
+        rows[a.id].status, rows[a.id].error_kind, rows[a.id].error = "sent", None, None
+        test_db_session.commit()
+        mailer = _Scripted()
+        out = retry_row(test_db_session, _rows(test_db_session)[b.id], mailer=mailer, cfg=_real_cfg())
+        assert out["invoices"] == 1 and "A/1" not in mailer.sent[0]["text"]
+
+    def test_an_invoice_moved_to_another_customer_stays_out_of_the_retry(self, test_db_session):
+        c, a, b, key = self._in_doubt(test_db_session)
+        other = _cust(test_db_session, "Altro Srl", "info@altro.it", partita_iva="01234567897")
+        b.customer_id = other.id
+        b.audit_reviewed_at = datetime(2026, 11, 10, 9, 0)   # abbinamento confermato: nessun altro motivo la esclude
+        test_db_session.commit()
+        assert skip_reason(b, other) is None
+        mailer = _Scripted()
+        out = retry_row(test_db_session, _rows(test_db_session)[a.id], mailer=mailer, cfg=_real_cfg())
+        assert out["invoices"] == 1 and "B/1" not in mailer.sent[0]["text"] and mailer.sent[0]["to"] == ["amministrazione@shabu.it"]
+        rows = _rows(test_db_session)
+        assert (rows[b.id].status, rows[b.id].error_kind, rows[b.id].customer_id) == ("failed", "network", c.id)
+
+    def test_an_invoice_whose_due_date_changed_or_passed_stays_out_of_the_retry(self, test_db_session, monkeypatch):
+        _c, a, b, key = self._in_doubt(test_db_session)
+        b.due_date = date(2026, 11, 20)
+        test_db_session.commit()
+        mailer = _Scripted()
+        assert retry_row(test_db_session, _rows(test_db_session)[a.id], mailer=mailer, cfg=_real_cfg())["invoices"] == 1
+        assert "B/1" not in mailer.sent[0]["text"] and _rows(test_db_session)[b.id].status == "failed"
+
+    def test_the_retry_of_the_merged_invoice_leaves_out_the_one_whose_due_date_has_passed(self, test_db_session, monkeypatch):
+        _c, a, b, key = self._in_doubt(test_db_session)
+        monkeypatch.setattr(re_mod, "italian_today", lambda *args, **kw: DAY_AFTER)   # il 12/11: A scadeva l'11
+        mailer = _Scripted()
+        out = retry_row(test_db_session, _rows(test_db_session)[b.id], mailer=mailer, cfg=_real_cfg(),
+                        now_utc=FIXED_NOW + timedelta(hours=2))
+        assert out["invoices"] == 1 and "A/1" not in mailer.sent[0]["text"] and mailer.keys == [key]
+        assert _rows(test_db_session)[a.id].status == "failed"
+        with pytest.raises(ValueError, match="scadenza già passata"):
+            retry_row(test_db_session, _rows(test_db_session)[a.id], mailer=_Scripted(), cfg=_real_cfg())
+
+    def test_two_separate_emails_of_the_same_customer_are_never_merged_by_a_retry(self, test_db_session):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        far = _inv(test_db_session, c, "C/1", 70.0, date(2026, 11, 13))
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_timeout()), cfg=_real_cfg())
+        run_reminders(test_db_session, due_date=date(2026, 11, 13), mailer=_Scripted(_timeout()), cfg=_real_cfg())
+        rows = _rows(test_db_session)
+        assert rows[a.id].group_key is None and rows[far.id].group_key is None
+        mailer = _Scripted()
+        out = retry_row(test_db_session, rows[a.id], mailer=mailer, cfg=_real_cfg())
+        assert out["invoices"] == 1 and mailer.keys == [KEY.format(a.id)] and "C/1" not in mailer.sent[0]["text"]
+        assert _rows(test_db_session)[far.id].status == "failed"
+
+    def test_a_doubt_born_in_test_mode_is_a_new_send_in_real_mode(self, test_db_session):
+        """La chiave di un tentativo di PROVA non si riusa per l'invio vero:
+        Resend la ricorderebbe (409) e il cliente non riceverebbe nulla."""
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, TOMORROW)
+        test_cfg = _real_cfg(REMINDER_EMAIL_TEST_TO="lorenzo@example.com")
+        first = _Scripted(_timeout())
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=first, cfg=test_cfg)
+        assert first.keys[0].endswith("-test")
+        mailer = _Scripted()
+        out = retry_row(test_db_session, _rows(test_db_session)[a.id], mailer=mailer, cfg=_real_cfg())
+        assert out["sent"] == 1 and out["invoices"] == 2
+        assert mailer.keys[0].endswith("-reale") and mailer.keys[0] != first.keys[0]
+        assert mailer.sent[0]["to"] == ["amministrazione@shabu.it"]
+        assert {(r.status, r.mode) for r in _rows(test_db_session).values()} == {("sent", "reale")}
+        assert b.id in _rows(test_db_session)
