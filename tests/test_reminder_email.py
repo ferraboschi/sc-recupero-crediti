@@ -803,6 +803,84 @@ class TestADoubtStaysADoubt:
         assert run_reminders(test_db_session, due_date=TOMORROW, mailer=mailer, cfg=_real_cfg())["sent"] == 1
         assert mailer.keys == [KEY.format(inv.id)]
 
+    def test_only_an_attempt_that_may_have_arrived_is_a_doubt(self, test_db_session):
+        """Una riga saltata, preparata o inviata non è «in dubbio»: se poi il
+        suo PRIMO invio reale viene rifiutato, è certamente non partita e il
+        giro deve ritentarla da solo (altrimenti il promemoria andrebbe perso)."""
+        for status in ("sent", "skipped", "prepared"):
+            row = SimpleNamespace(status=status, error_kind=None, mode="reale", created_at=None, attempted_at=None)
+            assert not re_mod.is_uncertain(row) and not re_mod.needs_confirmation(row)
+        c = _cust(test_db_session, email=None)
+        inv = _inv(test_db_session, c, "SALT/1", 100.0, TOMORROW)
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(), cfg=_real_cfg())
+        row = test_db_session.query(InvoiceReminderEmail).one()
+        assert (row.status, row.skip_reason) == ("skipped", "senza_email")
+        c.email = "amministrazione@shabu.it"
+        test_db_session.commit()
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_refused()), cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert (row.status, row.error_kind) == ("failed", "validation")
+        mailer = _Scripted()
+        assert run_reminders(test_db_session, due_date=TOMORROW, mailer=mailer, cfg=_real_cfg())["sent"] == 1
+        assert mailer.keys == [KEY.format(inv.id)]
+
+    def test_a_trial_then_a_refused_real_send_is_retried_by_the_round(self, test_db_session):
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c, "PROVA/1", 100.0, TOMORROW)
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(), cfg=_cfg())
+        row = test_db_session.query(InvoiceReminderEmail).one()
+        assert row.status == "prepared"
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_refused()), cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert (row.mode, row.status, row.error_kind) == ("reale", "failed", "validation")
+        mailer = _Scripted()
+        assert run_reminders(test_db_session, due_date=TOMORROW, mailer=mailer, cfg=_real_cfg())["sent"] == 1
+        assert mailer.keys == [KEY.format(inv.id)]
+
+    def test_a_doubt_keeps_the_kind_of_its_latest_uncertain_failure(self, test_db_session):
+        _c, _i, row = self._in_doubt(test_db_session)
+        down = MailSendError("Resend HTTP 503: service unavailable", kind="provider")
+        retry_row(test_db_session, row, mailer=_Scripted(down), cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert (row.status, row.error_kind) == ("failed", "provider") and "503" in row.error
+
+    def test_a_certain_failure_can_still_become_skipped(self, test_db_session):
+        """Solo l'incerto resta com'è: una riga certamente non partita, se oggi
+        il cliente non ha più l'email, viene saltata come prima."""
+        c = _cust(test_db_session)
+        _inv(test_db_session, c, "CERTA/2", 100.0, TOMORROW)
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_refused()), cfg=_real_cfg())
+        row = test_db_session.query(InvoiceReminderEmail).one()
+        c.email = None
+        test_db_session.commit()
+        retry_row(test_db_session, row, mailer=_Scripted(), cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert (row.status, row.skip_reason) == ("skipped", "senza_email")
+
+    def test_a_trial_doubt_can_become_skipped_in_real_mode(self, test_db_session):
+        """Il dubbio nato in test riguardava l'indirizzo di prova: in reale il cliente non ha ricevuto nulla."""
+        c = _cust(test_db_session)
+        _inv(test_db_session, c, "TEST/2", 100.0, TOMORROW)
+        test_cfg = _real_cfg(REMINDER_EMAIL_TEST_TO="lorenzo@example.com")
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_timeout()), cfg=test_cfg)
+        row = test_db_session.query(InvoiceReminderEmail).one()
+        assert (row.mode, row.error_kind) == ("test", "network")
+        c.email = None
+        test_db_session.commit()
+        retry_row(test_db_session, row, mailer=_Scripted(), cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert (row.mode, row.status, row.skip_reason) == ("reale", "skipped", "senza_email")
+
+    def test_the_age_of_the_doubt_is_measured_at_the_time_of_the_retry(self, test_db_session):
+        _c, _i, row = self._in_doubt(test_db_session)
+        row.created_at = FIXED_NOW.replace(tzinfo=None) - timedelta(hours=1)
+        test_db_session.commit()
+        later = FIXED_NOW + timedelta(hours=23)   # 24 ore dopo la nascita della riga
+        plain = _Scripted()
+        with pytest.raises(ValueError, match="controllato su Resend"):
+            retry_row(test_db_session, row, mailer=plain, cfg=_real_cfg(), now_utc=later)
+        assert plain.keys == []
+
     def test_needs_confirmation_without_dates_asks(self, test_db_session):
         row = SimpleNamespace(status="sending", error_kind=None, mode="reale", created_at=None, attempted_at=None)
         assert re_mod.needs_confirmation(row) is True
