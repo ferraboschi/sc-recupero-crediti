@@ -93,7 +93,11 @@ ERROR_OTHER = "other"
 # contenuto diverso: un tentativo PRECEDENTE gli era arrivato. È il contrario
 # di «certamente non partita»: mai un ritento automatico.
 ERROR_CONFLICT = "conflict"
-AUTO_RETRY_KINDS = (ERROR_PDF, ERROR_VALIDATION)
+# Errore imprevisto PRIMA di qualunque invio (piano del cliente, testo,
+# registro): nulla è partito, il giro lo riprova da solo — come un PDF non
+# generato. Mai per un tentativo che aveva già riservato le righe.
+ERROR_NOT_ATTEMPTED = "not_attempted"
+AUTO_RETRY_KINDS = (ERROR_PDF, ERROR_VALIDATION, ERROR_NOT_ATTEMPTED)
 
 # Resend ricorda una chiave per 24 ore: oltre non ferma più un doppione. Un
 # margine di un'ora, contato dalla NASCITA della riga (il primo uso possibile
@@ -777,8 +781,10 @@ def _carried_doubt(existing: Optional[InvoiceReminderEmail], mode: str) -> Optio
     reale che potrebbe essere arrivato."""
     if existing is None or mode != MODE_REALE or existing.mode != MODE_REALE or not is_uncertain(existing):
         return None
-    # Anche di una riga interrotta a metà invio: se portava il segno di un
-    # 409 (vedi _process_group), quel segno si eredita.
+    if existing.status == STATUS_SENDING:
+        # Riga interrotta a metà invio: eredita il segno di un 409 se lo
+        # portava (vedi _process_group); qualunque altro tipo vale «incerto».
+        return ERROR_CONFLICT if existing.error_kind == ERROR_CONFLICT else ERROR_OTHER
     return existing.error_kind or ERROR_OTHER
 
 
@@ -797,7 +803,7 @@ def needs_processing(existing: Optional[InvoiceReminderEmail], mode: str) -> Tup
 
     - nessuna riga → sì;
     - skipped → sì (rivalutata: l'email può essere stata aggiunta);
-    - failed → sì solo per errori senza invio tentato (PDF, validazione);
+    - failed → sì solo per errori senza invio (PDF, validazione, errore prima dell'invio);
     - prepared (prova) → sì se ora la modalità invia davvero;
     - sent in test → sì se ora la modalità è reale (il cliente non l'ha ricevuta);
     - sending (riga orfana di un crash) / sent reale / altro → no.
@@ -923,7 +929,7 @@ def _preview_customer(session: Session, customer_id: int, invoices: List[Invoice
                 "group_invoices": [other.invoice_number for other in plan.email if other.id != inv.id],
                 "merged_early": inv.id in plan.early_ids,
             })
-        elif existing is not None and existing.status != STATUS_SKIPPED and existing.subject:
+        elif not reason and existing is not None and existing.status != STATUS_SKIPPED and existing.subject:
             # Già lavorata (inviata, ferma, preparata…): si mostra l'email
             # scritta ALLORA, con le fatture che aveva — non un testo
             # ricomposto oggi, che il cliente non ha mai ricevuto.
@@ -1055,7 +1061,7 @@ def _record_skip(session: Session, inv: Invoice, row: Optional[InvoiceReminderEm
 def _process_group(session: Session, customer: Customer, invoices: List[Invoice], *, key: str, mode: str, mailer,
                    cfg, summary: dict, existing: Dict[int, InvoiceReminderEmail], today: Optional[date],
                    idempotency_key: str, carried: Optional[str] = None,
-                   release_key: Optional[str] = None) -> None:
+                   release_key: Optional[str] = None, early_ids: Iterable[int] = ()) -> None:
     """Compone, registra e (fuori dalla prova) invia UN promemoria per le
     fatture date dello stesso cliente. Una riga per fattura, riservate
     insieme PRIMA dell'invio e chiuse insieme dopo: le fatture di un'email
@@ -1125,6 +1131,8 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
         summary[outcome] += 1
         if outcome in ("sent", "prepared"):
             summary["invoices"] = summary.get("invoices", 0) + len(rows)
+            early = set(early_ids)
+            summary["merged_early"] = summary.get("merged_early", 0) + sum(1 for row in rows if row.invoice_id in early)
         for row, inv in zip(rows, invoices):
             summary["items"].append(_item(row, inv, customer))
 
@@ -1179,9 +1187,21 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
         row.error_kind = None
         row.sent_at = sent_at
         row.provider_message_id = message_id or None
-    if release_key:
-        _release_siblings(session, release_key, [row.id for row in rows])
+    sent_ids = [row.id for row in rows]
     close("sent")
+    if release_key:
+        # A scrittura fatta: un guasto qui non deve far credere fallita
+        # un'email partita (le righe rimaste fuori tengono la chiave: al
+        # loro ritento Resend risponderà 409 e deciderà un operatore).
+        try:
+            _release_siblings(session, release_key, sent_ids)
+            session.commit()
+        except Exception as e:
+            logger.error(f"Promemoria {label}: chiave non liberata sulle righe rimaste fuori: {e}")
+            try:
+                session.rollback()
+            except Exception:
+                pass
 
 
 def _release_siblings(session: Session, key: str, sent_ids: List[int]) -> None:
@@ -1204,37 +1224,64 @@ def _release_siblings(session: Session, key: str, sent_ids: List[int]) -> None:
 
 
 def _mark_unexpected(session: Session, facts: List[tuple], mode: str, carried: Optional[str], error: Exception,
-                     summary: dict, customer: Optional[Customer], early_ids: Iterable[int] = ()) -> None:
-    """Dopo un errore imprevisto: rollback, e ogni fattura dell'email ha una
-    riga `failed` (ferma finché un operatore non la riprende: l'invio
-    potrebbe essere partito). Una riga già scritta come inviata da questo
-    tentativo non si tocca: l'errore è arrivato dopo. `early_ids`: le
-    fatture unite perché scadono il giorno dopo — se l'errore è arrivato
-    PRIMA della riserva (nulla è partito) per loro non si scrive nulla: il
-    loro giorno è domani, e il giro di domani le prende."""
+                     summary: dict, customer: Optional[Customer], attempt_key: Optional[str] = None,
+                     early_ids: Iterable[int] = ()) -> None:
+    """Dopo un errore imprevisto: rollback, e ogni riga dice la verità su ciò
+    che è successo (stesse regole del secondo avviso):
+
+    - riga RISERVATA da questo tentativo (`sending` con la sua chiave):
+      l'email potrebbe essere partita → `failed`, ferma finché un operatore
+      non la riprende (col dubbio ereditato, se c'era);
+    - riga già scritta come inviata o preparata da questo tentativo (errore
+      arrivato DOPO la scrittura finale): non si tocca;
+    - riga ferma da prima che questo tentativo non ha riservato (esito
+      incerto, in invio da un altro tentativo, inviata in reale): non si
+      tocca — il suo stato è ancora vero;
+    - riga «a riposo» (saltata, preparata, inviata in test, fallita con
+      certezza) o fattura senza riga, con l'errore arrivato PRIMA della
+      riserva: nulla è partito → `failed/not_attempted`, visibile, e il giro
+      la riprova da solo. Per una fattura unita perché scade il giorno dopo
+      (`early_ids`) non si scrive nulla: il suo giorno è domani."""
     early_ids = set(early_ids)
     try:
         session.rollback()
-        marked = []
+        marked, done = [], 0
         for invoice_id, due, customer_id, amount_due, inv in facts:
             row = session.query(InvoiceReminderEmail).filter_by(invoice_id=invoice_id, due_date=due).first()
-            if invoice_id in early_ids and (row is None or row.status != STATUS_SENDING):
+            mine = row is not None and attempt_key is not None and row.idempotency_key == attempt_key
+            if mine and row.status in (STATUS_SENT, STATUS_PREPARED):
+                done += 1
                 continue
-            if row is None:
-                row = InvoiceReminderEmail(invoice_id=invoice_id, due_date=due, customer_id=customer_id,
-                                           mode=mode, amount_due=amount_due)
-            elif row.status == STATUS_SENT and row.mode == mode:
+            if mine and row.status == STATUS_SENDING:
+                row.status = STATUS_FAILED
+                row.error_kind = _kind_after(carried, ERROR_OTHER)
+                row.error = f"Errore imprevisto: {error}"[:500]
+            elif row is None or row.status in (STATUS_SKIPPED, STATUS_PREPARED) or (
+                    row.status == STATUS_SENT and (row.mode or MODE_REALE) != MODE_REALE) or (
+                    row.status == STATUS_FAILED and not is_uncertain(row)):
+                if invoice_id in early_ids:
+                    continue
+                if row is None:
+                    row = InvoiceReminderEmail(invoice_id=invoice_id, due_date=due, customer_id=customer_id,
+                                               mode=mode, amount_due=amount_due)
+                row.status = STATUS_FAILED
+                row.error_kind = ERROR_NOT_ATTEMPTED
+                row.error = f"Errore imprevisto prima dell'invio (nulla è partito): {error}"[:500]
+            else:
                 continue
-            row.status = STATUS_FAILED
-            row.error_kind = _kind_after(carried, ERROR_OTHER)
-            row.error = f"Errore imprevisto: {error}"[:500]
             session.add(row)
             marked.append((row, inv))
         if marked:
             session.commit()
+        if done < len(facts):
+            # Se tutte le righe risultano già inviate/preparate da questo
+            # tentativo l'errore è arrivato dopo: l'email è contata come tale.
             summary["failed"] += 1
-            for row, inv in marked:
-                summary["items"].append(_item(row, inv, customer))
+            # L'operatore legge l'errore nell'esito anche quando le righe
+            # restano com'erano (già ferme da prima).
+            summary["unexpected"] = str(error)[:300]
+        for row, inv in marked:
+            summary["items"].append(_item(row, inv, customer))
     except Exception as inner:
         logger.error(f"Promemoria: impossibile registrare l'errore: {inner}")
         try:
@@ -1249,16 +1296,15 @@ def _facts(invoices: Iterable[Invoice]) -> List[tuple]:
 
 def _process_group_safely(session: Session, customer: Customer, invoices: List[Invoice], **kwargs) -> None:
     """Un'email non deve mai far saltare le altre: eccezioni impreviste →
-    rollback, righe `failed` (other) se possibile, e si prosegue."""
+    rollback, ogni riga col suo esito vero (_mark_unexpected), e si prosegue."""
     facts = _facts(invoices)
-    early_ids = kwargs.pop("early_ids", ())
     try:
         _process_group(session, customer, invoices, **kwargs)
     except Exception as e:
         logger.error(f"Promemoria {', '.join(str(f[4].invoice_number) for f in facts)}: errore imprevisto: {e}",
                      exc_info=True)
         _mark_unexpected(session, facts, kwargs["mode"], kwargs.get("carried"), e, kwargs["summary"], customer,
-                         early_ids=early_ids)
+                         attempt_key=kwargs.get("idempotency_key"), early_ids=kwargs.get("early_ids", ()))
 
 
 def _record_skip_safely(session: Session, inv: Invoice, row: Optional[InvoiceReminderEmail], reason: str,
@@ -1275,8 +1321,8 @@ def _record_skip_safely(session: Session, inv: Invoice, row: Optional[InvoiceRem
         _mark_unexpected(session, facts, mode, None, e, summary, inv.customer)
 
 
-def _broken_copies(customer: Customer, invoices: Iterable[Invoice]) -> List[Invoice]:
-    """Le fatture la cui copia di cortesia oggi non si riesce a generare."""
+def _broken_copies(customer: Customer, invoices: Iterable[Invoice]) -> List[Tuple[Invoice, Exception]]:
+    """Le fatture la cui copia di cortesia oggi non si riesce a generare, con l'errore."""
     from backend.api.recovery import _build_invoice_pdf
 
     broken = []
@@ -1285,8 +1331,37 @@ def _broken_copies(customer: Customer, invoices: Iterable[Invoice]) -> List[Invo
             _build_invoice_pdf(customer, inv, courtesy=True)
         except Exception as e:
             logger.error(f"Promemoria {inv.invoice_number}: copia di cortesia non generabile: {e}")
-            broken.append(inv)
+            broken.append((inv, e))
     return broken
+
+
+def _record_broken_copy(session: Session, inv: Invoice, row: Optional[InvoiceReminderEmail], error: Exception,
+                        mode: str, summary: dict) -> None:
+    """La copia di cortesia di questa fattura oggi non si genera: riga
+    `failed/pdf` (visibile, e il giro la riprova), SENZA passare dall'invio —
+    il verdetto della prova vale, anche se un secondo tentativo riuscisse: in
+    un giro il cliente riceve al massimo una email."""
+    customer = inv.customer
+    row = row or InvoiceReminderEmail(invoice_id=inv.id, due_date=inv.due_date)
+    row.customer_id = customer.id if customer else None
+    row.mode = mode
+    row.amount_due = float(inv.amount_due or 0)
+    row.status = STATUS_FAILED
+    row.error_kind = ERROR_PDF
+    row.error = f"PDF non generato: {error}"[:500]
+    row.skip_reason = None
+    row.group_key = None
+    row.idempotency_key = None
+    row.attempted_at = datetime.utcnow()
+    session.add(row)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        summary["already"] += 1
+        return
+    summary["failed"] += 1
+    summary["items"].append(_item(row, inv, customer))
 
 
 def _run_customer(session: Session, customer_id: int, invoices: List[Invoice], dates: List[date], *, mode: str,
@@ -1302,49 +1377,62 @@ def _run_customer(session: Session, customer_id: int, invoices: List[Invoice], d
     summary["candidates"] += plan.candidates
     summary["already"] += len(plan.already)
     skipped = [(inv, plan.existing.get(inv.id), reason) for inv, reason in plan.skipped]
-    email, alone = list(plan.email), []
+    email, broken = list(plan.email), []
     if len(email) > 1:
-        broken = {inv.id for inv in _broken_copies(plan.customer, email)}
+        broken = _broken_copies(plan.customer, email)
         if broken:
-            alone = [inv for inv in email if inv.id in broken and inv.id not in plan.early_ids]
-            email = [inv for inv in email if inv.id not in broken]
+            broken_ids = {inv.id for inv, _error in broken}
+            email = [inv for inv in email if inv.id not in broken_ids]
             if not any(inv.id not in plan.early_ids for inv in email):
                 email = []   # restano solo fatture «del giorno dopo»: aspettano il loro giorno
-    # Nessun dubbio ereditato: il giro rilavora solo righe che certamente non
-    # erano partite (needs_processing lascia ferme le incerte).
-    for group in ([email] if email else []) + [[inv] for inv in alone]:
-        early_ids = {inv.id for inv in group if inv.id in plan.early_ids}
-        summary["merged_early"] = summary.get("merged_early", 0) + len(early_ids)
-        key = group_key(plan.customer.id, group, today)
+    if email:
+        # Nessun dubbio ereditato: il giro rilavora solo righe che certamente
+        # non erano partite (needs_processing lascia ferme le incerte).
+        key = group_key(plan.customer.id, email, today)
         _process_group_safely(
-            session, plan.customer, group, key=key, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
-            existing=plan.existing, today=today, idempotency_key=attempt_key(group, mode, key), early_ids=early_ids,
+            session, plan.customer, email, key=key, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
+            existing=plan.existing, today=today, idempotency_key=attempt_key(email, mode, key),
+            early_ids={inv.id for inv in email if inv.id in plan.early_ids},
         )
+    for inv, error in broken:
+        if inv.id in plan.early_ids:
+            continue   # il suo giorno è domani: oggi non si scrive nulla
+        facts = _facts([inv])
+        try:
+            _record_broken_copy(session, inv, plan.existing.get(inv.id), error, mode, summary)
+        except Exception as e:
+            logger.error(f"Promemoria {facts[0][4].invoice_number}: errore imprevisto: {e}", exc_info=True)
+            _mark_unexpected(session, facts, mode, None, e, summary, plan.customer)
     for inv, row, reason in skipped:
         _record_skip_safely(session, inv, row, reason, mode, summary)
 
 
-def _mark_broken(session: Session, invoices: Iterable[Invoice], mode: str, error: Exception, summary: dict) -> None:
+def _mark_broken(session: Session, invoices: Iterable[Invoice], dates: Iterable[date], mode: str, today: date,
+                 error: Exception, summary: dict) -> None:
     """Il giro di un cliente si è interrotto prima di lavorare le sue
-    fatture: quelle rimaste SENZA riga ne ricevono una `failed` (visibile in
-    Sistema, da riprendere a mano), così nessuna sparisce in silenzio — il
-    giro di domani non guarda più la loro scadenza. Le righe già presenti
-    non si toccano: il loro stato è ancora vero."""
+    fatture: quelle del giro rimaste SENZA riga ne ricevono una
+    `failed/not_attempted` — nulla è partito. Visibile in Sistema, e un altro
+    giro lo stesso giorno le riprende da solo, insieme; se non ce n'è un
+    altro, «Riprova» su una le rimanda tutte in un'unica email (stesso
+    `group_key`). Le righe già presenti non si toccano: il loro stato è
+    ancora vero."""
     try:
+        dates = set(dates)
+        missing = [inv for inv in invoices if inv.due_date in dates and _existing_row(session, inv) is None]
+        if not missing:
+            return
+        key = group_key(missing[0].customer_id, missing, today) if len(missing) > 1 else None
         marked = []
-        for inv in invoices:
-            if _existing_row(session, inv) is not None:
-                continue
+        for inv in missing:
             row = InvoiceReminderEmail(invoice_id=inv.id, due_date=inv.due_date, customer_id=inv.customer_id,
                                        mode=mode, amount_due=float(inv.amount_due or 0), status=STATUS_FAILED,
-                                       error_kind=ERROR_OTHER)
-            row.error = f"Errore imprevisto nel giro (nessun invio tentato): {error}"[:500]
+                                       error_kind=ERROR_NOT_ATTEMPTED, group_key=key)
+            row.error = f"Errore imprevisto nel giro (nulla è partito): {error}"[:500]
             session.add(row)
             marked.append((row, inv))
-        if marked:
-            session.commit()
-            for row, inv in marked:
-                summary["items"].append(_item(row, inv, inv.customer))
+        session.commit()
+        for row, inv in marked:
+            summary["items"].append(_item(row, inv, inv.customer))
     except Exception as inner:
         logger.error(f"Promemoria: impossibile registrare il giro interrotto: {inner}")
         try:
@@ -1400,7 +1488,7 @@ def run_reminders(
                         session.rollback()
                     except Exception:
                         pass
-                    _mark_broken(session, [inv for inv in invoices if inv.due_date in dates], mode, e, summary)
+                    _mark_broken(session, invoices, dates, mode, today, e, summary)
             # Nessun «riporto» di righe lavorate in prova/test fuori dalle date
             # del giro: il promemoria parte il giorno prima (mai il giorno
             # stesso) e mai nel weekend, quindi al passaggio in reale le date
@@ -1620,7 +1708,7 @@ def retry_row(session: Session, row: InvoiceReminderEmail, *, mailer=None, cfg=N
             if len(members) > 1:
                 # Una fattura la cui copia oggi non si genera non deve
                 # impedire di rimandare le altre: resta fuori, riga intatta.
-                broken = {b.id for b in _broken_copies(inv.customer, [m for m, _r in members[1:]])}
+                broken = {b.id for b, _error in _broken_copies(inv.customer, [m for m, _r in members[1:]])}
                 members = [(m, r) for m, r in members if m.id not in broken]
             ready = [member for member, _row in members]
             rows = [member_row for _member, member_row in members]

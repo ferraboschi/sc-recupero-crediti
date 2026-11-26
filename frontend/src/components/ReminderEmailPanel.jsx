@@ -328,7 +328,7 @@ export default function ReminderEmailPanel() {
                   ? `Errore: ${runResult.error}`
                   : runResult.info
                     ? runResult.info
-                    : `Esito: email inviate ${runResult.sent} · preparate ${runResult.prepared}${runResult.invoices > 0 ? ` (${plural(runResult.invoices, 'fattura', 'fatture')} in tutto)` : ''} · email con errore ${runResult.failed} · fatture saltate ${runResult.skipped} · fatture non lavorate ${runResult.already}${runResult.broken > 0 ? ` · ATTENZIONE: giro interrotto per ${plural(runResult.broken, 'cliente', 'clienti')} (vedi le righe «Errore» qui sotto)` : ''}`}
+                    : `Esito: email inviate ${runResult.sent} · preparate ${runResult.prepared}${runResult.invoices > 0 ? ` (${plural(runResult.invoices, 'fattura', 'fatture')} in tutto)` : ''} · email con errore ${runResult.failed} · fatture saltate ${runResult.skipped} · fatture non lavorate ${runResult.already}${runResult.broken > 0 ? ` · ATTENZIONE: giro interrotto per ${plural(runResult.broken, 'cliente', 'clienti')} (vedi le righe «Errore» qui sotto)` : ''}${runResult.unexpected ? ` · errore imprevisto: ${runResult.unexpected}` : ''}`}
               </span>
             )}
           </div>
