@@ -235,11 +235,16 @@ class TestConfig:
         assert followup_window(FIXED_NOW, _cfg(REMINDER_FOLLOWUP_DAYS="8", REMINDER_FOLLOWUP_LOOKBACK_DAYS="2")) == (
             date(2026, 11, 8), date(2026, 11, 10))
 
-    def test_near_due_date_means_one_day(self):
-        # «Scadenza prossima significa ± un giorno» (owner, 24/11/2026).
+    def test_near_due_dates_chain_up_to_yesterday(self):
+        # «Scadenza prossima significa ± un giorno» (owner, 24/11/2026), a
+        # catena (26/11/2026: «unite, non diventiamo assillanti»): dopo
+        # l'ultima scadenza della finestra si uniscono i giorni di fila, fino
+        # a IERI — una fattura si sollecita solo se è già scaduta.
         assert NEAR_DUE_DAYS == 1
-        assert merge_until(followup_window(FIXED_NOW, _cfg())) == date(2026, 11, 12)
-        assert merge_until((date(2026, 11, 10), date(2026, 11, 16))) == date(2026, 11, 17)
+        assert merge_until(followup_window(FIXED_NOW, _cfg())) == date(2026, 11, 17)
+        assert merge_until((date(2026, 11, 10), date(2026, 11, 16))) == date(2026, 11, 22)
+        # Con N = 1 dopo la finestra c'è solo oggi: nessuna unione.
+        assert merge_until((date(2026, 11, 11), date(2026, 11, 17)), _cfg(REMINDER_FOLLOWUP_DAYS="1")) == date(2026, 11, 17)
 
     def test_window_uses_italian_date(self):
         # 23:30 UTC di martedì 17/11 = 00:30 italiane di mercoledì 18/11.
@@ -305,7 +310,8 @@ class TestSelection:
             _inv(test_db_session, c, "IN/13", 10.0, date(2026, 11, 5)),          # 13 giorni: ultimo giorno
         ]
         near = _inv(test_db_session, c, "NEAR/6", 10.0, date(2026, 11, 12))      # 6 giorni: solo da UNIRE
-        _inv(test_db_session, c, "OUT/5", 10.0, date(2026, 11, 13))              # 5 giorni: non ancora
+        chain = _inv(test_db_session, c, "NEAR/5", 10.0, date(2026, 11, 13))     # 5 giorni: solo da UNIRE, a catena
+        _inv(test_db_session, c, "OUT/0", 10.0, date(2026, 11, 18))              # scade oggi: non è scaduta
         _inv(test_db_session, c, "OUT/14", 10.0, date(2026, 11, 4))              # 14 giorni: fuori
         _inv(test_db_session, c, "OUT/PAID", 10.0, DUE7, status="paid")
         _inv(test_db_session, c, "OUT/VOID", 10.0, DUE7, status="void")
@@ -313,17 +319,17 @@ class TestSelection:
         _inv(test_db_session, c, "OUT/ZERO", 10.0, DUE7, amount_due=0.0)
         _inv(test_db_session, None, "OUT/NOCUST", 10.0, DUE7)
         got = candidate_invoices(test_db_session, window)
-        assert [i.invoice_number for i in got] == ["IN/13", "IN/7", "NEAR/6"]
-        assert {i.id for i in got} == {i.id for i in keep} | {near.id}
+        assert [i.invoice_number for i in got] == ["IN/13", "IN/7", "NEAR/6", "NEAR/5"]
+        assert {i.id for i in got} == {i.id for i in keep} | {near.id, chain.id}
         # Solo le fatture di un cliente (invio di prova).
         other = _other(test_db_session, 2)
         mine = _inv(test_db_session, other, "ALTRO/7", 10.0, DUE7)
         assert [i.id for i in candidate_invoices(test_db_session, window, customer_id=other.id)] == [mine.id]
-        assert len(candidate_invoices(test_db_session, window)) == 4
+        assert len(candidate_invoices(test_db_session, window)) == 5
         # Raggruppate per cliente, dal cliente con la scadenza più vecchia.
         groups = by_customer(candidate_invoices(test_db_session, window))
         assert [(cid, [i.invoice_number for i in g]) for cid, g in groups] == [
-            (c.id, ["IN/13", "IN/7", "NEAR/6"]), (other.id, ["ALTRO/7"])]
+            (c.id, ["IN/13", "IN/7", "NEAR/6", "NEAR/5"]), (other.id, ["ALTRO/7"])]
 
     def test_needs_the_reminder_really_sent_to_the_customer(self, test_db_session):
         c = _cust(test_db_session)
@@ -577,7 +583,7 @@ class TestRun:
         assert (summary["candidates"], summary["sent"], summary["skipped"], summary["failed"]) == (1, 1, 0, 0)
         assert (summary["invoices"], summary["merged_early"]) == (1, 0)
         assert summary["window"] == ["2026-11-05", "2026-11-11"] and summary["sync"]["ok"] is True
-        assert summary["merge_until"] == "2026-11-12"
+        assert summary["merge_until"] == "2026-11-17"
         sent = mailer.sent[0]
         assert sent["to"] == ["amministrazione@akiro.it"]
         assert sent["cc"] == ["g.scotti@sakecompany.com", "fatture@sakecompany.com"]
@@ -1099,8 +1105,8 @@ class TestOneEmailPerCustomer:
         assert "un'altra fattura per 100,00 €. Totale da saldare: 300,00 €." in mailer.sent[1]["text"]
 
     def test_three_consecutive_due_dates(self, test_db_session):
-        # 10, 11 e 12/11: il 17 partono insieme le prime due (7 e 6 giorni);
-        # la terza, da sola, il 19 (7 giorni). Nessuna email il 18.
+        # 10, 11 e 12/11, a catena (decisione owner 26/11/2026): il 17 partono
+        # TUTTE insieme (scadute da 7, 6 e 5 giorni). Nessuna email il 18 né il 19.
         c = _cust(test_db_session)
         a = _due(test_db_session, c, num="A/1", due=date(2026, 11, 10))
         b = _due(test_db_session, c, num="B/2", due=date(2026, 11, 11))
@@ -1110,12 +1116,15 @@ class TestOneEmailPerCustomer:
         for day in (date(2026, 11, 17), TODAY, date(2026, 11, 19)):
             _sync(test_db_session, now=_at(day))
             out[day] = run_followups(test_db_session, now_utc=_at(day), mailer=mailer, cfg=_on_cfg())
-        assert [out[day]["sent"] for day in out] == [1, 0, 1]
-        assert (out[date(2026, 11, 17)]["invoices"], out[date(2026, 11, 17)]["merged_early"]) == (2, 1)
+        assert [out[day]["sent"] for day in out] == [1, 0, 0]
+        assert (out[date(2026, 11, 17)]["invoices"], out[date(2026, 11, 17)]["merged_early"]) == (3, 2)
         assert out[TODAY]["already"] == 2 and out[TODAY]["candidates"] == 2
-        assert "2 fatture scadute" in mailer.sent[0]["subject"] and "fattura n. C/3" in mailer.sent[1]["subject"]
+        assert out[date(2026, 11, 19)]["already"] == 3 and len(mailer.sent) == 1
+        assert "3 fatture scadute" in mailer.sent[0]["subject"]
+        text = mailer.sent[0]["text"]
+        assert "scaduta da 7 giorni" in text and "scaduta da 6 giorni" in text and "scaduta da 5 giorni" in text
         keys = {r.invoice_id: r.group_key for r in _rows(test_db_session)}
-        assert keys[a.id] == keys[b.id] != keys[d.id]
+        assert keys[a.id] == keys[b.id] == keys[d.id]
 
     def test_first_round_puts_everything_due_in_one_email_per_customer(self, test_db_session):
         # Prima accensione (o giro saltato): nella finestra ci sono più
@@ -2718,7 +2727,7 @@ class TestApi:
         assert data["send_mode"] == "reale" and data["missing_config"] == ["REMINDER_FOLLOWUP_ENABLED"]
         assert (data["days_after_due"], data["lookback_days"]) == (7, 6)
         assert data["window"] == ["2026-11-05", "2026-11-11"] and data["weekend"] is False
-        assert (data["near_days"], data["merge_until"]) == (1, "2026-11-12")
+        assert (data["near_days"], data["merge_until"]) == (1, "2026-11-17")
         assert data["sync"]["ok"] is True and data["schedule"].startswith("09:15")
         assert data["cc_effective"] == ["fatture@sakecompany.com"] and data["recent"] == []
         entry = data["preview"][0]
@@ -3226,3 +3235,86 @@ class TestModel:
         with pytest.raises(IntegrityError):
             test_db_session.commit()
         test_db_session.rollback()
+
+
+class TestChainedDueDates:
+    """Decisione owner 26/11/2026: «unite, non diventiamo assillanti» — le
+    scadenze in giorni di fila partono in UNA email, a catena, purché le
+    fatture siano già scadute."""
+
+    def _round(self, s, day, mailer):
+        _sync(s, now=_at(day))
+        return run_followups(s, now_utc=_at(day), mailer=mailer, cfg=_on_cfg())
+
+    def test_the_chain_goes_on_while_the_days_are_in_a_row(self, test_db_session):
+        c = _cust(test_db_session)
+        dues = [date(2026, 11, d) for d in (11, 12, 13, 14, 15)]   # scadute da 7, 6, 5, 4, 3 giorni
+        invoices = [_due(test_db_session, c, num=f"C/{n}", amount=10.0 + n, due=due) for n, due in enumerate(dues)]
+        mailer = FakeMailer()
+        out = self._round(test_db_session, TODAY, mailer)
+        assert out["sent"] == 1 and out["invoices"] == 5 and out["merged_early"] == 4 and out["candidates"] == 5
+        assert "5 fatture scadute" in mailer.sent[0]["subject"]
+        assert "scaduta da 3 giorni" in mailer.sent[0]["text"] and "scaduta da 7 giorni" in mailer.sent[0]["text"]
+        assert len({r.group_key for r in _rows(test_db_session)}) == 1 and len(invoices) == 5
+        # Nei giorni dopo nessuna email a parte.
+        for day in (date(2026, 11, 19), date(2026, 11, 20), date(2026, 11, 23)):
+            again = self._round(test_db_session, day, mailer)
+            assert again["sent"] == 0
+        assert len(mailer.sent) == 1
+
+    def test_a_day_without_invoices_breaks_the_chain(self, test_db_session):
+        c = _cust(test_db_session)
+        _due(test_db_session, c, num="A/1", due=DUE7)                      # 7 giorni: parte oggi
+        later = _due(test_db_session, c, num="D/1", due=date(2026, 11, 13))  # 5 giorni: il 12 non c'è nulla
+        mailer = FakeMailer()
+        out = self._round(test_db_session, TODAY, mailer)
+        assert out["sent"] == 1 and out["invoices"] == 1 and out["merged_early"] == 0
+        assert "fattura n. A/1" in mailer.sent[0]["subject"]
+        assert [r.invoice_id for r in _rows(test_db_session)] != [] and later.id not in {r.invoice_id for r in _rows(test_db_session)}
+        # Il suo giorno (20/11: scaduta da 7 giorni) parte da sola.
+        nxt = self._round(test_db_session, date(2026, 11, 20), mailer)
+        assert nxt["sent"] == 1 and "fattura n. D/1" in mailer.sent[1]["subject"]
+
+    def test_an_excluded_invoice_in_the_middle_breaks_the_chain(self, test_db_session):
+        c = _cust(test_db_session)
+        _due(test_db_session, c, num="A/1", due=DUE7)
+        _due(test_db_session, c, num="B/1", due=DUE6, status="promised")   # promessa: fuori
+        _due(test_db_session, c, num="D/1", due=date(2026, 11, 13))
+        mailer = FakeMailer()
+        out = self._round(test_db_session, TODAY, mailer)
+        assert out["sent"] == 1 and out["invoices"] == 1 and out["merged_early"] == 0 and out["skipped"] == 0
+        assert len(_rows(test_db_session)) == 1   # per le altre oggi non si scrive nulla
+
+    def test_an_invoice_not_yet_overdue_never_joins(self, test_db_session):
+        """Con N = 2 la catena potrebbe arrivare a oggi: una fattura che scade
+        oggi non è scaduta, e non si sollecita."""
+        c = _cust(test_db_session)
+        cfg = _on_cfg(REMINDER_FOLLOWUP_DAYS="2", REMINDER_FOLLOWUP_LOOKBACK_DAYS="0")
+        _due(test_db_session, c, num="A/1", due=date(2026, 11, 16))    # scaduta da 2 giorni
+        _due(test_db_session, c, num="B/1", due=date(2026, 11, 17))    # da 1 giorno: si unisce
+        _due(test_db_session, c, num="C/1", due=TODAY)                 # scade oggi: mai
+        _sync(test_db_session)
+        mailer = FakeMailer()
+        out = run_followups(test_db_session, mailer=mailer, cfg=cfg)
+        assert out["sent"] == 1 and out["invoices"] == 2 and out["merged_early"] == 1
+        assert "C/1" not in mailer.sent[0]["text"]
+
+    def test_the_chain_never_starts_without_an_invoice_of_the_window(self, test_db_session):
+        c = _cust(test_db_session)
+        _due(test_db_session, c, num="B/1", due=DUE6)
+        _due(test_db_session, c, num="D/1", due=date(2026, 11, 13))
+        mailer = FakeMailer()
+        out = self._round(test_db_session, TODAY, mailer)
+        assert out["sent"] == 0 and out["candidates"] == 0 and _rows(test_db_session) == [] and mailer.sent == []
+
+    def test_the_preview_shows_the_chained_invoices(self, test_db_session):
+        c = _cust(test_db_session)
+        _due(test_db_session, c, num="A/1", due=DUE7)
+        _due(test_db_session, c, num="B/1", due=DUE6)
+        _due(test_db_session, c, num="D/1", due=date(2026, 11, 13))
+        _sync(test_db_session)
+        [entry] = [e for e in preview_followups(test_db_session, cfg=_on_cfg()) if e["will_process"]]
+        assert entry["invoice_count"] == 3 and [i["early"] for i in entry["invoices"]] == [False, True, True]
+        mailer = FakeMailer()
+        run_followups(test_db_session, mailer=mailer, cfg=_on_cfg())
+        assert (entry["subject"], entry["text"]) == (mailer.sent[0]["subject"], mailer.sent[0]["text"])

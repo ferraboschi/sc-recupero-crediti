@@ -177,7 +177,7 @@ export default function FollowupEmailPanel() {
         <span className="text-xs text-txt-muted">
           Ogni giorno alle {data.schedule}, dopo i promemoria · {data.weekend
             ? 'weekend: nessun invio (le scadenze di sabato e domenica partono il lunedì)'
-            : `scadenze dal ${fmtDate(data.window[0])} al ${fmtDate(data.window[1])}, più quelle del ${fmtDate(data.merge_until)} se dello stesso cliente`}
+            : `scadenze dal ${fmtDate(data.window[0])} al ${fmtDate(data.window[1])}, più, per lo stesso cliente, quelle dei giorni di fila subito dopo (fino al ${fmtDate(data.merge_until)})`}
         </span>
       )}
     </div>
