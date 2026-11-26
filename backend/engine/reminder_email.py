@@ -1131,8 +1131,7 @@ def _process_group(session: Session, customer: Customer, invoices: List[Invoice]
         summary[outcome] += 1
         if outcome in ("sent", "prepared"):
             summary["invoices"] = summary.get("invoices", 0) + len(rows)
-            early = set(early_ids)
-            summary["merged_early"] = summary.get("merged_early", 0) + sum(1 for row in rows if row.invoice_id in early)
+            summary["merged_early"] = summary.get("merged_early", 0) + len(set(early_ids))
         for row, inv in zip(rows, invoices):
             summary["items"].append(_item(row, inv, customer))
 

@@ -2780,3 +2780,57 @@ class TestOneEmailPerCustomerRealDatabaseErrors:
         assert recent[today_round.id]["needs_manual_retry"] is False
         assert recent[passed.id]["needs_manual_retry"] is True
         assert recent[passed.id]["retry_needs_confirmation"] is False   # nulla era partito: nessuna conferma
+
+
+class TestOneEmailPerCustomerOnlyItsOwnRows:
+    """Dopo un errore il gestore tocca solo le righe che QUESTO tentativo
+    aveva riservato; le altre dicono ancora il vero."""
+
+    def test_a_row_left_sending_by_another_attempt_is_not_touched(self, test_db_session, monkeypatch):
+        """Riga rimasta «in invio» col segno del 409 (un «Invia comunque»
+        interrotto); un secondo «Invia comunque» inciampa prima di riservarla:
+        resta com'era — in invio, da confermare."""
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_timeout()), cfg=_real_cfg())
+        retry_row(test_db_session, _rows(test_db_session)[inv.id], mailer=_Scripted(_already_received()), cfg=_real_cfg())
+
+        class Dies:
+            def send(self, **kwargs):
+                raise KeyboardInterrupt()
+
+            def close(self):
+                pass
+
+        with pytest.raises(KeyboardInterrupt):
+            retry_row(test_db_session, _rows(test_db_session)[inv.id], mailer=Dies(), cfg=_real_cfg(), force=True)
+        test_db_session.rollback()
+        before = _rows(test_db_session)[inv.id]
+        stored = before.idempotency_key
+        assert (before.status, before.error_kind) == ("sending", "conflict")
+        monkeypatch.setattr(re_mod, "compose", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+        out = retry_row(test_db_session, before, mailer=_Scripted(), cfg=_real_cfg(), force=True,
+                        now_utc=FIXED_NOW + timedelta(minutes=5))
+        row = _rows(test_db_session)[inv.id]
+        assert out["failed"] == 1 and "boom" in out["unexpected"]
+        assert (row.status, row.error_kind, row.error, row.idempotency_key) == ("sending", "conflict", None, stored)
+
+    def test_rows_prepared_in_prova_are_marked_when_the_real_send_fails_before_starting(self, test_db_session, monkeypatch):
+        """Preparate in prova, poi il giro reale inciampa prima dell'invio:
+        non restano «preparate» (nessun giro reale le manderebbe più come
+        tali): nulla è partito, e il giro successivo le manda davvero."""
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, TOMORROW)
+        run_reminders(test_db_session, due_date=TOMORROW, cfg=_cfg())
+        assert {r.status for r in _rows(test_db_session).values()} == {"prepared"}
+        original = re_mod.compose_many
+        monkeypatch.setattr(re_mod, "compose_many", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+        summary, mailer = _real_round(test_db_session)
+        monkeypatch.setattr(re_mod, "compose_many", original)
+        rows = _rows(test_db_session)
+        assert mailer.calls == 0 and summary["failed"] == 1
+        assert {(r.status, r.error_kind, r.mode) for r in rows.values()} == {("failed", "not_attempted", "reale")}
+        assert rows[a.id].subject is None and rows[a.id].group_key == rows[b.id].group_key
+        again, mailer2 = _real_round(test_db_session)
+        assert again["sent"] == 1 and again["invoices"] == 2 and mailer2.calls == 1
