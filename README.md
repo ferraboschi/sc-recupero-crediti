@@ -122,6 +122,8 @@ Per setup completo con Nginx + SSL: `sudo bash deploy/setup.sh`
 - `GET /api/positions/suggestions` — Abbinamenti in quarantena da confermare
 - `POST /api/recovery/customers/{id}/solleciti` — Registra un sollecito WhatsApp sulla pratica
 - `GET /api/system/match-audit` — Audit abbinamenti fatture→clienti (warn/bad)
+- `GET /api/reminders/email/customer-status` — Email automatiche (promemoria e 2° avviso) da mostrare sotto il nome di ogni cliente: solo invii reali, solo fatture ancora da saldare (sola lettura)
+- `GET /api/reminders/email/sent?days=14` — Registro «Email inviate»: promemoria e secondi avvisi insieme, giorno per giorno, più le email ferme da gestire (sola lettura)
 - `POST /api/sync/full` — Sincronizzazione completa (fatture → clienti → matching → auto-create → ordini → pratiche)
 
 ## Struttura Progetto
@@ -134,14 +136,15 @@ Per setup completo con Nginx + SSL: `sudo bash deploy/setup.sh`
 │   │   ├── normalizer.py      # Normalizzazione ragioni sociali
 │   │   ├── piva.py            # Validazione P.IVA (checksum)
 │   │   ├── matching.py        # Matching fatture-clienti + quarantena
-│   │   └── cases.py           # Pratiche di recupero (lifecycle + backfill)
+│   │   ├── cases.py           # Pratiche di recupero (lifecycle + backfill)
+│   │   └── email_status.py    # Stato delle email automatiche accanto al cliente + registro «Email inviate» (sola lettura)
 │   ├── config.py       # Configurazione da .env
 │   ├── database.py     # SQLAlchemy ORM (PostgreSQL/SQLite)
 │   ├── scheduler.py    # APScheduler (job giornaliero)
 │   └── main.py         # Entry point FastAPI
 ├── frontend/
 │   ├── src/
-│   │   ├── pages/      # Dashboard, Attività, Fatture, Clienti, Sistema
+│   │   ├── pages/      # Dashboard, Attività, Clienti, Fatture, Email inviate, Sistema
 │   │   ├── api/        # Client Axios
 │   │   └── config.js   # URL backend configurabile
 │   └── public/

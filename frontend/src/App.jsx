@@ -10,11 +10,19 @@ import Attivita from './pages/Attivita'
 import Utilizzo from './pages/Utilizzo'
 import Avvocato from './pages/Avvocato'
 import System from './pages/System'
+import EmailInviate from './pages/EmailInviate'
 import Login from './pages/Login'
 import SyncStatus from './components/SyncStatus'
 import ReconcileButton from './components/ReconcileButton'
 
 /* ── SVG icon components ─────────────────────────────────────────── */
+function IconMail() {
+  return (
+    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+    </svg>
+  )
+}
 function IconDashboard() {
   return (
     <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
@@ -126,6 +134,7 @@ export default function App() {
     { path: '/attivita', label: 'Attivita', icon: <IconActivity />, hint: 'Azioni di recupero' },
     { path: '/customers', label: 'Clienti', icon: <IconCustomers />, hint: 'Anagrafica debitori' },
     { path: '/positions', label: 'Fatture', icon: <IconInvoices />, hint: 'Elenco fatture' },
+    { path: '/email-inviate', label: 'Email inviate', icon: <IconMail />, hint: 'Promemoria e 2° avviso' },
     { path: '/utilizzo', label: 'Utilizzo', icon: <IconUtilizzo />, hint: 'Registro del lavoro' },
     { path: '/avvocato', label: 'Avvocato', icon: <IconAvvocato />, hint: 'Pratiche legali' },
     { path: '/system', label: 'Sistema', icon: <IconSystem />, hint: 'Diagnostica' },
@@ -275,6 +284,7 @@ export default function App() {
             <Route path="/utilizzo" element={<Utilizzo />} />
             <Route path="/avvocato" element={<Avvocato />} />
             <Route path="/system" element={<System />} />
+            <Route path="/email-inviate" element={<EmailInviate />} />
           </Routes>
         </div>
       </div>

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 import AgentBadges from '../components/AgentBadges'
+import { EmailLegend, EmailStatusLine, EmailStatusNote, useEmailStatus } from '../components/EmailStatus'
 
 const ACTION_LABELS = {
   first_contact: 'I Contatto',
@@ -49,6 +50,8 @@ const PIPELINE_STAGES = [
 
 export default function Attivita() {
   const navigate = useNavigate()
+  // Email automatiche (promemoria e 2° avviso) sotto il nome di ogni cliente.
+  const emailStatus = useEmailStatus()
   const now = new Date()
 
   // Calendar state
@@ -334,6 +337,7 @@ export default function Attivita() {
                   const customers = getCustomersForOverlay()
                   return (
                     <div className="space-y-2">
+                      <EmailStatusNote status={emailStatus} />
                       {customers.length === 0 && <p className="text-sm text-txt-muted text-center py-4">Nessun cliente in questo stato.</p>}
                       {customers.map(c => (
                         <div key={c.id} onClick={() => { setOverlayType(null); navigate(`/customers/${c.id}`) }}
@@ -344,6 +348,7 @@ export default function Attivita() {
                               {c.overdue_count} fatture scadute
                               {c.last_contact_date ? ` — ultimo contatto: ${formatDate(c.last_contact_date)}` : ''}
                             </p>
+                            <EmailStatusLine status={emailStatus} customerId={c.id} />
                           </div>
                           <p className="text-sm font-bold text-accent-red">{formatCurrency(c.total_overdue)}</p>
                         </div>
@@ -560,6 +565,8 @@ export default function Attivita() {
                   <p className="text-sm text-txt-muted">Vai nella scheda cliente e registra la prima azione per iniziare il recupero.</p>
                 </div>
               ) : (
+                <>
+                <EmailLegend status={emailStatus} flush className="mb-3" />
                 <div className="overflow-x-auto">
                   <table className="w-full">
                     <thead>
@@ -585,6 +592,7 @@ export default function Attivita() {
                             <td className="py-3 pr-4">
                               <p className="text-sm font-medium text-txt-primary">{c.ragione_sociale}<AgentBadges agents={c.agents} className="ml-2" /></p>
                               {c.partita_iva && <p className="text-xs text-txt-muted font-mono">{c.partita_iva}</p>}
+                              <EmailStatusLine status={emailStatus} customerId={c.id} />
                             </td>
                             <td className="py-3 pr-4">
                               <span className={`${statusColor} sc-badge inline-block`}>
@@ -635,6 +643,7 @@ export default function Attivita() {
                     </tbody>
                   </table>
                 </div>
+                </>
               )}
             </>
           )}

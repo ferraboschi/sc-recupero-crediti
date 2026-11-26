@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 import AgentBadges from '../components/AgentBadges'
+import { EmailLegend, EmailStatusLine, useEmailStatus } from '../components/EmailStatus'
 
 const STATUS_LABELS = {
   idle: 'Da Gestire',
@@ -33,6 +34,8 @@ const SORT_OPTIONS = [
 
 export default function Customers() {
   const navigate = useNavigate()
+  // Email automatiche (promemoria e 2° avviso) sotto il nome di ogni cliente.
+  const emailStatus = useEmailStatus()
   const [customers, setCustomers] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -451,6 +454,7 @@ export default function Customers() {
           </div>
         ) : (
           <>
+            <EmailLegend status={emailStatus} />
             <div className="overflow-x-auto">
               <table className="w-full">
                 <thead className="bg-dark-surface border-b border-dark-border">
@@ -508,6 +512,7 @@ export default function Customers() {
                         {!customer.ragione_sociale && (
                           <span className="text-xs text-txt-muted">(nome mancante)</span>
                         )}
+                        <EmailStatusLine status={emailStatus} customerId={customer.id} />
                         {isExcluded && (
                           <span
                             className="mt-1 inline-block sc-badge bg-[rgba(148,163,184,0.15)] text-txt-muted"
