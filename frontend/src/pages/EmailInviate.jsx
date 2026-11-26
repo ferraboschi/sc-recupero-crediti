@@ -55,9 +55,7 @@ function daySummary(items) {
   const stuck = count('stuck')
   if (stuck) parts.push(`${stuck} ${stuck === 1 ? 'ferma' : 'ferme'}`)
   const missing = count('missing')
-  if (missing) parts.push(`${missing} non ${missing === 1 ? 'partita o incerta' : 'partite o incerte'}`)
-  const paused = count('paused')
-  if (paused) parts.push(`${paused} ${paused === 1 ? 'sospesa' : 'sospese'}`)
+  if (missing) parts.push(`${missing} da sistemare o ${missing === 1 ? 'incerta' : 'incerte'}`)
   return parts.length ? parts.join(' · ') : 'nessuna email inviata'
 }
 
@@ -164,11 +162,13 @@ export default function EmailInviate() {
 
   const totals = data?.totals || {}
   const maxDays = data?.range?.max_days || 90
+  // Senza dati non si mostra uno zero: «0 ferme» sarebbe un'affermazione.
+  const shown = (value) => (data ? (value ?? 0) : '—')
   const cards = [
-    ['Oggi', totals.today_sent ?? 0, 'email inviate', 'text-txt-primary'],
-    ['Ultimi 7 giorni', totals.week_sent ?? 0, 'email inviate', 'text-txt-primary'],
-    ['Ferme', totals.stuck ?? 0, 'da gestire', (totals.stuck || 0) > 0 ? 'text-accent-amber' : 'text-txt-primary'],
-    ['Non partite o incerte', totals.week_missing ?? 0, 'negli ultimi 7 giorni', (totals.week_missing || 0) > 0 ? 'text-accent-red' : 'text-txt-primary'],
+    ['Oggi', shown(totals.today_sent), 'email inviate', 'text-txt-primary'],
+    ['Ultimi 7 giorni', shown(totals.week_sent), 'email inviate', 'text-txt-primary'],
+    ['Ferme', shown(totals.stuck), 'da gestire', (totals.stuck || 0) > 0 ? 'text-accent-amber' : 'text-txt-primary'],
+    ['Da sistemare o incerte', shown(totals.week_missing), 'negli ultimi 7 giorni', (totals.week_missing || 0) > 0 ? 'text-accent-red' : 'text-txt-primary'],
   ]
 
   return (
@@ -240,7 +240,7 @@ export default function EmailInviate() {
           )}
           <p className="px-5 py-3 text-xs text-txt-muted border-t border-dark-border">
             Solo ciò che si può riprendere da Sistema: secondi avvisi fermi di fatture ancora da saldare (di qualunque
-            data) e promemoria fermi la cui scadenza non è ancora passata. Un invio fermo non viene ritentato da solo.
+            data) e promemoria fermi la cui scadenza non è ancora passata. Nessun giro in programma li riprenderà.
           </p>
         </div>
       )}
@@ -263,7 +263,7 @@ export default function EmailInviate() {
           ))}
           <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-txt-muted">
             <span>
-              Dal {formatDay(data.range.from)} al {formatDay(data.range.to)} · solo invii reali ai clienti (prove e test restano in Sistema)
+              Dal {formatDay(data.range.from)} al {formatDay(data.range.to)} · letto alle {data.read_at} · solo invii reali ai clienti (prove e test restano in Sistema)
               {data.followup_mode === 'off' ? ' · secondo avviso spento: partono solo i promemoria' : ''}
             </span>
             {data.range.days < maxDays && (

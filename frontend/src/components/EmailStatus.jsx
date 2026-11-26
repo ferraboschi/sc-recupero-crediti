@@ -6,10 +6,11 @@ import client from '../api/client'
 // (backend/engine/email_status.py: solo invii reali, solo fatture ancora da
 // saldare); qui solo colore e disposizione.
 //
-// Un colore = un significato, lo stesso in ogni pagina: verde = inviata,
-// grigio = in programma, ambra = ferma (un operatore può riprenderla da
-// Sistema), rosso = non partita o dall'esito incerto (il cliente potrebbe non
-// averla), viola = non partita per una scelta che vale ancora («In Attesa»).
+// Un colore = un significato, lo stesso in ogni pagina: verde = inviata;
+// grigio vuoto = in programma; ambra = serve un operatore, e da Sistema può
+// farlo; rosso = c'è un dato da sistemare, o l'esito è incerto; viola = ADESSO
+// il giro la salterebbe («In Attesa», promessa…); grigio pieno = non partita,
+// un fatto passato che non chiede nulla.
 const DOT = {
   sent: 'bg-accent-green',
   planned: 'border border-txt-muted',
@@ -31,9 +32,10 @@ const TEXT = {
 const LEGEND = [
   ['sent', 'inviata'],
   ['planned', 'in programma'],
-  ['stuck', 'ferma, da gestire'],
-  ['missing', 'non partita o incerta'],
+  ['stuck', 'da gestire'],
+  ['missing', 'da sistemare o incerta'],
   ['paused', 'sospesa'],
+  ['closed', 'non partita'],
 ]
 
 export function EmailItem({ tone, title, children }) {
@@ -55,31 +57,46 @@ export function EmailItem({ tone, title, children }) {
 // aspetta. Finché la risposta non c'è, o se non arriva, la legenda lo DICE:
 // l'assenza della riga sotto un nome non deve mai sembrare «nessuna email».
 const STATUS_TIMEOUT_MS = 30000
+// Lo stato cambia col giro del mattino: una scheda lasciata aperta lo rilegge
+// da sola (ogni 5 minuti, e quando torna in primo piano) e dice a che ora.
+const STATUS_REFRESH_MS = 5 * 60 * 1000
 
 export function useEmailStatus() {
-  const [status, setStatus] = useState({ byCustomer: {}, loading: true, error: false, followupReadable: true })
+  const [status, setStatus] = useState({ byCustomer: {}, loading: true, error: false, followupReadable: true, readAt: null })
   useEffect(() => {
     let alive = true
-    client.get('/reminders/email/customer-status', { timeout: STATUS_TIMEOUT_MS })
-      .then(res => {
-        if (!alive) return
-        const customers = res.data?.customers
-        if (!customers || typeof customers !== 'object' || Array.isArray(customers)) {
-          // Risposta che non è lo stato (es. pagina d'errore con 200): è un errore.
-          setStatus({ byCustomer: {}, loading: false, error: true, followupReadable: true })
-          return
-        }
-        setStatus({
-          byCustomer: customers,
-          loading: false,
-          error: false,
-          followupReadable: res.data.followup_readable !== false,
+    const read = () => {
+      client.get('/reminders/email/customer-status', { timeout: STATUS_TIMEOUT_MS })
+        .then(res => {
+          if (!alive) return
+          const customers = res.data?.customers
+          if (!customers || typeof customers !== 'object' || Array.isArray(customers)) {
+            // Risposta che non è lo stato (es. pagina d'errore con 200): è un errore.
+            setStatus({ byCustomer: {}, loading: false, error: true, followupReadable: true, readAt: null })
+            return
+          }
+          setStatus({
+            byCustomer: customers,
+            loading: false,
+            error: false,
+            followupReadable: res.data.followup_readable !== false,
+            readAt: res.data.read_at || null,
+          })
         })
-      })
-      .catch(() => {
-        if (alive) setStatus({ byCustomer: {}, loading: false, error: true, followupReadable: true })
-      })
-    return () => { alive = false }
+        .catch(() => {
+          // Meglio nessuna riga, e dirlo, che righe che potrebbero non valere più.
+          if (alive) setStatus({ byCustomer: {}, loading: false, error: true, followupReadable: true, readAt: null })
+        })
+    }
+    read()
+    const timer = setInterval(read, STATUS_REFRESH_MS)
+    const onVisible = () => { if (document.visibilityState === 'visible') read() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      alive = false
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [])
   return status
 }
@@ -122,6 +139,20 @@ export function EmailLegend({ status, flush = false, className = '' }) {
           Secondi avvisi non leggibili: qui sotto solo i promemoria.
         </span>
       )}
+      {!status?.loading && !status?.error && status?.readAt && (
+        <span className="text-xs text-txt-muted" data-testid="email-status-read-at">letto alle {status.readAt}</span>
+      )}
     </div>
+  )
+}
+
+// Dove la legenda non c'è (elenchi nei riquadri): almeno dire se lo stato
+// delle email non è ancora arrivato o non è disponibile.
+export function EmailStatusNote({ status, className = '' }) {
+  if (!status?.loading && !status?.error) return null
+  return (
+    <p className={`text-xs ${status.error ? 'font-semibold text-accent-amber' : 'text-txt-muted'} ${className}`} role="status">
+      {status.error ? 'Stato delle email non disponibile: ricarica la pagina.' : 'Lettura dello stato delle email in corso…'}
+    </p>
   )
 }

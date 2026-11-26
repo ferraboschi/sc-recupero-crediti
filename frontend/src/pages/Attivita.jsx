@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import client from '../api/client'
 import AgentBadges from '../components/AgentBadges'
-import { EmailLegend, EmailStatusLine, useEmailStatus } from '../components/EmailStatus'
+import { EmailLegend, EmailStatusLine, EmailStatusNote, useEmailStatus } from '../components/EmailStatus'
 
 const ACTION_LABELS = {
   first_contact: 'I Contatto',
@@ -337,6 +337,7 @@ export default function Attivita() {
                   const customers = getCustomersForOverlay()
                   return (
                     <div className="space-y-2">
+                      <EmailStatusNote status={emailStatus} />
                       {customers.length === 0 && <p className="text-sm text-txt-muted text-center py-4">Nessun cliente in questo stato.</p>}
                       {customers.map(c => (
                         <div key={c.id} onClick={() => { setOverlayType(null); navigate(`/customers/${c.id}`) }}
