@@ -571,6 +571,279 @@ class TestRun:
 
 # ── Weekend, etichette, copie, invio di prova ─────────────────────────
 
+class _Scripted:
+    """Resend finto: `errors` = gli errori da sollevare, uno per chiamata; poi invia. Ricorda le chiavi."""
+
+    def __init__(self, *errors):
+        self.errors = list(errors)
+        self.sent = []
+        self.keys = []
+
+    def send(self, **kwargs):
+        self.keys.append(kwargs.get("idempotency_key"))
+        if self.errors:
+            raise self.errors.pop(0)
+        self.sent.append(kwargs)
+        return f"msg-{len(self.sent)}"
+
+    def close(self):
+        pass
+
+
+def _timeout():
+    return MailSendError("Resend non raggiungibile: ReadTimeout", kind=ERROR_NETWORK)
+
+
+def _already_received():
+    """Così il connettore riporta un 409 di Resend: un 4xx, quindi «validation»."""
+    return MailSendError("Resend HTTP 409: Same idempotency key used with a different request payload",
+                         kind=ERROR_VALIDATION)
+
+
+def _refused():
+    return MailSendError("Resend HTTP 422: invalid recipient", kind=ERROR_VALIDATION)
+
+
+KEY = "reminder-{}-2026-11-11-reale"
+
+
+class TestADoubtStaysADoubt:
+    """Correzione 26/11/2026 (via libera owner): un promemoria dall'esito
+    incerto resta incerto finché l'email non parte davvero. Prima, dopo un
+    timeout, un «Riprova» a cui Resend rispondeva «già ricevuta» (409) lasciava
+    scritto «rifiutata»: il registro diceva il falso, il giro la ritentava da
+    solo e oltre le 24 ore un altro «Riprova» poteva mandare un doppione."""
+
+    def _in_doubt(self, s, **cust):
+        c = _cust(s, **cust)
+        inv = _inv(s, c, "DUB/1", 100.0, TOMORROW)
+        first = _Scripted(_timeout())
+        run_reminders(s, due_date=TOMORROW, mailer=first, cfg=_real_cfg())
+        row = s.query(InvoiceReminderEmail).one()
+        assert (row.status, row.error_kind) == ("failed", "network") and first.keys == [KEY.format(inv.id)]
+        return c, inv, row
+
+    def test_already_received_is_recorded_as_such(self, test_db_session):
+        _c, _i, row = self._in_doubt(test_db_session)
+        retry_row(test_db_session, row, mailer=_Scripted(_already_received()), cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert (row.status, row.error_kind) == ("failed", "conflict")
+        assert "aveva già ricevuto un tentativo precedente" in row.error and len(row.error) <= 500
+        assert re_mod.is_uncertain(row) and needs_processing(row, MODE_REALE)[0] is False
+
+    def test_a_long_answer_from_resend_never_cuts_the_warning(self, test_db_session):
+        _c, _i, row = self._in_doubt(test_db_session)
+        long_409 = MailSendError("Resend HTTP 409: " + "x" * 900, kind=ERROR_VALIDATION)
+        retry_row(test_db_session, row, mailer=_Scripted(long_409), cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert len(row.error) <= 500 and row.error.endswith("controllare su Resend se è stata consegnata.")
+
+    def test_in_prova_or_test_mode_the_panel_never_asks_for_the_confirmation(self, test_client, test_db_session, monkeypatch):
+        """Fuori dal reale «Riprova» non manda nulla al cliente: niente «Invia comunque»."""
+        from backend.config import config as real_config
+        _c, _i, row = self._in_doubt(test_db_session)
+        row.error_kind = "conflict"
+        test_db_session.commit()
+        monkeypatch.setattr(real_config, "REMINDER_EMAIL_ENABLED", False)
+        monkeypatch.setattr(real_config, "RESEND_API_KEY", "")
+        item = test_client.get("/api/reminders/email/log").json()["items"][0]
+        assert item["needs_manual_retry"] is True and item["retry_needs_confirmation"] is False
+
+    def test_already_received_is_never_retried_by_the_round(self, test_db_session):
+        _c, _i, row = self._in_doubt(test_db_session)
+        retry_row(test_db_session, row, mailer=_Scripted(_already_received()), cfg=_real_cfg())
+        again = _Scripted()
+        summary = run_reminders(test_db_session, due_date=TOMORROW, mailer=again, cfg=_real_cfg())
+        assert again.keys == [] and summary["sent"] == 0
+        test_db_session.refresh(row)
+        assert row.error_kind == "conflict"
+
+    def test_after_already_received_riprova_needs_the_operator_confirmation(self, test_db_session):
+        _c, inv, row = self._in_doubt(test_db_session)
+        retry_row(test_db_session, row, mailer=_Scripted(_already_received()), cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert re_mod.needs_confirmation(row) is True
+        plain = _Scripted()
+        with pytest.raises(ValueError, match="controllato su Resend"):
+            retry_row(test_db_session, row, mailer=plain, cfg=_real_cfg())
+        assert plain.keys == []
+        test_db_session.refresh(row)
+        assert (row.status, row.error_kind) == ("failed", "conflict")   # resta com'è
+        forced = _Scripted()
+        assert retry_row(test_db_session, row, mailer=forced, cfg=_real_cfg(), force=True)["sent"] == 1
+        # Tentativo NUOVO: chiave nuova, altrimenti Resend risponderebbe ancora 409.
+        assert forced.keys[0] != KEY.format(inv.id) and forced.keys[0].startswith(KEY.format(inv.id) + "-f")
+        test_db_session.refresh(row)
+        assert row.status == "sent"
+
+    def test_a_doubt_survives_a_refused_retry(self, test_db_session):
+        """Timeout (forse arrivata), poi «Riprova» rifiutato: se diventasse
+        «rifiutata» il giro la rimanderebbe da solo, e il registro mentirebbe."""
+        _c, _i, row = self._in_doubt(test_db_session)
+        retry_row(test_db_session, row, mailer=_Scripted(_refused()), cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert (row.status, row.error_kind) == ("failed", "network") and "422" in row.error
+        again = _Scripted()
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=again, cfg=_real_cfg())
+        assert again.keys == []
+
+    def test_a_doubt_survives_a_retry_that_fails_on_the_pdf(self, test_db_session, monkeypatch):
+        _c, _i, row = self._in_doubt(test_db_session)
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("font mancante")
+
+        monkeypatch.setattr(re_mod, "build_attachments", broken)
+        mailer = _Scripted()
+        retry_row(test_db_session, row, mailer=mailer, cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert (row.status, row.error_kind) == ("failed", "network") and row.error.startswith("PDF non generato")
+        assert mailer.keys == [] and needs_processing(row, MODE_REALE)[0] is False
+
+    def test_a_row_interrupted_mid_send_stays_a_doubt_too(self, test_db_session):
+        _c, _i, row = self._in_doubt(test_db_session)
+        row.status, row.error_kind = "sending", None
+        test_db_session.commit()
+        retry_row(test_db_session, row, mailer=_Scripted(_refused()), cfg=_real_cfg())
+        test_db_session.refresh(row)
+        assert (row.status, row.error_kind) == ("failed", "other") and re_mod.is_uncertain(row)
+
+    def test_a_doubt_is_never_rewritten_as_skipped(self, test_db_session):
+        """Se oggi non si può inviare, la riga resta com'è e l'operatore legge il perché."""
+        c, inv, row = self._in_doubt(test_db_session)
+        for change, why in (
+            (lambda: setattr(c, "email", None), "Cliente senza email"),
+            (lambda: (setattr(c, "email", "amministrazione@shabu.it"), setattr(inv, "missing_streak", 1)), "Forse già pagata"),
+        ):
+            change()
+            test_db_session.commit()
+            mailer = _Scripted()
+            with pytest.raises(ValueError, match=f"non inviabile ora: {why}"):
+                retry_row(test_db_session, row, mailer=mailer, cfg=_real_cfg())
+            test_db_session.refresh(row)
+            assert (row.status, row.error_kind, row.skip_reason) == ("failed", "network", None) and mailer.keys == []
+
+    def test_within_a_day_riprova_continues_the_same_attempt(self, test_db_session):
+        """Stessa chiave: se il primo tentativo era arrivato, Resend risponde 409 e non rimanda."""
+        _c, inv, row = self._in_doubt(test_db_session)
+        assert re_mod.needs_confirmation(row) is False
+        mailer = _Scripted()
+        assert retry_row(test_db_session, row, mailer=mailer, cfg=_real_cfg())["sent"] == 1
+        assert mailer.keys == [KEY.format(inv.id)]
+
+    def test_after_a_day_resend_has_forgotten_and_riprova_needs_the_confirmation(self, test_db_session):
+        _c, inv, row = self._in_doubt(test_db_session)
+        now = FIXED_NOW.replace(tzinfo=None)
+        row.created_at = now - timedelta(hours=22, minutes=59)
+        test_db_session.commit()
+        assert re_mod.needs_confirmation(row, now) is False
+        row.created_at = now - timedelta(hours=23, minutes=1)
+        test_db_session.commit()
+        assert re_mod.needs_confirmation(row, now) is True
+        plain = _Scripted()
+        with pytest.raises(ValueError, match="controllato su Resend"):
+            retry_row(test_db_session, row, mailer=plain, cfg=_real_cfg(), now_utc=FIXED_NOW)
+        assert plain.keys == []
+        forced = _Scripted()
+        assert retry_row(test_db_session, row, mailer=forced, cfg=_real_cfg(), now_utc=FIXED_NOW, force=True)["sent"] == 1
+        assert forced.keys[0].startswith(KEY.format(inv.id) + "-f")
+
+    def test_a_confirmed_retry_that_fails_again_is_still_a_doubt(self, test_db_session):
+        _c, _i, row = self._in_doubt(test_db_session)
+        retry_row(test_db_session, row, mailer=_Scripted(_already_received()), cfg=_real_cfg())
+        retry_row(test_db_session, row, mailer=_Scripted(_refused()), cfg=_real_cfg(), force=True)
+        test_db_session.refresh(row)
+        assert (row.status, row.error_kind) == ("failed", "conflict") and re_mod.needs_confirmation(row) is True
+
+    def test_force_changes_nothing_when_no_confirmation_is_needed(self, test_db_session):
+        _c, inv, row = self._in_doubt(test_db_session)
+        mailer = _Scripted()
+        assert retry_row(test_db_session, row, mailer=mailer, cfg=_real_cfg(), force=True)["sent"] == 1
+        assert mailer.keys == [KEY.format(inv.id)]
+
+    def test_certain_failures_behave_as_before(self, test_db_session):
+        """Rifiuto al PRIMO tentativo: certamente non partita. Il giro la ritenta da solo."""
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c, "CERTA/1", 100.0, TOMORROW)
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_refused()), cfg=_real_cfg())
+        row = test_db_session.query(InvoiceReminderEmail).one()
+        assert (row.status, row.error_kind) == ("failed", "validation")
+        assert not re_mod.is_uncertain(row) and not re_mod.needs_confirmation(row)
+        row.created_at = FIXED_NOW.replace(tzinfo=None) - timedelta(days=3)   # nemmeno se vecchia
+        test_db_session.commit()
+        assert not re_mod.needs_confirmation(row, FIXED_NOW.replace(tzinfo=None))
+        again = _Scripted()
+        assert run_reminders(test_db_session, due_date=TOMORROW, mailer=again, cfg=_real_cfg())["sent"] == 1
+        assert again.keys == [KEY.format(inv.id)]
+
+    def test_a_409_on_the_first_attempt_is_a_doubt_too(self, test_db_session):
+        """Chiave già vista da Resend senza che il registro lo sappia (riga persa, ripristino): comunque non si ritenta da soli."""
+        c = _cust(test_db_session)
+        _inv(test_db_session, c, "PRIMA/1", 100.0, TOMORROW)
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_already_received()), cfg=_real_cfg())
+        row = test_db_session.query(InvoiceReminderEmail).one()
+        assert (row.status, row.error_kind) == ("failed", "conflict")
+
+    def test_a_trial_doubt_is_a_new_send_in_real_mode(self, test_db_session):
+        """L'incertezza riguarda la modalità in cui è nata: in test l'email andava all'indirizzo di prova."""
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c, "TEST/1", 100.0, TOMORROW)
+        test_cfg = _real_cfg(REMINDER_EMAIL_TEST_TO="lorenzo@example.com")
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_timeout()), cfg=test_cfg)
+        row = test_db_session.query(InvoiceReminderEmail).one()
+        assert (row.mode, row.status, row.error_kind) == ("test", "failed", "network")
+        row.created_at = FIXED_NOW.replace(tzinfo=None) - timedelta(days=2)
+        test_db_session.commit()
+        assert re_mod.needs_confirmation(row, FIXED_NOW.replace(tzinfo=None)) is False
+        retry_row(test_db_session, row, mailer=_Scripted(_refused()), cfg=_real_cfg(), now_utc=FIXED_NOW)
+        test_db_session.refresh(row)
+        # In reale è stato un rifiuto al primo tentativo: certamente non partita.
+        assert (row.mode, row.status, row.error_kind) == ("reale", "failed", "validation")
+        mailer = _Scripted()
+        assert run_reminders(test_db_session, due_date=TOMORROW, mailer=mailer, cfg=_real_cfg())["sent"] == 1
+        assert mailer.keys == [KEY.format(inv.id)]
+
+    def test_needs_confirmation_without_dates_asks(self, test_db_session):
+        row = SimpleNamespace(status="sending", error_kind=None, mode="reale", created_at=None, attempted_at=None)
+        assert re_mod.needs_confirmation(row) is True
+        row.mode = "prova"
+        assert re_mod.needs_confirmation(row) is False
+
+    def test_is_conflict(self):
+        assert re_mod.is_conflict(_already_received()) and not re_mod.is_conflict(_refused())
+        assert not re_mod.is_conflict(_timeout())
+        odd = RuntimeError("altro")
+        odd.status_code = 409
+        assert re_mod.is_conflict(odd)
+
+    def test_api_shows_invia_comunque_and_sends_only_when_confirmed(self, test_client, test_db_session, monkeypatch):
+        from backend.config import config as real_config
+        monkeypatch.setattr(real_config, "REMINDER_EMAIL_ENABLED", True)
+        monkeypatch.setattr(real_config, "RESEND_API_KEY", "re_x")
+        monkeypatch.setattr(real_config, "REMINDER_EMAIL_TEST_TO", "")
+        created = []
+
+        class Spy(_Scripted):
+            def __init__(self, api_key, api_url=None):
+                super().__init__()
+                created.append(self)
+
+        monkeypatch.setattr("backend.connectors.resend_mail.ResendMailer", Spy)
+        _c, _i, row = self._in_doubt(test_db_session)
+        item = test_client.get("/api/reminders/email/log").json()["items"][0]
+        assert item["needs_manual_retry"] is True and item["retry_needs_confirmation"] is False
+        row.error_kind = "conflict"
+        test_db_session.commit()
+        item = test_client.get("/api/reminders/email/log").json()["items"][0]
+        assert item["needs_manual_retry"] is True and item["retry_needs_confirmation"] is True
+        plain = test_client.post(f"/api/reminders/email/{row.id}/retry", json={"expected_mode": "reale"})
+        assert plain.status_code == 409 and "controllato su Resend" in plain.json()["detail"]
+        assert all(m.keys == [] for m in created)
+        forced = test_client.post(f"/api/reminders/email/{row.id}/retry", json={"expected_mode": "reale", "force": True})
+        assert forced.status_code == 200 and forced.json()["sent"] == 1
+        assert sum(len(m.sent) for m in created) == 1
+
+
 class TestWeekendAndCopies:
     def test_target_due_dates_skip_weekend_and_anticipate_on_friday(self):
         # 2026-11-09 è lunedì (ora italiana: UTC+1 → 10:00Z = 11:00 CET)

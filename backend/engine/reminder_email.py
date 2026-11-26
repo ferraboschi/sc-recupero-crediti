@@ -41,7 +41,7 @@ import html
 import logging
 import re
 import threading
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 from sqlalchemy.exc import IntegrityError
@@ -71,7 +71,24 @@ ERROR_VALIDATION = "validation"  # Resend 4xx → invio certamente rifiutato
 ERROR_PROVIDER = "provider"      # Resend 5xx → stato incerto
 ERROR_NETWORK = "network"        # timeout/connessione → stato incerto
 ERROR_OTHER = "other"
+# Resend risponde 409 quando la chiave del tentativo è già stata usata con un
+# contenuto diverso: un tentativo PRECEDENTE gli era arrivato. È il contrario
+# di «certamente non partita»: mai un ritento automatico.
+ERROR_CONFLICT = "conflict"
 AUTO_RETRY_KINDS = (ERROR_PDF, ERROR_VALIDATION)
+
+# Resend ricorda una chiave per 24 ore: oltre non ferma più un doppione. Un
+# margine di un'ora, contato dalla NASCITA della riga (il primo uso possibile
+# della chiave: mai dopo il primo tentativo).
+RESEND_KEY_MEMORY = timedelta(hours=23)
+CONFLICT_NOTE = (
+    " — Resend aveva già ricevuto un tentativo precedente di questa email: prima di ritentare, "
+    "controllare su Resend se è stata consegnata."
+)
+CONFIRMATION_NEEDED = (
+    "questo promemoria potrebbe essere già arrivato al cliente e Resend non fermerebbe più un doppione: "
+    "si invia solo confermando di aver controllato su Resend che NON è stato consegnato"
+)
 
 # Stati fattura che NON sono crediti da ricordare.
 NOT_REMINDABLE_STATUSES = ("paid", "void", "disputed")
@@ -385,6 +402,43 @@ def build_attachments(customer: Customer, invoice: Invoice, overdue: List[Invoic
 
 # ── Decisioni per riga ────────────────────────────────────────────────
 
+def is_conflict(exc: Exception) -> bool:
+    """Resend ha risposto «chiave già usata» (HTTP 409)?"""
+    return getattr(exc, "status_code", None) == 409 or str(exc).startswith("Resend HTTP 409")
+
+
+def is_uncertain(row: InvoiceReminderEmail) -> bool:
+    """L'ultimo tentativo della riga potrebbe essere arrivato al cliente? Sì
+    per una riga interrotta a metà invio e per ogni fallimento che non sia
+    «certamente non partita» (PDF non generato, rifiuto di Resend)."""
+    if row.status == STATUS_SENDING:
+        return True
+    return row.status == STATUS_FAILED and (row.error_kind or ERROR_OTHER) not in AUTO_RETRY_KINDS
+
+
+def _utc_now(now_utc: Optional[datetime] = None) -> datetime:
+    """L'istante dato (o adesso) in UTC senza fuso, come le date del registro."""
+    now = now_utc or datetime.now(timezone.utc)
+    return now.astimezone(timezone.utc).replace(tzinfo=None) if now.tzinfo is not None else now
+
+
+def needs_confirmation(row: InvoiceReminderEmail, now: Optional[datetime] = None) -> bool:
+    """«Riprova» su questa riga può far arrivare al cliente un DOPPIONE che
+    Resend non fermerebbe? Sì per un invio REALE dall'esito incerto dopo un
+    409 (gli era già arrivato) o nato da più di un giorno (Resend ha
+    dimenticato la chiave). Serve la conferma esplicita di chi ha controllato
+    su Resend che l'email NON è stata consegnata. Una riga di prova o di test
+    non chiede nulla: il cliente non aveva ricevuto niente."""
+    if not is_uncertain(row) or row.mode != MODE_REALE:
+        return False
+    if row.error_kind == ERROR_CONFLICT:
+        return True
+    born = row.created_at or row.attempted_at
+    if born is None:
+        return True  # età ignota: non si può contare su Resend
+    return (now or _utc_now()) - born > RESEND_KEY_MEMORY
+
+
 def needs_processing(existing: Optional[InvoiceReminderEmail], mode: str) -> Tuple[bool, str]:
     """Se una riga esistente va (ri)lavorata nel giro di oggi e perché.
 
@@ -537,12 +591,21 @@ def _classify_error(exc: Exception) -> str:
 
 def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, mailer, cfg, summary: dict,
                      existing: Optional[InvoiceReminderEmail] = None,
-                     today: Optional[date] = None) -> Optional[InvoiceReminderEmail]:
+                     today: Optional[date] = None, key_suffix: str = "") -> Optional[InvoiceReminderEmail]:
     """Compone, registra e (fuori dalla prova) invia il promemoria di UNA
     fattura; aggiorna `summary` e ritorna la riga (None se un altro giro
-    l'aveva già riservata)."""
+    l'aveva già riservata).
+
+    Un esito incerto resta incerto finché l'email non parte davvero: se la
+    riga aveva un tentativo che potrebbe essere arrivato (stessa modalità),
+    un nuovo fallimento «certo» (PDF, rifiuto) NON la trasforma in qualcosa
+    che il giro ritenterebbe da solo. `key_suffix`: solo per un ritento
+    confermato dall'operatore, che deve partire con una chiave nuova."""
     customer = inv.customer
     row = existing or InvoiceReminderEmail(invoice_id=inv.id, due_date=due)
+    carried = None
+    if existing is not None and existing.mode == mode and is_uncertain(existing):
+        carried = (existing.error_kind or ERROR_OTHER) if existing.status == STATUS_FAILED else ERROR_OTHER
     row.customer_id = customer.id if customer else None
     row.mode = mode
     row.amount_due = float(inv.amount_due or 0)
@@ -591,7 +654,7 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
     except Exception as e:  # il PDF non deve far cadere il giro
         logger.error(f"Promemoria {inv.invoice_number}: PDF non generato: {e}", exc_info=True)
         row.status = STATUS_FAILED
-        row.error_kind = ERROR_PDF
+        row.error_kind = carried or ERROR_PDF
         row.error = f"PDF non generato: {e}"[:500]
         session.add(row)
         session.commit()
@@ -615,7 +678,7 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
                 cc=cc or None,
                 bcc=(getattr(cfg, "REMINDER_EMAIL_BCC", "") or None) if mode == MODE_REALE else None,
                 attachments=attachments,
-                idempotency_key=f"reminder-{inv.id}-{due.isoformat()}-{mode}",
+                idempotency_key=f"reminder-{inv.id}-{due.isoformat()}-{mode}{key_suffix}",
             )
             row.status = STATUS_SENT
             row.sent_at = datetime.utcnow()
@@ -624,8 +687,13 @@ def _process_invoice(session: Session, inv: Invoice, due: date, *, mode: str, ma
         except Exception as e:  # messaggio già privo di segreti (MailSendError)
             logger.error(f"Promemoria {inv.invoice_number}: invio fallito: {e}")
             row.status = STATUS_FAILED
-            row.error_kind = _classify_error(e)
-            row.error = str(e)[:500]
+            if is_conflict(e):
+                row.error_kind = ERROR_CONFLICT
+                row.error = (str(e)[:500 - len(CONFLICT_NOTE)] + CONFLICT_NOTE)
+            else:
+                kind = _classify_error(e)
+                row.error_kind = carried if (carried and kind in AUTO_RETRY_KINDS) else kind
+                row.error = str(e)[:500]
             summary["failed"] += 1
     session.add(row)
     session.commit()
@@ -787,10 +855,19 @@ def send_test(session: Session, invoice_id: int, to_address: str, *, mailer=None
 
 
 def retry_row(session: Session, row: InvoiceReminderEmail, *, mailer=None, cfg=None, mode: Optional[str] = None,
-              expected_mode: Optional[str] = None) -> dict:
+              expected_mode: Optional[str] = None, force: bool = False,
+              now_utc: Optional[datetime] = None) -> dict:
     """Ritenta UNA riga ferma (`failed` o `sending` orfana) di una scadenza
     non ancora passata: il giro quotidiano guarda solo le prossime scadenze.
-    La fattura deve essere ancora da ricordare."""
+    La fattura deve essere ancora da ricordare.
+
+    Un invio dall'esito incerto (potrebbe essere arrivato) resta tale finché
+    l'email non parte davvero: se oggi non si può inviare (email mancante,
+    forse pagata…) la riga resta com'è e l'operatore legge il perché — non
+    diventa «saltata». `force`: l'operatore conferma di aver controllato su
+    Resend che l'email NON è stata consegnata; serve dopo un 409 e per un
+    invio incerto più vecchio di un giorno (needs_confirmation). Con la
+    conferma parte un tentativo nuovo, con una chiave nuova."""
     cfg = cfg or config
     if row.status not in (STATUS_FAILED, STATUS_SENDING):
         raise ValueError("si ritentano solo i promemoria falliti o interrotti")
@@ -807,11 +884,23 @@ def retry_row(session: Session, row: InvoiceReminderEmail, *, mailer=None, cfg=N
         mode, missing, mailer, own_mailer = _resolve_runtime(cfg, mailer, mode)
         if expected_mode and expected_mode != mode:
             raise ModeMismatch(mode, expected_mode)
+        key_suffix = ""
+        # L'incertezza riguarda la modalità in cui è nata: una riga di prova o
+        # di test ritentata in reale è un invio nuovo.
+        if is_uncertain(row) and row.mode == mode:
+            reason = skip_reason(inv, inv.customer)
+            if reason:
+                raise ValueError(f"promemoria non inviabile ora: {SKIP_LABELS.get(reason, reason)}")
+            now = _utc_now(now_utc)
+            if needs_confirmation(row, now):
+                if not force:
+                    raise ValueError(CONFIRMATION_NEEDED)
+                key_suffix = f"-f{now.strftime('%Y%m%d%H%M%S%f')}"
         summary = _empty_summary(row.due_date, mode, missing)
         summary["candidates"] = 1
         try:
             _process_safely(session, inv, row.due_date, mode=mode, mailer=mailer, cfg=cfg, summary=summary,
-                            existing=row)
+                            existing=row, key_suffix=key_suffix)
         finally:
             if own_mailer and mailer is not None:
                 mailer.close()
