@@ -364,6 +364,11 @@ class InvoiceReminderEmail(Base):
     attempted_at = Column(DateTime, nullable=True)               # ultimo tentativo di invio
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     sent_at = Column(DateTime, nullable=True)
+    # Una email per cliente (decisione owner 26/11/2026): le fatture della
+    # stessa email hanno una riga ciascuna e lo stesso `group_key` (vuoto per
+    # un'email con una fattura sola, e per le righe nate prima).
+    group_key = Column(String, nullable=True, index=True)
+    idempotency_key = Column(String, nullable=True)              # chiave usata verso Resend nell'ultimo tentativo
 
 
 class InvoiceFollowupEmail(Base):
@@ -595,6 +600,10 @@ def _run_migrations(engine):
         # Secondo avviso: chiave dell'email unica per cliente (la tabella
         # nuova nasce già completa da create_all; qui per i DB locali creati
         # con la prima stesura).
+        "ALTER TABLE invoice_reminder_emails ADD COLUMN group_key VARCHAR",
+        "ALTER TABLE invoice_reminder_emails ADD COLUMN idempotency_key VARCHAR",
+        "CREATE INDEX IF NOT EXISTS ix_invoice_reminder_emails_group_key "
+        "ON invoice_reminder_emails (group_key)",
         "ALTER TABLE invoice_followup_emails ADD COLUMN group_key VARCHAR",
         "ALTER TABLE invoice_followup_emails ADD COLUMN idempotency_key VARCHAR",
         "ALTER TABLE invoice_followup_emails ADD COLUMN key_first_used_at TIMESTAMP",

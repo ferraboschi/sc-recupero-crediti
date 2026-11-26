@@ -3204,17 +3204,17 @@ class TestSchedulerJob:
 
 
 class TestModel:
-    def test_same_columns_as_the_reminder_registry_plus_the_group_key(self):
+    def test_same_columns_as_the_reminder_registry_plus_the_key_age(self):
         # Il registro del secondo avviso ha le colonne di quello dei promemoria
-        # (stessa lettura nel pannello e nello storico) più la chiave dell'email.
+        # (stessa lettura nel pannello e nello storico, comprese le chiavi
+        # dell'email unica: `group_key` e `idempotency_key`) più il primo uso
+        # della chiave.
         cols = lambda model: {c.name: (str(c.type), c.nullable) for c in model.__table__.columns}  # noqa: E731
         followup_cols = cols(InvoiceFollowupEmail)
-        assert followup_cols.pop("group_key") == ("VARCHAR", True)
-        assert followup_cols.pop("idempotency_key") == ("VARCHAR", True)
         assert followup_cols.pop("key_first_used_at") == ("DATETIME", True)
         assert followup_cols == cols(InvoiceReminderEmail)
+        assert followup_cols["group_key"] == ("VARCHAR", True) and followup_cols["idempotency_key"] == ("VARCHAR", True)
         assert InvoiceFollowupEmail.__tablename__ == "invoice_followup_emails"
-        assert "group_key" not in cols(InvoiceReminderEmail)  # il registro in produzione non cambia
 
     def test_one_row_per_invoice_and_due_date(self, test_db_session):
         from sqlalchemy.exc import IntegrityError

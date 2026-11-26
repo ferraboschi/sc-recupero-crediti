@@ -1353,6 +1353,54 @@ class TestAgainstTheRealEngines:
         assert (row.status, row.error_kind) == ("failed", "network")
         return c, inv, row
 
+    def test_one_reminder_for_two_invoices_is_one_email_next_to_the_name(self, test_db_session):
+        """Una email per cliente (26/11/2026): due fatture nello stesso
+        promemoria sono UNA email — sotto il nome, e in «Email inviate»."""
+        s = test_db_session
+        c = _cust(s)
+        _inv(s, c, "2026/00001804/SAK - Fattura", 426.76, due=date(2026, 11, 19))
+        _inv(s, c, "2026/00001812/SAK - Fattura", 310.0, due=date(2026, 11, 20))   # scade il giorno dopo: unita
+        mailer = _Mailer()
+        rem.run_reminders(s, now_utc=_at(TODAY, 8, 15), mailer=mailer, cfg=_off())
+        assert len(mailer.sent) == 1
+        [item] = _items(s, c, now=LATE)
+        assert (item["state"], item["label"], item["count"]) == ("sent", "Promemoria 18/11", 1)
+        assert "Fatture 2026/00001804/SAK, 2026/00001812/SAK: promemoria inviato" in item["title"]
+        [entry] = [e for d in _log(s, now=LATE)["days"] for e in d["items"]]
+        assert [i["number"] for i in entry["invoices"]] == ["2026/00001804/SAK", "2026/00001812/SAK"]
+        assert entry["amount"] == 736.76 and entry["state_label"] == "Inviata" and len(entry["row_ids"]) == 2
+        assert _log(s, now=LATE)["totals"]["today_sent"] == 1
+
+    def test_one_reminder_for_two_invoices_in_doubt_is_one_email_to_handle(self, test_db_session):
+        s = test_db_session
+        c = _cust(s)
+        _inv(s, c, "2026/00001804/SAK - Fattura", 426.76, due=date(2026, 11, 19))
+        _inv(s, c, "2026/00001812/SAK - Fattura", 310.0, due=date(2026, 11, 20))
+        rem.run_reminders(s, now_utc=_at(TODAY, 8, 15), mailer=_Mailer(TIMEOUT()), cfg=_off())
+        [item] = _items(s, c, now=LATE)
+        assert (item["state"], item["label"], item["count"]) == ("stuck", "Promemoria fermo 18/11", 1)
+        assert "Fatture 2026/00001804/SAK, 2026/00001812/SAK: ultimo tentativo" in item["title"]
+        log = _log(s, now=LATE)
+        [stuck] = log["stuck"]
+        assert len(stuck["invoices"]) == 2 and stuck["state_label"] == "Ferma: da gestire" and log["totals"]["stuck"] == 1
+        CLOCK["now"] = LATE
+        mailer = _Mailer()
+        rem.retry_row(s, s.query(InvoiceReminderEmail).first(), mailer=mailer, cfg=_off())
+        assert len(mailer.sent) == 1 and _labels(s, c, now=LATE) == ["Promemoria 18/11"]
+
+    def test_of_one_email_only_the_invoices_still_to_pay_are_listed(self, test_db_session):
+        s = test_db_session
+        c = _cust(s)
+        a = _inv(s, c, "2026/00001804/SAK - Fattura", 426.76, due=date(2026, 11, 19))
+        b = _inv(s, c, "2026/00001812/SAK - Fattura", 310.0, due=date(2026, 11, 19))
+        rem.run_reminders(s, now_utc=_at(TODAY, 8, 15), mailer=_Mailer(), cfg=_off())
+        b.status, b.amount_due = "paid", 0
+        s.commit()
+        [item] = _items(s, c, now=LATE)
+        assert item["label"] == "Promemoria 18/11" and "Fattura 2026/00001804/SAK: promemoria inviato" in item["title"]
+        assert "00001812" not in item["title"]
+        assert a.id and len([e for d in _log(s, now=LATE)["days"] for e in d["items"]]) == 1
+
     def test_a_reminder_in_doubt_is_retriable_and_riprova_accepts_it(self, test_db_session):
         c, _inv_, row = self._reminder_in_doubt(test_db_session)
         assert _pairs(test_db_session, c, now=LATE) == [("stuck", "Promemoria fermo 18/11")]
