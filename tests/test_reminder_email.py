@@ -1747,7 +1747,17 @@ class TestOneEmailPerCustomer:
 
         monkeypatch.setattr(re_mod, "plan_customer", broken)
         summary, mailer = _real_round(test_db_session)
-        assert summary["broken"] == 1 and summary["sent"] == 1 and set(_rows(test_db_session)) == {x.id}
+        assert summary["broken"] == 1 and summary["sent"] == 1
+        rows = _rows(test_db_session)
+        assert rows[x.id].status == "sent"
+        # La fattura del cliente interrotto non sparisce in silenzio: una riga
+        # ferma, visibile in Sistema, da riprendere a mano.
+        [lost] = [r for r in rows.values() if r.invoice_id != x.id]
+        assert (lost.status, lost.error_kind, lost.mode) == ("failed", "other", "reale")
+        assert "nessun invio tentato" in lost.error and "piano rotto" in lost.error
+        monkeypatch.setattr(re_mod, "plan_customer", original)
+        again = _Scripted()
+        assert retry_row(test_db_session, lost, mailer=again, cfg=_real_cfg())["sent"] == 1
 
     def test_if_another_round_took_one_invoice_the_email_does_not_leave(self, test_db_session, monkeypatch):
         from sqlalchemy.exc import IntegrityError
@@ -2293,3 +2303,204 @@ class TestOneEmailPerCustomerAfterTheRound:
         assert [m["invoice_number"] for m in log[early.id]["group_invoices"]] == ["A/1", "B/1"]
         detail = test_client.get(f"/api/reminders/email/{recent[b.id]['id']}").json()
         assert detail["group_size"] == 3 and "sono in scadenza le seguenti fatture" in detail["body_text"]
+
+
+class TestOneEmailPerCustomerFailuresAtTheWrongMoment:
+    """Dalla revisione dell'invio: i guasti nei momenti peggiori."""
+
+    def test_an_interrupted_send_anyway_still_asks_for_the_confirmation(self, test_db_session):
+        """Timeout (arrivata), «Riprova» → 409, «Invia comunque» e il processo
+        muore durante l'invio: la riga resta «in invio» ma porta ancora il
+        segno del 409. Un «Riprova» semplice non deve partire con la chiave
+        nuova, che Resend non ha mai visto: manderebbe un doppione."""
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_timeout()), cfg=_real_cfg())
+        row = _rows(test_db_session)[inv.id]
+        retry_row(test_db_session, row, mailer=_Scripted(_already_received()), cfg=_real_cfg())
+
+        class Dies:
+            keys = []
+
+            def send(self, **kwargs):
+                self.keys.append(kwargs["idempotency_key"])
+                raise KeyboardInterrupt()   # nessun gestore: come un processo ucciso
+
+            def close(self):
+                pass
+
+        with pytest.raises(KeyboardInterrupt):
+            retry_row(test_db_session, _rows(test_db_session)[inv.id], mailer=Dies(), cfg=_real_cfg(), force=True)
+        test_db_session.rollback()
+        row = _rows(test_db_session)[inv.id]
+        assert (row.status, row.error_kind) == ("sending", "conflict") and row.idempotency_key == Dies.keys[0]
+        assert re_mod.needs_confirmation(row)
+        plain = _Scripted()
+        with pytest.raises(ValueError, match="controllato su Resend"):
+            retry_row(test_db_session, row, mailer=plain, cfg=_real_cfg())
+        assert plain.keys == []
+        forced = _Scripted()
+        later = FIXED_NOW + timedelta(minutes=5)   # un'altra conferma, un altro istante: un'altra chiave
+        out = retry_row(test_db_session, _rows(test_db_session)[inv.id], mailer=forced, cfg=_real_cfg(), force=True,
+                        now_utc=later)
+        assert out["sent"] == 1
+        assert forced.keys[0] not in (KEY.format(inv.id), Dies.keys[0]) and "-f2026" in forced.keys[0]
+        row = _rows(test_db_session)[inv.id]
+        assert (row.status, row.error_kind, row.error) == ("sent", None, None)
+
+    def test_a_received_mark_survives_a_second_interrupted_attempt_that_then_times_out(self, test_db_session):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, TOMORROW)
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=_Scripted(_timeout()), cfg=_real_cfg())
+        retry_row(test_db_session, _rows(test_db_session)[a.id], mailer=_Scripted(_already_received()), cfg=_real_cfg())
+
+        class Dies:
+            def send(self, **kwargs):
+                raise KeyboardInterrupt()
+
+            def close(self):
+                pass
+
+        with pytest.raises(KeyboardInterrupt):
+            retry_row(test_db_session, _rows(test_db_session)[b.id], mailer=Dies(), cfg=_real_cfg(), force=True)
+        test_db_session.rollback()
+        assert {(r.status, r.error_kind) for r in _rows(test_db_session).values()} == {("sending", "conflict")}
+        retry_row(test_db_session, _rows(test_db_session)[a.id], mailer=_Scripted(_timeout()), cfg=_real_cfg(), force=True)
+        assert {(r.status, r.error_kind) for r in _rows(test_db_session).values()} == {("failed", "conflict")}
+
+    def test_an_ordinary_interrupted_send_carries_no_received_mark(self, test_db_session):
+        c = _cust(test_db_session)
+        inv = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+
+        class Dies:
+            def send(self, **kwargs):
+                raise KeyboardInterrupt()
+
+            def close(self):
+                pass
+
+        with pytest.raises(KeyboardInterrupt):
+            run_reminders(test_db_session, due_date=TOMORROW, mailer=Dies(), cfg=_real_cfg())
+        test_db_session.rollback()
+        row = _rows(test_db_session)[inv.id]
+        assert (row.status, row.error_kind) == ("sending", None)
+        mailer = _Scripted()
+        assert retry_row(test_db_session, row, mailer=mailer, cfg=_real_cfg())["sent"] == 1
+        assert mailer.keys == [KEY.format(inv.id)]
+
+    def test_an_error_before_anything_is_reserved_does_not_hold_the_day_after_invoice(self, test_db_session, monkeypatch):
+        """Nulla è partito: la fattura del giro resta visibile come errore, ma
+        quella unita perché scade il giorno dopo non riceve nessuna riga —
+        il suo giorno è domani, e domani parte."""
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        original = re_mod.compose_many
+        monkeypatch.setattr(re_mod, "compose_many", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+        summary, mailer = _real_round(test_db_session)
+        rows = _rows(test_db_session)
+        assert mailer.calls == 0 and summary["failed"] == 1 and set(rows) == {a.id}
+        assert (rows[a.id].status, rows[a.id].error_kind) == ("failed", "other")
+        monkeypatch.setattr(re_mod, "compose_many", original)
+        nxt_mailer = FakeMailer()
+        nxt = run_reminders(test_db_session, due_date=DAY_AFTER, mailer=nxt_mailer, cfg=_real_cfg())
+        assert nxt["sent"] == 1 and "B/1" in nxt_mailer.sent[0]["subject"] and _rows(test_db_session)[b.id].status == "sent"
+
+    def test_an_error_after_the_reservation_marks_the_day_after_invoice_too(self, test_db_session, monkeypatch):
+        """Dopo la riserva l'email potrebbe essere partita: tutte le sue
+        fatture restano ferme, anche quella del giorno dopo."""
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        real_commit, state = test_db_session.commit, {"n": 0}
+
+        def commit():
+            state["n"] += 1
+            if state["n"] == 2:   # la scrittura finale, dopo l'invio
+                raise RuntimeError("db giù")
+            return real_commit()
+
+        monkeypatch.setattr(test_db_session, "commit", commit)
+        summary, mailer = _real_round(test_db_session)
+        monkeypatch.setattr(test_db_session, "commit", real_commit)
+        rows = _rows(test_db_session)
+        assert mailer.calls == 1 and summary["sent"] == 0 and summary["failed"] == 1
+        assert {(rows[a.id].status, rows[a.id].error_kind), (rows[b.id].status, rows[b.id].error_kind)} == {("failed", "other")}
+        # Il giorno dopo il giro non la rimanda da sola: decide un operatore.
+        nxt_mailer = FakeMailer()
+        assert run_reminders(test_db_session, due_date=DAY_AFTER, mailer=nxt_mailer, cfg=_real_cfg())["already"] == 1
+        assert nxt_mailer.calls == 0
+
+    def _break_pdf_of(self, monkeypatch, *numbers):
+        from backend.api import recovery
+        original = recovery._build_invoice_pdf
+
+        def flaky(customer, invoice, **kw):
+            if invoice.invoice_number in numbers:
+                raise RuntimeError("carattere non stampabile")
+            return original(customer, invoice, **kw)
+
+        monkeypatch.setattr(recovery, "_build_invoice_pdf", flaky)
+
+    def test_an_invoice_whose_copy_cannot_be_built_does_not_block_the_others(self, test_db_session, monkeypatch):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, TOMORROW)
+        early = _inv(test_db_session, c, "C/1", 30.0, DAY_AFTER)
+        self._break_pdf_of(monkeypatch, "A/1")
+        summary, mailer = _real_round(test_db_session)
+        assert summary["sent"] == 1 and summary["failed"] == 1 and summary["invoices"] == 2 and mailer.calls == 1
+        assert mailer.sent[0]["subject"] == "Promemoria: 2 fatture in scadenza (80,00 €)" and "A/1" not in mailer.sent[0]["text"]
+        rows = _rows(test_db_session)
+        assert (rows[a.id].status, rows[a.id].error_kind, rows[a.id].group_key) == ("failed", "pdf", None)
+        assert rows[b.id].status == rows[early.id].status == "sent" and rows[b.id].group_key == rows[early.id].group_key
+        # Riparata la copia, il giro la riprende da sola (era certamente non partita).
+        monkeypatch.undo()
+        monkeypatch.setattr("backend.engine.format.datetime", _FixedDatetime)
+        monkeypatch.setattr("backend.engine.reminder_email.datetime", _FixedDatetime)
+        again, mailer2 = _real_round(test_db_session)
+        assert again["sent"] == 1 and "A/1" in mailer2.sent[0]["subject"]
+
+    def test_with_only_day_after_invoices_left_nothing_leaves_today(self, test_db_session, monkeypatch):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        self._break_pdf_of(monkeypatch, "A/1")
+        summary, mailer = _real_round(test_db_session)
+        rows = _rows(test_db_session)
+        assert mailer.calls == 0 and summary["failed"] == 1 and summary["merged_early"] == 0
+        assert set(rows) == {a.id} and rows[a.id].error_kind == "pdf" and b.id not in rows
+
+    def test_a_broken_copy_of_the_day_after_invoice_just_leaves_it_for_its_day(self, test_db_session, monkeypatch):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        self._break_pdf_of(monkeypatch, "B/1")
+        summary, mailer = _real_round(test_db_session)
+        assert summary["sent"] == 1 and summary["failed"] == 0 and mailer.sent[0]["subject"].startswith("Promemoria: fattura n. A/1")
+        assert set(_rows(test_db_session)) == {a.id} and b.id
+
+    def test_the_retry_leaves_out_an_invoice_whose_copy_cannot_be_built(self, test_db_session, monkeypatch):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, TOMORROW)
+        first = _Scripted(_timeout())
+        run_reminders(test_db_session, due_date=TOMORROW, mailer=first, cfg=_real_cfg())
+        self._break_pdf_of(monkeypatch, "A/1")
+        mailer = _Scripted()
+        out = retry_row(test_db_session, _rows(test_db_session)[b.id], mailer=mailer, cfg=_real_cfg())
+        assert out["sent"] == 1 and out["invoices"] == 1 and "A/1" not in mailer.sent[0]["text"] and mailer.keys == first.keys
+        rows = _rows(test_db_session)
+        assert (rows[a.id].status, rows[a.id].error_kind) == ("failed", "network")   # intatta: resta un dubbio
+
+    def test_an_interrupted_customer_never_overwrites_rows_that_already_tell_the_truth(self, test_db_session, monkeypatch):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        _real_round(test_db_session)
+        new = _inv(test_db_session, c, "NEW/1", 50.0, TOMORROW)   # arrivata dopo il primo giro
+        monkeypatch.setattr(re_mod, "plan_customer", lambda *args, **kw: (_ for _ in ()).throw(RuntimeError("piano rotto")))
+        summary, mailer = _real_round(test_db_session)
+        rows = _rows(test_db_session)
+        assert summary["broken"] == 1 and mailer.calls == 0
+        assert rows[a.id].status == "sent" and (rows[new.id].status, rows[new.id].error_kind) == ("failed", "other")
