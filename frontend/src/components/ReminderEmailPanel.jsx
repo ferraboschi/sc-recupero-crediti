@@ -70,12 +70,16 @@ export const KIND_LABEL = { promemoria: 'Promemoria', followup: 'Secondo avviso'
 // Una email può riguardare più fatture dello stesso cliente (una riga del
 // registro per fattura). Sotto il numero dice con quali altre fatture ha
 // viaggiato, così due righe non sembrano due email.
+// Il numero come lo legge il cliente: FatturaPro accoda « - Fattura» (o il
+// tipo di documento); nelle note basta il numero.
+export const shortNumber = (number) => String(number || '').replace(/\s*-\s*(fattura|nota di credito|nota di debito)\s*$/i, '')
+
 export function GroupNote({ row }) {
   const others = row.group_invoices || []
   if (others.length === 0) return null
   return (
     <span className="block text-txt-muted font-sans whitespace-normal" data-testid="email-group-note">
-      stessa email di {others.map(m => m.invoice_number).join(', ')}
+      stessa email di {others.map(m => shortNumber(m.invoice_number)).join(', ')}
     </span>
   )
 }
@@ -208,7 +212,7 @@ export default function ReminderEmailPanel() {
     // Non si promette l'elenco: una fattura nel frattempo saldata, o oggi
     // non inviabile, resta fuori dal ritento.
     const which = together.length > 0
-      ? `della fattura ${row.invoice_number} — riparte l'email intera, con le altre sue fatture ancora ferme (erano insieme: ${together.join(', ')})`
+      ? `della fattura ${row.invoice_number} — riparte l'email intera, con le altre sue fatture ancora ferme (erano insieme: ${together.map(shortNumber).join(', ')})`
       : `della fattura ${row.invoice_number}`
     const msg = force
       ? `ATTENZIONE: il promemoria ${which} potrebbe essere GIÀ arrivato al cliente (${row.to_email}), e Resend non fermerebbe più un doppione.\n\nHai controllato su Resend che l'email NON risulta consegnata?\n\nOK = sì, ho controllato: invia comunque.\nAnnulla = non inviare.`
@@ -364,7 +368,7 @@ export default function ReminderEmailPanel() {
                         {p.invoice_number}
                         {(p.group_invoices || []).length > 0 && (
                           <span className="block text-txt-muted font-sans whitespace-normal" data-testid="preview-group-note">
-                            stessa email di {p.group_invoices.join(', ')}
+                            stessa email di {p.group_invoices.map(shortNumber).join(', ')}
                           </span>
                         )}
                       </td>
