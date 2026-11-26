@@ -11,14 +11,15 @@ Una email per CLIENTE (decisione owner 26/11/2026: «non si devono ricevere
 due mail; in caso di scadenze prossime unire le mail e adeguare il testo;
 scadenza prossima significa ± un giorno»): tutte le fatture di un cliente
 che il giro di oggi deve ricordare partono in UN'UNICA email (elenco, totale,
-una copia di cortesia per ciascuna). Nella stessa email entra anche una sua
-fattura che scade il giorno dopo l'ultima scadenza del giro, che così
-l'indomani non riceve un'email a parte. Da sola, quella fattura non fa
-partire nulla: aspetta il suo giorno. «± un giorno» è applicato alla
-lettera, non a catena: tre scadenze in tre giorni di fila producono due
-email (stessa regola del secondo avviso; es. giovedì parte venerdì+sabato,
-venerdì parte domenica). Con una sola fattura l'email è quella di sempre,
-parola per parola.
+una copia di cortesia per ciascuna). Nella stessa email entrano anche le sue
+fatture che scadono nei giorni SUBITO DOPO l'ultima scadenza del giro,
+finché le scadenze sono di fila (il giorno dopo, poi quello dopo ancora…):
+così l'indomani non ricevono un'email a parte. «± un giorno» vale A CATENA
+(decisione owner 26/11/2026: «unite, non diventiamo assillanti»): con
+scadenze venerdì, sabato e domenica, giovedì parte UNA email con tutte e
+tre. La catena si ferma al primo giorno senza una sua fattura pronta. Da
+sole, quelle fatture non fanno partire nulla: aspettano il loro giorno. Con
+una sola fattura l'email è quella di sempre, parola per parola.
 
 Modalità (risolta dalla configurazione, mai implicita):
 - prova  → le email vengono COMPOSTE e REGISTRATE (status prepared) ma non
@@ -574,15 +575,13 @@ def build_group_attachments(customer: Customer, invoices: List[Invoice], overdue
 
 # ── Una email per cliente ─────────────────────────────────────────────
 
-# «Scadenza prossima» = ± un giorno (decisione owner 24/11/2026).
+# «Scadenza prossima» = ± un giorno (decisione owner 24/11/2026), a catena
+# (26/11/2026): dopo l'ultima scadenza del giro si uniscono le scadenze dei
+# giorni di fila.
 NEAR_DUE_DAYS = 1
-
-
-def near_due_date(dates: Iterable[date]) -> Optional[date]:
-    """La scadenza che si può UNIRE alle email del giro: il giorno dopo
-    l'ultima scadenza del giro. Da sola non fa partire nulla."""
-    dates = list(dates)
-    return max(dates) + timedelta(days=NEAR_DUE_DAYS) if dates else None
+# Solo una rete di sicurezza contro un ciclo senza fine: nessuno ha fatture
+# in scadenza per due mesi di fila, un giorno dopo l'altro.
+CHAIN_SAFETY_DAYS = 60
 
 
 def by_customer(invoices: Iterable[Invoice]) -> List[Tuple[int, List[Invoice]]]:
@@ -661,6 +660,22 @@ def _existing_row(session: Session, invoice: Invoice) -> Optional[InvoiceReminde
     )
 
 
+def chain_after(last: date, later: Iterable[Invoice]) -> List[Invoice]:
+    """La catena: delle fatture che scadono DOPO l'ultima scadenza del giro,
+    quelle che si uniscono all'email di oggi — il giorno dopo, poi quello dopo
+    ancora, finché ogni giorno ne ha almeno una. Al primo giorno vuoto la
+    catena si ferma: le altre aspettano il loro giorno."""
+    by_due: Dict[date, List[Invoice]] = {}
+    for inv in later:
+        by_due.setdefault(inv.due_date, []).append(inv)
+    chained: List[Invoice] = []
+    day = last + timedelta(days=NEAR_DUE_DAYS)
+    while day in by_due:
+        chained.extend(by_due[day])
+        day += timedelta(days=NEAR_DUE_DAYS)
+    return chained
+
+
 @dataclass
 class CustomerPlan:
     """Cosa fa il giro di oggi per le fatture di UN cliente."""
@@ -668,7 +683,7 @@ class CustomerPlan:
     # Le fatture dell'UNICA email del cliente (vuoto = nessuna email oggi),
     # nell'ordine dell'elenco.
     email: List[Invoice] = field(default_factory=list)
-    # Tra quelle, le fatture UNITE perché scadono il giorno dopo le scadenze del giro.
+    # Tra quelle, le fatture UNITE perché scadono nei giorni subito dopo le scadenze del giro.
     early_ids: Set[int] = field(default_factory=set)
     # Righe già presenti nel registro, per fattura.
     existing: Dict[int, InvoiceReminderEmail] = field(default_factory=dict)
@@ -687,8 +702,10 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], targets: Iterab
     Una fattura è PRONTA se è ancora da saldare, non ha una riga che blocca
     (già inviata, ferma…) e non ha motivi di esclusione. L'email parte se
     almeno una pronta ha una scadenza DEL GIRO; in quel caso porta con sé
-    anche le pronte che scadono il giorno dopo. Queste, da sole, non
-    producono nulla oggi: né email, né righe, né conteggi.
+    anche le pronte che scadono nei giorni subito dopo, A CATENA: il giorno
+    dopo l'ultima scadenza del giro, poi quello dopo ancora, finché ogni
+    giorno ha almeno una sua fattura pronta. Queste, da sole, non producono
+    nulla oggi: né email, né righe, né conteggi.
 
     Lo stato delle fatture è quello letto ADESSO: una fattura saldata, o
     passata a un altro cliente, a giro in corso esce dal piano.
@@ -696,7 +713,7 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], targets: Iterab
     l'email del cliente non serve.
     """
     targets = set(targets)
-    near = near_due_date(targets)
+    last = max(targets) if targets else None
     invoices = in_email_order(invoices)
     if customer_id is None and invoices:
         customer_id = invoices[0].customer_id
@@ -706,7 +723,7 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], targets: Iterab
         if inv.customer_id is None or inv.customer_id != customer_id:
             continue
         early = inv.due_date not in targets
-        if early and inv.due_date != near:
+        if early and (last is None or inv.due_date is None or inv.due_date <= last):
             continue
         if inv.status in NOT_REMINDABLE_STATUSES or float(inv.amount_due or 0) <= 0:
             continue
@@ -731,8 +748,9 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], targets: Iterab
             continue
         ready.append((inv, early))
     if any(not early for _inv, early in ready):
-        plan.email = [inv for inv, _early in ready]
-        plan.early_ids = {inv.id for inv, early in ready if early}
+        chained = chain_after(last, [inv for inv, early in ready if early])
+        plan.email = in_email_order([inv for inv, early in ready if not early] + chained)
+        plan.early_ids = {inv.id for inv in chained}
     return plan
 
 
@@ -851,11 +869,23 @@ def _item(row: InvoiceReminderEmail, invoice: Invoice, customer: Optional[Custom
 
 def _round_invoices(session: Session, dates: List[date]) -> List[Invoice]:
     """Le fatture che il giro guarda: quelle con una scadenza del giro, più
-    quelle che scadono il giorno dopo (si possono unire all'email di oggi)."""
-    near = near_due_date(dates)
+    quelle degli STESSI clienti che scadono nei giorni subito dopo (si
+    possono unire all'email di oggi, a catena). Si legge un giorno alla
+    volta e ci si ferma al primo giorno in cui nessuno di quei clienti ha
+    una fattura: oltre, nessuna catena può proseguire."""
     out: List[Invoice] = []
-    for due in list(dates) + ([near] if near is not None and near not in dates else []):
+    for due in dates:
         out.extend(candidate_invoices(session, due))
+    if not dates or not out:
+        return out
+    customers = {inv.customer_id for inv in out}
+    day = max(dates)
+    for _ in range(CHAIN_SAFETY_DAYS):
+        day += timedelta(days=NEAR_DUE_DAYS)
+        found = [inv for inv in candidate_invoices(session, day) if inv.customer_id in customers]
+        if not found:
+            break
+        out.extend(found)
     return out
 
 
@@ -886,7 +916,7 @@ def _preview_customer(session: Session, customer_id: int, invoices: List[Invoice
     for inv in in_email_order(invoices):
         early = inv.due_date not in dates
         if early and inv.id not in in_email:
-            continue  # scade il giorno dopo e oggi non parte con nessuna: aspetta il suo giorno
+            continue  # scade dopo le scadenze del giro e oggi non parte con nessuna: aspetta il suo giorno
         customer = inv.customer
         existing = plan.existing.get(inv.id) or _existing_row(session, inv)
         reason = skip_reason(inv, customer)
@@ -914,7 +944,7 @@ def _preview_customer(session: Session, customer_id: int, invoices: List[Invoice
             "text": None,
             # Una email per cliente: quante fatture porta l'email di questa
             # fattura, quali sono le altre, e se questa è unita in anticipo
-            # (scade il giorno dopo le scadenze del giro).
+            # (scade nei giorni subito dopo le scadenze del giro).
             "group_size": 1,
             "group_invoices": [],
             "merged_early": False,
@@ -1256,8 +1286,8 @@ def _mark_unexpected(session: Session, facts: List[tuple], mode: str, carried: O
       `failed/not_attempted`, visibile, e il giro la riprova da solo; le
       fatture della stessa email restano legate (`group`), così anche un
       «Riprova» le rimanda in un'unica email. Per una fattura unita perché
-      scade il giorno dopo (`early_ids`) non si scrive nulla: il suo giorno
-      è domani."""
+      scade dopo le scadenze del giro (`early_ids`) non si scrive nulla: il
+      suo giorno deve ancora venire."""
     early_ids = set(early_ids)
     several = sum(1 for f in facts if f[0] not in early_ids) > 1
     try:
@@ -1404,9 +1434,14 @@ def _run_customer(session: Session, customer_id: int, invoices: List[Invoice], d
         broken = _broken_copies(plan.customer, email)
         if broken:
             broken_ids = {inv.id for inv, _error in broken}
-            email = [inv for inv in email if inv.id not in broken_ids]
-            if not any(inv.id not in plan.early_ids for inv in email):
-                email = []   # restano solo fatture «del giorno dopo»: aspettano il loro giorno
+            good = [inv for inv in email if inv.id not in broken_ids]
+            of_round = [inv for inv in good if inv.id not in plan.early_ids]
+            # Senza fatture del giro non parte nulla (le altre aspettano il
+            # loro giorno); e la catena si rifà sulle rimaste: una copia
+            # non generabile è un giorno vuoto, oltre non si prosegue.
+            email = in_email_order(
+                of_round + chain_after(max(dates), [inv for inv in good if inv.id in plan.early_ids])
+            ) if of_round else []
     if email:
         # Nessun dubbio ereditato: il giro rilavora solo righe che certamente
         # non erano partite (needs_processing lascia ferme le incerte).
@@ -1494,7 +1529,7 @@ def run_reminders(
         summary["due_dates"] = [d.isoformat() for d in dates]
         # Una email per cliente: `sent`/`prepared`/`failed` contano le EMAIL,
         # `invoices` le fatture dentro quelle inviate o preparate,
-        # `merged_early` quelle unite perché scadono il giorno dopo.
+        # `merged_early` quelle unite perché scadono nei giorni subito dopo.
         summary.update({"invoices": 0, "merged_early": 0, "broken": 0})
         today = italian_today(now_utc)
         try:

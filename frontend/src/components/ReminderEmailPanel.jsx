@@ -179,7 +179,7 @@ export default function ReminderEmailPanel() {
     const early = toSend.filter(p => p.merged_early).length
     const dates = (fresh.target_due_dates || []).map(fmtDate).join(', ')
     const msg = fresh.mode === 'reale'
-      ? `Invio ADESSO ${plural(emails, 'email', 'email')} AI CLIENTI (una per cliente) per ${n} fattur${n === 1 ? 'a' : 'e'} in scadenza il ${dates}${early ? ` (${early} unit${early === 1 ? 'a' : 'e'} perché scad${early === 1 ? 'e' : 'ono'} il giorno dopo)` : ''}${(fresh.cc_effective || []).length ? `, con copia a ${fresh.cc_effective.join(', ')}` : ''}${Object.keys(fresh.agent_emails || {}).length ? ' e al commerciale del cliente' : ''}. Procedere?`
+      ? `Invio ADESSO ${plural(emails, 'email', 'email')} AI CLIENTI (una per cliente) per ${n} fattur${n === 1 ? 'a' : 'e'} in scadenza il ${dates}${early ? ` (${early} unit${early === 1 ? 'a' : 'e'} perché scad${early === 1 ? 'e' : 'ono'} nei giorni subito dopo)` : ''}${(fresh.cc_effective || []).length ? `, con copia a ${fresh.cc_effective.join(', ')}` : ''}${Object.keys(fresh.agent_emails || {}).length ? ' e al commerciale del cliente' : ''}. Procedere?`
       : fresh.mode === 'test'
         ? `Invio ${emails} email di prova a ${fresh.test_to} (i clienti non ricevono nulla). Procedere?`
         : `Modalità prova: preparo e registro ${emails} email senza inviarle. Procedere?`
@@ -293,7 +293,7 @@ export default function ReminderEmailPanel() {
       {/* Configurazione */}
       <div className="px-6 py-4 border-b border-dark-border text-sm space-y-2">
         <p className="text-txt-secondary">
-          Per le fatture non pagate in scadenza domani il cliente riceve una email con la copia di cortesia di ciascuna e, se ha scadute non saldate, il riepilogo con il totale. Una email per cliente: le sue fatture in scadenza partono insieme, compresa una che scade il giorno dopo.
+          Per le fatture non pagate in scadenza domani il cliente riceve una email con la copia di cortesia di ciascuna e, se ha scadute non saldate, il riepilogo con il totale. Una email per cliente: le sue fatture in scadenza partono insieme, comprese quelle che scadono nei giorni subito dopo, finché le scadenze sono di fila.
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs">
           <p><span className="text-txt-muted">Mittente:</span> <span className="text-txt-primary">{data.sender || '—'}</span></p>
@@ -374,7 +374,7 @@ export default function ReminderEmailPanel() {
                       </td>
                       <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap">
                         {p.due_label || fmtDate(p.due_date)}
-                        {p.merged_early && <span className="block text-txt-muted whitespace-normal">unita: scade il giorno dopo le scadenze del giro</span>}
+                        {p.merged_early && <span className="block text-txt-muted whitespace-normal">unita: scadenza di fila con quelle del giro</span>}
                       </td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(p.amount_due)}</td>
                       <td className="py-2 pr-3 text-right text-txt-secondary">{p.overdue_count > 0 ? `${p.overdue_count} · ${fmtEur(p.overdue_total)}` : '—'}</td>

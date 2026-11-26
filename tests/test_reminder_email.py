@@ -2834,3 +2834,152 @@ class TestOneEmailPerCustomerOnlyItsOwnRows:
         assert rows[a.id].subject is None and rows[a.id].group_key == rows[b.id].group_key
         again, mailer2 = _real_round(test_db_session)
         assert again["sent"] == 1 and again["invoices"] == 2 and mailer2.calls == 1
+
+
+class TestOneEmailPerCustomerChain:
+    """Decisione owner 26/11/2026: «unite, non diventiamo assillanti» — le
+    scadenze in giorni di fila partono in UNA email, a catena."""
+
+    D13 = date(2026, 11, 13)
+    D14 = date(2026, 11, 14)
+
+    def test_three_due_dates_in_a_row_make_one_email(self, test_db_session):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        d = _inv(test_db_session, c, "D/1", 25.0, self.D13)
+        summary, mailer = _real_round(test_db_session)
+        assert summary["candidates"] == 1 and summary["sent"] == 1 and summary["invoices"] == 3
+        assert summary["merged_early"] == 2 and mailer.calls == 1
+        text = mailer.sent[0]["text"]
+        assert "- n. A/1 di 100,00 €, scade domani, mercoledì 11/11/2026" in text
+        assert "- n. B/1 di 50,00 €, scade giovedì 12/11/2026" in text
+        assert "- n. D/1 di 25,00 €, scade venerdì 13/11/2026" in text
+        assert mailer.sent[0]["subject"] == "Promemoria: 3 fatture in scadenza (175,00 €)"
+        rows = _rows(test_db_session)
+        assert {rows[i.id].status for i in (a, b, d)} == {"sent"} and len({r.group_key for r in rows.values()}) == 1
+        # Nei due giorni dopo nessuna email a parte.
+        for day, due in ((11, DAY_AFTER), (12, self.D13)):
+            mailer2 = FakeMailer()
+            nxt = run_reminders(test_db_session, now_utc=datetime(2026, 11, day, 10, tzinfo=timezone.utc), mailer=mailer2,
+                                cfg=_real_cfg())
+            assert nxt["due_dates"] == [due.isoformat()] and nxt["already"] == 1 and mailer2.calls == 0
+
+    def test_a_day_without_invoices_breaks_the_chain(self, test_db_session):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        far = _inv(test_db_session, c, "D/1", 25.0, self.D13)   # il 12 non c'è nulla: non è «di fila»
+        summary, mailer = _real_round(test_db_session)
+        assert summary["invoices"] == 1 and summary["merged_early"] == 0
+        assert mailer.sent[0]["subject"].startswith("Promemoria: fattura n. A/1")
+        assert set(_rows(test_db_session)) == {a.id} and far.id
+
+    def test_an_excluded_invoice_in_the_middle_breaks_the_chain(self, test_db_session):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER, due_date_source="assumed")
+        _inv(test_db_session, c, "D/1", 25.0, self.D13)
+        summary, mailer = _real_round(test_db_session)
+        assert summary["invoices"] == 1 and summary["merged_early"] == 0 and summary["skipped"] == 0
+        assert set(_rows(test_db_session)) == {a.id}   # per le altre oggi non si scrive nulla
+
+    def test_the_chain_takes_every_invoice_of_each_day(self, test_db_session):
+        c = _cust(test_db_session)
+        _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        _inv(test_db_session, c, "B/2", 60.0, DAY_AFTER)
+        _inv(test_db_session, c, "D/1", 25.0, self.D13)
+        _inv(test_db_session, c, "E/1", 10.0, self.D14)
+        summary, mailer = _real_round(test_db_session)
+        assert summary["sent"] == 1 and summary["invoices"] == 5 and summary["merged_early"] == 4
+        assert "indicando nella causale i numeri delle fatture." in mailer.sent[0]["text"]
+        assert [name for name, _ in mailer.sent[0]["attachments"]] == [
+            f"copia_cortesia_fattura_{n}.pdf" for n in ("A_1", "B_1", "B_2", "D_1", "E_1")]
+
+    def test_the_chain_never_starts_without_an_invoice_of_the_round(self, test_db_session):
+        c = _cust(test_db_session)
+        _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        _inv(test_db_session, c, "D/1", 25.0, self.D13)
+        summary, mailer = _real_round(test_db_session)
+        assert summary["candidates"] == 0 and mailer.calls == 0 and _rows(test_db_session) == {}
+        assert preview(test_db_session, due_date=TOMORROW, mode=MODE_REALE, cfg=_real_cfg()) == []
+
+    def test_the_chain_of_one_customer_does_not_pull_another_customer(self, test_db_session):
+        c = _cust(test_db_session)
+        other = _cust(test_db_session, "Altro Srl", "info@altro.it", partita_iva="01234567897")
+        _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        _inv(test_db_session, other, "X/1", 70.0, TOMORROW)
+        _inv(test_db_session, other, "X/3", 30.0, self.D13)   # per lui il 12 non c'è nulla
+        summary, mailer = _real_round(test_db_session)
+        by_to = {m["to"][0]: m for m in mailer.sent}
+        assert summary["sent"] == 2 and summary["invoices"] == 3
+        assert "B/1" in by_to["amministrazione@shabu.it"]["text"]
+        assert by_to["info@altro.it"]["subject"].startswith("Promemoria: fattura n. X/1")
+
+    def test_thursday_takes_the_whole_weekend_and_friday_sends_nothing(self, test_db_session):
+        """Il caso dell'owner: venerdì, sabato, domenica (e lunedì). Giovedì
+        parte UNA email con tutte; venerdì il giro non manda più nulla."""
+        c = _cust(test_db_session)
+        for num, day in (("VEN/1", 13), ("SAB/1", 14), ("DOM/1", 15), ("LUN/1", 16)):
+            _inv(test_db_session, c, num, 10.0, date(2026, 11, day))
+        thursday = datetime(2026, 11, 12, 10, tzinfo=timezone.utc)
+        mailer = FakeMailer()
+        thu = run_reminders(test_db_session, now_utc=thursday, mailer=mailer, cfg=_real_cfg())
+        assert thu["due_dates"] == ["2026-11-13"] and thu["sent"] == 1 and thu["invoices"] == 4
+        for num in ("VEN/1", "SAB/1", "DOM/1", "LUN/1"):
+            assert f"- n. {num} di" in mailer.sent[0]["text"]
+        friday = datetime(2026, 11, 13, 10, tzinfo=timezone.utc)
+        fri = run_reminders(test_db_session, now_utc=friday, mailer=mailer, cfg=_real_cfg())
+        assert fri["due_dates"] == ["2026-11-14", "2026-11-15", "2026-11-16"]
+        assert fri["already"] == 3 and fri["sent"] == 0 and len(mailer.sent) == 1
+
+    def test_the_preview_marks_every_chained_invoice(self, test_db_session):
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        b = _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        d = _inv(test_db_session, c, "D/1", 25.0, self.D13)
+        items = {e["invoice_id"]: e for e in preview(test_db_session, due_date=TOMORROW, mode=MODE_REALE, cfg=_real_cfg())}
+        assert [items[i.id]["merged_early"] for i in (a, b, d)] == [False, True, True]
+        assert items[d.id]["group_size"] == 3 and items[d.id]["due_label"] == "venerdì 13/11/2026"
+        _summary, mailer = _real_round(test_db_session)
+        assert {(e["subject"], e["text"]) for e in items.values()} == {(mailer.sent[0]["subject"], mailer.sent[0]["text"])}
+
+    def test_the_round_reads_only_the_days_a_chain_can_reach(self, test_db_session):
+        c = _cust(test_db_session)
+        _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        lonely = _cust(test_db_session, "Altro Srl", "info@altro.it", partita_iva="01234567897")
+        _inv(test_db_session, lonely, "X/2", 70.0, DAY_AFTER)    # nessuna fattura del giro: non lo riguarda
+        _inv(test_db_session, c, "Z/1", 5.0, date(2026, 11, 20))  # oltre il buco: non letta
+        loaded = {inv.invoice_number for inv in re_mod._round_invoices(test_db_session, [TOMORROW])}
+        assert loaded == {"A/1", "B/1"}
+
+
+class TestOneEmailPerCustomerChainAndBrokenCopies:
+    def test_a_copy_that_cannot_be_built_is_an_empty_day_for_the_chain(self, test_db_session, monkeypatch):
+        """La copia della fattura «in mezzo» non si genera: la catena si ferma
+        lì — quelle dei giorni dopo aspettano il loro giorno, senza righe."""
+        from backend.api import recovery
+        c = _cust(test_db_session)
+        a = _inv(test_db_session, c, "A/1", 100.0, TOMORROW)
+        _inv(test_db_session, c, "B/1", 50.0, DAY_AFTER)
+        _inv(test_db_session, c, "D/1", 25.0, date(2026, 11, 13))
+        original = recovery._build_invoice_pdf
+
+        def flaky(customer, invoice, **kw):
+            if invoice.invoice_number == "B/1":
+                raise RuntimeError("carattere non stampabile")
+            return original(customer, invoice, **kw)
+
+        monkeypatch.setattr(recovery, "_build_invoice_pdf", flaky)
+        summary, mailer = _real_round(test_db_session)
+        assert summary["sent"] == 1 and summary["invoices"] == 1 and summary["merged_early"] == 0 and summary["failed"] == 0
+        assert mailer.sent[0]["subject"].startswith("Promemoria: fattura n. A/1")
+        assert set(_rows(test_db_session)) == {a.id}
+
+    def test_chain_after_stops_at_the_first_empty_day(self):
+        inv = lambda n, day: SimpleNamespace(id=n, due_date=date(2026, 11, day))  # noqa: E731
+        later = [inv(1, 12), inv(2, 12), inv(3, 13), inv(4, 15)]
+        assert [i.id for i in re_mod.chain_after(TOMORROW, later)] == [1, 2, 3]
+        assert re_mod.chain_after(TOMORROW, [inv(5, 13)]) == [] and re_mod.chain_after(TOMORROW, []) == []
