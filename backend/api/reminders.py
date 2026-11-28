@@ -21,8 +21,8 @@ from backend.engine.agents import agents_of
 from backend.connectors.resend_mail import MailSendError
 from backend.engine.reminder_email import (
     AUTO_RETRY_KINDS, MODE_LABELS, MODE_REALE, SKIP_LABELS, ModeMismatch, NotFound, ReminderBusy, agent_emails,
-    build_attachments, carbon_copies, needs_confirmation, normalize_email, overdue_invoices, preview, resolve_mode,
-    retry_row, run_reminders, send_test, target_due_dates,
+    build_group_attachments, carbon_copies, group_members, needs_confirmation, normalize_email, overdue_invoices,
+    preview, resolve_mode, retry_row, row_invoices, run_reminders, send_test, target_due_dates,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,8 +46,8 @@ class RunBody(BaseModel):
 def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], kind: str = "promemoria",
                groups: Optional[dict] = None) -> dict:
     """Una riga del registro (promemoria o secondo avviso: stesse colonne).
-    `groups` (solo secondo avviso): le fatture della stessa email, per
-    `group_key` — una email con più fatture ha una riga per fattura."""
+    `groups`: le fatture della stessa email, per `group_key` — una email con
+    più fatture ha una riga per fattura."""
     group_key = getattr(row, "group_key", None)
     members = (groups or {}).get(group_key) or [] if group_key else []
     is_followup = kind == followup.KIND_KEY
@@ -78,9 +78,15 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
         "error_kind": row.error_kind,
         # Ferma finché un operatore non preme «Riprova»? (secondo avviso: anche
         # «nessun invio tentato» si ritenta da solo)
+        # Promemoria: ciò che certamente non è partito lo riprende un giro,
+        # ma solo nel giorno di giro di quella scadenza — dopo, nessun giro la
+        # guarda più: resta ferma finché non la riprende un operatore.
         "needs_manual_retry": flags["needs_manual_retry"] if is_followup else (
             row.status == "sending" or (
-                row.status == "failed" and (row.error_kind or "other") not in AUTO_RETRY_KINDS
+                row.status == "failed" and not (
+                    (row.error_kind or "other") in AUTO_RETRY_KINDS
+                    and email_status.reminder_round_day(row.due_date, followup.italian_today()) is not None
+                )
             )
         ),
         # «Riprova» può creare un doppione che Resend non fermerebbe (dopo un
@@ -96,8 +102,8 @@ def _serialize(row, invoice: Optional[Invoice], customer: Optional[Customer], ki
         "attempted_at": row.attempted_at.isoformat() if row.attempted_at else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "sent_at": row.sent_at.isoformat() if row.sent_at else None,
-        # Email unica per più fatture dello stesso cliente (secondo avviso):
-        # le ALTRE fatture della stessa email.
+        # Email unica per più fatture dello stesso cliente: le ALTRE fatture
+        # della stessa email.
         "group_key": group_key,
         "group_size": max(len(members), 1),
         "group_invoices": [m for m in members if m["row_id"] != row.id],
@@ -183,6 +189,7 @@ def reminder_email_status(
         .all()
     )
     rows = [found for found in stuck if found[0].id not in listed] + rows
+    groups = group_members(session, [r for r, _i, _c in rows])
     return {
         "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),
@@ -204,7 +211,7 @@ def reminder_email_status(
         "target_due_dates": [d.isoformat() for d in dates],
         "weekend": not dates,
         "preview": preview(session, due_dates=dates, mode=mode) if dates else [],
-        "recent": [_serialize(r, i, c) for r, i, c in rows],
+        "recent": [_serialize(r, i, c, groups=groups) for r, i, c in rows],
     }
 
 
@@ -269,7 +276,8 @@ def reminder_email_log(
             if customer_id is not None:
                 query = query.filter(model.customer_id == customer_id)
             rows = query.order_by(model.created_at.desc(), model.id.desc()).limit(limit).all()
-            groups = followup.group_members(session, [r for r, _i, _c in rows]) if kind == followup.KIND_KEY else None
+            members = followup.group_members if kind == followup.KIND_KEY else group_members
+            groups = members(session, [r for r, _i, _c in rows])
             items.extend(_serialize(r, i, c, kind, groups) for r, i, c in rows)
         except Exception as e:
             if kind != followup.KIND_KEY:
@@ -309,30 +317,49 @@ def reminder_email_detail(row_id: int, session: Session = Depends(get_session)):
     if not found:
         raise HTTPException(status_code=404, detail="Promemoria non trovato")
     row, invoice, customer = found
-    data = _serialize(row, invoice, customer)
+    data = _serialize(row, invoice, customer, groups=group_members(session, [row]))
     data["body_text"] = row.body_text
     return data
 
 
 @router.get("/email/{row_id}/attachments/{index}")
 def reminder_email_attachment(row_id: int, index: int, session: Session = Depends(get_session)):
-    """Rigenera l'allegato n-esimo (0 = copia di cortesia, 1 = riepilogo
-    scadute) dai dati attuali, per controllo: può differire da quello
-    inviato se nel frattempo le scadute sono cambiate."""
+    """Rigenera l'allegato n-esimo (una copia di cortesia per ogni fattura
+    dell'email, poi il riepilogo delle scadute) dai dati attuali, per
+    controllo: può differire da quello inviato se nel frattempo le scadute
+    sono cambiate."""
     found = _rows_query(session).filter(InvoiceReminderEmail.id == row_id).first()
     if not found:
         raise HTTPException(status_code=404, detail="Promemoria non trovato")
     row, invoice, customer = found
     if invoice is None or customer is None:
         raise HTTPException(status_code=404, detail="Fattura o cliente non più disponibili")
-    overdue = overdue_invoices(session, customer.id, exclude_id=invoice.id)
-    attachments = build_attachments(customer, invoice, overdue)
-    if index < 0 or index >= len(attachments):
-        raise HTTPException(
-            status_code=404,
-            detail="Allegato non più disponibile: viene rigenerato dai dati attuali e le scadute sono cambiate",
-        )
-    name, content = attachments[index]
+    gone = HTTPException(
+        status_code=404,
+        detail="Allegato non più disponibile: viene rigenerato dai dati attuali e le scadute sono cambiate",
+    )
+    invoices = row_invoices(session, row) or [invoice]
+    overdue = overdue_invoices(session, customer.id, exclude_ids=[inv.id for inv in invoices])
+    attachments = build_group_attachments(customer, invoices, overdue)
+    stored = row.attachments_json or []
+    if index < 0:
+        raise gone
+    if row.group_key and stored:
+        # Email con più fatture: l'allegato si cerca per NOME (quello
+        # registrato all'invio), mai per posizione — se nel frattempo
+        # l'insieme è cambiato (fattura pagata, passata a un altro cliente,
+        # scheda unita) non si consegna un altro documento sotto il nome di
+        # questo.
+        if index >= len(stored):
+            raise gone
+        match = next(((n, c) for n, c in attachments if n == stored[index]), None)
+        if match is None:
+            raise gone
+        name, content = match
+    else:
+        if index >= len(attachments):
+            raise gone
+        name, content = attachments[index]
     return StreamingResponse(
         BytesIO(content),
         media_type="application/pdf",

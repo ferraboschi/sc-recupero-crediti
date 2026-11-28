@@ -334,8 +334,9 @@ class InvoiceReminderEmail(Base):
     `failed` vengono ritentate). Le esclusioni restano registrate con il
     motivo (`skipped`): nessun dato scartato in silenzio.
 
-    Tabella NUOVA: la crea create_all (nessuna ALTER); la RLS la copre perché
-    derivata dai modelli.
+    La tabella la crea create_all; le colonne aggiunte dopo (tipo di errore,
+    copie, chiavi dell'email unica) arrivano all'avvio con le ALTER di
+    _run_migrations. La RLS la copre perché derivata dai modelli.
     """
     __tablename__ = "invoice_reminder_emails"
     __table_args__ = (
@@ -364,6 +365,11 @@ class InvoiceReminderEmail(Base):
     attempted_at = Column(DateTime, nullable=True)               # ultimo tentativo di invio
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     sent_at = Column(DateTime, nullable=True)
+    # Una email per cliente (decisione owner 26/11/2026): le fatture della
+    # stessa email hanno una riga ciascuna e lo stesso `group_key` (vuoto per
+    # un'email con una fattura sola, e per le righe nate prima).
+    group_key = Column(String, nullable=True, index=True)
+    idempotency_key = Column(String, nullable=True)              # chiave usata verso Resend nell'ultimo tentativo
 
 
 class InvoiceFollowupEmail(Base):
@@ -592,6 +598,13 @@ def _run_migrations(engine):
         "ALTER TABLE invoice_reminder_emails ADD COLUMN error_kind VARCHAR",
         "ALTER TABLE invoice_reminder_emails ADD COLUMN attempted_at TIMESTAMP",
         "ALTER TABLE invoice_reminder_emails ADD COLUMN cc_json JSON",
+        # Promemoria: una email per cliente (26/11/2026) — le righe della
+        # stessa email e la chiave usata verso Resend. SERVONO in produzione:
+        # la tabella esiste già, queste colonne no.
+        "ALTER TABLE invoice_reminder_emails ADD COLUMN group_key VARCHAR",
+        "ALTER TABLE invoice_reminder_emails ADD COLUMN idempotency_key VARCHAR",
+        "CREATE INDEX IF NOT EXISTS ix_invoice_reminder_emails_group_key "
+        "ON invoice_reminder_emails (group_key)",
         # Secondo avviso: chiave dell'email unica per cliente (la tabella
         # nuova nasce già completa da create_all; qui per i DB locali creati
         # con la prima stesura).

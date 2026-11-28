@@ -67,18 +67,28 @@ export async function errorDetail(e) {
 export const rowPath = (row) => `/reminders/${row.kind === 'followup' ? 'followup' : 'email'}/${row.id}`
 export const KIND_LABEL = { promemoria: 'Promemoria', followup: 'Secondo avviso' }
 
-// Secondo avviso: una email può riguardare più fatture dello stesso cliente
-// (una riga del registro per fattura). Sotto il numero dice con quali altre
-// fatture ha viaggiato, così due righe non sembrano due email.
+// Una email può riguardare più fatture dello stesso cliente (una riga del
+// registro per fattura). Sotto il numero dice con quali altre fatture ha
+// viaggiato, così due righe non sembrano due email.
+// Il numero come lo legge il cliente: FatturaPro accoda « - Fattura» (o il
+// tipo di documento); nelle note basta il numero.
+export const shortNumber = (number) => String(number || '').replace(/\s*-\s*(fattura|nota di credito|nota di debito)\s*$/i, '')
+
 export function GroupNote({ row }) {
   const others = row.group_invoices || []
   if (others.length === 0) return null
   return (
     <span className="block text-txt-muted font-sans whitespace-normal" data-testid="email-group-note">
-      stessa email di {others.map(m => m.invoice_number).join(', ')}
+      stessa email di {others.map(m => shortNumber(m.invoice_number)).join(', ')}
     </span>
   )
 }
+
+// Quante EMAIL sono le voci date dell'anteprima: una per cliente (le fatture
+// dello stesso cliente partono insieme).
+export const emailCount = (entries) => new Set((entries || []).map(p => p.customer_id)).size
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`
 
 export function Attachments({ row }) {
   const [busy, setBusy] = useState(null)
@@ -165,12 +175,14 @@ export default function ReminderEmailPanel() {
     if (!fresh) return
     const toSend = (fresh.preview || []).filter(p => p.will_process)
     const n = toSend.length
+    const emails = emailCount(toSend)
+    const early = toSend.filter(p => p.merged_early).length
     const dates = (fresh.target_due_dates || []).map(fmtDate).join(', ')
     const msg = fresh.mode === 'reale'
-      ? `Invio ADESSO le email AI CLIENTI per ${n} fattur${n === 1 ? 'a' : 'e'} in scadenza il ${dates}${(fresh.cc_effective || []).length ? `, con copia a ${fresh.cc_effective.join(', ')}` : ''}${Object.keys(fresh.agent_emails || {}).length ? ' e al commerciale del cliente' : ''}. Procedere?`
+      ? `Invio ADESSO ${plural(emails, 'email', 'email')} AI CLIENTI (una per cliente) per ${n} fattur${n === 1 ? 'a' : 'e'} in scadenza il ${dates}${early ? ` (${early} unit${early === 1 ? 'a' : 'e'} perché scad${early === 1 ? 'e' : 'ono'} nei giorni subito dopo)` : ''}${(fresh.cc_effective || []).length ? `, con copia a ${fresh.cc_effective.join(', ')}` : ''}${Object.keys(fresh.agent_emails || {}).length ? ' e al commerciale del cliente' : ''}. Procedere?`
       : fresh.mode === 'test'
-        ? `Invio ${n} email di prova a ${fresh.test_to} (i clienti non ricevono nulla). Procedere?`
-        : `Modalità prova: preparo e registro ${n} email senza inviarle. Procedere?`
+        ? `Invio ${emails} email di prova a ${fresh.test_to} (i clienti non ricevono nulla). Procedere?`
+        : `Modalità prova: preparo e registro ${emails} email senza inviarle. Procedere?`
     if (!window.confirm(msg)) return
     setRunning(true)
     setRunResult(null)
@@ -194,13 +206,21 @@ export default function ReminderEmailPanel() {
     // parte solo con la conferma di chi ha controllato che NON è arrivata.
     const current = (fresh.recent || []).find(r => r.id === row.id) || row
     const force = fresh.mode === 'reale' && !!current.retry_needs_confirmation
+    // Una email per cliente: «Riprova» rimanda l'email INTERA, con le altre
+    // fatture della stessa email ancora ferme.
+    const together = (current.group_invoices || []).map(m => m.invoice_number)
+    // Non si promette l'elenco: una fattura nel frattempo saldata, o oggi
+    // non inviabile, resta fuori dal ritento.
+    const which = together.length > 0
+      ? `della fattura ${row.invoice_number} — riparte l'email intera, con le altre sue fatture ancora ferme (erano insieme: ${together.map(shortNumber).join(', ')})`
+      : `della fattura ${row.invoice_number}`
     const msg = force
-      ? `ATTENZIONE: il promemoria della fattura ${row.invoice_number} potrebbe essere GIÀ arrivato al cliente (${row.to_email}), e Resend non fermerebbe più un doppione.\n\nHai controllato su Resend che l'email NON risulta consegnata?\n\nOK = sì, ho controllato: invia comunque.\nAnnulla = non inviare.`
+      ? `ATTENZIONE: il promemoria ${which} potrebbe essere GIÀ arrivato al cliente (${row.to_email}), e Resend non fermerebbe più un doppione.\n\nHai controllato su Resend che l'email NON risulta consegnata?\n\nOK = sì, ho controllato: invia comunque.\nAnnulla = non inviare.`
       : fresh.mode === 'reale'
-      ? `Ritento ADESSO l'invio AL CLIENTE (${row.to_email}) della fattura ${row.invoice_number}.\n\nSe l'invio precedente fosse in realtà arrivato, Resend lo riconosce e non lo rimanda (vale per 24 ore).\n\nProcedere?`
+      ? `Ritento ADESSO l'invio AL CLIENTE (${row.to_email}) ${which}.\n\nSe l'invio precedente fosse in realtà arrivato, Resend lo riconosce e non lo rimanda (vale per 24 ore).\n\nProcedere?`
       : fresh.mode === 'test'
-        ? `Ritento l'invio di prova a ${fresh.test_to} per la fattura ${row.invoice_number}. Procedere?`
-        : `Modalità prova: preparo di nuovo il promemoria della fattura ${row.invoice_number} senza inviarlo. Procedere?`
+        ? `Ritento l'invio di prova a ${fresh.test_to} ${which}. Procedere?`
+        : `Modalità prova: preparo di nuovo il promemoria ${which} senza inviarlo. Procedere?`
     if (!window.confirm(msg)) return
     setRetryingId(row.id)
     setRunResult(null)
@@ -223,7 +243,8 @@ export default function ReminderEmailPanel() {
     setRunResult(null)
     try {
       const res = await client.post('/reminders/email/test', { invoice_id: p.invoice_id, to }, { noRetry: true, timeout: 120000 })
-      setRunResult({ info: `Prova inviata a ${res.data.sent_to} (${res.data.attachments.length} allegati). In reale andrebbe in copia a: ${(res.data.would_cc || []).join(', ') || 'nessuno'}.` })
+      const together = (res.data.invoices || []).length
+      setRunResult({ info: `Prova inviata a ${res.data.sent_to} (${together > 1 ? `email unica per ${together} fatture, ` : ''}${res.data.attachments.length} allegati). In reale andrebbe in copia a: ${(res.data.would_cc || []).join(', ') || 'nessuno'}.` })
     } catch (e) {
       setRunResult({ error: e.response?.data?.detail || e.message })
     } finally {
@@ -272,7 +293,7 @@ export default function ReminderEmailPanel() {
       {/* Configurazione */}
       <div className="px-6 py-4 border-b border-dark-border text-sm space-y-2">
         <p className="text-txt-secondary">
-          Per ogni fattura non pagata in scadenza domani il cliente riceve una email con la copia di cortesia della fattura e, se ha scadute non saldate, il riepilogo con il totale. Una email per fattura.
+          Per le fatture non pagate in scadenza domani il cliente riceve una email con la copia di cortesia di ciascuna e, se ha scadute non saldate, il riepilogo con il totale. Una email per cliente: le sue fatture in scadenza partono insieme, comprese quelle che scadono nei giorni subito dopo, finché le scadenze sono di fila.
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs">
           <p><span className="text-txt-muted">Mittente:</span> <span className="text-txt-primary">{data.sender || '—'}</span></p>
@@ -303,7 +324,7 @@ export default function ReminderEmailPanel() {
           <div className="flex items-center gap-3 flex-wrap min-h-[2rem]">
             <p className="text-sm font-semibold text-txt-primary">
               {data.weekend ? 'Weekend: nessun promemoria oggi' : `Prossimo giro: ${preview.length === 0 ? 'nessuna fattura' : `${preview.length} fattur${preview.length === 1 ? 'a' : 'e'}`}`}
-              {preview.length > 0 && <span className="text-txt-muted font-normal"> · {toSend.length} da lavorare</span>}
+              {preview.length > 0 && <span className="text-txt-muted font-normal"> · {toSend.length} da lavorare{toSend.length > 0 ? ` in ${plural(emailCount(toSend), 'email', 'email')}` : ''}</span>}
             </p>
             {runResult && (
               <span className={`text-xs ${runResult.error ? 'text-accent-red' : 'text-txt-secondary'}`} role="status">
@@ -311,7 +332,7 @@ export default function ReminderEmailPanel() {
                   ? `Errore: ${runResult.error}`
                   : runResult.info
                     ? runResult.info
-                    : `Esito: ${runResult.sent} inviate · ${runResult.prepared} preparate · ${runResult.skipped} saltate · ${runResult.failed} errori · ${runResult.already} non lavorate`}
+                    : `Esito: email inviate ${runResult.sent} · preparate ${runResult.prepared}${runResult.invoices > 0 ? ` (${plural(runResult.invoices, 'fattura', 'fatture')} in tutto)` : ''} · email con errore ${runResult.failed} · fatture saltate ${runResult.skipped} · fatture non lavorate ${runResult.already}${runResult.broken > 0 ? ` · ATTENZIONE: giro interrotto per ${plural(runResult.broken, 'cliente', 'clienti')} (vedi le righe «Errore» qui sotto)` : ''}${runResult.unexpected ? ` · errore imprevisto: ${runResult.unexpected}` : ''}`}
               </span>
             )}
           </div>
@@ -343,8 +364,18 @@ export default function ReminderEmailPanel() {
                         {p.cc && p.cc.length > 0 && <span className="block text-xs text-txt-muted">cc: {p.cc.join(', ')}</span>}
                         {(!p.cc || p.cc.length === 0) && p.would_cc && p.would_cc.length > 0 && <span className="block text-xs text-txt-muted">in reale cc: {p.would_cc.join(', ')}</span>}
                       </td>
-                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary">{p.invoice_number}</td>
-                      <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap">{p.due_label || fmtDate(p.due_date)}</td>
+                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary">
+                        {p.invoice_number}
+                        {(p.group_invoices || []).length > 0 && (
+                          <span className="block text-txt-muted font-sans whitespace-normal" data-testid="preview-group-note">
+                            stessa email di {p.group_invoices.map(shortNumber).join(', ')}
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2 pr-3 text-xs text-txt-secondary whitespace-nowrap">
+                        {p.due_label || fmtDate(p.due_date)}
+                        {p.merged_early && <span className="block text-txt-muted whitespace-normal">unita: scadenza di fila con quelle del giro</span>}
+                      </td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(p.amount_due)}</td>
                       <td className="py-2 pr-3 text-right text-txt-secondary">{p.overdue_count > 0 ? `${p.overdue_count} · ${fmtEur(p.overdue_total)}` : '—'}</td>
                       <td className="py-2 pr-3">
@@ -387,7 +418,7 @@ export default function ReminderEmailPanel() {
 
       {/* Registro */}
       <div className="px-6 py-4">
-        <p className="text-sm font-semibold text-txt-primary mb-3">Ultime email registrate</p>
+        <p className="text-sm font-semibold text-txt-primary mb-3">Ultime email registrate <span className="text-txt-muted font-normal">· una riga per fattura</span></p>
         {recent.length === 0 ? (
           <p className="text-sm text-txt-muted">Nessuna email ancora registrata.</p>
         ) : (
@@ -414,7 +445,10 @@ export default function ReminderEmailPanel() {
                         <CustomerName id={row.customer_id} name={row.ragione_sociale} navigate={navigate} />
                         <AgentBadges agents={row.agents} className="ml-2" />
                       </td>
-                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary whitespace-nowrap">{row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span></td>
+                      <td className="py-2 pr-3 font-mono text-xs text-txt-secondary whitespace-nowrap">
+                        {row.invoice_number} <span className="text-txt-muted">· scad. {fmtDate(row.due_date)}</span>
+                        <GroupNote row={row} />
+                      </td>
                       <td className="py-2 pr-3 text-right text-txt-primary">{fmtEur(row.amount_due)}</td>
                       <td className="py-2 pr-3"><ReminderStatusBadge row={row} />{row.mode === 'test' && <span className="ml-1 text-xs text-txt-muted">(test)</span>}</td>
                       <td className="py-2 pr-3 text-xs font-mono text-txt-secondary">

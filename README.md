@@ -102,7 +102,7 @@ Per setup completo con Nginx + SSL: `sudo bash deploy/setup.sh`
 | `JWT_SECRET` | Segreto JWT (obbligatoria) |
 | `AUTH_PASSWORD` | Password di accesso (obbligatoria) |
 | `CORS_ORIGINS` | Origini CORS consentite |
-| `REMINDER_EMAIL_ENABLED` | `true` accende i promemoria email pre-scadenza (default: prova, nessun invio) |
+| `REMINDER_EMAIL_ENABLED` | `true` accende i promemoria email pre-scadenza (default: prova, nessun invio). Una sola email per cliente: le sue fatture in scadenza partono insieme, comprese quelle che scadono nei giorni subito dopo (a catena, finché le scadenze sono di fila) |
 | `RESEND_API_KEY` | Chiave Resend per l'invio (dominio sakecompany.com) |
 | `REMINDER_EMAIL_TEST_TO` | Se impostata, tutte le email di promemoria vanno a questo indirizzo |
 | `REMINDER_EMAIL_FROM` / `REMINDER_EMAIL_REPLY_TO` / `REMINDER_EMAIL_BCC` | Mittente, risposte, copia nascosta |

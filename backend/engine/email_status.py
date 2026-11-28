@@ -48,7 +48,7 @@ from backend.engine.agents import agents_of
 from backend.engine.format import italian_today
 from backend.engine.reminder_email import (
     MODE_REALE, NOT_REMINDABLE_STATUSES, STATUS_FAILED, STATUS_SENDING, STATUS_SENT, STATUS_SKIPPED,
-    WEEKDAYS_IT, invoice_label, is_uncertain, resolve_mode, skip_reason, target_due_dates,
+    ERROR_NOT_ATTEMPTED, WEEKDAYS_IT, invoice_label, is_uncertain, resolve_mode, skip_reason, target_due_dates,
 )
 
 logger = logging.getLogger(__name__)
@@ -383,6 +383,11 @@ def _email_key(row) -> str:
     return row.group_key or f"riga-{row.id}"
 
 
+def _newest(group: list):
+    """La riga più recente tra quelle (fattura, riga) di una stessa email."""
+    return max((row for _inv, row in group), key=lambda row: event_time(row) or datetime.min)
+
+
 def _numbers(group: list) -> str:
     """«Fattura N» / «Fatture N, M» per le fatture di una stessa email."""
     numbers = ", ".join(invoice_label(inv.invoice_number) for inv, _row in group)
@@ -421,22 +426,29 @@ def _reminder_items(entries: List[Tuple[Invoice, list]], today: date, now: datet
     `now`: adesso, in UTC senza fuso (come le date del registro); `mode`: la
     modalità in cui il promemoria invia adesso."""
     reminded = reminded_ids(entries)
-    sent: List[Tuple[Invoice, InvoiceReminderEmail]] = []
-    stuck: List[Tuple[Invoice, InvoiceReminderEmail]] = []
-    uncertain: List[Tuple[Invoice, InvoiceReminderEmail]] = []
+    # Una email per cliente: le fatture della stessa email sono UNA voce.
+    sent: Dict[str, list] = {}
+    stuck: Dict[str, list] = {}
+    uncertain: Dict[str, list] = {}
+    unsent: Dict[str, list] = {}   # errore prima di qualunque invio, non più riprendibile: nulla è arrivato
     skipped: List[Tuple[Invoice, Tuple[Optional[str], Optional[date]]]] = []
     for inv, rows in entries:
         current = _current(rows, inv)
         for r in rows:
             if r.status == STATUS_SENT:
-                sent.append((inv, r))
+                sent.setdefault(_email_key(r), []).append((inv, r))
             elif was_attempted(r) and not in_flight(r, now):
                 # Tentato e non concluso: non si può mai dire «non partito».
                 # «Fermo» (da gestire) solo se «Riprova» lo accetta adesso.
                 if r is current and r.status in STUCK_STATUSES and reminder_retriable(r, inv, today, mode):
-                    stuck.append((inv, r))
+                    stuck.setdefault(_email_key(r), []).append((inv, r))
+                elif r.status == STATUS_FAILED and r.error_kind == ERROR_NOT_ATTEMPTED:
+                    # Errore prima di qualunque invio: il motore scrive questo
+                    # tipo solo quando nulla è partito. (Per gli altri
+                    # fallimenti resta la lettura prudente: «esito incerto».)
+                    unsent.setdefault(_email_key(r), []).append((inv, r))
                 else:
-                    uncertain.append((inv, r))
+                    uncertain.setdefault(_email_key(r), []).append((inv, r))
         if current is not None and current.status == STATUS_SKIPPED and not was_attempted(current):
             # «Non ancora» solo finché un giro può mandarlo al cliente: nel
             # giorno di giro di questa scadenza, a promemoria in reale.
@@ -444,35 +456,58 @@ def _reminder_items(entries: List[Tuple[Invoice, list]], today: date, now: datet
             skipped.append((inv, (current.skip_reason or None, round_day)))
     items: List[dict] = []
     if sent:
-        days = {event_day(r) for _i, r in sent}
+        days, lines = set(), []
+        for group in sent.values():
+            newest = _newest(group)
+            days.add(event_day(newest))
+            lines.append(f"{_numbers(group)}: promemoria inviato {_when_text(event_time(newest))}"
+                         f"{' a ' + newest.to_email if newest.to_email else ''}")
         items.append(_item(
-            KIND_REMINDER, SENT, _counted(len(sent), days, "Promemoria", "promemoria", today),
-            (f"Fattura {invoice_label(i.invoice_number)}: promemoria inviato {_when_text(event_time(r))}"
-             f"{' a ' + r.to_email if r.to_email else ''}" for i, r in sent),
+            KIND_REMINDER, SENT, _counted(len(sent), days, "Promemoria", "promemoria", today), lines,
             day=_latest(days), count=len(sent),
         ))
     if stuck:
-        days = {event_day(r) for _i, r in stuck}
+        days, lines = set(), []
+        for group in stuck.values():
+            newest = _newest(group)
+            days.add(event_day(newest))
+            lines.append(f"{_numbers(group)}: ultimo tentativo {_when_text(event_time(newest))}, non concluso")
         items.append(_item(
-            KIND_REMINDER, STUCK, _counted(len(stuck), days, "Promemoria fermo", "promemoria fermi", today),
-            (f"Fattura {invoice_label(i.invoice_number)}: ultimo tentativo {_when_text(event_time(r))}, non concluso"
-             for i, r in stuck),
+            KIND_REMINDER, STUCK, _counted(len(stuck), days, "Promemoria fermo", "promemoria fermi", today), lines,
             ["Da gestire in Sistema → «Promemoria email». Prima di ritentare, verificare su Resend che un "
              "tentativo precedente non sia già arrivato."],
             day=_latest(days), count=len(stuck),
         ))
     if uncertain:
-        days = {event_day(r) for _i, r in uncertain}
+        days, lines = set(), []
+        for group in uncertain.values():
+            newest = _newest(group)
+            days.add(event_day(newest))
+            lines.append(f"{_numbers(group)}: ultimo tentativo {_when_text(event_time(newest))}, non concluso"
+                         f"{' (' + newest.error[:120] + ')' if newest.error else ''}")
         notes = ["Non si sa se il cliente l'ha ricevuto: si può verificare su Resend."]
-        if any(i.id not in reminded for i, _r in uncertain):
+        if any(i.id not in reminded for group in uncertain.values() for i, _r in group):
             # Vero solo se per la scadenza di adesso non c'è un promemoria inviato.
             notes.append("Senza un promemoria inviato per la scadenza attuale il secondo avviso automatico non parte.")
         items.append(_item(
             KIND_REMINDER, MISSING,
             _counted(len(uncertain), days, "Promemoria dall'esito incerto", "promemoria dall'esito incerto", today),
-            (f"Fattura {invoice_label(i.invoice_number)}: ultimo tentativo {_when_text(event_time(r))}, non concluso"
-             f"{' (' + r.error[:120] + ')' if r.error else ''}" for i, r in uncertain),
-            notes, day=_latest(days), count=len(uncertain),
+            lines, notes, day=_latest(days), count=len(uncertain),
+        ))
+    if unsent:
+        days, lines = set(), []
+        for group in unsent.values():
+            newest = _newest(group)
+            days.add(event_day(newest))
+            lines.append(f"{_numbers(group)}: invio non riuscito {_when_text(event_time(newest))}, nulla è partito")
+        notes = ["L'invio non è riuscito e al cliente non è arrivato nulla."]
+        if any(i.id not in reminded for group in unsent.values() for i, _r in group):
+            notes.append("Senza un promemoria inviato per la scadenza attuale il secondo avviso automatico non parte.")
+        n = len(unsent)
+        items.append(_item(
+            KIND_REMINDER, CLOSED,
+            "Promemoria non partito: invio non riuscito" if n == 1 else f"{n} promemoria non partiti: invio non riuscito",
+            lines, notes, day=_latest(days), count=n,
         ))
     grouped: Dict[Tuple[Optional[str], Optional[date]], List[Invoice]] = {}
     for inv, key in skipped:
@@ -750,7 +785,9 @@ def _log_state(merged: Dict[int, int], reminded: set, kind: str, row, inv: Optio
     if kind == KIND_REMINDER:
         if ours and row.status in STUCK_STATUSES and reminder_retriable(row, inv, today, reminder_mode(cfg)):
             return STUCK, "Ferma: da gestire"
-        # Solo l'ultimo errore è registrato: non si può dire «non partita».
+        if row.status == STATUS_FAILED and row.error_kind == ERROR_NOT_ATTEMPTED:
+            # Errore prima di qualunque invio: nulla è partito.
+            return CLOSED, "Non partita: invio non riuscito"
         return MISSING, "Esito incerto: da verificare su Resend"
     if row.status == STATUS_SKIPPED:
         # Il motore non riscrive mai come «saltata» un invio incerto: questo
@@ -800,13 +837,13 @@ def _reminded_for(session: Session, merged: Dict[int, int], invoices: Dict[int, 
 
 def _entries(merged: Dict[int, int], reminded: set, kind: str, found: list, mode: str, today: date, start: date,
              cfg, now: datetime) -> List[dict]:
-    """Le righe (riga, fattura, cliente) come voci del registro: un promemoria
-    è una voce; le fatture di uno stesso secondo avviso sono una voce sola."""
+    """Le righe (riga, fattura, cliente) come voci del registro: le fatture
+    di una stessa email (promemoria o secondo avviso) sono una voce sola."""
     groups: Dict[tuple, list] = {}
     for row, inv, customer in found:
         state, label = _log_state(merged, reminded, kind, row, inv, mode, today, start, cfg, now)
         # Una email è di UN cliente: stessa chiave su clienti diversi = email diverse.
-        key = (_email_key(row) if kind == KIND_FOLLOWUP else f"riga-{row.id}", row.customer_id, state, label)
+        key = (_email_key(row), row.customer_id, state, label)
         groups.setdefault(key, []).append((row, inv, customer))
     out: List[dict] = []
     for (_key, _customer_id, state, label), members in groups.items():
