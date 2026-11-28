@@ -19,10 +19,13 @@ Regole (ognuna ha il suo test in tests/test_followup_email.py):
 - UNA EMAIL PER CLIENTE. Tutte le fatture di un cliente che il giro di oggi
   deve sollecitare partono in UN'UNICA email (elenco delle fatture, totale,
   una copia di cortesia per ciascuna). Nella stessa email entrano anche le
-  sue fatture con la scadenza del giorno dopo (NEAR_DUE_DAYS = 1: scadute da
-  N−1 giorni): così due scadenze a un giorno di distanza non producono due
-  email in due giorni. Da sola, una fattura scaduta da N−1 giorni non fa
-  partire nulla: aspetta il suo giorno.
+  sue fatture GIÀ SCADUTE con le scadenze dei giorni subito dopo, A CATENA
+  (decisione owner 26/11/2026: «unite, non diventiamo assillanti»): il
+  giorno dopo l'ultima scadenza della finestra (scaduta da N−1 giorni), poi
+  quello dopo ancora, finché ogni giorno ha almeno una sua fattura pronta e
+  già scaduta. Così più scadenze di fila non producono più email in giorni
+  diversi. Da sole, quelle fatture non fanno partire nulla: aspettano il
+  loro giorno.
 - A CHI. Solo alle fatture il cui promemoria pre-scadenza è stato inviato
   davvero ALLO STESSO cliente (riga `sent` in modalità reale per la stessa
   scadenza e lo stesso cliente): è un secondo avviso, mai il primo. Le
@@ -181,10 +184,12 @@ def followup_window(now_utc: Optional[datetime] = None, cfg=None) -> Optional[Tu
     return today - timedelta(days=days + followup_lookback(cfg)), today - timedelta(days=days)
 
 
-def merge_until(window: Tuple[date, date]) -> date:
-    """L'ultima scadenza che può essere UNITA all'email di oggi: il giorno
-    dopo l'ultima scadenza della finestra (scadenza prossima = ± un giorno)."""
-    return window[1] + timedelta(days=NEAR_DUE_DAYS)
+def merge_until(window: Tuple[date, date], cfg=None) -> date:
+    """L'ultima scadenza che può essere UNITA all'email di oggi, a catena
+    dopo l'ultima della finestra: IERI (una fattura si sollecita solo se è
+    già scaduta). Con N = 1 coincide con l'ultima della finestra: nessuna
+    unione."""
+    return window[1] + timedelta(days=max(followup_days(cfg) - 1, 0))
 
 
 def sync_gate(session: Session, now_utc: Optional[datetime] = None, cfg=None) -> dict:
@@ -225,14 +230,15 @@ def sync_gate(session: Session, now_utc: Optional[datetime] = None, cfg=None) ->
 # ── Selezione ─────────────────────────────────────────────────────────
 
 def candidate_invoices(session: Session, window: Tuple[date, date],
-                       customer_id: Optional[int] = None) -> List[Invoice]:
+                       customer_id: Optional[int] = None, cfg=None) -> List[Invoice]:
     """Fatture non pagate/annullate/contestate con scadenza nella finestra O
-    nel giorno dopo (quelle che si possono unire all'email di oggi), dalla
-    scadenza più vecchia. `customer_id`: solo quel cliente."""
+    nei giorni dopo fino a ieri (quelle che si possono unire all'email di
+    oggi, a catena), dalla scadenza più vecchia. `customer_id`: solo quel
+    cliente."""
     first = window[0]
     query = session.query(Invoice).filter(
         Invoice.due_date >= first,
-        Invoice.due_date <= merge_until(window),
+        Invoice.due_date <= merge_until(window, cfg),
         Invoice.status.notin_(NOT_REMINDABLE_STATUSES),
         Invoice.amount_due > 0,
         Invoice.customer_id.isnot(None),
@@ -440,9 +446,11 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], window: Tuple[d
     ha una riga che blocca (già inviata, fallita in modo incerto…) e non ha
     motivi di esclusione. L'email parte se almeno una pronta è NELLA finestra
     (scaduta da almeno N giorni); in quel caso porta con sé anche le pronte
-    con la scadenza del giorno dopo. Le fatture del giorno dopo, da sole, non
-    producono nulla oggi: né email, né righe, né conteggi. Una fattura non
-    ancora scaduta (`due_date >= today`) non entra mai, nemmeno da «prossima».
+    con le scadenze dei giorni subito dopo, A CATENA: il giorno dopo l'ultima
+    della finestra, poi quello dopo ancora, finché ogni giorno ne ha almeno
+    una. Da sole, non producono nulla oggi: né email, né righe, né conteggi.
+    Una fattura non ancora scaduta (`due_date >= today`) non entra mai,
+    nemmeno da «prossima».
 
     `customer_id`: il cliente del gruppo com'era alla selezione. Una fattura
     che nel frattempo non è più sua (riabbinata o staccata da un sync a giro
@@ -460,6 +468,11 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], window: Tuple[d
         early = inv.due_date > last
         if early and inv.due_date >= today:
             # Con N = 1 il «giorno dopo» sarebbe oggi: non è scaduta, non si sollecita.
+            continue
+        if early and not ready:
+            # Le fatture arrivano dalla scadenza più vecchia: se nessuna della
+            # finestra è pronta, oggi non parte nulla e queste aspettano il
+            # loro giorno — inutile leggerne promemoria e registro.
             continue
         if not still_due(inv):
             if not early:
@@ -489,8 +502,9 @@ def plan_customer(session: Session, invoices: Iterable[Invoice], window: Tuple[d
         plan.why[inv.id] = why
         ready.append((inv, early))
     if any(not early for _inv, early in ready):
-        plan.email = [inv for inv, _early in ready]
-        plan.early_ids = {inv.id for inv, early in ready if early}
+        chained = base.chain_after(last, [inv for inv, early in ready if early])
+        plan.email = _in_email_order([inv for inv, early in ready if not early] + chained)
+        plan.early_ids = {inv.id for inv in chained}
     return plan
 
 
@@ -755,7 +769,7 @@ def _invoice_entry(inv: Invoice, today: date, reminder: Optional[InvoiceReminder
         "due_date": inv.due_date.isoformat(),
         "days_overdue": days_overdue_on(inv, today),
         "reminder_sent_at": reminder.sent_at.isoformat() if reminder is not None and reminder.sent_at else None,
-        # Unita all'email di oggi perché scade il giorno dopo un'altra.
+        # Unita all'email di oggi perché scade nei giorni subito dopo (a catena).
         "early": early,
     }
 
@@ -811,7 +825,7 @@ def preview_followups(session: Session, *, now_utc: Optional[datetime] = None, c
     eval_mode = resolve_mode(cfg)[0] if mode == MODE_OFF else mode
     today = italian_today(now_utc)
     out = []
-    for customer_id, invoices in by_customer(candidate_invoices(session, window)):
+    for customer_id, invoices in by_customer(candidate_invoices(session, window, cfg=cfg)):
         try:
             entries = _preview_customer(session, customer_id, invoices, window, eval_mode, today, cfg)
         except Exception as e:  # un cliente non deve far cadere il pannello
@@ -869,17 +883,17 @@ def _preview_customer(session: Session, customer_id: int, invoices: List[Invoice
 
 # ── Esecuzione ────────────────────────────────────────────────────────
 
-def _summary(mode: str, missing: List[str], window: Optional[Tuple[date, date]]) -> dict:
+def _summary(mode: str, missing: List[str], window: Optional[Tuple[date, date]], cfg=None) -> dict:
     """Esito di un giro. `sent`, `prepared` e `failed` contano le EMAIL;
     `invoices` le fatture coperte dalle email inviate o preparate."""
     summary = base._empty_summary(None, mode, missing)
     summary.update({
         "kind": KIND_KEY,
         "window": [d.isoformat() for d in window] if window else None,
-        "merge_until": merge_until(window).isoformat() if window else None,
+        "merge_until": merge_until(window, cfg).isoformat() if window else None,
         # Fatture coperte dalle email inviate o preparate.
         "invoices": 0,
-        # Di cui unite perché scadono il giorno dopo un'altra dello stesso cliente.
+        # Di cui unite perché scadono nei giorni subito dopo (a catena).
         "merged_early": 0,
         # Fatture nella finestra ma senza promemoria inviato: non lavorate.
         "out_of_scope": 0,
@@ -1307,7 +1321,7 @@ def run_followups(
     if expected_mode and expected_mode != mode:
         raise ModeMismatch(mode, expected_mode)
     window = followup_window(now_utc, cfg)
-    summary = _summary(mode, missing, window)
+    summary = _summary(mode, missing, window, cfg)
     if mode == MODE_OFF:
         return _blocked(summary, "off")
     if window is None:
@@ -1324,7 +1338,7 @@ def run_followups(
         mode, _missing, mailer, own_mailer = base._resolve_runtime(cfg, mailer, mode)
         today = italian_today(now_utc)
         try:
-            for customer_id, invoices in by_customer(candidate_invoices(session, window)):
+            for customer_id, invoices in by_customer(candidate_invoices(session, window, cfg=cfg)):
                 try:
                     _run_customer(session, customer_id, invoices, window, mode=mode, mailer=mailer, cfg=cfg,
                                   summary=summary, today=today)
@@ -1553,8 +1567,8 @@ def retry_followup_row(session: Session, row: InvoiceFollowupEmail, *, mailer=No
         days = followup_days(cfg)
         if not any(days_overdue_on(member, today) >= days for member in ready):
             raise ValueError(
-                f"la fattura è scaduta da meno di {days} giorni e le altre della stessa email non sono più "
-                "da sollecitare: si potrà ritentare dal giorno in cui compie i giorni previsti"
+                f"la fattura è scaduta da meno di {days} giorni e nessun'altra della stessa email si può "
+                "rimandare oggi con lei: si potrà ritentare dal giorno in cui compie i giorni previsti"
             )
         rows = [member_row for _member, member_row in members]
         # Un invio REALE dall'esito incerto non si «ritenta» in prova o in
@@ -1604,7 +1618,7 @@ def email_group_of(session: Session, invoice: Invoice, *, now_utc: Optional[date
     window = followup_window(now_utc, cfg)
     if window is None:
         return [invoice]
-    candidates = candidate_invoices(session, window, customer_id=invoice.customer_id)
+    candidates = candidate_invoices(session, window, customer_id=invoice.customer_id, cfg=cfg)
     plan = plan_customer(session, candidates, window, resolve_mode(cfg)[0], italian_today(now_utc),
                          ignore_email=True, customer_id=invoice.customer_id)
     if any(inv.id == invoice.id for inv in plan.email):

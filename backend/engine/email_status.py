@@ -48,7 +48,8 @@ from backend.engine.agents import agents_of
 from backend.engine.format import italian_today
 from backend.engine.reminder_email import (
     MODE_REALE, NOT_REMINDABLE_STATUSES, STATUS_FAILED, STATUS_SENDING, STATUS_SENT, STATUS_SKIPPED,
-    ERROR_NOT_ATTEMPTED, WEEKDAYS_IT, invoice_label, is_uncertain, resolve_mode, skip_reason, target_due_dates,
+    ERROR_NOT_ATTEMPTED, WEEKDAYS_IT, chain_after, invoice_label, is_uncertain, resolve_mode, skip_reason,
+    target_due_dates,
 )
 
 logger = logging.getLogger(__name__)
@@ -403,18 +404,21 @@ def _by_reason(pairs: List[Tuple[Invoice, Optional[str]]]) -> Dict[Optional[str]
 
 def leave_days(pairs: List[Tuple[Invoice, date]], cfg=None) -> Dict[int, date]:
     """{id fattura: giorno in cui parte davvero}. Una email per cliente: il
-    giorno della prima porta con sé le fatture che quel giorno sono al più a
-    un giorno dalla soglia (scadenza prossima); le altre fanno lo stesso tra
-    loro, alla loro prima data. `pairs`: (fattura, il suo giorno da sola),
-    tutte dello stesso cliente e contate dallo stesso primo giro."""
-    reach = timedelta(days=followup.NEAR_DUE_DAYS) - timedelta(days=followup.followup_days(cfg))
+    giorno della prima porta con sé le fatture che quel giorno sono nella
+    finestra e, a catena, quelle già scadute con le scadenze dei giorni
+    subito dopo (stessa regola del giro: followup.plan_customer); le altre
+    fanno lo stesso tra loro, alla loro prima data. `pairs`: (fattura, il suo
+    giorno da sola), tutte dello stesso cliente e contate dallo stesso primo
+    giro."""
+    days = timedelta(days=followup.followup_days(cfg))
     remaining = list(pairs)
     out: Dict[int, date] = {}
     while remaining:
         first = min(day for _inv, day in remaining)
-        for inv, _own in remaining:
-            if inv.due_date <= first + reach:
-                out[inv.id] = first
+        last = first - days   # l'ultima scadenza della finestra di quel giro
+        later = [inv for inv, _own in remaining if last < inv.due_date < first]
+        for inv in [inv for inv, _own in remaining if inv.due_date <= last] + chain_after(last, later):
+            out[inv.id] = first
         remaining = [(inv, own) for inv, own in remaining if inv.id not in out]
     return out
 
@@ -724,7 +728,8 @@ def _followup_items(reminders: List[Tuple[Invoice, list]], followups: List[Tuple
             KIND_FOLLOWUP, CLOSED, "2° avviso non previsto: giorni utili passati",
             (f"Fattura {invoice_label(i.invoice_number)}: i suoi giorni utili sono passati" for i in expired),
             [f"Il secondo avviso automatico parte solo nei giorni utili dopo la scadenza (dal {first_useful}° al "
-             f"{last_useful}°, mai nel weekend)."],
+             f"{last_useful}°, mai nel weekend; prima solo insieme a un'altra fattura dello stesso cliente con "
+             "le scadenze di fila)."],
             count=len(expired),
         ))
     return items
