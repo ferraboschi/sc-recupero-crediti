@@ -181,10 +181,35 @@ def run_email_jobs():
     secondi avvisi. In sequenza (condividono il lock) e isolati: ognuno
     cattura i propri errori, quindi il guasto dell'uno non ferma l'altro. Se
     un giro manuale è in corso, ognuno aspetta e riprova (fino a ~5 minuti)."""
-    return {
+    out = {
         "reminder": _retry_while_busy(run_reminder_email_job),
         "followup": _retry_while_busy(run_followup_email_job),
     }
+    out["stuck_alert"] = run_stuck_alert_job()
+    return out
+
+
+def run_stuck_alert_job():
+    """Dopo il giro: se un'email automatica è rimasta ferma, un avviso
+    interno (backend/engine/stuck_alert.py). Non manda nulla ai clienti e
+    non fa mai cadere il giro."""
+    try:
+        from backend.database import get_session_direct
+        from backend.engine.stuck_alert import send_stuck_alert
+    except Exception as e:
+        logger.error(f"Stuck alert job failed: {e}", exc_info=True)
+        return {"error": str(e)}
+    session = get_session_direct()
+    try:
+        return send_stuck_alert(session)
+    except Exception as e:
+        logger.error(f"Stuck alert job failed: {e}", exc_info=True)
+        return {"error": str(e)}
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 def run_reminder_email_catchup():

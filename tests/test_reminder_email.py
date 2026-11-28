@@ -1460,7 +1460,9 @@ class TestSchedulerJob:
         monkeypatch.setattr("backend.engine.reminder_email.in_catchup_window", lambda: True)
         monkeypatch.setattr(sched, "run_reminder_email_job", lambda: {"ran": True})
         monkeypatch.setattr(sched, "run_followup_email_job", lambda: {"ran": "followup"})
-        assert sched.run_reminder_email_catchup() == {"reminder": {"ran": True}, "followup": {"ran": "followup"}}
+        monkeypatch.setattr(sched, "run_stuck_alert_job", lambda: {"sent": False})
+        assert sched.run_reminder_email_catchup() == {"reminder": {"ran": True}, "followup": {"ran": "followup"},
+                                                      "stuck_alert": {"sent": False}}
 
 
 # ── Una email per cliente (decisione owner 26/11/2026) ────────────────

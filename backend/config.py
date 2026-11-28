@@ -67,6 +67,9 @@ class Config:
     # Copia (CC) visibile su ogni promemoria REALE: la casella fatture + il
     # commerciale di riferimento del cliente (decisione owner 10/11/2026).
     REMINDER_EMAIL_CC = os.getenv("REMINDER_EMAIL_CC", "fatture@sakecompany.com")
+    # Avviso INTERNO quando un'email automatica resta ferma (decisione owner
+    # 28/11/2026): a chi arriva. Mai a un cliente.
+    REMINDER_ALERT_TO = os.getenv("REMINDER_ALERT_TO", "lorenzo@ef-ti.com,fatture@sakecompany.com")
     # "Maggioni:mail;Izzo:mail;Scotti:mail" — senza indirizzo il commerciale non riceve copia.
     REMINDER_AGENT_EMAILS = os.getenv(
         "REMINDER_AGENT_EMAILS",
