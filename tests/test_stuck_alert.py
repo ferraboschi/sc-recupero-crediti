@@ -176,7 +176,8 @@ def test_the_alert_never_goes_to_a_customer_and_never_touches_the_registries(tes
     alert.send_stuck_alert(test_db_session, mailer=mailer, cfg=_cfg(), now_utc=NOW)
     test_db_session.expire_all()
     assert before == [(r.id, r.status, r.error_kind, r.error, r.idempotency_key) for r in test_db_session.query(InvoiceReminderEmail)]
-    assert "amministrazione@shabu.it" not in mailer.sent[0]["to"] and a.id
+    assert mailer.sent[0]["to"] == ["lorenzo@ef-ti.com", "fatture@sakecompany.com"] and a.id
+    assert not mailer.sent[0].get("cc") and not mailer.sent[0].get("bcc")
 
 
 def test_the_morning_job_runs_the_alert_after_the_two_rounds(monkeypatch):
@@ -201,7 +202,7 @@ def test_a_row_being_sent_right_now_is_not_stuck(test_db_session):
     inv = _inv(test_db_session, c, "S/1")
     row = InvoiceReminderEmail(invoice_id=inv.id, customer_id=c.id, due_date=inv.due_date, status="sending", mode="reale",
                                to_email="amministrazione@shabu.it", amount_due=100.0,
-                               attempted_at=(NOW - timedelta(minutes=3)).replace(tzinfo=None))
+                               attempted_at=(NOW - timedelta(minutes=1)).replace(tzinfo=None))
     test_db_session.add(row)
     test_db_session.commit()
     mailer = Mailer()
@@ -209,4 +210,35 @@ def test_a_row_being_sent_right_now_is_not_stuck(test_db_session):
     later = NOW + timedelta(minutes=20)
     out = alert.send_stuck_alert(test_db_session, mailer=mailer, cfg=_cfg(), now_utc=later)
     assert out["sent"] and "Invio interrotto a metà" in mailer.sent[0]["text"]
-    assert "Ultimo tentativo: 10/11/2026 10:57" in mailer.sent[0]["text"]   # ora italiana (09:57 UTC)
+    assert "Ultimo tentativo: 10/11/2026 10:59" in mailer.sent[0]["text"]   # ora italiana (09:59 UTC)
+
+
+def test_a_round_that_retries_and_fails_the_same_way_does_not_alert_again(test_db_session):
+    # Indirizzo rifiutato (422): il giro e ogni recupero al riavvio ritentano
+    # da soli e falliscono uguale. Un solo avviso, non uno per giro.
+    c = _cust(test_db_session)
+    _inv(test_db_session, c, "V/1")
+    rejected = lambda: MailSendError("Resend HTTP 422: invalid to", kind="validation")  # noqa: E731
+    mailer = Mailer()
+    for _ in range(4):
+        rem.run_reminders(test_db_session, due_date=TOMORROW, mailer=Mailer(rejected()), cfg=_cfg())
+        alert.send_stuck_alert(test_db_session, mailer=mailer, cfg=_cfg(), now_utc=NOW)
+    assert len(mailer.sent) == 1 and "Certamente NON partita" in mailer.sent[0]["text"]
+
+
+def test_marks_follow_what_is_still_stuck(test_db_session):
+    _c, a, b = _stuck_round(test_db_session)
+    mailer = Mailer()
+    alert.send_stuck_alert(test_db_session, mailer=mailer, cfg=_cfg(), now_utc=NOW)
+    kept = test_db_session.query(SyncState).filter_by(key=alert.STATE_KEY).one().result["marks"]
+    assert len(kept) == 2
+    # Saldate: non più ferme. Un'altra email ferma: l'elenco tiene solo lei.
+    for inv in (a, b):
+        inv.status, inv.amount_due = "paid", 0
+    other = _cust(test_db_session, "Altro Srl", "info@altro.it", "01234567897")
+    _inv(test_db_session, other, "X/1")
+    rem.run_reminders(test_db_session, due_date=TOMORROW, mailer=Mailer(_timeout()), cfg=_cfg())
+    alert.send_stuck_alert(test_db_session, mailer=mailer, cfg=_cfg(), now_utc=NOW)
+    test_db_session.expire_all()
+    assert len(test_db_session.query(SyncState).filter_by(key=alert.STATE_KEY).one().result["marks"]) == 1
+    assert len(mailer.sent) == 2 and "Altro Srl" in mailer.sent[1]["text"] and "Shabu" not in mailer.sent[1]["text"]

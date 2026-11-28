@@ -8,8 +8,8 @@ interrotta a metà invio) di una fattura ancora da saldare parte UNA email
 interna, una volta sola per quel tentativo.
 
 Non invia nulla ai clienti, non tocca i registri delle email: ricorda solo,
-in `sync_state` (chiave `email_stuck_alert`), di quali tentativi ha già
-avvisato. Un errore qui non deve mai far cadere il giro.
+in `sync_state` (chiave `email_stuck_alert`), di quali situazioni ferme ha
+già avvisato. Un errore qui non deve mai far cadere il giro.
 """
 import hashlib
 import logging
@@ -31,8 +31,7 @@ from backend.engine.reminder_email import (
 logger = logging.getLogger(__name__)
 
 STATE_KEY = "email_stuck_alert"
-KEEP_MARKS = 500   # quanti tentativi già avvisati si ricordano
-SENDING_GRACE = timedelta(minutes=10)   # una riga «in invio» più giovane è un invio in corso, non una riga ferma
+SENDING_GRACE = timedelta(minutes=2)   # una riga «in invio» più giovane è un invio in corso, non una riga ferma
 KINDS = (("promemoria", "Promemoria", InvoiceReminderEmail), ("followup", "Secondo avviso", InvoiceFollowupEmail))
 
 
@@ -49,9 +48,10 @@ def recipients(cfg=None) -> List[str]:
 
 
 def _mark(kind: str, row) -> str:
-    """L'identità di UN tentativo fermo: la riga e il suo ultimo tentativo."""
-    moment = row.attempted_at or row.created_at
-    return f"{kind}:{row.id}:{moment.isoformat() if moment else '-'}"
+    """L'identità di UNA situazione ferma: la riga e COME è ferma. Non l'ora
+    del tentativo: un giro che ritenta da solo e fallisce allo stesso modo
+    (indirizzo rifiutato, PDF mancante) non deve riavvisare ogni volta."""
+    return f"{kind}:{row.id}:{row.status}:{row.error_kind or '-'}"
 
 
 def _why(kind: str, row) -> str:
@@ -142,7 +142,7 @@ def _load_marks(session: Session) -> List[str]:
 def _save_marks(session: Session, marks: List[str], now: datetime) -> None:
     row = session.query(SyncState).filter(SyncState.key == STATE_KEY).first() or SyncState(key=STATE_KEY)
     row.last_sync = now
-    row.result = {"marks": marks[-KEEP_MARKS:]}
+    row.result = {"marks": marks}
     session.add(row)
     session.commit()
 
@@ -171,6 +171,10 @@ def send_stuck_alert(session: Session, *, mailer=None, cfg=None, now_utc: Option
             return out
         msg = compose(fresh, getattr(cfg, "TIMEZONE", None) or "Europe/Rome")
         marks = sorted(mark for e in fresh for mark in e["marks"])
+        # Si ricordano solo le situazioni ANCORA ferme: l'elenco non cresce
+        # all'infinito e una riga che torna ferma dopo essere stata risolta
+        # avvisa di nuovo.
+        current = {mark for e in entries for mark in e["marks"]}
         own = False
         if mailer is None:
             from backend.connectors.resend_mail import ResendMailer
@@ -185,7 +189,7 @@ def send_stuck_alert(session: Session, *, mailer=None, cfg=None, now_utc: Option
             if own:
                 mailer.close()
         now = now_utc or datetime.now(timezone.utc)
-        _save_marks(session, seen + [m for m in marks if m not in seen], now.replace(tzinfo=None) if now.tzinfo else now)
+        _save_marks(session, sorted(current & (set(seen) | set(marks))), now.replace(tzinfo=None) if now.tzinfo else now)
         out["sent"] = True
         logger.info("Avviso email ferme inviato a %d destinatari per %d email", len(to), len(fresh))
     except Exception as e:  # l'avviso non deve mai far cadere il giro
