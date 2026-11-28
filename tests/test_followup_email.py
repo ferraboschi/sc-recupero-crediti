@@ -3170,8 +3170,10 @@ class TestSchedulerJob:
                    "followup": [{"sent": 1, "items": []}]}
         monkeypatch.setattr(sched, "run_reminder_email_job", lambda: answers["reminder"].pop(0))
         monkeypatch.setattr(sched, "run_followup_email_job", lambda: answers["followup"].pop(0))
+        monkeypatch.setattr(sched, "run_stuck_alert_job", lambda: {"sent": False})
         out = sched.run_email_jobs()
-        assert out == {"reminder": {"sent": 3, "items": []}, "followup": {"sent": 1, "items": []}}
+        assert out == {"reminder": {"sent": 3, "items": []}, "followup": {"sent": 1, "items": []},
+                       "stuck_alert": {"sent": False}}
         assert waits == [sched.EMAIL_JOB_BUSY_WAIT_SECONDS] * 2
         # Occupato a oltranza: dopo i tentativi previsti si arrende e lo dice.
         waits.clear()
